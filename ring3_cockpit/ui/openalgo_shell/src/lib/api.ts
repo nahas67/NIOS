@@ -1,0 +1,86 @@
+import type {
+  BrokerControlPayload,
+  CockpitState,
+  ExtensionsActionResponse,
+  ExtensionsControlPayload,
+  ExtensionsState,
+  KillReport,
+  LLMControlPayload,
+} from '@/types'
+
+const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? ''
+
+export class ApiError extends Error {
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(init?.headers ?? {}),
+    },
+  })
+  const text = await response.text()
+  if (!response.ok) {
+    let detail = text
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown }
+      if (typeof parsed.detail === 'string') detail = parsed.detail
+      else if (Array.isArray(parsed.detail)) detail = JSON.stringify(parsed.detail)
+    } catch {
+      // keep the raw body
+    }
+    throw new ApiError(detail || `HTTP ${response.status}`, response.status)
+  }
+  return (text ? JSON.parse(text) : {}) as T
+}
+
+export function streamUrl(): string {
+  return `${API_BASE}/api/v2/cockpit/stream`
+}
+
+export function fetchState(): Promise<CockpitState> {
+  return request<CockpitState>('/api/v2/cockpit/state')
+}
+
+export function postBroker(payload: BrokerControlPayload): Promise<unknown> {
+  return request('/api/v2/control/brokers', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function postLLM(payload: LLMControlPayload): Promise<unknown> {
+  return request('/api/v2/control/llms', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function postKillSwitch(reason = 'operator kill switch'): Promise<KillReport> {
+  return request<KillReport>('/api/v2/control/killswitch', {
+    method: 'POST',
+    body: JSON.stringify({ reason, flatten: true, confirm: true }),
+  })
+}
+
+export function fetchExtensions(): Promise<ExtensionsState> {
+  return request<ExtensionsState>('/api/v2/control/extensions')
+}
+
+export function postExtensions(
+  payload: ExtensionsControlPayload
+): Promise<ExtensionsActionResponse> {
+  return request<ExtensionsActionResponse>('/api/v2/control/extensions', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}

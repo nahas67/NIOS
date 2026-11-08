@@ -1,0 +1,170 @@
+# NIOS Core v3.0 -- 4-ring network-segmented production topology.
+#
+# Segmentation contract (sec_004):
+#   ring0-vault  : ring0-net only. The only ring that holds broker keys/signers.
+#   ring1-spinal : ring0-net + ring1-net. Pinned CPUs, large /dev/shm.
+#   ring2-brain  : ring1-net + ring2-net. NO ring0-net -> no broker sockets.
+#   ring3-cockpit: ring2-net + ring3-net. Public 8000/tcp, no broker network.
+#
+# A ring-2 container can reach the lease bridge and NATS spine but cannot route
+# to the Ring 0 signer or any broker adapter network.
+
+name: nios-core
+
+x-nios-common: &nios-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: nios-core:3.0.0
+  restart: unless-stopped
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  ring0-vault:
+    <<: *nios-common
+    container_name: nios-ring0-vault
+    command: ["python", "scripts/run_nios.py", "--role", "ring0-vault"]
+    environment:
+      NIOS_RING: "0"
+      NIOS_MODE: "PAPER"
+      NIOS_KEY_VAULT: "/var/lib/nios/keys"
+    networks:
+      - ring0-net
+    volumes:
+      - ring0-state:/var/lib/nios
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from core.orchestrator import NIOSCoreOrchestrator; print('ring0-ok')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  ring1-spinal:
+    <<: *nios-common
+    container_name: nios-ring1-spinal
+    command: ["python", "scripts/run_nios.py", "--role", "ring1-spinal"]
+    environment:
+      NIOS_RING: "1"
+      NIOS_MODE: "PAPER"
+      NIOS_SHM_LEASES: "shm://nios-active-leases"
+      NIOS_SHM_KILL_LATCH: "shm://nios-global-kill-latch"
+    # sec_004 / sec_010: deterministic pinned cores, never share with Ring 2.
+    cpuset: "2-3"
+    shm_size: "1gb"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    networks:
+      - ring0-net
+      - ring1-net
+    volumes:
+      - type: tmpfs
+        target: /dev/shm
+        tmpfs:
+          size: 1073741824
+    depends_on:
+      ring0-vault:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from core.shm_ipc import LeaseTableSHM; print('ring1-ok')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  ring2-brain:
+    <<: *nios-common
+    container_name: nios-ring2-brain
+    command: ["python", "scripts/run_nios.py", "--role", "ring2-brain"]
+    environment:
+      NIOS_RING: "2"
+      # Auditable air-gap: Ring 2 has no broker credentials and no exchange
+      # sockets. It can only emit unsigned, SHA-256-committed proposals.
+      NIOS_AIR_GAP: "broker-keys,exchange-sockets,broker-order-placement"
+      NIOS_FORGE_UTC: "00:00"
+    networks:
+      # Deliberately no ring0-net: Ring 2 cannot route to the signer.
+      - ring1-net
+      - ring2-net
+    depends_on:
+      ring1-spinal:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from ring2_brain.forge.alpha_forge import NocturnalAlphaForge; print('ring2-ok')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  ring3-cockpit:
+    <<: *nios-common
+    container_name: nios-ring3-cockpit
+    command: ["python", "scripts/run_nios.py", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      NIOS_RING: "3"
+      NIOS_HOST: "0.0.0.0"
+      NIOS_PORT: "8000"
+      NIOS_LLM_DAILY_BUDGET_USD: "3.10"
+    ports:
+      - "8000:8000"
+    networks:
+      - ring2-net
+      - ring3-net
+    depends_on:
+      ring2-brain:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v2/cockpit/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+networks:
+  ring0-net:
+    internal: true
+  ring1-net:
+    internal: true
+  ring2-net:
+    internal: true
+  ring3-net:
+    driver: bridge
+
+volumes:
+  ring0-state:

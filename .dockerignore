@@ -1,0 +1,11 @@
+.git
+.gitignore
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.pyc
+**/node_modules
+_donor_staging
+ring3_cockpit/ui/openalgo_shell/dist
+tests
+specs

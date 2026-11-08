@@ -1,0 +1,932 @@
+{
+  "document_metadata": {
+    "title": "NIOS CORE v3.0: Sovereign Autonomous Quantitative Operating System — Principal Systems Architecture Specification",
+    "document_type": "manual",
+    "total_pages": 14,
+    "summary": "NIOS Core v3.0 is a principal systems architecture specification (document NIOS-ARC-2026-V3, version 3.0.0-PROD, 14 pages) for an operating-system-isolated autonomous quantitative trading platform built on four air-gapped process rings. It specifies a 0.14 ms p99 Rust/Cython spinal reflex scalper, a bicameral LLM brain combining MiroFish five-archetype contagion simulation with a TradingAgents investment committee, a 98% split-conformal capital deployment gate, and a TigerBeetle/PostgreSQL 16 double-entry IBOR protected by SHA-256 numerical grounding. The document also defines latency benchmarks, TLA+/VOPR formal safety proofs, four broker-market silos, operator APIs, a four-phase roadmap, and five constitutional laws.",
+    "primary_entities": [
+      "NIOS Core v3.0",
+      "NIOS-ARC-2026-V3",
+      "TigerBeetle",
+      "NautilusTrader",
+      "MiroFish",
+      "TradingAgents",
+      "Vibe-Trading",
+      "OpenAlgo",
+      "Binance",
+      "OKX",
+      "Bybit",
+      "Zerodha Kite",
+      "Dhan",
+      "Interactive Brokers",
+      "Alpaca",
+      "MetaTrader 5",
+      "OANDA",
+      "PostgreSQL 16",
+      "DuckDB",
+      "NATS JetStream"
+    ]
+  },
+  "sections": [
+    {
+      "section_id": "sec_001",
+      "heading": "NIOS CORE v3.0: Sovereign Autonomous Quantitative Operating System",
+      "level": 1,
+      "page_start": 1,
+      "page_end": 1,
+      "summary": "Front matter defining the document identity and the platform's executive positioning as a mathematically gated, OS-isolated capital engine, followed by the headline architectural dimension table.",
+      "tags": ["title", "executive_positioning", "4-ring_architecture", "benchmarks", "NIOS-ARC-2026-V3"],
+      "content_blocks": [
+        {
+          "type": "key_value_pairs",
+          "page_number": 1,
+          "data": {
+            "document_class": "Principal Systems Architecture Specification",
+            "document_id": "NIOS-ARC-2026-V3",
+            "version": "3.0.0-PROD",
+            "subtitle": "4-Ring Air-Gapped Process Architecture Fusing 0.1ms Spinal Microstructure Reflexes, System 1 Instinct Leases, MiroFish Crowd Contagion Cascades, and Formally Verified Sovereign Capital Firewalls"
+          }
+        },
+        {
+          "type": "paragraph",
+          "page_number": 1,
+          "text": "Executive Positioning: NIOS Core v3.0 replaces monolithic large language model (LLM) trading scripts with an operating-system-isolated, mathematically gated capital engine that abstains on 99.1% of market noise. By separating sub-millisecond compiled orderflow execution (Ring 1) from asynchronous cognitive reasoning (Ring 2) and air-gapped cryptographic key custody (Ring 0), the platform eliminates tick-latency bleed, orderbook spoofing traps, numerical hallucination, and prompt-injection key exfiltration across four global market silos."
+        },
+        {
+          "type": "table",
+          "page_number": 1,
+          "table_data": [
+            {
+              "architectural_dimension": "Tier-0 Spinal Reflex (Ring 1)",
+              "core_subsystem_and_production_foundation": "Rust/Cython NautilusTrader actor core + Python 3.12 uvloop with garbage collection disabled during active tick windows (per core); zero LLM token burn on quiet tape",
+              "verified_production_benchmark_or_invariant": "0.14 ms p99 tick-to-intent latency (25,000 ticks/sec per core); zero LLM token burn on quiet tape"
+            },
+            {
+              "architectural_dimension": "Quant Factor Zoo & Truth Ledger (Ring 2)",
+              "core_subsystem_and_production_foundation": "Vibe-Trading 480+ vectorized alphas (Polars/Numba), automated 3-Statement/DCF/Comps valuation, and SHA-256 Numerical Grounding Ledger",
+              "verified_production_benchmark_or_invariant": "Scans 5,000 global instruments in <120 ms; aborts execution on any unhashed LLM numerical claim"
+            },
+            {
+              "architectural_dimension": "Crowd Contagion & Committee (Ring 2)",
+              "core_subsystem_and_production_foundation": "MiroFish 5-Archetype 3-Tick Liquidity Cascade Simulator + TradingAgents Staged Bull/Bear/Risk Investment Committee",
+              "verified_production_benchmark_or_invariant": "1.8 ms deterministic contagion cascade; revokes long leases when fragility index ≥ 0.75"
+            },
+            {
+              "architectural_dimension": "Sovereign Vault, OMS & IBOR (Ring 0)",
+              "core_subsystem_and_production_foundation": "TigerBeetle VOPR-verified double-entry ledger + PostgreSQL 16 outbox + 98% Split-Conformal Precision Gate + OpenAlgo / Nautilus adapters",
+              "verified_production_benchmark_or_invariant": "Deploys capital strictly when lower-bound net edge beats spread, fees, and taxes (Net_LB > 0 bps)"
+            },
+            {
+              "architectural_dimension": "Multi-Market Autonomous Books",
+              "core_subsystem_and_production_foundation": "4 Isolated Broker Silos: Crypto (Binance/OKX/Bybit), India (Zerodha/Dhan), US (IBKR/Alpaca), and Forex/Futures (MT5/OANDA/CTP)",
+              "verified_production_benchmark_or_invariant": "0.0 bps cross-border wire bleed via in-silo profit ratcheting (35% Compounder / 15% Reserve Yield)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_002",
+      "heading": "01. Executive Technical Overview: Solving the 7 Fatal Flaws of Naive AI Trading",
+      "level": 1,
+      "page_start": 2,
+      "page_end": 2,
+      "summary": "Enumerates the seven structural failure modes of monolithic LLM trading agents and pairs each with the NIOS Core v3.0 architectural countermeasure.",
+      "tags": ["failure_modes", "latency", "spoofing", "conformal_gate", "prompt_injection", "lookahead_bias"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 2,
+          "text": "First-generation autonomous financial agents fail in live production because they place high-latency generative models directly inside the market tick loop, trust spoofable limit-order books, and expose broker API credentials inside processes that scrape untrusted external web content. NIOS Core v3.0 engineers out all seven structural failure modes through three non-negotiable architectural pillars."
+        },
+        {
+          "type": "table",
+          "page_number": 2,
+          "table_data": [
+            {
+              "legacy_ai_trading_failure_mode": "1. LLM Tick-Latency Bleed",
+              "root_cause_in_monolithic_architectures": "Calling a 300 ms LLM on live WebSocket ticks guarantees adverse selection against 0.1 ms high-frequency market makers.",
+              "nios_core_v3_ground_up_breakthrough": "3-Speed Bicameral Brain: 0.14 ms compiled math Spinal Reflex armed asynchronously by <80 ms System 1 leases and governed by System 2 deep contagion."
+            },
+            {
+              "legacy_ai_trading_failure_mode": "2. Spoofed Order-Book Traps",
+              "root_cause_in_monolithic_architectures": "Triggering entries on resting L2 bid/ask depth falls prey to 40 ms phantom liquidity pulls and layering algorithms.",
+              "nios_core_v3_ground_up_breakthrough": "Executed Flow Physics (OFI): Ignores resting limit orders; triggers strictly on aggressive Taker Buy/Sell ratios (≥ 65%) and Cancel-to-Fill velocity (< 3.0)."
+            },
+            {
+              "legacy_ai_trading_failure_mode": "3. Two-Body Debate Blindness",
+              "root_cause_in_monolithic_architectures": "Static Bull/Bear LLM prompts miss 2nd- and 3rd-order forced liquidations (Vol-CTAs, Dealer Gamma flips, Pod Shop stops).",
+              "nios_core_v3_ground_up_breakthrough": "MiroFish 5-Archetype Cascade: Simulates Retail 0DTE, Options Dealers, Vol-CTAs, Pod Shops, and Value Funds across 3 deterministic ticks."
+            },
+            {
+              "legacy_ai_trading_failure_mode": "4. Conformal Cold-Start Deadlock",
+              "root_cause_in_monolithic_architectures": "Applying heavy uncertainty penalties at sample size N = 0 blocks all live trades and prevents residual calibration.",
+              "nios_core_v3_ground_up_breakthrough": "Shadow-to-Live Execution Twin: New strategies warm up across 30 real-time L2 orderbook shadow fills before unlocking live vault capital."
+            },
+            {
+              "legacy_ai_trading_failure_mode": "5. Cross-Broker Wire & Tax Bleed",
+              "root_cause_in_monolithic_architectures": "Daily cash transfers across crypto and equity brokers lose 50–150 bps in FX spreads, wire delays, and statutory STT/TDS taxes.",
+              "nios_core_v3_ground_up_breakthrough": "In-Silo Profit Ratchet: Sweeps 35% of scalp gains into Long-Term Compounders and 15% into Reserve Yield ETFs inside the exact same broker account."
+            },
+            {
+              "legacy_ai_trading_failure_mode": "6. Prompt-Injection Key Exposure",
+              "root_cause_in_monolithic_architectures": "Scraping live news or social feeds in the same process that holds broker API keys or executes tick loops enables key theft and GIL starvation.",
+              "nios_core_v3_ground_up_breakthrough": "4-Ring Process Air-Gap: Untrusted ingestion (Ring 2) is physically isolated from the Broker Signer Vault (Ring 0) and Zero-GC Spinal Loop (Ring 1)."
+            },
+            {
+              "legacy_ai_trading_failure_mode": "7. Lookahead & Hallucinated Math",
+              "root_cause_in_monolithic_architectures": "Backtesting on fiscal period-end dates instead of SEC filing timestamps and permitting LLMs to invent valuation ratios.",
+              "nios_core_v3_ground_up_breakthrough": "Bitemporal PIT & SHA-256 Grounding: Enforces t_knowledge ≤ t_as-of and aborts any thesis citing a number absent from the Grounding Ledger."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_003",
+      "heading": "The Three Foundational Design Pillars",
+      "level": 2,
+      "page_start": 3,
+      "page_end": 3,
+      "summary": "Defines the three governing principles: point-in-time cryptographic truth, the 98% split-conformal precision gate with tail-copula shield, and nightly Darwinian strategy evolution.",
+      "tags": ["point_in_time", "SHA-256", "conformal_prediction", "copula", "alpha_forge", "governance"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 3,
+          "text": "Pillar 1 — Cryptographic Truth & Point-in-Time (PIT) Integrity (Ring 2 Truth): Every market bar, SEC 10-K/10-Q filing, and factor output is stamped with both validTime and knowledgeTimestamp (filing acceptance cutoff). A Self-Healing Dual-Vendor Router quarantines any tick with >1.50% cross-vendor divergence or unadjusted split gaps, while the SHA-256 Grounding Ledger hashes every numeric figure prior to LLM ingestion."
+        },
+        {
+          "type": "paragraph",
+          "page_number": 3,
+          "text": "Pillar 2 — 98% Split-Conformal Precision Gate & Tail-Copula Shield (Ring 0 Vault): Capital deploys only when worst-case lower-bound net edge is strictly positive: Net_LB = E[r] − (Spread + 2 × Fee + Tax + Q_0.98(Residuals)) > 0. A Cross-Silo Copula Shield dynamically shrinks position sizing whenever tail correlation across Crypto, US, and India silos exceeds 0.60."
+        },
+        {
+          "type": "paragraph",
+          "page_number": 3,
+          "text": "Pillar 3 — Darwinian Self-Evolution (Nocturnal Alpha Forge): No strategy or agent holds a permanent seat. Every night at 00:00 UTC, the Nocturnal Alpha Forge audits the active roster, automatically demoting any live champion whose rolling net edge drops below +0.50 bps and promoting walk-forward challengers achieving a Deflated Sharpe Ratio ≥ 1.50 across 30+ winning shadow fills."
+        }
+      ]
+    },
+    {
+      "section_id": "sec_004",
+      "heading": "02. High-Level System Architecture: 4-Ring Process Isolation & IPC Topology",
+      "level": 1,
+      "page_start": 3,
+      "page_end": 4,
+      "summary": "Describes the four-ring OS process isolation model, the lock-free shared-memory and NATS JetStream IPC spine, and the three inter-ring control contracts including the sub-millisecond global kill switch.",
+      "tags": ["process_isolation", "IPC", "shared_memory", "SeqLock", "NATS_JetStream", "kill_switch"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 3,
+          "text": "NIOS Core v3.0 enforces strict operating-system process isolation across four concentric security and latency rings. Inter-ring communication uses lock-free POSIX shared memory (shm-open with 64-byte cache-line aligned SeqLock structures) for the microsecond hot path and durable NATS JetStream streams for asynchronous thesis, execution, and audit telemetry."
+        },
+        {
+          "type": "table",
+          "page_number": 3,
+          "table_data": [
+            {
+              "ring": "RING 3",
+              "label": "GLASS COCKPIT",
+              "role": "React 19 + FastAPI SSE",
+              "components": "Tab 1: Plain-English SSE Cards; Tab 2: Contagion & Lease X-Ray REST; Tab 3: Hot-Swap Control Room; Read-Only MCP Tool Bridge; TradingAgents Risk Committee; GLOBAL KILL SWITCH preempts Ring 1 & Ring 0 (<1ms)"
+            },
+            {
+              "ring": "RING 2",
+              "label": "BICAMERAL BRAIN",
+              "role": "Air-Gapped from Broker Keys",
+              "components": "System 1 Instinct (<80ms Ollama); Vibe-Trading 480+ Factor Zoo; SHA-256 Grounding Fact Ledger; MiroFish 5-Archetype Cascade; 30-Trade L2 Shadow Exec Twin; Nocturnal Alpha Forge (00:00)"
+            },
+            {
+              "ring": "RING 1",
+              "label": "SPINAL REFLEX",
+              "role": "Zero-GC Loop (<0.14ms p99)",
+              "components": "Dual-Vendor Self-Healing Feed; Executed Taker OFI (≥65% Buy); Cancel-to-Fill Guard (<3.0x); 0.1ms Vol Spike Breaker (≥3.5x); Pinned CPU Cores per Silo"
+            },
+            {
+              "ring": "RING 0",
+              "label": "SOVEREIGN VAULT",
+              "role": "Hardware Signer & IBOR",
+              "components": "98% Split-Conformal Gate; Cross-Silo Tail-Copula Shield; Nautilus RiskEngine (ADR-009); Smart OMS (Maker-Peg / TWAP); TigerBeetle 2-Phase IBOR; Encrypted Broker Outbound"
+            }
+          ]
+        },
+        {
+          "type": "callout",
+          "page_number": 3,
+          "text": "Figure 1 — NIOS Core v3.0 4-Ring Process Isolation Topology, Lock-Free Shared Memory Lease Bridge, and Air-Gapped Signer Custody. Semantic purpose: gives operators and integrators the authoritative deployment-boundary map showing which workloads can ever touch broker credentials or exchange sockets."
+        },
+        {
+          "type": "paragraph",
+          "page_number": 3,
+          "text": "DETERMINISTIC IPC SPINE: POSIX Shared Memory SeqLock (<0.008ms Lease & Kill Latch) | NATS JetStream Durable Bus (<1.5ms Thesis, Outbox & SSE Streams)."
+        },
+        {
+          "type": "bullet_list",
+          "page_number": 4,
+          "items": [
+            "Ring 3 ↔ Ring 2/0 Control Boundary: Authenticated REST/SSE control plane updates LLM token budgets, broker fee tables, and vault allocation sliders without restarting worker processes. Triggering the Global Kill Switch flips the POSIX shared-memory kill latch and disarms all scalpers in <1.0 ms.",
+            "Ring 2 → Ring 1 Lease Bridge: System 1 writes 60-second TTL System1Lease structs into lock-free shared memory; Ring 1 reads them in 0.005 ms median (0.008 ms p99) using a single-writer atomic sequence lock.",
+            "Ring 1 → Ring 0 Intent Pipe: Ring 1 emits unsigned scalp proposals only when anti-spoofing executed orderflow physics pass; Ring 0 verifies the 98% split-conformal lower bound and portfolio copula heat before signing with hardware/OS keys."
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_005",
+      "heading": "03. Foundational Technologies & Production Donor Organ Harvest",
+      "level": 1,
+      "page_start": 4,
+      "page_end": 5,
+      "summary": "Maps six production open-source donor repositories to the specific subsystems harvested, the scaffolding deleted, and the resulting NIOS target packages.",
+      "tags": ["open_source", "Vibe-Trading", "TradingAgents", "MiroFish", "NautilusTrader", "TigerBeetle", "OpenAlgo"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 4,
+          "text": "NIOS Core v3.0 is engineered by harvesting the top 75% battle-tested primitives from six production open-source repositories (over 95,000+ combined GitHub stars) while surgically deleting 65% of overlapping chatbot, toy UI, and wrapper bloat. The remaining 25% consists of native glue: the POSIX SeqLock bridge, the 98% Split-Conformal gate, and the 3-Tab Glass Cockpit."
+        },
+        {
+          "type": "table",
+          "page_number": 4,
+          "table_data": [
+            {
+              "donor_repository": "HKUDS / Vibe-Trading quantlib",
+              "harvested_core_technologies": "480+ Factor Zoo (Alpha101, GTJA191, Qlib158, Fundamental PIT), quantlib (DCF, Comps, 3-Stmt, Options, Market Impact, Deflated Sharpe), 33 Loaders, 12 Regional Engines",
+              "deleted_redundant_scaffolding": "15 Chat bots (WhatsApp, WeChat, QQ, DingTalk), Pixel Office toy, CLI slash router",
+              "nios_target_package": "ring2-brain/quant & ring2-brain/truth grounding/ledger.py"
+            },
+            {
+              "donor_repository": "TauricResearch / TradingAgents",
+              "harvested_core_technologies": "Staged Investment Committee (4 Analysts → Bull/Bear Debate → Trader → 3-Way Risk Debaters), SEC statementKnowledgeTime guard, Multi-Vendor Router, Delayed Memory Settlement",
+              "deleted_redundant_scaffolding": "Interactive CLI wizard, basic single-asset backtester, raw Yahoo wrappers",
+              "nios_target_package": "ring2-brain/cognition"
+            },
+            {
+              "donor_repository": "666ghj / MiroFish Contagion Simulator",
+              "harvested_core_technologies": "Causal Shock Ontology Extractor (ontologyGenerator.py) & Multi-Agent re-anchored to 5 Capital-Weighted Market Archetypes across 3 ticks",
+              "deleted_redundant_scaffolding": "Zep Cloud latency barriers, unweighted Twitter/Reddit social bots, Vue 5-step SPA",
+              "nios_target_package": "ring2-brain/mirofish"
+            },
+            {
+              "donor_repository": "nautechsystems / nautilus-trader (31k+ ★)",
+              "harvested_core_technologies": "Compiled Rust/Cython ExecEngine & OrderBook, RiskEngine (HALTED & REDUCING fast path), TWAP & Iceberg OMS slicers, Live 2-Way Reconciliation, Binance/OKX/Bybit/IBKR adapters",
+              "deleted_redundant_scaffolding": "Sports betting adapters, legacy backtest notebooks, unused venue connectors",
+              "nios_target_package": "ring0-vault/kernel & ring1-spinal"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "page_number": 5,
+          "table_data": [
+            {
+              "donor_repository": "tigerbeetle / tigerbeetle (17.3k+ ★)",
+              "harvested_core_technologies": "VOPR formally verified double-entry financial ledger, Two-Phase Atomic Transfers (Crash-Atomic Outbox), strict vault balance enforcement (debitsMustNotExceedCredits)",
+              "deleted_redundant_scaffolding": "Multi-datacenter cluster orchestration (runs single-file replica + PostgreSQL 16 tax-lot store)",
+              "nios_target_package": "ring0-vault/ibor"
+            },
+            {
+              "donor_repository": "marketcalls / openalgo (3k+ ★) + vnpy / vnpy (46k+ ★)",
+              "harvested_core_technologies": "Dhan, Zerodha Kite, AngelOne & Upstox India adapters, MT5/CTP Forex & Futures gateway, Fernet/Argon2 API key vault, Analyzer Shadow Mode, MCP Bridge",
+              "deleted_redundant_scaffolding": "CodeMirror web editor, xyflow visual no-code builder, Telegram bot menus",
+              "nios_target_package": "ring0-vault/silos & ring3-cockpit"
+            }
+          ]
+        },
+        {
+          "type": "callout",
+          "page_number": 5,
+          "text": "Key Takeaway: Replacing fragile prototype kernels with NautilusTrader (Rust/Cython execution), TigerBeetle (formally verified double-entry IBOR), and OpenAlgo (React 19 shell + India broker adapters) grounds NIOS Core v3.0 in institutional-grade primitives."
+        }
+      ]
+    },
+    {
+      "section_id": "sec_006",
+      "heading": "04. Ingestion & Pre-Processing Pipeline: Self-Healing Router & Grounding Ledger",
+      "level": 1,
+      "page_start": 5,
+      "page_end": 6,
+      "summary": "Specifies the five-stage ingestion pipeline from 33+ dual-vendor loaders through quarantine, point-in-time normalization and SHA-256 fact commitment, plus the anti-spoofing, anti-lookahead and zero-hallucination gates.",
+      "tags": ["data_ingestion", "quarantine", "point_in_time", "corporate_actions", "grounding_ledger", "anti_spoofing"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 5,
+          "text": "NIOS treats all external market feeds and LLM prose as untrusted until dual-vendor cross-verification, corporate-action split normalization, bitemporal point-in-time (PIT) cutoff validation, and cryptographic SHA-256 fact commitment succeed."
+        },
+        {
+          "type": "table",
+          "page_number": 5,
+          "table_data": [
+            {
+              "stage": "STAGE 1",
+              "name": "33+ LOADERS — Dual-Vendor Feeds",
+              "components": "Crypto: Binance, OKX, Bybit; India: Zerodha Kite, Dhan; US: IBKR TWS, Polygon; Filings: SEC EDGAR 10-K/Q; Macro: FRED & Calendars",
+              "output": "DualVendorBar(P1, P2)"
+            },
+            {
+              "stage": "STAGE 2",
+              "name": "QUARANTINE — Self-Healing DataGuard",
+              "components": "Lag Gate: Drop >5,000ms; Vendor Diff: |P1−P2|/P >1.5%; Split Guard: Blocks ≥45% single-feed phantom crash",
+              "output": "Bad Ticks → Quarantine DB; Clean Ticks → Stage 3"
+            },
+            {
+              "stage": "STAGE 3",
+              "name": "PIT & CORP ACT — Temporal Normalization",
+              "components": "Canonical Security Master ID; Split & Dividend Adjustment; SEC EDGAR Acceptance Cutoff: knowledgeTime ≤ asOfTime; Historical PIT FX Conversion",
+              "output": "Zero Lookahead Guaranteed"
+            },
+            {
+              "stage": "STAGE 4",
+              "name": "SHA-256 LEDGER — Fact Commitment",
+              "components": "480+ Polars Factors Computed; 3-Stmt / DCF / Comps Models; Registers Every Metric in Immutable Grounding Map; Emits SHA-256 Fact Digest",
+              "output": "GroundedFactPacket"
+            },
+            {
+              "stage": "STAGE 5",
+              "name": "RING DISPATCH — Dual-Speed Routing",
+              "components": "Ring 1 Fast Path: ExecutedFlowTick in 0.05ms SHM RingBuffer; Ring 2 Deep Brain: Top 1% Dislocations Wake MiroFish & Committee",
+              "output": "Dual-speed dispatch to Ring 1 hot path and Ring 2 deep brain"
+            }
+          ]
+        },
+        {
+          "type": "callout",
+          "page_number": 5,
+          "text": "Figure 2 — 5-Stage Self-Healing Ingestion, Point-in-Time Corporate Action Guard, and Cryptographic Numerical Grounding Pipeline. Semantic purpose: shows data-lineage owners exactly where a feed can be rejected, normalized, or cryptographically committed before reaching any trading logic."
+        },
+        {
+          "type": "bullet_list",
+          "page_number": 6,
+          "items": [
+            "1. Anti-Spoofing Orderflow Serialization (Ring 1 Ingest): Instead of passing manipulable L2 resting limit-order book snapshots to the scalper, the normalizer aggregates 5-second rolling ExecutedFlowTick frames measuring takerBuyVolume5s vs. takerSellVolume5s (who actually crossed the spread and paid fees) alongside bidCancelToFillRatio and askCancelToFillRatio (flagging phantom liquidity pulls whenever ratio ≥ 3.0).",
+            "2. SEC & Fundamental Knowledge-Time Guard (Anti-Lookahead): Harvested from TradingAgents/vendors/sec-edgar.py, financial statements are indexed strictly by SEC EDGAR acceptance timestamp rather than fiscal period end. This prevents walk-forward learners from reading Q4 earnings in January when the 10-K was actually filed in March, raising a hard exception if t_knowledge > t_as-of.",
+            "3. Numerical Grounding Gate (Zero Hallucination): Harvested from Vibe-Trading/agent/grounding/ledger.py, every computed factor, price, and DCF output is registered in an immutable lookup map. Before any System 2 committee synthesis reaches Ring 0, an AST/regex verifier checks every cited figure against GroundedFactPacket; any fabricated number triggers UNGROUNDED-NUMERICAL-CLAIM and aborts order signing."
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_007",
+      "heading": "05. Core Processing & Bicameral Execution Engine: Three-Speed Synchronization",
+      "level": 1,
+      "page_start": 6,
+      "page_end": 7,
+      "summary": "Details the three execution tiers — Tier 0 spinal reflex, Tier 1 System 1 instinct leases, and Tier 2 System 2 deep reasoning — with their sequential steps, math gates and latency budgets.",
+      "tags": ["execution_engine", "bicameral", "spinal_reflex", "System1", "System2", "latency_budget"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 6,
+          "text": "NIOS Core v3.0 separates biological reflex from deliberative cognition across three distinct execution horizons. System 1 LLM acts as the tactical commander that sets trap parameters every 30 seconds off-path, while Tier 0 compiled math springs the trap in <0.14 ms and pulls the emergency brake in 0.10 ms if microstructure toxicity spikes."
+        },
+        {
+          "type": "table",
+          "page_number": 6,
+          "table_data": [
+            {
+              "execution_tier_and_cadence": "Tier 0: Spinal Reflex Fast Path — executes every WebSocket tick in Ring 1",
+              "sequential_processing_workflow_and_mathematical_gates": "Step 1 (SHM Lease Read): Lock-free SeqLock read verifies System1Lease is active (t < t_expires) and global kill latch is 0 (0.005 ms). Step 2 (0.1ms Spinal Breaker): Instant HALT & lease disarm if Vol_5s ÷ NormVol_5s ≥ 3.5×, if 2 consecutive maker fills move adversely within 500 ms, or if spread exceeds cap. Step 3 (Anti-Spoof OFI Gate): Requires aggressive executed TakerBuyRatio_5s ≥ 0.65 and CancelToFillRatio < 3.0. Step 4 (Ring 0 Conformal & Peg): Verifies 98% conformal lower bound (Net_LB > 0 bps) and dispatches 3s Maker-Peg order.",
+              "latency_token_cost": "0.088 ms p50; 0.140 ms p99; $0.00 token burn"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "page_number": 7,
+          "table_data": [
+            {
+              "execution_tier_and_cadence": "Tier 1: System 1 Fast Instinct — runs every 30s or on headline shock",
+              "sequential_processing_workflow_and_mathematical_gates": "Step 1 (Tape & Regime Digest): Local Ollama (Qwen-2.5-3B) or Gemini 2.5 Flash-Lite evaluates 1-minute realized volatility, spread regime, and orderflow imbalance. Step 2 (Auto-Failover Circuit): Any LLM endpoint exceeding a 250 ms ping is automatically demoted to the local HTTP/2 keep-alive pool. Step 3 (60s Dead-Man TTL Lease): Writes System1Lease(mode: LONG-ONLY | SHORT-ONLY | MEAN-REV, targetBps, stopBps, expiresAt) into POSIX shared memory; auto-disarms in 60s if LLM or network stalls.",
+              "latency_token_cost": "48.0 ms p50; 78.0 ms p99; HTTP/2 (250 ms hard cap)"
+            },
+            {
+              "execution_tier_and_cadence": "Tier 2: System 2 Deep Mind — runs on top 1% scanner dislocations",
+              "sequential_processing_workflow_and_mathematical_gates": "Step 1 (Universe Scanner): Evaluates 480+ Polars/Numba factors and 3-Stmt/DCF/Comps models across 5,000 tickers in <120 ms, rejecting 99% noise. Step 2 (MiroFish 3-Tick Contagion): Simulates 5 capital-weighted archetypes across 3 deterministic ticks in 1.8 ms. Step 3 (TradingAgents Committee): 4 Analysts → Multi-Round Bull/Bear Debate → Trader → 3-Way Risk Debaters (Aggressive/Neutral/Conservative) + SHA-256 Grounding check. Step 4 (Vault Route): Routes approved theses to Long-Term Compounder or Tactical Swing vaults; overrides System 1 if Fragility ≥ 0.75.",
+              "latency_token_cost": "9.40 s p50; 14.20 s p99; (Top 1% setups only)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_008",
+      "heading": "MiroFish 3-Tick Capital Contagion Features (Second-Order Alpha)",
+      "level": 2,
+      "page_start": 7,
+      "page_end": 7,
+      "summary": "Defines the five capital-weighted institutional archetypes, their simulation weights, and the three structural contagion features written into the feature store.",
+      "tags": ["MiroFish", "contagion", "archetypes", "fragility_index", "feature_store"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 7,
+          "text": "Instead of relying on unweighted retail social sentiment, Ring 2 runs the harvested MiroFish contagion simulator anchored to five capital-weighted institutional archetypes: Retail 0DTE Options (15% weight), Options Dealer Gamma Hedgers (25% weight), Volatility-Target CTAs (25% weight), and Multi-Manager Pod Shop Stops & Value Funds (35% weight). Across three deterministic simulation ticks, it writes three structural features into core/feature-store.py."
+        },
+        {
+          "type": "table",
+          "page_number": 7,
+          "table_data": [
+            {
+              "archetype": "Retail 0DTE Options",
+              "capital_weight": "15%"
+            },
+            {
+              "archetype": "Options Dealer Gamma Hedgers",
+              "capital_weight": "25%"
+            },
+            {
+              "archetype": "Volatility-Target CTAs",
+              "capital_weight": "25%"
+            },
+            {
+              "archetype": "Multi-Manager Pod Shop Stops & Value Funds",
+              "capital_weight": "35%"
+            }
+          ]
+        },
+        {
+          "type": "bullet_list",
+          "page_number": 7,
+          "items": [
+            "crowdAsymmetryScore [-1.0, +1.0]: Capital-weighted net orderflow imbalance across all five market archetypes after tick-3 equilibrium.",
+            "cascadeFragilityIndex [0.0, 1.0]: Joint probability that Pod Shop drawdown stops, Dealer short-gamma hedging, and CTA volatility triggers cause a forced liquidation cascade. Whenever cascadeFragilityIndex ≥ 0.75, System 2 immediately revokes all active Ring 1 long leases.",
+            "narrativeExhaustionDivergence [-1.0, +1.0]: Captures regime inflection points where Tick-1 retail euphoria is absorbed and faded by Tick-3 institutional value accumulation."
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_009",
+      "heading": "06. Data Architecture, Double-Entry IBOR & 4-Tier State Management",
+      "level": 1,
+      "page_start": 8,
+      "page_end": 8,
+      "summary": "Partitions state by latency and durability across four storage tiers, then specifies the TigerBeetle/PostgreSQL double-entry IBOR, crash-atomic outbox, 60-second reconciliation and Darwinian episodic memory.",
+      "tags": ["IBOR", "TigerBeetle", "PostgreSQL", "DuckDB", "state_management", "idempotency", "reconciliation"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 8,
+          "text": "State management in NIOS Core v3.0 is partitioned by latency and durability requirements: hot-path microstructure state resides in 10-microsecond lock-free shared memory, while financial truth is governed by a formally verified double-entry Investment Book of Record (IBOR) backed by TigerBeetle and PostgreSQL 16 with bitemporal DuckDB + Parquet auditability."
+        },
+        {
+          "type": "table",
+          "page_number": 8,
+          "table_data": [
+            {
+              "tier": "TIER 0",
+              "name": "POSIX SHM (<10µs)",
+              "role": "Lock-Free mmap State",
+              "contents": "shm://nios-active-leases[sym]; shm://nios-global-kill-latch; 5s Rolling OFI & Cancel Buffer; L2 Shadow Twin Book Snapshot",
+              "consistency": "Atomic SeqLock"
+            },
+            {
+              "tier": "TIER 1",
+              "name": "NATS JETSTREAM (<1.5ms)",
+              "role": "Durable Event Bus",
+              "contents": "stream.ring1.scalp-proposals; stream.ring2.deep-theses; stream.ring0.execution-events; stream.ring3.cockpit-cards",
+              "consistency": "At-Least-Once + Idempotency Key"
+            },
+            {
+              "tier": "TIER 2",
+              "name": "DUCKDB + PARQUET",
+              "role": "Bitemporal Feature Lake",
+              "contents": "Partition: (silo, sym, asOfDate); Index: knowledgeTs ≤ asOfTs; 480+ Alpha Vectors & DCF Sets; 200-Trade Conformal Residuals",
+              "consistency": "Immutable Append-Only Snapshots"
+            },
+            {
+              "tier": "TIER 3",
+              "name": "TIGERBEETLE + PG16",
+              "role": "Sovereign IBOR & Outbox",
+              "contents": "2-Phase Atomic Outbox Transfers; 4-Vault Double-Entry Ledger; Multi-FX Tax Lots (STT / TDS); SHA-256 Grounding Hash Store",
+              "consistency": "VOPR + Serializable ACID Truth"
+            }
+          ]
+        },
+        {
+          "type": "callout",
+          "page_number": 8,
+          "text": "Figure 3 — 4-Tier Storage Architecture Spanning 10µs Lock-Free Shared Memory to Formally Verified Double-Entry IBOR Accounting. Semantic purpose: establishes the durability and consistency contract for each class of platform state so recovery and audit tooling can be designed against known guarantees."
+        },
+        {
+          "type": "paragraph",
+          "page_number": 8,
+          "text": "Investment Book of Record (IBOR — TigerBeetle + PostgreSQL 16): NIOS maintains an internal double-entry general ledger independent of broker UI snapshots, tracking every cent in 128-bit integers across four vaults per broker silo: ReserveYield, LongTermCompounder, TacticalSwing, and SpinalScalper. Point-in-time NAV is computed using historical FX rates and deducts accrued STT, TDS, stamp duty, and maker/taker fees on every fill."
+        },
+        {
+          "type": "paragraph",
+          "page_number": 8,
+          "text": "Two-Phase Crash-Atomic Outbox & 60s Reconciliation: Before any signed order touches a broker socket, Ring 0 commits a TigerBeetle two-phase pending transfer and a PostgreSQL 16 financialOutbox record with a deterministic idempotency key. If power or network drops mid-flight, NautilusTrader live reconciliation queries open broker orders on restart, settles or voids pending transfers atomically, and freezes any silo exhibiting >0.01% position drift."
+        },
+        {
+          "type": "paragraph",
+          "page_number": 8,
+          "text": "Delayed Settlement & Darwinian Episodic Memory: Every agent prediction is logged with an explicit evaluation horizon. Once the holding period elapses, the settlement worker grades predicted basis points against realized net basis points, updates the agent's 200-trade rolling conformal residual window (Q_0.98), and adjusts its Darwinian trust multiplier between 0.8× and 1.5×."
+        }
+      ]
+    },
+    {
+      "section_id": "sec_010",
+      "heading": "07. Core Capabilities, Subsystem Breakdown & Quantitative SLA Matrix",
+      "level": 1,
+      "page_start": 9,
+      "page_end": 9,
+      "summary": "Provides the eight-row capability matrix binding each subsystem to its ring owner, mathematical mechanism, latency SLA and automatic degradation fallback.",
+      "tags": ["SLA_matrix", "capabilities", "fallback_modes", "OMS", "alpha_forge", "conformal_gate"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 9,
+          "text": "Every autonomous capability in NIOS Core v3.0 is governed by a deterministic mathematical formula, a strict latency service-level agreement (SLA), and an automatic degradation path to Shadow Mode or Silo Halt."
+        },
+        {
+          "type": "table",
+          "page_number": 9,
+          "table_data": [
+            {
+              "subsystem_capability": "1. Spinal Anti-Spoof Scalper",
+              "ring_owner": "RING 1",
+              "technical_mechanism_and_mathematical_specification": "5s Executed Taker Buy/Sell Ratio (≥ 0.65) + Cancel-to-Fill Velocity (< 3.0) + 0.1ms Vol Spike Breaker (≥ 3.5×) on Rust/Cython ring buffers",
+              "throughput_latency_sla": "0.14 ms p99; 25,000 ticks/sec",
+              "failure_fallback_mode": "Instant lease disarm on vol spike or 2 consecutive adverse fills"
+            },
+            {
+              "subsystem_capability": "2. System 1 Instinct Controller",
+              "ring_owner": "RING 2 → 1",
+              "technical_mechanism_and_mathematical_specification": "Local Ollama Qwen-2.5-3B / Gemini 2.5 Flash-Lite refreshes 60s TTL System1Lease in lock-free POSIX shared memory",
+              "throughput_latency_sla": "64 ms p95 (250 ms hard cap)",
+              "failure_fallback_mode": "60s dead-man TTL expires; auto-switches to local Ollama pool"
+            },
+            {
+              "subsystem_capability": "3. 480+ Factor & Valuation Lab",
+              "ring_owner": "RING 2",
+              "technical_mechanism_and_mathematical_specification": "Alpha101 + GTJA191 + Qlib158 + Fundamental PIT + Automated 3-Statement, DCF & Comps valuation in Polars/Numba",
+              "throughput_latency_sla": "5,000 tickers in <120 ms",
+              "failure_fallback_mode": "Quarantines missing PIT fields; enforces Deflated Sharpe filter"
+            },
+            {
+              "subsystem_capability": "4. MiroFish Contagion Engine",
+              "ring_owner": "RING 2",
+              "technical_mechanism_and_mathematical_specification": "Causal Shock Ontology + 3-Tick cascade across 5 capital-weighted archetypes (Retail, Dealers, CTAs, Pods, Value)",
+              "throughput_latency_sla": "1.8 ms deterministic cascade",
+              "failure_fallback_mode": "If cascadeFragility ≥ 0.75, forces immediate Ring 1 HALT"
+            },
+            {
+              "subsystem_capability": "5. TradingAgents Committee",
+              "ring_owner": "RING 2",
+              "technical_mechanism_and_mathematical_specification": "4 Analysts → Multi-Round Bull/Bear Debate → Trader → 3-Way Risk Debaters (Aggressive/Neutral/Conservative) in LangGraph",
+              "throughput_latency_sla": "8–15 s (Top 1% setups only)",
+              "failure_fallback_mode": "Aborts trade if SHA-256 Grounding Ledger hash check fails"
+            },
+            {
+              "subsystem_capability": "6. Conformal 98% & Shadow Twin",
+              "ring_owner": "RING 0",
+              "technical_mechanism_and_mathematical_specification": "Split-conformal 98% lower bound: E[r] − Friction − Q_0.98(Err) > 0; 30 live L2 shadow fills required for promotion",
+              "throughput_latency_sla": "0.42 ms gate",
+              "failure_fallback_mode": "Routes unproven or decayed agents to L2 Shadow Warmup"
+            },
+            {
+              "subsystem_capability": "7. Smart OMS & In-Silo Ratchet",
+              "ring_owner": "RING 0",
+              "technical_mechanism_and_mathematical_specification": "3s Maker-Peg Chaser (max 2 re-pegs) for scalps; TWAP Iceberg (≤10% top book) for DCF; sweeps 50% scalp profit in-silo",
+              "throughput_latency_sla": "<2.0 ms two-phase Outbox commit",
+              "failure_fallback_mode": "Cancels unfilled maker pegs at 3.0s; ADR-009 exit fast-path"
+            },
+            {
+              "subsystem_capability": "8. Nocturnal Alpha Forge",
+              "ring_owner": "RING 2",
+              "technical_mechanism_and_mathematical_specification": "00:00 UTC walk-forward evolution; retires champions < +0.50 bps; promotes challengers with Deflated Sharpe ≥ 1.50 (1,000+ genomes)",
+              "throughput_latency_sla": "Nightly batch",
+              "failure_fallback_mode": "Purged K-Fold CV + False Discovery Rate control blocks overfit"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_011",
+      "heading": "08. Security, Governance, Formal Verification & Circuit Breakers",
+      "level": 1,
+      "page_start": 10,
+      "page_end": 10,
+      "summary": "Establishes the zero-trust prompt-injection defence via OS air-gaps and hardware signing, and defines the three-tier circuit breaker hierarchy.",
+      "tags": ["security", "prompt_injection", "air_gap", "Ed25519", "circuit_breakers", "governance"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 10,
+          "text": "Any LLM that ingests live financial news, RSS feeds, or social sentiment is exposed to indirect prompt injection. NIOS Core v3.0 makes credential theft and rogue order submission impossible by construction: safety is enforced by OS kernel process boundaries, hardware-backed cryptographic signing, and model-checked state machines—never by hoping an LLM follows instructions in a system prompt."
+        },
+        {
+          "type": "table",
+          "page_number": 10,
+          "table_data": [
+            {
+              "zone": "RING 2",
+              "heading": "UNTRUSTED WEB / NEWS INGEST — Zero-Privilege Cognitive Sandbox",
+              "controls": "NO Broker API Keys in Process Memory; NO Outbound Route to Exchange Sockets; Emits Fixed-Schema UnsignedProposal; Attaches SHA-256 GroundingHash",
+              "invariant": "Prompt Injection Cannot Access Keys"
+            },
+            {
+              "zone": "RING 0",
+              "heading": "SOVEREIGN SIGNER & FIREWALLS — Deterministic Mathematical Gates",
+              "controls": "1. Verifies SHA-256 Grounding Digest; 2. Checks Symbol Whitelist & Notional Caps (≤5% Scalp Vault / ≤12% Compounder Cap); 3. Evaluates 98% Split-Conformal & Copula; 4. Commits TigerBeetle 2-Phase Pending Outbox; 5. Signs via Fernet / Ed25519 OS Keystore",
+              "invariant": "OS AIR-GAP FIREWALL"
+            },
+            {
+              "zone": "CIRCUIT BREAKERS",
+              "heading": "3-TIER CIRCUIT BREAKER MATRIX",
+              "controls": "Tier 1: 0.1ms Microstructure (Ring 1) — 5s Vol ≥ 3.5x | 2 Adverse Fills | Spread Cap; Tier 2: Contagion & Copula (Ring 2/0) — Fragility ≥ 0.75 | Cross-Silo Heat > 25% NAV; Tier 3: Sovereign Vault & ADR-009 (Ring 0) — Daily Loss Stop Locks Silo | Reduce-Only",
+              "invariant": "Fast-Path Bypasses All Queues (<1ms)"
+            }
+          ]
+        },
+        {
+          "type": "callout",
+          "page_number": 10,
+          "text": "Figure 4 — Zero-Trust Air-Gapped Signer Architecture and Three-Tier Circuit Breaker Hierarchy. Semantic purpose: documents why credential exfiltration is structurally impossible and which breaker fires first at each level of market stress."
+        }
+      ]
+    },
+    {
+      "section_id": "sec_012",
+      "heading": "Formal State-Machine Proofs & Deterministic Simulation Verification",
+      "level": 2,
+      "page_start": 10,
+      "page_end": 11,
+      "summary": "Lists the TLA+ specifications, NautilusTrader property tests and TigerBeetle VOPR simulations that machine-check emergency halt, order lifecycle, outbox atomicity and IBOR convergence.",
+      "tags": ["TLA+", "formal_verification", "VOPR", "NautilusTrader", "safety_invariants", "property_testing"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 10,
+          "text": "Critical financial state transitions are specified in TLA+ (specs/*.tla) and continuously verified via NautilusTrader property-based testing (proptest) and TigerBeetle's VOPR deterministic fault-injection simulator across all reachable concurrency states."
+        },
+        {
+          "type": "table",
+          "page_number": 10,
+          "table_data": [
+            {
+              "formal_specification_and_engine": "KillSwitch.tla + Nautilus RiskEngine",
+              "formally_proven_safety_invariant": "GlobalHalt ⇒ □(ActiveLeases = 0 ∧ NewOrders = ∅) — Emergency kill switch preempts all cognitive agents, flips TradingState.HALTED, and disarms all Ring 1 scalpers in <1.0 ms."
+            },
+            {
+              "formal_specification_and_engine": "OrderLifecycle.tla + Nautilus ExecEngine",
+              "formally_proven_safety_invariant": "NoOrphanedOrders ∧ BoundedExposure — Every child slice (Maker-Peg or TWAP Iceberg) reaches a deterministic terminal state (FILLED, CANCELED, or REJECTED) with bounded notional risk."
+            },
+            {
+              "formal_specification_and_engine": "Outbox.tla + TigerBeetle Two-Phase",
+              "formally_proven_safety_invariant": "AtMostOnceExecution — Crash-atomic two-phase pending transfer reservation ensures network drops or process restarts never double-submit an order or overdraft a vault."
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "page_number": 11,
+          "table_data": [
+            {
+              "formal_specification_and_engine": "Reconciliation.tla + Live Reconciler",
+              "formally_proven_safety_invariant": "EventualIBORConvergence — Any discrepancy >0.01% between broker fill reports and internal double-entry IBOR balances immediately halts the affected silo and triggers deterministic repair."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_013",
+      "heading": "09. Performance Benchmarks, Latency Budget & Token Cost Scalability",
+      "level": 1,
+      "page_start": 11,
+      "page_end": 11,
+      "summary": "Quantifies the end-to-end latency budget per execution path and the token-cost economics, showing a 96.4% LLM spend reduction and 2,140× faster tick execution than monolithic LLM loops.",
+      "tags": ["benchmarks", "latency_budget", "p50", "p99", "token_cost", "scalability"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 11,
+          "text": "By using vectorized math in Ring 2 and compiled Rust/Cython orderflow physics in Ring 1 to filter out 99.1% of market noise at zero API cost, NIOS Core v3.0 reduces daily LLM token expenditure across a 5,000-asset universe from $86.40/day to $3.10/day (-96.4%) while executing ticks 2,140× faster than monolithic LLM loops."
+        },
+        {
+          "type": "table",
+          "page_number": 11,
+          "table_data": [
+            {
+              "execution_stage_or_path": "SHM Lease + Global Kill-Latch Read",
+              "median_p50": "0.005 ms",
+              "tail_p99": "0.008 ms",
+              "execution_context_and_optimization_mechanism": "POSIX mmap cache-line aligned atomic SeqLock read in Ring 1"
+            },
+            {
+              "execution_stage_or_path": "Spinal Breaker + Executed OFI Check",
+              "median_p50": "0.088 ms",
+              "tail_p99": "0.140 ms",
+              "execution_context_and_optimization_mechanism": "Ring 1 Zero-GC Python 3.12 uvloop + Rust/Cython NautilusTrader ring buffers"
+            },
+            {
+              "execution_stage_or_path": "Ring 0 Conformal + Firewall + Sign",
+              "median_p50": "0.290 ms",
+              "tail_p99": "0.420 ms",
+              "execution_context_and_optimization_mechanism": "In-memory 200-trade residual quantile (Q_0.98) + TigerBeetle reservation + Ed25519 sign"
+            },
+            {
+              "execution_stage_or_path": "System 1 Instinct Lease Refresh",
+              "median_p50": "48.0 ms",
+              "tail_p99": "78.0 ms",
+              "execution_context_and_optimization_mechanism": "Asynchronous off-tick loop (30s interval) via local Ollama HTTP/2 keep-alive pool"
+            },
+            {
+              "execution_stage_or_path": "5,000-Ticker 480-Factor Universe Scan",
+              "median_p50": "85.0 ms",
+              "tail_p99": "118.0 ms",
+              "execution_context_and_optimization_mechanism": "Polars + NumPy/Numba vectorized matrix evaluation over memory-mapped Parquet"
+            },
+            {
+              "execution_stage_or_path": "System 2 Contagion + Committee Thesis",
+              "median_p50": "9.40 s",
+              "tail_p99": "14.20 s",
+              "execution_context_and_optimization_mechanism": "Triggered strictly on top 1% scanner dislocations (50 candidates → 3–8 precision trades)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_014",
+      "heading": "Horizontal & Vertical Scaling Patterns",
+      "level": 2,
+      "page_start": 11,
+      "page_end": 12,
+      "summary": "Describes CPU-affinity silo sharding, the two-tier 5,000-to-50-to-3-8 funnel, and the tax-net cost floor that prevents sub-cost churn.",
+      "tags": ["scaling", "CPU_affinity", "funnel_compression", "transaction_tax", "cost_floor"],
+      "content_blocks": [
+        {
+          "type": "bullet_list",
+          "page_number": 11,
+          "items": [
+            "Silo-Sharded Ring 1 Workers with CPU Affinity: Each market silo (Crypto-Binance, India-Zerodha-Dhan, US-IBKR, FX-MT5) runs on a dedicated pinned physical CPU core (Linux taskset / Docker cpuset-cpus) with isolated WebSocket multiplexers, achieving linear horizontal scaling across venues.",
+            "Two-Tier Funnel Compression: 5,000 Tickers → [Polars Vector Filter: $0 cost] → 50 Candidates (1%) → [MiroFish 3-Tick Cascade + TradingAgents Committee] → [98% Split-Conformal Gate] → 3–8 High-Precision Trades."
+          ]
+        },
+        {
+          "type": "paragraph",
+          "page_number": 12,
+          "text": "Tax-Net Cost Floor Enforcement: Every silo pre-loads exact venue maker/taker fees and statutory taxes (such as India's 5.5 bps Securities Transaction Tax and stamp duty floor) into Ring 0 so scalpers never churn sub-cost microstructure noise."
+        }
+      ]
+    },
+    {
+      "section_id": "sec_015",
+      "heading": "10. Integration Ecosystem, Multi-Market Silos & Operator Control APIs",
+      "level": 1,
+      "page_start": 12,
+      "page_end": 12,
+      "summary": "Defines the four sovereign broker silos with their adapters, microstructure and tax rules, reserve-yield and long-term-sweep assets, and the zero-cross-border-wire profit ratchet.",
+      "tags": ["broker_silos", "India", "US_equities", "crypto", "forex", "profit_ratchet", "tax"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 12,
+          "text": "NIOS Core v3.0 operates four sovereign market silos with zero cross-border wire transfers. Realized short-term scalp profits are compounded inside the originating broker account via the automated In-Silo Profit Ratchet (sweeping 35% into Long-Term Compounders and 15% into Reserve Yield instruments)."
+        },
+        {
+          "type": "table",
+          "page_number": 12,
+          "table_data": [
+            {
+              "market_silo": "Crypto (24/7)",
+              "production_broker_adapters": "Binance, OKX, Bybit (NautilusTrader Rust WS)",
+              "microstructure_and_statutory_tax_rules": "Post-only maker-peg chasing; perpetual funding-rate & liquidation cascade hooks",
+              "reserve_yield_asset_15pct": "USYC Tokenized T-Bill",
+              "long_term_sweep_asset_35pct": "BTC-USDT / ETH-USDT"
+            },
+            {
+              "market_silo": "India Equities & F&O",
+              "production_broker_adapters": "Zerodha Kite, Dhan, AngelOne, Upstox (OpenAlgo)",
+              "microstructure_and_statutory_tax_rules": "NSE/BSE MIS intraday vs. CNC delivery; 5.5 bps STT + Stamp Duty + Brokerage floor",
+              "reserve_yield_asset_15pct": "LIQUIDBEES.NS",
+              "long_term_sweep_asset_35pct": "NIFTYBEES.NS & DCF Picks"
+            },
+            {
+              "market_silo": "US & Global Equities",
+              "production_broker_adapters": "Interactive Brokers (TWS), Alpaca v2 (NautilusTrader)",
+              "microstructure_and_statutory_tax_rules": "T+1 settlement, Reg-T margin guards, sub-penny maker pegging, SEC EDGAR PIT",
+              "reserve_yield_asset_15pct": "SGOV (0–3M Treasury ETF)",
+              "long_term_sweep_asset_35pct": "VOO / QQQ & DCF Picks"
+            },
+            {
+              "market_silo": "Forex & Futures",
+              "production_broker_adapters": "MetaTrader 5 (MT5), OANDA, CTP Futures (Vn.py IPC)",
+              "microstructure_and_statutory_tax_rules": "24/5 pip-spread gates, macro calendar blackout windows, futures roll-yield guards",
+              "reserve_yield_asset_15pct": "Unlevered Gold / Short-Duration Sovereign",
+              "long_term_sweep_asset_35pct": "Sovereign Carry Repo"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_016",
+      "heading": "Multi-LLM Switchboard, MCP Bridge & 3-Tab FastAPI SSE Control Plane",
+      "level": 2,
+      "page_start": 12,
+      "page_end": 13,
+      "summary": "Specifies LLM provider routing and failover rules, the authenticated control-plane endpoints, and the plain-English proof telemetry rendered to operators.",
+      "tags": ["LLM_routing", "failover", "FastAPI", "SSE", "control_plane", "MCP", "telemetry"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "page_number": 12,
+          "text": "Multi-LLM Auto-Failover Switchboard: System 1 routes across local Ollama (Qwen-2.5-3B / Llama-3.2-3B), Gemini 2.5 Flash-Lite, and Groq, automatically demoting any provider whose ping exceeds 250 ms. System 2 routes across DeepSeek-R1, Claude Sonnet/Opus, and OpenRouter with strict daily USD spend caps."
+        },
+        {
+          "type": "bullet_list",
+          "page_number": 12,
+          "items": [
+            "GET /api/v2/cockpit/stream streams 60 FPS PlainEnglishCockpitCard telemetry and 4-vault NAV updates.",
+            "POST /api/v2/control/brokers hot-swaps Paper/Live mode and daily loss stops per silo.",
+            "POST /api/v2/control/llms hot-swaps System 1/2 models with write-only masked API keys (...9A4F).",
+            "POST /api/v2/control/killswitch disarms all Ring 1 leases and triggers ADR-009 reduce-only flatten in <1.0 ms."
+          ]
+        },
+        {
+          "type": "paragraph",
+          "page_number": 13,
+          "text": "Plain-English Mathematical Proof Telemetry: Every trade and abstention renders in Tab 1 with a single-sentence explanation and a deterministic math proof line. Example: [LIVE CAPITAL • ZERODHA-INDIA • RELIANCE.NS] Spinal Reflex bought RELIANCE: Aggressive buyers took 71% of 5s executed volume with clean book. | Gross: +18.0 bps | Fee+STT: 5.5 bps | Uncert (Q98): 6.2 bps | Net LB: +6.3 bps."
+        }
+      ]
+    },
+    {
+      "section_id": "sec_017",
+      "heading": "11. Architectural Evolution Roadmap & The 5 Constitutional Laws of NIOS Core",
+      "level": 1,
+      "page_start": 13,
+      "page_end": 13,
+      "summary": "Lays out the four-phase delivery roadmap from sovereign kernel and truth layer through multi-silo OMS and autonomous alpha forge, with explicit verification targets per phase.",
+      "tags": ["roadmap", "phases", "kernel_bypass", "DPDK", "verification", "delivery"],
+      "content_blocks": [
+        {
+          "type": "table",
+          "page_number": 13,
+          "table_data": [
+            {
+              "evolution_phase": "Phase 1: Sovereign Kernel & Truth Layer",
+              "architectural_milestone_and_subsystem_scope": "4-Ring OS process isolation, POSIX shared-memory SeqLock lease table, harvest of 480+ Factor Zoo, DCF/Comps valuation engine, SHA-256 Grounding Ledger, and TigerBeetle + PostgreSQL 16 double-entry IBOR.",
+              "operational_verification_target": "Zero lookahead bias (t_knowledge ≤ t_as-of); VOPR & TLA+ state-machine invariants verified."
+            },
+            {
+              "evolution_phase": "Phase 2: Bicameral Brain & Conformal Gate",
+              "architectural_milestone_and_subsystem_scope": "<0.14 ms Anti-Spoofing Executed OFI Spinal Scalper + 0.1 ms Circuit Breaker, MiroFish 5-Archetype Contagion Cascade, TradingAgents Committee, 30-Trade Live L2 Shadow Execution Twin, and 98% Split-Conformal Gate.",
+              "operational_verification_target": "99.1% noise abstention; zero unhashed numerical claims permitted past Ring 2."
+            },
+            {
+              "evolution_phase": "Phase 3: Multi-Silo OMS & Copula Shield",
+              "architectural_milestone_and_subsystem_scope": "Full multi-market deployment across Binance/OKX, Zerodha/Dhan, IBKR/Alpaca, and MT5 silos; 3s Maker-Peg Chaser & TWAP Iceberg Slicer in Ring 0; Cross-Silo Tail-Copula Correlation Shield & In-Silo Profit Ratchet.",
+              "operational_verification_target": "0.0 bps cross-broker wire bleed; automatic correlation haircut when cross-silo heat > 0.60."
+            },
+            {
+              "evolution_phase": "Phase 4: Nocturnal Alpha Forge & Kernel Bypass",
+              "architectural_milestone_and_subsystem_scope": "Autonomous 00:00 UTC walk-forward strategy evolution over Purged K-Fold CV partitions, Rust/DPDK kernel-bypass networking for sub-20µs tick ingestion, and automated cross-asset options tail-hedging in the Tactical Vault.",
+              "operational_verification_target": "Continuous retirement of champions < +0.50 bps and promotion of challengers with Deflated Sharpe ≥ 1.50."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "sec_018",
+      "heading": "Executive Summary: The 5 Non-Negotiable Constitutional Laws of NIOS Core v3.0",
+      "level": 2,
+      "page_start": 13,
+      "page_end": 14,
+      "summary": "Condenses the architecture into five binding laws covering data trust, LLM placement, contagion simulation with numerical grounding, shadow graduation, and in-silo compounding with nightly evolution.",
+      "tags": ["constitutional_laws", "principles", "abstention", "shadow_mode", "profit_ratchet"],
+      "content_blocks": [
+        {
+          "type": "bullet_list",
+          "page_number": 13,
+          "items": [
+            "1. Law 1 — Never Trust Resting Orders or Single Feeds: Cross-check dual data vendors, normalize splits pre-ingest, and trigger scalps strictly on executed aggressive taker flow (TakerBuyRatio_5s ≥ 0.65, CancelToFill < 3.0)—never on spoofable resting L2 book depth.",
+            "2. Law 2 — Never Put an LLM in the Microsecond Loop: System 1 LLM arms 60-second leases off-path; Tier 0 compiled Rust/Cython math executes ticks in <0.14 ms and pulls the emergency brake in 0.10 ms on flash crashes.",
+            "3. Law 3 — Simulate Contagion, Hash Every Number: Model 2nd- and 3rd-order forced liquidations across 5 capital-weighted market archetypes (MiroFish) and reject any committee synthesis citing an unhashed figure absent from the SHA-256 Grounding Ledger."
+          ]
+        },
+        {
+          "type": "bullet_list",
+          "page_number": 14,
+          "items": [
+            "4. Law 4 — 99% Noise Abstention & 30-Trade Shadow Graduation: Every agent warms up in live L2 Shadow Mode for 30 trades and deploys real vault capital strictly when its 98% split-conformal lower bound beats spread, fees, and statutory taxes (Net_LB > 0 bps).",
+            "5. Law 5 — Compound Inside the Silo, Evolve Every Midnight: Sweep 50% of winning short-term scalps into long-term compounders (35%) and reserve yield ETFs (15%) inside the same broker account, while the Nocturnal Alpha Forge replaces decaying strategies at 00:00 UTC."
+          ]
+        }
+      ]
+    }
+  ],
+  "global_key_values": {
+    "effective_date": null,
+    "document_id": "NIOS-ARC-2026-V3",
+    "parties_involved": []
+  }
+}

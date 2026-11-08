@@ -1,0 +1,132 @@
+import { Activity, CircleDollarSign, Radio, ShieldAlert, Skull, Zap } from 'lucide-react'
+
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Progress } from '@/components/ui/progress'
+import { formatPct, formatUsd, timeAgo } from '@/lib/format'
+import type { CockpitState, KillReport } from '@/types'
+
+interface TopBarProps {
+  state: CockpitState | null
+  connected: boolean
+  killReport: KillReport | null
+  lastFrameAt: number
+  onKill: () => void
+}
+
+export function TopBar({ state, connected, killReport, lastFrameAt, onKill }: TopBarProps) {
+  const status = state?.system.status ?? 'HALTED'
+  const armed = status === 'ARMED'
+  const abstention = state?.abstention
+  const llm = state?.llm
+  const spend = llm?.daily_spend_usd ?? 0
+  const cap = llm?.daily_spend_cap_usd ?? 3.1
+  const spendPct = cap > 0 ? Math.min(100, (spend / cap) * 100) : 0
+
+  return (
+    <header className="sticky top-0 z-40 border-b border-border/80 bg-background/85 backdrop-blur-xl">
+      <div className="flex flex-wrap items-center gap-4 px-4 py-3 lg:px-6">
+        <div className="flex items-center gap-3">
+          <div className="flex size-10 items-center justify-center rounded-xl border border-primary/30 bg-primary/10">
+            <Zap className="size-5 text-primary" />
+          </div>
+          <div>
+            <div className="text-[10px] font-semibold uppercase tracking-[0.28em] text-muted-foreground">
+              NIOS Core v3.0
+            </div>
+            <div className="text-sm font-semibold tracking-tight">Glass Cockpit</div>
+          </div>
+          <Badge
+            variant={armed ? 'default' : 'destructive'}
+            className={
+              armed
+                ? 'border-emerald-400/40 bg-emerald-500/15 text-emerald-300'
+                : 'animate-pulse border-red-400/50 bg-red-500/20 text-red-200'
+            }
+          >
+            {armed ? <Activity className="size-3" /> : <ShieldAlert className="size-3" />}
+            {status}
+          </Badge>
+        </div>
+
+        <div className="hidden h-9 w-px bg-border lg:block" />
+
+        <div className="flex min-w-[190px] flex-1 items-center gap-3">
+          <div className="flex size-8 items-center justify-center rounded-lg bg-muted">
+            <Radio className="size-4 text-muted-foreground" />
+          </div>
+          <div className="w-full">
+            <div className="mb-1 flex items-baseline justify-between gap-2 text-[11px]">
+              <span className="font-medium uppercase tracking-wider text-muted-foreground">
+                Noise abstention
+              </span>
+              <span className="font-mono tabular-nums">
+                {formatPct(abstention?.rate ?? 0)}
+                <span className="ml-1 text-muted-foreground">
+                  / {formatPct(abstention?.target_rate ?? 0.991)}
+                </span>
+              </span>
+            </div>
+            <Progress value={Math.min(100, (abstention?.rate ?? 0) * 100)} className="h-1.5" />
+          </div>
+        </div>
+
+        <div className="flex min-w-[190px] flex-1 items-center gap-3">
+          <div className="flex size-8 items-center justify-center rounded-lg bg-muted">
+            <CircleDollarSign className="size-4 text-muted-foreground" />
+          </div>
+          <div className="w-full">
+            <div className="mb-1 flex items-baseline justify-between gap-2 text-[11px]">
+              <span className="font-medium uppercase tracking-wider text-muted-foreground">
+                LLM spend / day
+              </span>
+              <span className="font-mono tabular-nums">
+                {formatUsd(spend, 2)}
+                <span className="ml-1 text-muted-foreground">/ {formatUsd(cap, 2)}</span>
+              </span>
+            </div>
+            <Progress
+              value={spendPct}
+              className={spendPct > 85 ? 'h-1.5 [&>div]:bg-amber-400' : 'h-1.5'}
+            />
+          </div>
+        </div>
+
+        <div className="hidden items-center gap-2 text-[11px] text-muted-foreground xl:flex">
+          <span
+            className={`size-2 rounded-full ${connected ? 'bg-emerald-400' : 'bg-red-400'}`}
+            aria-hidden
+          />
+          <span className="font-mono tabular-nums">
+            {connected ? `SSE 60 FPS · ${timeAgo(lastFrameAt)}` : 'SSE disconnected'}
+          </span>
+        </div>
+
+        <Button
+          type="button"
+          onClick={onKill}
+          className="ml-auto h-10 gap-2 bg-red-600 px-4 font-semibold text-white shadow-[0_0_24px_rgba(220,38,38,0.35)] hover:bg-red-500"
+          aria-label="Global kill switch: disarm all leases and flatten positions in under one millisecond"
+        >
+          <Skull className="size-4" />
+          GLOBAL KILL SWITCH
+          <span className="rounded bg-black/25 px-1.5 py-0.5 font-mono text-[10px]">
+            &lt;1ms FLATTEN
+          </span>
+        </Button>
+      </div>
+
+      {killReport ? (
+        <div className="border-t border-red-500/30 bg-red-500/10 px-4 py-1.5 text-[11px] text-red-200 lg:px-6">
+          Kill switch fired in{' '}
+          <span className="font-mono tabular-nums">
+            {(killReport.latency_ns / 1_000_000).toFixed(3)} ms
+          </span>{' '}
+          · disarmed {killReport.disarmed_leases} leases · cancelled{' '}
+          {killReport.cancelled_orders} entries · voided {killReport.voided_reservations}{' '}
+          reservations · flattened {killReport.flattened_orders} positions
+        </div>
+      ) : null}
+    </header>
+  )
+}

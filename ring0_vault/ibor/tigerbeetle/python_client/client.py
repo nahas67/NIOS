@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import logging
+import os
+import sys
+import threading
+import time
+from collections.abc import Callable  # noqa: TCH003
+from dataclasses import dataclass
+from typing import Any
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
+
+from . import bindings
+from .lib import tb_assert, c_uint128
+
+logger = logging.getLogger("tigerbeetle")
+
+
+class AtomicInteger:
+    def __init__(self, value: int = 0) -> None:
+        self._value = value
+        self._lock = threading.Lock()
+
+    def increment(self) -> int:
+        with self._lock:
+            self._value += 1
+            return self._value
+
+
+@dataclass
+class CompletionContextSync:
+    event: threading.Event
+
+
+@dataclass
+class CompletionContextAsync:
+    loop: asyncio.AbstractEventLoop
+    event: asyncio.Event
+
+
+@dataclass
+class InflightBatch:
+    batch: bindings.CBatch
+    response: Any
+    operation: bindings.Operation
+    c_event_type: Any
+    c_result_type: Any
+    on_completion: Callable[[Self], None] | None
+    on_completion_context: CompletionContextSync | CompletionContextAsync | None
+
+class _IDGenerator:
+    """
+    Generator for Universally Unique and Sortable Identifiers as a 128-bit integers, based on ULIDs.
+
+    Keeps a monotonically increasing millisecond timestamp between calls to `.generate()`.
+    """
+    _last_time_ms: int
+    _last_random: int
+
+    def __init__(self) -> None:
+        self._last_time_ms = time.time_ns() // (1000 * 1000)
+        self._last_random = int.from_bytes(os.urandom(10), 'little')
+        assert self._last_time_ms < (1 << 48)
+        assert self._last_random < (1 << 80)
+
+    def generate(self) -> int:
+        time_ms = time.time_ns() // (1000 * 1000)
+
+        # Ensure time_ms monotonically increases.
+        if time_ms <= self._last_time_ms:
+            time_ms = self._last_time_ms
+        else:
+            self._last_time_ms = time_ms
+            self._last_random = int.from_bytes(os.urandom(10), 'little')
+
+        self._last_random += 1
+        if self._last_random == 2 ** 80:
+            time_ms += 1
+            self._last_time_ms = time_ms
+            self._last_random = 0
+            if time_ms == 1 << 48:
+                raise Exception('Timestamp bits overflow on monotonic increment')
+
+        return (time_ms << 80) | self._last_random
+
+# Module-level singleton instance.
+_id_generator = _IDGenerator()
+
+
+def id() -> int:
+    """
+    Generates a Universally Unique and Sortable Identifier as a 128-bit integer. Based on ULIDs.
+    """
+    return _id_generator.generate()
+
+
+AMOUNT_MAX = (2 ** 128) - 1
+
+
+class InitError(Exception):
+    pass
+
+class ClientClosedError(Exception):
+    def __init__(self) -> None:
+        super().__init__("Client was closed.")
+
+class TooMuchDataError(Exception):
+    def __init__(self) -> None:
+        super().__init__("Too much data was sent or requested in this batch.")
+
+class ClientEvictedError(Exception):
+    def __init__(self) -> None:
+        super().__init__("Client was evicted.")
+
+class ClientReleaseTooLowError(Exception):
+    def __init__(self) -> None:
+        super().__init__("Client was evicted: release too old.")
+
+class ClientReleaseTooHighError(Exception):
+    def __init__(self) -> None:
+        super().__init__("Client was evicted: release too new.")
+
+class Client:
+    _clients: dict[int, Any] = {}
+    _counter = AtomicInteger()
+
+    def __init__(self, cluster_id: int, replica_addresses: str) -> None:
+        self._client_key = Client._counter.increment()
+        self._client = bindings.CClient()
+
+        self._inflight_batches: dict[int, InflightBatch] = {}
+
+        # ctypes needs a reference to keep this alive through the FFI call. Having it as a temporary
+        # within the call _does not_ work.
+        cluster_id_u128 = c_uint128.from_param(cluster_id, name="cluster_id")
+        init_status = bindings.tb_client_init(
+            ctypes.byref(self._client),
+            ctypes.cast(
+                ctypes.byref(cluster_id_u128), ctypes.POINTER(ctypes.c_uint8 * 16)
+            ),
+            replica_addresses.encode("ascii"),
+            len(replica_addresses),
+            self._client_key,
+            self._c_on_completion
+        )
+        if init_status != bindings.InitStatus.SUCCESS:
+            raise InitError(init_status)
+
+        Client._clients[self._client_key] = self
+
+
+    def _acquire_batch(self, operation: bindings.Operation, operations: Any,
+                        c_event_type: Any, c_result_type: Any) -> InflightBatch:
+        batch = bindings.CBatch()
+        batch.next = None
+        batch.user_data = Client._counter.increment()
+        batch.user_tag = 0
+        batch.operation = operation
+        batch.status = bindings.BatchStatus.OK
+
+        operations_array_type = c_event_type * len(operations)
+        operations_array = operations_array_type(*map(c_event_type.from_param, operations))
+
+        batch.data_size = ctypes.sizeof(operations_array)
+        batch.data = ctypes.cast(operations_array, ctypes.c_void_p)
+
+        return InflightBatch(
+            batch=batch,
+            response=None,
+            on_completion=None,
+            on_completion_context=None,
+            operation=operation,
+            c_event_type=c_event_type,
+            c_result_type=c_result_type)
+
+    @staticmethod
+    @bindings.OnCompletion  # type: ignore[misc]
+    def _c_on_completion(completion_ctx: int, batch: Any, timestamp: int, bytes_ptr: Any, len_: int) -> None:
+        """
+        Invoked in a separate thread
+        """
+        self: Client = Client._clients[completion_ctx]
+
+        batch = ctypes.cast(batch, ctypes.POINTER(bindings.CBatch))
+        inflight_batch = self._inflight_batches[batch[0].user_data]
+        if inflight_batch.on_completion is None:
+            # Can't use tb_assert here, as mypy complains later that it might be None.
+            raise TypeError("inflight_batch.on_completion not set")
+
+        if batch[0].status == bindings.BatchStatus.OK.value:
+            c_result_type = inflight_batch.c_result_type
+            tb_assert(len_ % ctypes.sizeof(c_result_type) == 0)
+
+            # The memory referenced in bytes_ptr is only valid for the duration of this callback. Copy
+            # it to a fresh, Python owned buffer and do the conversion from the raw C type to the Python
+            # dataclass.
+            results_slice = ctypes.cast(
+                bytes_ptr,
+                ctypes.POINTER(c_result_type)
+            )[0:(len_ // ctypes.sizeof(c_result_type))]
+            results = [result.to_python() for result in results_slice]
+
+            inflight_batch.response = results
+
+        elif batch[0].status == bindings.BatchStatus.TOO_MUCH_DATA.value:
+            inflight_batch.response = TooMuchDataError()
+
+        elif batch[0].status == bindings.BatchStatus.CLIENT_EVICTED.value:
+            inflight_batch.response = ClientEvictedError()
+
+        elif batch[0].status == bindings.BatchStatus.CLIENT_RELEASE_TOO_LOW.value:
+            inflight_batch.response = ClientReleaseTooLowError()
+
+        elif batch[0].status == bindings.BatchStatus.CLIENT_RELEASE_TOO_HIGH.value:
+            inflight_batch.response = ClientReleaseTooHighError()
+
+        elif batch[0].status == bindings.BatchStatus.CLIENT_CLOSED.value:
+            inflight_batch.response = ClientClosedError()
+
+        else:
+            # INVALID_OPERATION and INVALID_DATA_SIZE are unexpected.
+            inflight_batch.response = Exception("Unexpected BatchStatus {status}")
+
+        inflight_batch.on_completion(inflight_batch)
+
+
+class ClientSync(Client, bindings.StateMachineMixin):
+    def _on_completion(self, inflight_batch: InflightBatch) -> None:
+        if not isinstance(inflight_batch.on_completion_context, CompletionContextSync):
+            raise TypeError(repr(inflight_batch.on_completion_context))
+        inflight_batch.on_completion_context.event.set()
+
+    def _submit(self, operation: bindings.Operation, operations: list[Any],
+                c_event_type: Any, c_result_type: Any) -> Any:
+        inflight_batch = self._acquire_batch(operation, operations, c_event_type, c_result_type)
+        self._inflight_batches[inflight_batch.batch.user_data] = inflight_batch
+
+        inflight_batch.on_completion = self._on_completion
+        inflight_batch.on_completion_context = CompletionContextSync(event=threading.Event())
+
+        client_state = bindings.tb_client_submit(ctypes.byref(self._client), ctypes.byref(inflight_batch.batch))
+        if client_state == bindings.ClientStatus.SUCCESS:
+            inflight_batch.on_completion_context.event.wait()
+
+        del self._inflight_batches[inflight_batch.batch.user_data]
+
+        if client_state == bindings.ClientStatus.CLOSED:
+            raise ClientClosedError()
+
+        if client_state == bindings.ClientStatus.NOT_INITIALIZED:
+            raise Exception("Client interface not initialized")
+
+        if isinstance(inflight_batch.response, Exception):
+            raise inflight_batch.response
+
+        return inflight_batch.response
+
+    def close(self) -> None:
+        tb_assert(self._client is not None)
+        client_state = bindings.tb_client_deinit(ctypes.byref(self._client))
+        tb_assert(client_state != bindings.ClientStatus.NOT_INITIALIZED)
+        if client_state == bindings.ClientStatus.CLOSED:
+            return
+
+        tb_assert(len(self._inflight_batches) == 0)
+        del Client._clients[self._client_key]
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+
+class ClientAsync(Client, bindings.AsyncStateMachineMixin):
+    def _on_completion(self, inflight_batch: InflightBatch) -> None:
+        """
+        Called by Client._c_on_completion, which itself is called from a different thread. Use
+        `call_soon_threadsafe` to return to the thread of the event loop the request was invoked
+        from, so _trigger_event() can trigger the async event and allow the client to progress.
+        """
+        if not isinstance(inflight_batch.on_completion_context, CompletionContextAsync):
+            raise TypeError(repr(inflight_batch.on_completion_context))
+        inflight_batch.on_completion_context.loop.call_soon_threadsafe(
+            self._trigger_event,
+            inflight_batch
+        )
+
+    def _trigger_event(self, inflight_batch:InflightBatch) -> None:
+        if not isinstance(inflight_batch.on_completion_context, CompletionContextAsync):
+            raise TypeError(repr(inflight_batch.on_completion_context))
+        inflight_batch.on_completion_context.event.set()
+
+    async def _submit(self, operation: bindings.Operation, operations: Any,
+                      c_event_type: Any, c_result_type: Any) -> Any:
+        inflight_batch = self._acquire_batch(operation, operations, c_event_type, c_result_type)
+        self._inflight_batches[inflight_batch.batch.user_data] = inflight_batch
+
+        inflight_batch.on_completion = self._on_completion
+        inflight_batch.on_completion_context = CompletionContextAsync(
+            loop=asyncio.get_event_loop(),
+            event=asyncio.Event()
+        )
+
+        client_state = bindings.tb_client_submit(ctypes.byref(self._client), ctypes.byref(inflight_batch.batch))
+        if client_state == bindings.ClientStatus.SUCCESS:
+            await inflight_batch.on_completion_context.event.wait()
+
+        del self._inflight_batches[inflight_batch.batch.user_data]
+
+        if client_state == bindings.ClientStatus.CLOSED:
+            raise ClientClosedError()
+
+        if client_state == bindings.ClientStatus.NOT_INITIALIZED:
+            raise Exception("Client interface not initialized")
+
+        if isinstance(inflight_batch.response, Exception):
+            raise inflight_batch.response
+
+        return inflight_batch.response
+
+    async def close(self) -> None:
+        tb_assert(self._client is not None)
+        client_state = bindings.tb_client_deinit(ctypes.byref(self._client))
+        tb_assert(client_state != bindings.ClientStatus.NOT_INITIALIZED)
+        if client_state == bindings.ClientStatus.CLOSED:
+            return
+
+        # tb_client_deinit internally clears any inflight requests, and calls their callbacks, so
+        # the client needs to stick around until that's done.
+        #
+        # This isn't a problem for ClientSync, but ClientAsync invokes the callbacks using
+        # call_soon_threadsafe(), so wait for the event to fire on all pending batches.
+        all_events = []
+        for batch in self._inflight_batches.values():
+            if not isinstance(batch.on_completion_context, CompletionContextAsync):
+                raise AssertionError()
+            all_events.append(batch.on_completion_context.event.wait())
+
+        await asyncio.gather(*all_events)
+
+        tb_assert(len(self._inflight_batches) == 0)
+        del Client._clients[self._client_key]
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
+
+
+@bindings.LogHandler  # type: ignore[misc]
+def log_handler(level_zig: bindings.LogLevel, message_ptr: Any, message_len: int) -> None:
+    level_python = {
+        bindings.LogLevel.ERR: logging.ERROR,
+        bindings.LogLevel.WARN: logging.WARNING,
+        bindings.LogLevel.INFO: logging.INFO,
+        bindings.LogLevel.DEBUG: logging.DEBUG,
+    }[level_zig]
+    logger.log(level_python, ctypes.string_at(message_ptr, message_len).decode("utf-8"))
+
+tb_assert(bindings.tb_client_register_log_callback(log_handler, True) ==
+    bindings.RegisterLogCallbackStatus.SUCCESS)
+
+
+def configure_logging(
+    *,
+    debug: bool,
+    handler: Callable[[bindings.LogLevel, Any, int], None] = log_handler,
+) -> None:
+    # First disable the existing log handler, before enabling the new one.
+    tb_assert(bindings.tb_client_register_log_callback(None, debug) ==
+        bindings.RegisterLogCallbackStatus.SUCCESS)
+
+    tb_assert(bindings.tb_client_register_log_callback(handler, debug) ==
+        bindings.RegisterLogCallbackStatus.SUCCESS)
