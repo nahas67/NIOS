@@ -248,6 +248,16 @@ class PluginRegistry:
         except Exception as exc:  # pragma: no cover - malformed forge dependency
             record.last_error = f"{type(exc).__name__}: {exc}"
 
+    def register_plugin(
+        self,
+        manifest: PluginManifest,
+        *,
+        factory: Callable[..., Any] | None = None,
+        activate: bool = True,
+    ) -> PluginRecord:
+        """Alias for :meth:`register` (operator vocabulary)."""
+        return self.register(manifest, factory=factory, activate=activate)
+
     def unregister(self, name: str) -> bool:
         with self._lock:
             token = str(name)
@@ -272,6 +282,15 @@ class PluginRegistry:
     def list_plugins(self) -> list[dict[str, Any]]:
         with self._lock:
             return [record.to_dict() for record in self._plugins.values()]
+
+    def list(self) -> list[dict[str, Any]]:
+        return self.list_plugins()
+
+    def toggle_plugin(self, name: str, enabled: bool) -> dict[str, Any]:
+        return self.toggle(name, enabled)
+
+    def record_fill(self, name: str, net_bps: float = 0.0) -> dict[str, Any]:
+        return self.record_shadow_fill(name, net_bps)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -319,6 +338,20 @@ class PluginRegistry:
         return self.toggle(name, False)
 
     # -- shadow graduation -------------------------------------------------
+    def _sync_forge(self, record: PluginRecord) -> None:
+        forge = self.forge
+        if forge is None or not hasattr(forge, "get_challenger"):
+            return
+        challenger = forge.get_challenger(f"plugin:{record.name}")
+        if challenger is None:
+            return
+        challenger.shadow_fills = max(
+            int(challenger.shadow_fills), int(record.shadow_fills)
+        )
+        challenger.winning_shadow_fills = max(
+            int(challenger.winning_shadow_fills), int(record.winning_shadow_fills)
+        )
+
     def record_shadow_fill(self, name: str, net_bps: float = 0.0) -> dict[str, Any]:
         """Record one live L2 shadow fill for a plugin.
 
@@ -351,6 +384,7 @@ class PluginRegistry:
                         "timestamp_ns": time.time_ns(),
                     }
                 )
+            self._sync_forge(record)
             return record.to_dict()
 
     def sync_shadow_twin(self, name: str | None = None) -> int:
@@ -387,6 +421,7 @@ class PluginRegistry:
                     record.shadow_fills >= REQUIRED_SHADOW_FILLS
                     and record.winning_shadow_fills >= REQUIRED_SHADOW_FILLS
                 )
+                self._sync_forge(record)
                 updated += 1
         return updated
 

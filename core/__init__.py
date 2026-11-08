@@ -34,6 +34,12 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "JetStreamBus": ("core.nats_bus", "JetStreamBus"),
     # tier 2
     "FeatureStore": ("core.feature_store", "FeatureStore"),
+    # step 8 extensions
+    "PluginRegistry": ("core.plugins", "PluginRegistry"),
+    "PluginManifest": ("core.plugins", "PluginManifest"),
+    "PluginKind": ("core.plugins", "PluginKind"),
+    "PluginRecord": ("core.plugins", "PluginRecord"),
+    "PluginStatus": ("core.plugins", "PluginStatus"),
 }
 
 __all__ = ["__version__", *_LAZY_EXPORTS]

@@ -136,7 +136,8 @@ def run_smoke(
             vaults = runtime.ledger.vault_balances(PRIMARY_SILO)
             return (
                 f"IBOR balanced, {report['accounts']} accounts, "
-                f"{len(vaults)} vaults, nav={runtime.ledger.silo_nav_micros(PRIMARY_SILO)}usd"
+                f"{len(vaults)} vaults, "
+                f"nav_micros={runtime.ledger.silo_nav_micros(PRIMARY_SILO)}"
             )
 
         table.check("Ring 0 sovereign vault / IBOR", ring0)
@@ -355,12 +356,18 @@ def run_role(role: str, *, workspace: str | Path | None = None) -> int:
             )
         elif token == "ring2-brain":
             runtime.forge.audit()
+            threading.Thread(
+                target=runtime.forge.run_scheduler_forever,
+                name="nios-alpha-forge-0000utc",
+                daemon=True,
+            ).start()
             print(
                 json.dumps(
                     {
                         "role": "ring2-brain",
                         "skills": runtime.skills.describe()["count"],
                         "forge_next_utc": "00:00",
+                        "forge_scheduler": "running",
                     }
                 )
             )

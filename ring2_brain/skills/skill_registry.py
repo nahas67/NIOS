@@ -17,9 +17,9 @@ forensics, crypto funding cascades, and FX macro blackout windows.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 __all__ = [
     "CORE_SKILLS",
@@ -132,7 +132,7 @@ class SkillRegistry:
         self._skills: dict[str, _SkillEntry] = {}
         self._disabled: set[str] = set()
         self._load_order: list[str] = []
-        if seed_if_empty and not any(self.root.glob("*/SKILL.md")):
+        if seed_if_empty:
             seed_core_skills(self.root)
         if auto_discover:
             self.discover()
@@ -155,14 +155,8 @@ class SkillRegistry:
             tags = frontmatter.get("tags", [])
             if isinstance(tags, str):
                 tags = [tags]
-            header_tokens = max(
-                1, int((len(header_text) - len(header_text)) / 4)  # frontmatter only
-            )
-            # Frontmatter token estimate is computed from the raw header to
-            # keep the accounting honest without loading the body.
             match = _FRONTMATTER_RE.match(header_text)
-            if match:
-                header_tokens = max(1, len(match.group(0)) // 4)
+            header_tokens = max(1, len(match.group(0)) // 4) if match else 1
             metadata = SkillMetadata(
                 name=name,
                 description=description,
@@ -274,6 +268,21 @@ class SkillRegistry:
 
     def list_skills(self) -> list[dict[str, Any]]:
         return [entry.metadata.to_dict() for entry in self._skills.values()]
+
+    def list(self) -> list[dict[str, Any]]:
+        return self.list_skills()
+
+    def get_skill(self, name: str) -> SkillMetadata | None:
+        return self.get(name)
+
+    def get_metadata(self, name: str) -> SkillMetadata | None:
+        return self.get(name)
+
+    def active_skills(self) -> list[dict[str, Any]]:
+        return [item for item in self.list_skills() if item["enabled"]]
+
+    def load_skill(self, name: str) -> str:
+        return self.load(name)
 
     def describe(self) -> dict[str, Any]:
         """Frontmatter-only snapshot; safe to call on every cockpit frame."""

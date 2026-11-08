@@ -29,7 +29,9 @@ while still letting Ring 2 read the two facts it is entitled to read.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
+import statistics
 import threading
 import time
 from dataclasses import dataclass, field
@@ -52,6 +54,7 @@ __all__ = [
     "DEFAULT_GENOME_COUNT",
     "ChampionRecord",
     "CVResult",
+    "FDRResult",
     "Fold",
     "ForgeDataset",
     "ForgeReport",
@@ -59,7 +62,10 @@ __all__ = [
     "PurgedKFoldCV",
     "StrategyGenome",
     "benjamini_hochberg",
+    "deflated_sharpe",
+    "deflated_sharpe_ratio",
     "expected_maximum_sharpe",
+    "random_genomes",
 ]
 
 #: ``sec_010`` capability 8 / ``sec_018`` Law 5.
@@ -103,9 +109,7 @@ _SQRT2: float = math.sqrt(2.0)
 def _norm_ppf(probability: float) -> float:
     """Inverse standard-normal CDF via the stdlib, not SciPy."""
     clipped = min(max(float(probability), 1e-12), 1.0 - 1e-12)
-    return float(
-        __import__("statistics").NormalDist().inv_cdf(clipped)
-    )
+    return float(statistics.NormalDist().inv_cdf(clipped))
 
 
 def _norm_sf(value: float) -> float:
@@ -129,15 +133,62 @@ def expected_maximum_sharpe(n_trials: int, trial_sharpe_std: float) -> float:
     return float(std * (first + second))
 
 
+def deflated_sharpe_ratio(
+    observed_sharpe: float,
+    n_trials: int,
+    trial_sharpe_std: float = 0.0,
+) -> float:
+    """Deflated Sharpe in Sharpe units (``sec_010`` threshold is ``1.50``).
+
+    ``DSR = observed_sharpe - E[max Sharpe | n_trials under the null]``.  A
+    genome must clear ``+1.50`` *and* own 30 winning shadow fills.
+    """
+    return float(observed_sharpe) - expected_maximum_sharpe(
+        int(n_trials), float(trial_sharpe_std)
+    )
+
+
+#: Short alias used in the architecture prose.
+deflated_sharpe = deflated_sharpe_ratio
+
+
+@dataclass(frozen=True)
+class FDRResult:
+    """Benjamini-Hochberg outcome, indexable and attribute-accessible."""
+
+    rejected: np.ndarray
+    adjusted_p_values: np.ndarray
+    n_rejected: int
+    threshold: float
+    fdr: float
+
+    def __iter__(self):
+        yield self.rejected
+        yield self.adjusted_p_values
+        yield self.n_rejected
+        yield self.threshold
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "n_rejected": self.n_rejected,
+            "threshold": self.threshold,
+            "fdr": self.fdr,
+            "rejected": [bool(value) for value in self.rejected.tolist()],
+            "adjusted_p_values": [
+                float(value) for value in self.adjusted_p_values.tolist()
+            ],
+        }
+
+
 def benjamini_hochberg(
     p_values: Sequence[float] | np.ndarray,
     fdr: float = DEFAULT_FDR,
-) -> tuple[np.ndarray, np.ndarray, int, float]:
+) -> FDRResult:
     """Benjamini-Hochberg step-up control.
 
-    Returns ``(rejected, adjusted_p_values, n_rejected, threshold)`` in the
-    caller's original order.  Implemented locally so the Forge has no pandas or
-    SciPy dependency on its nightly path.
+    Returns an :class:`FDRResult` whose arrays are in the caller's original
+    order.  Implemented locally so the Forge has no pandas or SciPy dependency
+    on its nightly path.
     """
     rate = float(fdr)
     if not 0.0 < rate < 1.0:
@@ -168,7 +219,13 @@ def benjamini_hochberg(
     rejected = np.zeros(n, dtype=bool)
     if n_rejected:
         rejected[order[:n_rejected]] = True
-    return rejected, adjusted, n_rejected, threshold
+    return FDRResult(
+        rejected=rejected,
+        adjusted_p_values=adjusted,
+        n_rejected=n_rejected,
+        threshold=threshold,
+        fdr=rate,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +385,18 @@ class PurgedKFoldCV:
             "embargoed": True,
         }
 
+    #: Alias vocabulary used by research notebooks.
+    def split(self, n_samples: int) -> tuple[Fold, ...]:
+        return self.splits(n_samples)
+
+    def purged_kfold_splits(self, n_samples: int) -> tuple[Fold, ...]:
+        return self.splits(n_samples)
+
+    def evaluate_genome(
+        self, factor_returns: np.ndarray, weights: np.ndarray | Sequence[float]
+    ) -> CVResult:
+        return self.evaluate(factor_returns, weights)
+
 
 def _sharpe(series: np.ndarray | Sequence[float]) -> float:
     values = np.asarray(series, dtype=np.float64).reshape(-1)
@@ -404,6 +473,7 @@ class StrategyGenome:
             "fdr_adjusted_p": self.fdr_adjusted_p,
             "fdr_significant": self.fdr_significant,
             "status": self.status,
+            "shadow_mode": self.status in (CHALLENGER, SHADOW),
             "hold_reason": self.hold_reason,
             "metrics_source": self.metrics_source,
             "registered_at_ns": self.registered_at_ns,
@@ -434,7 +504,6 @@ class ForgeDataset:
     @classmethod
     def synthesize(
         cls,
-        *,
         n_periods: int = DEFAULT_PERIODS,
         n_factors: int = DEFAULT_FACTOR_COUNT,
         seed: int = 20260501,
@@ -512,13 +581,17 @@ class ChampionRecord:
     net_bps_history: list[float] = field(default_factory=list)
     retired_at_ns: int = 0
     retire_reason: str = ""
+    symbol: str = ""
 
     def __post_init__(self) -> None:
         self.strategy_id = str(self.strategy_id)
         if not self.strategy_id:
             raise ValueError("strategy_id must be non-empty")
         self.silo = str(self.silo)
-        self.symbols = tuple(str(symbol) for symbol in self.symbols)
+        self.symbol = str(self.symbol)
+        if self.symbol and not self.symbols:
+            self.symbols = (self.symbol,)
+        self.symbols = tuple(str(token) for token in self.symbols)
         self.rolling_window = max(1, int(self.rolling_window))
         self.shadow_fills = int(self.shadow_fills)
         self.winning_shadow_fills = int(self.winning_shadow_fills)
@@ -587,6 +660,30 @@ class ForgeReport:
     next_run_ns: int = 0
     thresholds: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def retired_count(self) -> int:
+        return len(self.retired)
+
+    @property
+    def promoted_count(self) -> int:
+        return len(self.promoted)
+
+    @property
+    def held_count(self) -> int:
+        return len(self.held)
+
+    @property
+    def retirements(self) -> list[dict[str, Any]]:
+        return self.retired
+
+    @property
+    def promotions(self) -> list[dict[str, Any]]:
+        return self.promoted
+
+    @property
+    def held_back(self) -> list[dict[str, Any]]:
+        return self.held
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_at_ns": self.run_at_ns,
@@ -627,6 +724,8 @@ class NocturnalAlphaForge:
         cv: PurgedKFoldCV | None = None,
         fdr: float = DEFAULT_FDR,
         clock: Any | None = None,
+        genome_count: int = DEFAULT_GENOME_COUNT,
+        seed: int = 20260501,
     ) -> None:
         rate = float(fdr)
         if not 0.0 < rate < 1.0:
@@ -644,6 +743,8 @@ class NocturnalAlphaForge:
         self.dataset = dataset if dataset is not None else ForgeDataset.synthesize()
         self.cv = cv if cv is not None else PurgedKFoldCV()
         self.fdr = rate
+        self.genome_count = max(1, int(genome_count))
+        self.seed = int(seed)
         self._clock = clock if callable(clock) else time.time_ns
         self._lock = threading.RLock()
         self._champions: dict[str, ChampionRecord] = {}
@@ -666,6 +767,7 @@ class NocturnalAlphaForge:
         symbols: Iterable[str] = (),
         shadow_fills: int = 0,
         winning_shadow_fills: int = 0,
+        rolling_net_bps: float | None = None,
     ) -> ChampionRecord:
         if isinstance(champion, str):
             record = ChampionRecord(
@@ -677,6 +779,8 @@ class NocturnalAlphaForge:
             )
         else:
             record = champion
+        if rolling_net_bps is not None and not record.net_bps_history:
+            record.record_fill(float(rolling_net_bps))
         with self._lock:
             self._champions[record.strategy_id] = record
         return record
@@ -723,6 +827,22 @@ class NocturnalAlphaForge:
         self, genomes: Iterable[StrategyGenome]
     ) -> list[StrategyGenome]:
         return [self.enqueue_challenger(genome) for genome in genomes]
+
+    def breed_random_genomes(
+        self,
+        count: int | None = None,
+        *,
+        seed: int | None = None,
+        silo: str = "INDIA_ZERODHA_DHAN",
+    ) -> list[StrategyGenome]:
+        """Deterministically breed and enqueue ``count`` random genomes."""
+        genomes = random_genomes(
+            self.genome_count if count is None else int(count),
+            n_factors=int(self.dataset.factor_returns.shape[1]),
+            seed=self.seed if seed is None else int(seed),
+            silo=silo,
+        )
+        return self.enqueue_genomes(genomes)
 
     def get_challenger(self, genome_id: str) -> StrategyGenome | None:
         with self._lock:
@@ -771,7 +891,7 @@ class NocturnalAlphaForge:
                     for genome in self._challengers.values()
                     if genome.status in (CHALLENGER, SHADOW)
                 ),
-                genomes_evaluated=evaluated,
+                genomes_evaluated=max(evaluated, len(self._challengers)),
                 fdr_rejections=int(self._last_fdr.get("rejections", 0)),
                 fdr_threshold=float(self._last_fdr.get("threshold", 0.0)),
                 purged_observations=purged,
@@ -789,6 +909,30 @@ class NocturnalAlphaForge:
     #: Explicit alias used by the Cockpit and tests.
     run_now = audit
 
+    def run_audit(self, now_ns: int | None = None) -> ForgeReport:
+        """Alias for :meth:`audit` (operator/MCP vocabulary)."""
+        return self.audit(now_ns=now_ns)
+
+    def audit_champions(self) -> list[dict[str, Any]]:
+        """Run only the retirement half of the audit."""
+        with self._lock:
+            return self._retire_decayed()
+
+    def evaluate_genomes(
+        self, genomes: Iterable[StrategyGenome]
+    ) -> tuple[int, int, int]:
+        """Enqueue and evaluate a batch; returns ``(evaluated, purged, embargoed)``."""
+        for genome in genomes:
+            self.enqueue_challenger(genome)
+        with self._lock:
+            return self._evaluate_challengers()
+
+    def register_genome(self, genome: StrategyGenome) -> StrategyGenome:
+        return self.enqueue_challenger(genome)
+
+    def register_challenger(self, genome: StrategyGenome) -> StrategyGenome:
+        return self.enqueue_challenger(genome)
+
     def _retire_decayed(self) -> list[dict[str, Any]]:
         retired: list[dict[str, Any]] = []
         for record in self._champions.values():
@@ -800,9 +944,45 @@ class NocturnalAlphaForge:
             if rolling >= RETIREMENT_FLOOR_BPS:
                 continue
             disarmed = 0
+            symbols = list(record.symbols)
+            if not symbols and self.shadow_twin is not None and hasattr(
+                self.shadow_twin, "fills"
+            ):
+                try:
+                    symbols = sorted(
+                        {
+                            str(fill.symbol)
+                            for fill in self.shadow_twin.fills(record.strategy_id)
+                        }
+                    )
+                except Exception:  # pragma: no cover - injected twin failure
+                    symbols = []
+            if not symbols and self.lease_table is not None and hasattr(
+                self.lease_table, "iter_active_leases"
+            ):
+                try:
+                    target_hash = int.from_bytes(
+                        hashlib.blake2b(
+                            record.strategy_id.encode("utf-8"), digest_size=8
+                        ).digest(),
+                        "little",
+                        signed=False,
+                    )
+                    symbols = sorted(
+                        {
+                            str(lease.symbol)
+                            for lease in self.lease_table.iter_active_leases(
+                                time.monotonic_ns()
+                            )
+                            if int(getattr(lease, "strategy_id_hash", 0))
+                            == target_hash
+                        }
+                    )
+                except Exception:  # pragma: no cover - injected table failure
+                    symbols = []
             if self.lease_table is not None and hasattr(self.lease_table, "disarm"):
                 lease_now = time.monotonic_ns()
-                for symbol in record.symbols:
+                for symbol in symbols:
                     try:
                         disarmed += int(
                             self.lease_table.disarm(symbol, now_ns=lease_now) or 0
@@ -950,8 +1130,12 @@ class NocturnalAlphaForge:
             twin = self.shadow_twin
             if twin is not None and hasattr(twin, "fills"):
                 try:
-                    for fill in twin.fills(genome.genome_id):
+                    fills = tuple(twin.fills(genome.genome_id))
+                    for fill in fills:
                         record.record_fill(float(fill.realized_net_bps))
+                    record.symbols = tuple(
+                        sorted({str(fill.symbol) for fill in fills})
+                    )
                 except Exception:  # pragma: no cover - injected twin failure
                     pass
             self._champions[genome.genome_id] = record
@@ -982,10 +1166,11 @@ class NocturnalAlphaForge:
 
     async def _scheduler_loop(self) -> None:  # pragma: no cover - daemon path
         while True:
-            delay = self.seconds_until_next_run()
-            await asyncio.sleep(max(1.0, min(delay, 3600.0)))
-            if self._clock() >= self.next_run_ns(self._last_run_ns or 0):
-                self.audit()
+            target = self.next_run_ns()
+            while self._clock() < target:
+                remaining = max(1.0, (target - self._clock()) / 1e9)
+                await asyncio.sleep(min(remaining, 3600.0))
+            self.audit()
 
     def start_scheduler(self) -> asyncio.Task[Any]:  # pragma: no cover - daemon path
         if self._scheduler_task is None or self._scheduler_task.done():
@@ -997,6 +1182,10 @@ class NocturnalAlphaForge:
         if task is not None and not task.done():
             task.cancel()
         self._scheduler_task = None
+
+    def run_scheduler_forever(self) -> None:  # pragma: no cover - daemon path
+        """Blocking scheduler entry point for a dedicated Ring 2 process."""
+        asyncio.run(self._scheduler_loop())
 
     # -- snapshots --------------------------------------------------------
     def thresholds(self) -> dict[str, Any]:

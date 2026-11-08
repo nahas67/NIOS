@@ -12,12 +12,16 @@ from .alpha_forge import (
     SHADOW_RETIRED,
     ChampionRecord,
     CVResult,
+    FDRResult,
     Fold,
     ForgeDataset,
     ForgeReport,
     NocturnalAlphaForge,
     PurgedKFoldCV,
     StrategyGenome,
+    benjamini_hochberg,
+    deflated_sharpe_ratio,
+    random_genomes,
 )
 
 __all__ = [
@@ -30,10 +34,14 @@ __all__ = [
     "SHADOW_RETIRED",
     "ChampionRecord",
     "CVResult",
+    "FDRResult",
     "Fold",
     "ForgeDataset",
     "ForgeReport",
     "NocturnalAlphaForge",
     "PurgedKFoldCV",
     "StrategyGenome",
+    "benjamini_hochberg",
+    "deflated_sharpe_ratio",
+    "random_genomes",
 ]

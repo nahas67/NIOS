@@ -22,8 +22,8 @@ from __future__ import annotations
 import json
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -83,10 +83,21 @@ class MCPTool:
 
 
 class MCPCallRequest(BaseModel):
-    """``POST /api/v2/mcp/call`` payload."""
+    """``POST /api/v2/mcp/call`` payload.
 
-    name: str = Field(..., min_length=1)
+    Accepts both the MCP-native ``name`` key and the shorthand ``tool`` key so
+    HTTP clients and JSON-RPC adapters can share one request model.
+    """
+
+    name: str | None = None
+    tool: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
+
+    def resolved_name(self) -> str:
+        token = str(self.name or self.tool or "").strip()
+        if not token:
+            raise ValueError("request must carry 'name' or 'tool'")
+        return token
 
 
 @dataclass(slots=True)
@@ -274,6 +285,25 @@ class MCPBridge:
     def tool_names(self) -> tuple[str, ...]:
         return tuple(self._tools)
 
+    def get_tool(self, name: str) -> MCPTool | None:
+        return self._tools.get(str(name))
+
+    def tool_definitions(self) -> tuple[MCPTool, ...]:
+        return tuple(self._tools.values())
+
+    def tools(self) -> list[dict[str, Any]]:
+        return self.list_tools()
+
+    def call(
+        self, name: str, arguments: Mapping[str, Any] | None = None
+    ) -> Any:
+        return self.call_tool(name, arguments)
+
+    def invoke(
+        self, name: str, arguments: Mapping[str, Any] | None = None
+    ) -> Any:
+        return self.call_tool(name, arguments)
+
     def set_enabled(self, name: str, enabled: bool) -> dict[str, Any]:
         token = str(name)
         if token not in self._tools:
@@ -333,13 +363,26 @@ class MCPBridge:
             }
         payload["total_nav_micros"] = total
         payload["total_nav"] = total / 1_000_000.0
+        market_map = {
+            "CRYPTO_BINANCE": "CRYPTO",
+            "INDIA_ZERODHA_DHAN": "INDIA",
+            "US_IBKR": "US",
+            "FX_MT5": "FX",
+        }
+        payload["markets"] = {
+            market: payload["silos"][silo]
+            for silo, market in market_map.items()
+            if silo in payload["silos"]
+        }
         return payload
 
     def _tool_verify_grounding(self, arguments: dict[str, Any]) -> dict[str, Any]:
         from core.schemas import GroundedFactPacket
         from ring2_brain.truth.grounding_gate import NumericalGroundingVerifier
 
-        thesis = str(arguments.get("thesis_text", "")).strip()
+        thesis = str(
+            arguments.get("thesis_text") or arguments.get("thesis") or ""
+        ).strip()
         if not thesis:
             raise ValueError("thesis_text must be non-empty")
         tolerance = float(arguments.get("tolerance", 1e-4))
@@ -408,6 +451,10 @@ class MCPBridge:
         if result is None:
             return {"ok": False, "error": "MIROFISH_ENGINE_UNAVAILABLE"}
         payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+        features = payload.get("features")
+        if isinstance(features, dict):
+            for key, value in features.items():
+                payload.setdefault(key, value)
         payload["ok"] = True
         return payload
 
@@ -431,6 +478,7 @@ class MCPBridge:
         payload = result.to_dict()
         payload["ok"] = True
         payload["top_fraction"] = top_k / float(n_symbols)
+        payload["top_candidates"] = payload.get("candidates", [])
         return payload
 
     def _tool_killswitch(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -516,20 +564,24 @@ class MCPBridge:
         def call_tool(request: MCPCallRequest) -> dict[str, Any]:
             started = time.perf_counter()
             try:
-                result = self.call_tool(request.name, request.arguments)
+                tool_name = request.resolved_name()
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            try:
+                result = self.call_tool(tool_name, request.arguments)
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
             except PermissionError as exc:
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
             except Exception as exc:  # tool failure is reported, not 500
                 return {
-                    "name": request.name,
+                    "name": tool_name,
                     "ok": False,
                     "error": f"{type(exc).__name__}: {exc}",
                     "elapsed_ms": (time.perf_counter() - started) * 1e3,
                 }
             return {
-                "name": request.name,
+                "name": tool_name,
                 "ok": True,
                 "result": result,
                 "elapsed_ms": (time.perf_counter() - started) * 1e3,

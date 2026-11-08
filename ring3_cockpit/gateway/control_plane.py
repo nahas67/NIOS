@@ -1,7 +1,8 @@
 """Ring 3 Glass Cockpit control plane (``sec_004``, ``sec_011``, ``sec_016``).
 
-The cockpit is the only writable surface in NIOS.  It exposes exactly four
-endpoints, and nothing else:
+The cockpit is the only writable surface in NIOS.  The four constitutional
+endpoints remain, and Step 8 adds two explicitly authorized read/toggle
+surfaces (extensions + read-only MCP) without granting order authority:
 
 ======================  =====================================================
 ``GET  /api/v2/cockpit/stream``  60 FPS SSE cards, abstention meter, 4-vault NAV
@@ -9,6 +10,10 @@ endpoints, and nothing else:
 ``POST /api/v2/control/brokers`` Paper/Live, fee floors, loss stops, sliders
 ``POST /api/v2/control/llms``    System 1/2 hot swap with write-only keys
 ``POST /api/v2/control/killswitch`` <1.0 ms global preemption + ADR-009 flatten
+``GET  /api/v2/control/extensions`` skills / plugins / MCP / Forge status
+``POST /api/v2/control/extensions`` toggle an extension or run a Forge audit
+``GET  /api/v2/mcp/tools``       five read-only MCP tools + air-gap audit
+``POST /api/v2/mcp/call``        invoke one read-only tool
 ======================  =====================================================
 
 Design notes
@@ -210,6 +215,8 @@ class ExtensionsControlRequest(BaseModel):
     @classmethod
     def _target_ok(cls, value: str) -> str:
         token = str(value).strip().lower().replace("-", "_")
+        if token == "mcp":
+            token = "mcp_tool"
         if token not in ("skill", "plugin", "mcp_tool", "forge"):
             raise ValueError("target must be skill, plugin, mcp_tool or forge")
         return token
@@ -1094,10 +1101,24 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     ``ring3_cockpit/ui/openalgo_shell/dist/index.html`` exists; API routes keep
     precedence because the static mount is registered last.
     """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        forge = getattr(control, "forge", None)
+        if forge is not None and hasattr(forge, "start_scheduler"):
+            forge.start_scheduler()
+        try:
+            yield
+        finally:
+            if forge is not None and hasattr(forge, "stop_scheduler"):
+                forge.stop_scheduler()
+
     app = FastAPI(
         title="NIOS Ring 3 Glass Cockpit",
         version="2.0.0",
         description="Authenticated REST/SSE control plane (sec_004, sec_011, sec_016).",
+        lifespan=_lifespan,
     )
     app.add_middleware(
         CORSMiddleware,
