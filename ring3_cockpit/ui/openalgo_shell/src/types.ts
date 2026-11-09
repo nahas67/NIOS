@@ -171,6 +171,37 @@ export interface KillReport {
   timestamp_ns: number
 }
 
+export interface RearmReport {
+  status: string
+  reason: string
+  operator: string
+  kill_latch_hot: boolean
+  rearmed_silos: string[]
+  leases_cleared: boolean
+  autopilot_resumes: boolean
+  timestamp_ns: number
+}
+
+export interface AutopilotState {
+  enabled: boolean
+  mode?: string
+  interval_ms?: number
+  instruments?: Record<string, string>
+  rounds?: number
+  ticks?: number
+  live_fills?: number
+  shadow_fills?: number
+  graduated?: boolean
+  paused?: boolean
+  last_tick_ns?: number
+  last?: {
+    status?: string
+    actions?: Record<string, string>
+    prices?: Record<string, number>
+    cascade_fragility_index?: number
+  }
+}
+
 export interface SkillInfo {
   name: string
   description: string
@@ -505,6 +536,7 @@ export interface FormalProofState {
 
 export interface CockpitState {
   version: string
+  document_id: string
   system: SystemState
   abstention: AbstentionState
   silos: Record<string, SiloState>
@@ -516,6 +548,7 @@ export interface CockpitState {
   kill_switch: KillReport | null
   extensions: ExtensionsState
   formal_proofs: FormalProofState
+  autopilot: AutopilotState
   streams: { cockpit: string; fps: number }
 }
 

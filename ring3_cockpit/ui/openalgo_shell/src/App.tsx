@@ -10,7 +10,7 @@ import { useCockpit } from '@/hooks/use-cockpit'
 
 export default function App() {
   const cockpit = useCockpit()
-  const { state, cards, connected, error, killReport, lastFrameAt, refresh, kill } =
+  const { state, cards, connected, error, killReport, rearmReport, lastFrameAt, refresh, kill, rearm } =
     cockpit
 
   return (
@@ -30,8 +30,10 @@ export default function App() {
           state={state}
           connected={connected}
           killReport={killReport}
+          rearmReport={rearmReport}
           lastFrameAt={lastFrameAt}
           onKill={() => void kill()}
+          onRearm={() => void rearm()}
         />
 
         {error ? (
@@ -83,8 +85,8 @@ export default function App() {
 
           <footer className="mt-8 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3 text-[10px] text-muted-foreground">
             <span>
-              NIOS-ARC-2026-V3 · Ring 3 is read-only for market state; writes are
-              limited to the four control endpoints.
+              NIOS-ARC-2026-V3 · v{state?.version ?? '3.0.0-PROD'} · Ring 3 is read-only
+              for market state; writes are limited to the control endpoints.
             </span>
             <span className="font-mono">
               99.1% noise abstention · 98% split-conformal · 35/15 in-silo ratchet

@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
 
-import { fetchState, postKillSwitch, streamUrl } from '@/lib/api'
+import { fetchState, postKillSwitch, postRearm, streamUrl } from '@/lib/api'
 import type {
   CockpitCard,
   CockpitFrame,
   CockpitState,
   KillReport,
+  RearmReport,
   SiloState,
 } from '@/types'
 
@@ -43,9 +44,11 @@ export interface CockpitController {
   connected: boolean
   error: string | null
   killReport: KillReport | null
+  rearmReport: RearmReport | null
   lastFrameAt: number
   refresh: () => Promise<void>
   kill: () => Promise<void>
+  rearm: () => Promise<void>
   dismissError: () => void
 }
 
@@ -55,6 +58,7 @@ export function useCockpit(): CockpitController {
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [killReport, setKillReport] = useState<KillReport | null>(null)
+  const [rearmReport, setRearmReport] = useState<RearmReport | null>(null)
   const [lastFrameAt, setLastFrameAt] = useState(0)
 
   const refresh = useCallback(async () => {
@@ -116,9 +120,21 @@ export function useCockpit(): CockpitController {
     try {
       const report = await postKillSwitch('cockpit 1-click kill switch')
       setKillReport(report)
+      setRearmReport(null)
       await refresh()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'kill switch failed')
+    }
+  }, [refresh])
+
+  const rearm = useCallback(async () => {
+    try {
+      const report = await postRearm('cockpit re-arm')
+      setRearmReport(report)
+      setKillReport(null)
+      await refresh()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 're-arm failed')
     }
   }, [refresh])
 
@@ -128,9 +144,11 @@ export function useCockpit(): CockpitController {
     connected,
     error,
     killReport,
+    rearmReport,
     lastFrameAt,
     refresh,
     kill,
+    rearm,
     dismissError: () => setError(null),
   }
 }

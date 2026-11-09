@@ -10,6 +10,7 @@ surfaces (extensions + read-only MCP) without granting order authority:
 ``POST /api/v2/control/brokers`` Paper/Live, fee floors, loss stops, sliders
 ``POST /api/v2/control/llms``    System 1/2 hot swap with write-only keys
 ``POST /api/v2/control/killswitch`` <1.0 ms global preemption + ADR-009 flatten
+``POST /api/v2/control/rearm``    explicit human reset back to ``ARMED``
 ``GET  /api/v2/control/extensions`` skills / plugins / MCP / Forge status
 ``POST /api/v2/control/extensions`` toggle an extension or run a Forge audit
 ``GET  /api/v2/mcp/tools``       five read-only MCP tools + air-gap audit
@@ -30,8 +31,10 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,16 +79,26 @@ __all__ = [
     "BrokerControlRequest",
     "LLMControlRequest",
     "KillSwitchRequest",
+    "RearmRequest",
     "ExtensionsControlRequest",
+    "autopilot_paper_loop",
     "create_app",
     "DEFAULT_DAILY_LLM_BUDGET_USD",
+    "DOCUMENT_ID",
     "KILL_LATENCY_BUDGET_NS",
+    "PLATFORM_VERSION",
 ]
+
+#: ``sec_001``: the constitution's document identity and released version.
+DOCUMENT_ID: str = "NIOS-ARC-2026-V3"
+PLATFORM_VERSION: str = "3.0.0-PROD"
 
 #: ``sec_016``: the standing daily LLM spend cap.
 DEFAULT_DAILY_LLM_BUDGET_USD: float = 3.10
 #: ``sec_004`` / ``sec_016``: kill switch preemption budget.
 KILL_LATENCY_BUDGET_NS: int = 1_000_000
+#: Paper-shadow autopilot cadence (250 ms - 500 ms, ``sec_013``).
+AUTOPILOT_INTERVAL_S: float = 0.4
 
 #: ``sec_008``: five capital-weighted MiroFish archetypes.
 ARCHETYPE_WEIGHTS: tuple[tuple[str, float], ...] = (
@@ -196,6 +209,13 @@ class KillSwitchRequest(BaseModel):
     reason: str = "manual operator kill switch"
     flatten: bool = True
     confirm: bool = True
+
+
+class RearmRequest(BaseModel):
+    """``POST /api/v2/control/rearm`` payload (explicit human reset)."""
+
+    reason: str = "operator re-arm"
+    operator: str = "ring3.operator"
 
 
 class ExtensionsControlRequest(BaseModel):
@@ -322,6 +342,8 @@ class ControlPlane:
         vopr_simulator: Any = None,
         tb_pg_provisioner: Any = None,
         tail_hedger: Any = None,
+        autopilot_runner: Any = None,
+        autopilot_provider: Any = None,
     ) -> None:
         self.ledger = ledger
         self.firewall = firewall
@@ -349,6 +371,12 @@ class ControlPlane:
         self.vopr_simulator = vopr_simulator
         self.tb_pg_provisioner = tb_pg_provisioner
         self.tail_hedger = tail_hedger
+        # The PAPER autopilot is supplied by the orchestrator; Ring 3 only
+        # schedules it inside the FastAPI lifespan and never trades directly.
+        self.autopilot_runner = autopilot_runner
+        self.autopilot_provider = autopilot_provider
+        self.autopilot_interval_s = AUTOPILOT_INTERVAL_S
+        self._bus_cursor = 0
         self._formal_cache: dict[str, Any] | None = None
         if token_ledger is not None:
             self.token_ledger = token_ledger
@@ -841,7 +869,8 @@ class ControlPlane:
             for silo_id in self.registry.silo_ids()
         }
         return {
-            "version": "2.0",
+            "version": PLATFORM_VERSION,
+            "document_id": DOCUMENT_ID,
             "system": self.system_status(),
             "abstention": self._abstention(),
             "silos": silos,
@@ -853,10 +882,25 @@ class ControlPlane:
             "kill_switch": self._kill_report,
             "extensions": self._extensions_state(),
             "formal_proofs": self.formal_proofs(),
+            "autopilot": self.autopilot_state(),
             "streams": {
                 "cockpit": STREAM_RING3_COCKPIT,
                 "fps": 60,
             },
+        }
+
+    def autopilot_state(self) -> dict[str, Any]:
+        """Paper-shadow autopilot telemetry (``sec_013`` lifecycle)."""
+        provider = self.autopilot_provider
+        if callable(provider):
+            try:
+                return dict(provider())
+            except Exception:  # pragma: no cover - telemetry is non-fatal
+                return {"enabled": False, "error": "autopilot telemetry unavailable"}
+        return {
+            "enabled": False,
+            "mode": "PAPER",
+            "interval_ms": int(AUTOPILOT_INTERVAL_S * 1000),
         }
 
     # -- cards ------------------------------------------------------------
@@ -893,12 +937,19 @@ class ControlPlane:
     def _bus_cards(self, limit: int = 50) -> list[dict[str, Any]]:
         if self.bus is None or not hasattr(self.bus, "replay"):
             return []
+        # Replay only a bounded tail window: a 400 ms autopilot round appends
+        # cards continuously, and the state endpoint must not rescan the whole
+        # session on every hydration poll.
+        from_sequence = max(1, int(self._bus_cursor) - max(1, int(limit)) * 2)
         try:
-            events = self.bus.replay(STREAM_RING3_COCKPIT, from_sequence=1)
+            events = self.bus.replay(
+                STREAM_RING3_COCKPIT, from_sequence=from_sequence
+            )
         except Exception:  # pragma: no cover - optional bus
             return []
         out: list[dict[str, Any]] = []
-        for event in list(events)[-limit:]:
+        for event in list(events)[-max(1, int(limit)):]:
+            self._bus_cursor = max(self._bus_cursor, int(event.sequence))
             payload = dict(event.payload)
             payload.setdefault("proof_line", _proof_line(payload))
             out.append(payload)
@@ -1177,6 +1228,47 @@ class ControlPlane:
             )
         return proposals
 
+    def rearm(self, request: RearmRequest | None = None) -> dict[str, Any]:
+        """Explicit human reset: clear the kill latch and re-arm every silo.
+
+        ADR-009 requires a *human* to reset a vault stop (``sec_004`` Tier 3), so
+        this is the only path back from ``HALTED`` to ``ARMED``.  It clears the
+        global latch, unfreezes reconciled/ADR-009 silos and puts every silo back
+        into ``ACTIVE`` trading state; the paper autopilot resumes on its next
+        tick without a server restart.
+        """
+        reason = request.reason if request is not None else "operator re-arm"
+        operator = request.operator if request is not None else "ring3.operator"
+        now_mono = time.monotonic_ns()
+        rearmed: list[str] = []
+        if self.kill_latch is not None:
+            self.kill_latch.arm(now_ns=now_mono)
+        for silo_id in self.registry.silo_ids():
+            self.firewall.set_trading_state(silo_id, TradingState.ACTIVE)
+            if self.guard is not None:
+                self.guard.unfreeze(silo_id)
+            rearmed.append(silo_id)
+        self._kill_report = None
+        return {
+            "status": "ARMED",
+            "reason": str(reason),
+            "operator": str(operator),
+            "kill_latch_hot": bool(
+                self.kill_latch is not None and self.kill_latch.is_halted
+            ),
+            "rearmed_silos": rearmed,
+            "leases_cleared": True,
+            "autopilot_resumes": self.autopilot_runner is not None,
+            "timestamp_ns": time.time_ns(),
+        }
+
+    def autopilot_tick(self) -> dict[str, Any]:
+        """Run one paper-shadow round through the orchestrator (sync, cheap)."""
+        runner = self.autopilot_runner
+        if runner is None:
+            return {"status": "DISABLED", "paused": True, "ticks": 0}
+        return dict(runner())
+
     # -- SSE --------------------------------------------------------------
     def frame(self, sequence: int, *, cards: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
         vaults = {
@@ -1239,6 +1331,51 @@ class ControlPlane:
 # ---------------------------------------------------------------------------
 
 
+def autopilot_enabled(control: ControlPlane) -> bool:
+    """``NIOS_AUTOPILOT`` gate: PAPER-only, opt-out via ``NIOS_AUTOPILOT=0``."""
+    flag = os.environ.get("NIOS_AUTOPILOT", "1").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return False
+    if getattr(control, "autopilot_runner", None) is None:
+        return False
+    try:
+        return all(
+            str(silo.mode) == SiloMode.PAPER.value for silo in control.registry.silos
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+async def autopilot_paper_loop(
+    control: ControlPlane,
+    *,
+    interval_s: float | None = None,
+    max_rounds: int | None = None,
+) -> None:
+    """Continuous paper-shadow tape for the whole four-silo runtime.
+
+    Every ``250-500 ms`` the orchestrator receives a realistic dual-vendor bar
+    and executed L2/trade flow for ``BTC-USDT``, ``RELIANCE.NS``, ``NVDA`` and
+    ``EUR_USD``.  The orchestrator itself resolves the 30-fill shadow
+    graduation, the 98% conformal gate, the Maker-Peg paper fill and the 35/15
+    in-silo ratchet; this task only supplies the clock.
+
+    A hot ``GlobalKillLatch`` pauses the tape immediately, and
+    ``POST /api/v2/control/rearm`` resumes it.
+    """
+    period = float(
+        AUTOPILOT_INTERVAL_S if interval_s is None else max(0.25, interval_s)
+    )
+    rounds = 0
+    while max_rounds is None or rounds < max_rounds:
+        try:
+            control.autopilot_tick()
+        except Exception:  # pragma: no cover - the tape must never kill Ring 3
+            pass
+        rounds += 1
+        await asyncio.sleep(period)
+
+
 def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -> FastAPI:
     """Build the Ring 3 ASGI app around an existing control plane.
 
@@ -1251,18 +1388,36 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
         forge = getattr(control, "forge", None)
+        forge_task: asyncio.Task[Any] | None = None
         if forge is not None and hasattr(forge, "start_scheduler"):
-            forge.start_scheduler()
+            forge_task = forge.start_scheduler()
+        autopilot: asyncio.Task[None] | None = None
+        if autopilot_enabled(control):
+            autopilot = asyncio.create_task(
+                autopilot_paper_loop(control),
+                name="nios-autopilot-paper",
+            )
+        _app.state.autopilot_task = autopilot
         try:
             yield
         finally:
+            if autopilot is not None:
+                autopilot.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await autopilot
+            if forge_task is not None:
+                forge_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await forge_task
             if forge is not None and hasattr(forge, "stop_scheduler"):
                 forge.stop_scheduler()
 
     app = FastAPI(
         title="NIOS Ring 3 Glass Cockpit",
-        version="2.0.0",
-        description="Authenticated REST/SSE control plane (sec_004, sec_011, sec_016).",
+        version=PLATFORM_VERSION,
+        description=(
+            f"{DOCUMENT_ID} REST/SSE control plane (sec_004, sec_011, sec_016)."
+        ),
         lifespan=_lifespan,
     )
     app.add_middleware(
@@ -1299,7 +1454,9 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return {
             "ok": True,
             "status": control.system_status()["status"],
-            "version": "2.0",
+            "version": PLATFORM_VERSION,
+            "document_id": DOCUMENT_ID,
+            "autopilot": control.autopilot_state().get("enabled", False),
         }
 
     @app.get("/api/v2/cockpit/state")
@@ -1346,6 +1503,10 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.post("/api/v2/control/killswitch")
     def control_killswitch(request: KillSwitchRequest) -> dict[str, Any]:
         return control.kill(request)
+
+    @app.post("/api/v2/control/rearm")
+    def control_rearm(request: RearmRequest | None = None) -> dict[str, Any]:
+        return control.rearm(request)
 
     @app.get("/api/v2/control/extensions")
     def control_extensions() -> dict[str, Any]:

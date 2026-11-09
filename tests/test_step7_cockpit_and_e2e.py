@@ -564,4 +564,5 @@ def test_gate5_orchestrator_exposes_ring3_app(
     health = client.get("/api/v2/cockpit/health")
     assert health.status_code == 200
     assert health.json()["ok"] is True
-    assert health.json()["version"] == "2.0"
+    assert health.json()["version"] == "3.0.0-PROD"
+    assert health.json()["document_id"] == "NIOS-ARC-2026-V3"

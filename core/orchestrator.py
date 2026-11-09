@@ -28,9 +28,10 @@ and every hop fails closed.
 
 from __future__ import annotations
 
+import math
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -105,9 +106,14 @@ from ring0_vault.kernel.formal_verifier import FormalVerificationSuite
 
 __all__ = [
     "NIOSCoreOrchestrator",
+    "ALL_SILOS",
+    "AUTOPILOT_CONTAGION_EVERY",
+    "AUTOPILOT_INTERVAL_S",
     "DISPLAY_SILO",
     "PRIMARY_SILO",
     "PRIMARY_SYMBOL",
+    "SILO_INSTRUMENTS",
+    "SILO_REFERENCE_PRICES",
     "STRATEGY_ID",
     "make_flow_tick",
     "make_dual_vendor_bar",
@@ -131,6 +137,28 @@ ALL_SILOS: tuple[str, ...] = (
     "US_IBKR",
     "FX_MT5",
 )
+
+#: ``sec_015``: the one instrument each silo is whitelisted to scalp.
+SILO_INSTRUMENTS: Mapping[str, str] = {
+    "CRYPTO_BINANCE": "BTC-USDT",
+    PRIMARY_SILO: "RELIANCE.NS",
+    "US_IBKR": "NVDA",
+    "FX_MT5": "EUR_USD",
+}
+
+#: Reference mid for the paper-shadow tape (no live venue is contacted).
+SILO_REFERENCE_PRICES: Mapping[str, float] = {
+    "CRYPTO_BINANCE": 64_250.0,
+    PRIMARY_SILO: 2_942.5,
+    "US_IBKR": 121.4,
+    "FX_MT5": 1.0842,
+}
+
+#: ``sec_013``: the paper-shadow autopilot cadence (250 ms - 500 ms window).
+AUTOPILOT_INTERVAL_S: float = 0.4
+
+#: Re-run the three-tick MiroFish cascade every N autopilot rounds.
+AUTOPILOT_CONTAGION_EVERY: int = 6
 
 
 def make_dual_vendor_bar(
@@ -266,6 +294,13 @@ class NIOSCoreOrchestrator:
         self._last_buy_ratio: float = 0.0
         self._report: PipelineReport | None = None
         self._cards: list[dict[str, Any]] = []
+        # Paper-shadow autopilot telemetry (Ring 3 lifespan drives ``autopilot_tick``).
+        self._autopilot_rounds = 0
+        self._autopilot_ticks = 0
+        self._autopilot_live_fills = 0
+        self._autopilot_last_ns = 0
+        self._autopilot_paused = False
+        self._autopilot_last: dict[str, Any] = {}
 
         # ---- Tier 1 / Tier 2 -------------------------------------------
         self.bus = bus if bus is not None else LocalJetStreamBus(self.workspace / "bus")
@@ -346,7 +381,10 @@ class NIOSCoreOrchestrator:
             shield=self.shield,
             signer=self.signer,
             guard=self.guard,
-            whitelists={silo: [PRIMARY_SYMBOL] for silo in self.silos},
+            whitelists={
+                silo: [SILO_INSTRUMENTS.get(silo, PRIMARY_SYMBOL)]
+                for silo in self.silos
+            },
             daily_loss_stops_micros={
                 silo: int(daily_loss_stop_micros) for silo in self.silos
             },
@@ -447,6 +485,8 @@ class NIOSCoreOrchestrator:
             formal_verifier=self.formal_verifier,
             tail_hedger=self.tail_hedger,
             tb_pg_provisioner=self.tb_pg_provisioner,
+            autopilot_runner=self.autopilot_tick,
+            autopilot_provider=self.autopilot_snapshot,
         )
 
     # -- properties -------------------------------------------------------
@@ -599,33 +639,49 @@ class NIOSCoreOrchestrator:
             cost_floor=floor,
             mode_badge="LIVE CAPITAL",
         )
-        self._verdicts[proposal.proposal_id] = verdict
+        # Ring 1 numbers proposals per engine, so the same id can be produced by
+        # two silos inside one autopilot round.  The verdict key carries the
+        # silo to keep the reservations from crossing silo boundaries.
+        key = (str(proposal.silo), str(proposal.proposal_id))
+        if verdict.accepted:
+            self._verdicts[key] = verdict
+        else:
+            # A rejected verdict is never consumed by the sink; drop it so a
+            # long autopilot run cannot grow this map without bound.
+            self._verdicts.pop(key, None)
         self._last_live_verdict = verdict
         return bool(verdict.accepted)
 
     def _on_live_proposal(self, proposal: UnsignedProposal) -> None:
-        verdict = self._verdicts.pop(proposal.proposal_id, None)
+        verdict = self._verdicts.pop(
+            (str(proposal.silo), str(proposal.proposal_id)), None
+        )
         if verdict is None or not verdict.accepted or verdict.reservation is None:
             return
+        # One OMS order id per silo: ``proposal_id`` alone is engine-local.
+        order = replace(
+            proposal, proposal_id=f"{proposal.silo}:{proposal.proposal_id}"
+        )
         now = time.monotonic_ns()
         price = float(proposal.limit_price)
         half_spread = price * 0.0001
         self.oms.submit_maker_peg(
-            proposal,
+            order,
             verdict.reservation,
             (price - half_spread, price + half_spread),
             now_ns=now,
         )
         realized = self._realized_net_micros(proposal)
         reservation = self.oms.on_fill(
-            proposal.proposal_id,
+            order.proposal_id,
             price=price,
             realized_net_micros=realized,
             now_ns=now,
         )
+        self._autopilot_live_fills += 1
         self._last_committed_reservation = reservation
         self.firewall.record_realized_pnl(proposal.silo, realized)
-        self._settle_live_trade(proposal, realized, now_ns=now)
+        self._settle_live_trade(order, realized, now_ns=now)
         display = DISPLAY_SILO.get(proposal.silo, proposal.silo)
         gate = verdict.gate
         card = PlainEnglishCockpitCard(
@@ -705,6 +761,140 @@ class NIOSCoreOrchestrator:
 
     def _on_card(self, card: PlainEnglishCockpitCard) -> None:
         self._cards.append(card.to_dict())
+
+    # -- paper-shadow autopilot (Ring 3 lifespan) -------------------------
+    def autopilot_snapshot(self) -> dict[str, Any]:
+        """Live autopilot telemetry for ``GET /api/v2/cockpit/state``."""
+        twin = self.twin
+        return {
+            "enabled": True,
+            "mode": "PAPER",
+            "interval_ms": int(AUTOPILOT_INTERVAL_S * 1000),
+            "instruments": dict(SILO_INSTRUMENTS),
+            "rounds": int(self._autopilot_rounds),
+            "ticks": int(self._autopilot_ticks),
+            "live_fills": int(self._autopilot_live_fills),
+            "shadow_fills": int(twin.shadow_fill_count(self.strategy_id)),
+            "graduated": bool(twin.is_graduated(self.strategy_id)),
+            "paused": bool(self._autopilot_paused),
+            "last_tick_ns": int(self._autopilot_last_ns),
+            "last": dict(self._autopilot_last),
+        }
+
+    def autopilot_tick(
+        self,
+        *,
+        now_ns: int | None = None,
+        silos: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Feed one realistic dual-vendor round across all four silos.
+
+        Each round is the full constitutional path: dual-vendor bar ->
+        ``SelfHealingDataGuard`` -> Tier-2 factors -> MiroFish contagion ->
+        System 1 60 s lease -> Tier-0 spinal engine -> 30-fill shadow
+        graduation -> Ring 0 conformal/firewall -> Maker-Peg paper fill ->
+        in-silo 35/15 ratchet -> Ring 3 proof card.
+
+        The loop is *paused* the instant the ``GlobalKillLatch`` is hot (the
+        red ``<1ms FLATTEN`` button) or a silo is frozen, and resumes only when
+        the operator re-arms the system (``POST /api/v2/control/rearm``).
+        """
+        stamp_wall = int(now_ns if now_ns is not None else time.time_ns())
+        round_no = self._autopilot_rounds
+        if self.kill_latch.is_halted or bool(self.guard.frozen_silos):
+            self._autopilot_paused = True
+            payload = {
+                "status": "HALTED",
+                "paused": True,
+                "round": round_no,
+                "ticks": 0,
+                "total_ticks": int(self._autopilot_ticks),
+                "actions": {},
+                "shadow_fills": int(self.twin.shadow_fill_count(self.strategy_id)),
+                "live_fills": int(self._autopilot_live_fills),
+                "graduated": bool(self.twin.is_graduated(self.strategy_id)),
+                "timestamp_ns": stamp_wall,
+            }
+            self._autopilot_last = payload
+            self._autopilot_last_ns = stamp_wall
+            return payload
+
+        self._autopilot_paused = False
+        targets = tuple(str(s) for s in (silos if silos is not None else self.silos))
+        stamp_mono = time.monotonic_ns()
+
+        # ``sec_018`` Law 3: refresh the five-archetype cascade on a cadence and
+        # hand the freshest fragility to System 1 before any lease is armed.
+        if round_no % AUTOPILOT_CONTAGION_EVERY == 0:
+            self.run_contagion(symbol=self.symbol, now_ns=stamp_wall)
+        last_cascade = self.contagion.last_result
+        features = last_cascade.features if last_cascade is not None else None
+
+        actions: dict[str, str] = {}
+        prices: dict[str, float] = {}
+        for index, silo in enumerate(targets):
+            symbol = SILO_INSTRUMENTS.get(silo, PRIMARY_SYMBOL)
+            reference = SILO_REFERENCE_PRICES.get(silo, 100.0)
+            wave = math.sin((round_no + index) * 0.35)
+            price = reference * (1.0 + 0.0008 * wave)
+            prices[symbol] = round(price, 6)
+            half_spread = price * 0.00005
+            # Two thirds of the tape carries an executed-flow edge; the rest is
+            # balanced noise that must abstain (``sec_018`` Law 4).  When the
+            # tape prints at the touch the maker BUY peg is filled exactly as a
+            # live L2 would fill it.
+            active = (round_no + index) % 3 != 0
+            bar = make_dual_vendor_bar(symbol, price=price, now_ns=stamp_wall)
+            tick = make_flow_tick(
+                symbol,
+                last_price=(price - half_spread) if active else price,
+                now_ns=stamp_wall,
+                buy_volume=(150.0 + 40.0 * wave) if active else 120.0,
+                sell_volume=3.0 if active else 120.0,
+                spread_bps=1.2,
+                realized_vol=5.0,
+                normal_vol=10.0,
+            )
+            self.ingest_bar(bar, tick, silo=silo, as_of_ns=stamp_wall)
+            self.refresh_system1(
+                tick, contagion=features, now_ns=stamp_mono
+            )
+            self._last_buy_ratio = tick.taker_buy_ratio_5s
+            self.shadow_book.write_snapshot(
+                symbol,
+                best_bid=price - half_spread,
+                best_ask=price + half_spread,
+                bid_qty=50_000.0,
+                ask_qty=50_000.0,
+                updated_at_ns=stamp_mono,
+            )
+            engine = self.engines.get(silo)
+            if engine is None:
+                continue
+            outcome = engine.on_tick(tick, now_ns=stamp_mono)
+            actions[silo] = str(outcome.action)
+            self._autopilot_ticks += 1
+
+        self._autopilot_rounds = round_no + 1
+        self._autopilot_last_ns = stamp_wall
+        payload = {
+            "status": "ARMED",
+            "paused": False,
+            "round": self._autopilot_rounds,
+            "ticks": len(actions),
+            "total_ticks": int(self._autopilot_ticks),
+            "actions": actions,
+            "prices": prices,
+            "shadow_fills": int(self.twin.shadow_fill_count(self.strategy_id)),
+            "live_fills": int(self._autopilot_live_fills),
+            "graduated": bool(self.twin.is_graduated(self.strategy_id)),
+            "cascade_fragility_index": float(
+                features.cascade_fragility_index if features is not None else 0.0
+            ),
+            "timestamp_ns": stamp_wall,
+        }
+        self._autopilot_last = payload
+        return payload
 
     # -- full end-to-end lifecycle ---------------------------------------
     def run_end_to_end(

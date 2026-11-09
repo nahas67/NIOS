@@ -7,6 +7,7 @@ import type {
   FormalProofState,
   KillReport,
   LLMControlPayload,
+  RearmReport,
 } from '@/types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? ''
@@ -83,6 +84,19 @@ export function postKillSwitch(reason = 'operator kill switch'): Promise<KillRep
   return request<KillReport>('/api/v2/control/killswitch', {
     method: 'POST',
     body: JSON.stringify({ reason, flatten: true, confirm: true }),
+  })
+}
+
+/**
+ * Explicit human reset after a kill switch or ADR-009 vault stop.
+ *
+ * Clears the global kill latch, unfreezes every silo and puts them back into
+ * ACTIVE trading state; the paper autopilot resumes without a restart.
+ */
+export function postRearm(reason = 'cockpit re-arm'): Promise<RearmReport> {
+  return request<RearmReport>('/api/v2/control/rearm', {
+    method: 'POST',
+    body: JSON.stringify({ reason, operator: 'ring3.cockpit' }),
   })
 }
 

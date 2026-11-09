@@ -1,20 +1,30 @@
-import { Activity, CircleDollarSign, Radio, ShieldAlert, Skull, Zap } from 'lucide-react'
+import { Activity, CircleDollarSign, Radio, ShieldAlert, ShieldCheck, Skull, Zap } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
 import { formatPct, formatUsd, timeAgo } from '@/lib/format'
-import type { CockpitState, KillReport } from '@/types'
+import type { CockpitState, KillReport, RearmReport } from '@/types'
 
 interface TopBarProps {
   state: CockpitState | null
   connected: boolean
   killReport: KillReport | null
+  rearmReport: RearmReport | null
   lastFrameAt: number
   onKill: () => void
+  onRearm: () => void
 }
 
-export function TopBar({ state, connected, killReport, lastFrameAt, onKill }: TopBarProps) {
+export function TopBar({
+  state,
+  connected,
+  killReport,
+  rearmReport,
+  lastFrameAt,
+  onKill,
+  onRearm,
+}: TopBarProps) {
   const status = state?.system.status ?? 'HALTED'
   const armed = status === 'ARMED'
   const abstention = state?.abstention
@@ -105,7 +115,8 @@ export function TopBar({ state, connected, killReport, lastFrameAt, onKill }: To
         <Button
           type="button"
           onClick={onKill}
-          className="ml-auto h-10 gap-2 bg-red-600 px-4 font-semibold text-white shadow-[0_0_24px_rgba(220,38,38,0.35)] hover:bg-red-500"
+          disabled={!armed}
+          className="ml-auto h-10 gap-2 bg-red-600 px-4 font-semibold text-white shadow-[0_0_24px_rgba(220,38,38,0.35)] hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-40"
           aria-label="Global kill switch: disarm all leases and flatten positions in under one millisecond"
         >
           <Skull className="size-4" />
@@ -114,7 +125,28 @@ export function TopBar({ state, connected, killReport, lastFrameAt, onKill }: To
             &lt;1ms FLATTEN
           </span>
         </Button>
+
+        {armed ? null : (
+          <Button
+            type="button"
+            onClick={onRearm}
+            className="h-10 gap-2 border border-emerald-400/40 bg-emerald-600 px-4 font-semibold text-white shadow-[0_0_24px_rgba(16,185,129,0.35)] hover:bg-emerald-500"
+            aria-label="Re-arm the system: clear the kill latch, unfreeze every silo and resume the paper autopilot without a restart"
+          >
+            <ShieldCheck className="size-4" />
+            RE-ARM SYSTEM
+          </Button>
+        )}
       </div>
+
+      {rearmReport ? (
+        <div className="border-t border-emerald-500/30 bg-emerald-500/10 px-4 py-1.5 text-[11px] text-emerald-200 lg:px-6">
+          Re-armed by <span className="font-mono">{rearmReport.operator}</span> ·{' '}
+          {rearmReport.rearmed_silos.length} silos ACTIVE · kill latch{' '}
+          {rearmReport.kill_latch_hot ? 'HOT' : 'clear'} · autopilot{' '}
+          {rearmReport.autopilot_resumes ? 'resumed' : 'idle'} · no restart required
+        </div>
+      ) : null}
 
       {killReport ? (
         <div className="border-t border-red-500/30 bg-red-500/10 px-4 py-1.5 text-[11px] text-red-200 lg:px-6">

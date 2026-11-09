@@ -147,9 +147,15 @@ def test_gate3_tigerbeetle_binary_probe_and_replica_format(tmp_path: Path) -> No
     assert result.replica_count == 1
     assert Path(result.path).exists()
     assert Path(result.path).stat().st_size >= 64 * 1024
-    # The host policy blocks execution, so the artifact must declare itself.
-    assert result.executable is False
-    assert result.emulated is True
+    # The artifact must declare which durability path it took, never both and
+    # never neither: the real ``tigerbeetle format`` runs on a permissive host,
+    # and a host whose application-control policy blocks the binary gets an
+    # explicitly labelled emulated replica.
+    assert result.executable is not result.emulated
+    if result.executable:
+        assert result.message == "tigerbeetle format completed"
+    else:
+        assert "emulated" in result.message
 
 
 def test_gate3_pg16_schema_executes_all_seven_tables_and_constraints() -> None:
@@ -178,7 +184,11 @@ def test_gate3_aggregate_provisioner_status() -> None:
     assert status["ready"] is True, status
     assert status["tigerbeetle"]["found"] is True
     assert status["tigerbeetle"]["version"] == "0.17.9"
-    assert status["tigerbeetle"]["execution_blocked"] is True
+    # Execution is either permitted or blocked by host policy; the probe must
+    # report it truthfully instead of assuming a locked-down host.
+    assert status["tigerbeetle"]["execution_blocked"] is not bool(
+        status["tigerbeetle"]["executable"]
+    )
     assert status["postgres"]["schema"]["valid"] is True
     assert status["postgres"]["ready"] is True
     assert status["durability"]["tigerbeetle"] in {"emulated_replica+journal", "hardware_verified"}
@@ -298,10 +308,11 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
     assert violations == [], violations
 
 
-def test_gate5_full_test_inventory_is_eleven_files() -> None:
+def test_gate5_full_test_inventory_is_twelve_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 11, [path.name for path in test_files]
+    assert len(test_files) == 12, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
+    assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
 
 
 # ---------------------------------------------------------------------------
