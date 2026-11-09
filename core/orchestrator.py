@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from core.feature_store import FeatureStore
+from core.llm_transport import LLMHttp2TransportPool, TokenBudgetLedger
 from core.nats_bus import LocalJetStreamBus
 from core.plugins import PluginRegistry
 from core.schemas import (
@@ -89,6 +90,7 @@ from ring2_brain.mirofish.contagion_engine import (
     ShockVector,
 )
 from ring2_brain.quant.scanner import FactorPanel, ScanResult, VectorizedFactorScanner
+from ring2_brain.quant.tail_hedger import TacticalTailHedger
 from ring2_brain.skills.skill_registry import SkillRegistry
 from ring2_brain.truth.data_guard import (
     NormalizedBar,
@@ -98,6 +100,8 @@ from ring2_brain.truth.data_guard import (
 )
 from ring2_brain.truth.grounding_gate import GroundingLedger
 from ring2_brain.truth.settlement_worker import DelayedSettlementWorker
+from ring0_vault.ibor.tb_pg_provisioner import TigerBeetlePG16Provisioner
+from ring0_vault.kernel.formal_verifier import FormalVerificationSuite
 
 __all__ = [
     "NIOSCoreOrchestrator",
@@ -285,10 +289,16 @@ class NIOSCoreOrchestrator:
             self.feature_store, self.lease_table, silo=PRIMARY_SILO, warmup=True
         )
         self.switchboard = MultiLLMSwitchboard(default_providers())
+        self.token_ledger = TokenBudgetLedger(daily_usd_cap=float(llm_budget_usd))
+        self.llm_transport = LLMHttp2TransportPool(ledger=self.token_ledger)
+        self.switchboard.ledger = self.token_ledger
+        self.switchboard.transport_pool = self.llm_transport
         self.system1 = System1InstinctController(
             self.switchboard,
             self.lease_table,
             kill_latch=self.kill_latch,
+            ledger=self.token_ledger,
+            transport_pool=self.llm_transport,
         )
         self.settlement = DelayedSettlementWorker(
             self.feature_store, persist_trust=False
@@ -300,6 +310,8 @@ class NIOSCoreOrchestrator:
             bus=self.bus,
             silo=PRIMARY_SILO,
             nav=float(funding_micros) / 1_000_000.0 * 4.0,
+            transport_pool=self.llm_transport,
+            token_ledger=self.token_ledger,
         )
 
         # ---- Ring 0 -----------------------------------------------------
@@ -314,6 +326,16 @@ class NIOSCoreOrchestrator:
         self.gate = SplitConformal98Gate(self.mirror)
         total_nav = sum(self.ledger.silo_nav_micros(silo) for silo in self.silos)
         self.shield = CrossSiloCopulaShield(nav_micros=total_nav)
+        self.formal_verifier = FormalVerificationSuite(vopr_steps=1000, vopr_seed=7)
+        self.tail_hedger = TacticalTailHedger(
+            contagion_engine=self.contagion,
+            copula_shield=self.shield,
+            portfolio_notional_micros=total_nav,
+            tactical_vault_micros=max(
+                1, self.ledger.balance("US_IBKR", VaultName.TACTICAL_SWING)
+            ),
+        )
+        self.tb_pg_provisioner: TigerBeetlePG16Provisioner | None = None
         self.outbox = CrashAtomicOutbox(self.ledger)
         self.signer = OrderSigner()
         self.guard = SiloGuard()
@@ -420,6 +442,11 @@ class NIOSCoreOrchestrator:
             forge=self.forge,
             plugins=self.plugins,
             skills=self.skills,
+            token_ledger=self.token_ledger,
+            llm_transport=self.llm_transport,
+            formal_verifier=self.formal_verifier,
+            tail_hedger=self.tail_hedger,
+            tb_pg_provisioner=self.tb_pg_provisioner,
         )
 
     # -- properties -------------------------------------------------------
@@ -849,6 +876,10 @@ class NIOSCoreOrchestrator:
                 resource.close()
             except Exception:
                 pass
+        try:
+            self.llm_transport.close()
+        except Exception:
+            pass
         try:
             self.data_guard.quarantine.close()
         except Exception:

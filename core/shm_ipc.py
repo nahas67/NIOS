@@ -29,10 +29,18 @@ Design notes
   single worker process.
 * No locks, no allocation, no logging, no attribute-heavy abstractions on the
   read path.
+* Every segment name is namespaced by ``NIOS_SHM_PREFIX`` (default ``"nios"``
+  in production).  Tests and parallel ``pytest`` runs set a process-unique
+  prefix, so a test process can never collide with -- or reset -- the segments
+  a live NIOS server is using.
+* Segment creation is race-proof: if ``create=True`` loses to another process
+  and raises ``FileExistsError``, the segment is attached with
+  ``create=False`` and its header/buffer are zeroed instead of crashing.
 """
 
 from __future__ import annotations
 
+import os
 import struct
 import time
 import zlib
@@ -49,6 +57,8 @@ from .schemas import (
 
 __all__ = [
     "SHM_URI_PREFIX",
+    "SHM_PREFIX_ENV",
+    "DEFAULT_SHM_PREFIX",
     "KILL_LATCH_SHM_NAME",
     "LEASE_TABLE_SHM_NAME",
     "OFI_RING_SHM_NAME",
@@ -61,6 +71,8 @@ __all__ = [
     "OfiRingBuffer",
     "ShadowBookSnapshot",
     "ShadowBookSHM",
+    "segment_name",
+    "shm_prefix",
     "reset_named_segment",
     "unlink_all",
 ]
@@ -68,10 +80,43 @@ __all__ = [
 SHM_URI_PREFIX = "shm://"
 CACHE_LINE = 64
 
+#: Environment variable that namespaces every Tier-0 segment.
+#:
+#: Production leaves it unset and gets the ``nios-*`` names promised by
+#: ``sec_009``.  ``tests/conftest.py`` sets a per-PID value so ``pytest`` and a
+#: live NIOS server can run at the same instant with zero collisions.
+SHM_PREFIX_ENV = "NIOS_SHM_PREFIX"
+DEFAULT_SHM_PREFIX = "nios"
+
 KILL_LATCH_SHM_NAME = "nios-global-kill-latch"
 LEASE_TABLE_SHM_NAME = "nios-active-leases"
 OFI_RING_SHM_NAME = "nios-ofi-cancel-ring"
 SHADOW_BOOK_SHM_NAME = "nios-shadow-book"
+
+
+def shm_prefix() -> str:
+    """Active segment namespace (read live so tests can monkeypatch it)."""
+    raw = os.environ.get(SHM_PREFIX_ENV, "").strip()
+    if not raw:
+        return DEFAULT_SHM_PREFIX
+    # SharedMemory forbids path separators in names on both Windows and POSIX.
+    return raw.replace("\\", "-").replace("/", "-")
+
+
+def segment_name(name: str) -> str:
+    """Map a logical NIOS segment name into the active prefix namespace.
+
+    Idempotent: a name that already carries the active prefix is returned
+    unchanged, so ``reset_named_segment(segment_name(x))`` is always safe.
+    """
+    prefix = shm_prefix()
+    if prefix == DEFAULT_SHM_PREFIX:
+        return name
+    if name == prefix or name.startswith(prefix + "-"):
+        return name
+    if name.startswith(DEFAULT_SHM_PREFIX):
+        name = name[len(DEFAULT_SHM_PREFIX):].lstrip("-_")
+    return f"{prefix}-{name}" if name else prefix
 
 #: 0 == ARMED, 1 == HALTED (``sec_004``).
 KILL_ARMED = 0
@@ -115,51 +160,85 @@ def _unlink_quiet(name: str) -> None:
 
 
 def reset_named_segment(name: str) -> None:
-    """Public helper used by tests and crash recovery to drop stale state."""
-    _unlink_quiet(name)
+    """Public helper used by tests and crash recovery to drop stale state.
+
+    The name is resolved through :func:`segment_name`, so a logical
+    ``nios-active-leases`` only ever drops the segment in the *active*
+    namespace -- never a live server's.
+    """
+    _unlink_quiet(segment_name(name))
 
 
 class _SharedSegment:
-    """Create-or-attach wrapper around :class:`SharedMemory`."""
+    """Create-or-attach wrapper around :class:`SharedMemory`.
+
+    ``reset=True`` means "guarantee a fresh, zeroed segment".  It is
+    implemented as *create, else attach-and-zero* instead of
+    ``unlink(); create()``, because the unlink/create pair races any other
+    process (or pytest worker) touching the same name:
+
+    * ``create=True`` wins -> we own a brand-new mapping and zero it.
+    * ``FileExistsError``  -> another process won the race.  Attach with
+      ``create=False``, zero the header and payload, and carry on.  Never
+      crash, never leave a half-initialised segment behind.
+
+    ``reset=False`` attaches without destroying state, which is what a second
+    NIOS process must do when it joins a live server's segments.
+    """
 
     __slots__ = ("name", "size", "magic", "created", "_shm", "_buf")
 
     def __init__(self, name: str, size: int, magic: bytes, reset: bool = False):
         if len(magic) != 8:
             raise ValueError("magic must be exactly 8 bytes")
-        self.name = name
+        self.name = segment_name(name)
         self.size = int(size)
         self.magic = magic
         self.created = False
         self._shm: SharedMemory | None = None
         self._buf = None
-        self._open(reset)
+        self._open(bool(reset))
 
     # -- lifecycle --------------------------------------------------------
+    def _create_or_attach(self, size: int) -> tuple[SharedMemory, bool]:
+        """Create the segment, or attach when it already exists.
+
+        Windows raises ``FileExistsError`` (WinError 183) and POSIX raises
+        ``EEXIST``; both surface as ``FileExistsError`` from CPython, and both
+        are handled identically: attach to the existing segment.
+        """
+        try:
+            return SharedMemory(name=self.name, create=True, size=size), True
+        except FileExistsError:
+            return SharedMemory(name=self.name, create=False), False
+
     def _open(self, reset: bool) -> None:
+        # Best effort: drop a stale segment when no live process holds it.  The
+        # attach path below is what makes the operation race-proof when it does.
         if reset:
             _unlink_quiet(self.name)
 
-        try:
-            handle = SharedMemory(name=self.name, create=True, size=self.size)
-            created = True
-        except FileExistsError:
-            handle = SharedMemory(name=self.name)
-            created = False
-
+        handle, created = self._create_or_attach(self.size)
         if handle.size < self.size:
+            # An older build sized the segment smaller; grow in place.
             handle.close()
             _unlink_quiet(self.name)
-            handle = SharedMemory(name=self.name, create=True, size=self.size)
-            created = True
+            handle, created = self._create_or_attach(self.size)
 
         self._shm = handle
         self._buf = handle.buf
         self.created = created
 
         existing = bytes(self._buf[0:8])
-        if created or existing != self.magic:
+        if created or reset or existing != self.magic:
+            # Fresh segment, explicit reset, or stale bytes from another build:
+            # zero header + payload so no lease, latch, offset or cursor can
+            # leak across a restart or a namespace change.
+            self._zero()
             self._write_header()
+
+    def _zero(self) -> None:
+        self._buf[:] = bytes(len(self._buf))
 
     def _write_header(self) -> None:
         _SEGMENT_HEADER.pack_into(self._buf, 0, self.magic, 1, 0, self.size)
@@ -393,7 +472,7 @@ class LeaseTableSHM:
         # field values.
         self._lease_cache: dict[int, tuple[int, System1Lease]] = {}
 
-        if kill_latch is None and name == LEASE_TABLE_SHM_NAME:
+        if kill_latch is None and segment_name(name) == segment_name(LEASE_TABLE_SHM_NAME):
             try:
                 kill_latch = GlobalKillLatch()
             except Exception:  # pragma: no cover - degraded mode
@@ -846,6 +925,10 @@ ALL_SEGMENTS = (
 
 
 def unlink_all() -> None:
-    """Drop every NIOS Tier-0 segment (crash recovery / test teardown)."""
+    """Drop every NIOS Tier-0 segment in the active namespace.
+
+    Used for crash recovery and test teardown.  With a test prefix set this is
+    guaranteed not to touch a live server's segments.
+    """
     for name in ALL_SEGMENTS:
-        _unlink_quiet(name)
+        _unlink_quiet(segment_name(name))

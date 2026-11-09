@@ -236,6 +236,9 @@ class MultiLLMSwitchboard:
         probe_timeout_ms: float = PROBE_TIMEOUT_MS,
         demotion_cooldown_ns: int = 30_000_000_000,
         clock: Callable[[], int] = time.monotonic_ns,
+        transport_pool: Any | None = None,
+        ledger: Any | None = None,
+        auto_probe: bool = False,
     ) -> None:
         self.providers: list[LLMProvider] = []
         for provider in providers if providers is not None else default_providers():
@@ -249,9 +252,20 @@ class MultiLLMSwitchboard:
             raise ValueError("probe_timeout_ms must be within (0, hard_timeout_ms]")
         self.demotion_cooldown_ns = int(demotion_cooldown_ns)
         self.clock = clock
+        self.transport_pool = transport_pool
+        self.ledger = ledger
         self._lock = threading.RLock()
         self._routes = 0
         self._fallbacks = 0
+        if auto_probe and transport_pool is not None:
+            for provider in self.providers:
+                try:
+                    provider.probe = transport_pool.probe_for(provider.name)
+                except KeyError:
+                    # A provider the transport pool does not know keeps its
+                    # injected probe (or the fail-closed offline default).
+                    continue
+
 
     # -- management -------------------------------------------------------
     def provider(self, name: str) -> LLMProvider:
@@ -291,6 +305,13 @@ class MultiLLMSwitchboard:
                 "routes": self._routes,
                 "fallbacks": self._fallbacks,
                 "providers": [provider.to_dict() for provider in self.providers],
+                "demoted_providers": list(self.demoted_names()),
+                "budget": self.ledger.snapshot() if self.ledger is not None else None,
+                "transport": (
+                    self.transport_pool.status()
+                    if self.transport_pool is not None
+                    else None
+                ),
             }
 
     def demoted_names(self) -> tuple[str, ...]:
@@ -368,6 +389,14 @@ class MultiLLMSwitchboard:
                     provider.demoted = False
                     provider.demoted_reason = ""
 
+                # Budget authority runs before the network: once the daily cap
+                # is reached a paid endpoint is skipped, never called.
+                if self.ledger is not None and not self.ledger.can_spend(
+                    provider.name, 1
+                ):
+                    demoted_now.append(provider.name)
+                    continue
+
                 value, elapsed, error = self._invoke(provider, context)
                 provider.last_latency_ms = elapsed
                 provider.ewma_latency_ms = (
@@ -399,6 +428,8 @@ class MultiLLMSwitchboard:
                     demoted_now.append(provider.name)
                     continue
                 provider.successes += 1
+                if self.ledger is not None:
+                    self.ledger.set_active(1, provider.name)
                 return RoutingDecision(
                     provider_name=provider.name,
                     model=provider.model,
@@ -410,13 +441,15 @@ class MultiLLMSwitchboard:
                 )
 
             self._fallbacks += 1
+            if self.ledger is not None:
+                self.ledger.set_active(1, "deterministic-local")
             return RoutingDecision(
                 provider_name="deterministic-local",
                 model="nios-native-instinct",
                 suggestion=None,
                 used_fallback=True,
                 latency_ms=0.0,
-                reason="all providers offline or demoted",
+                reason="all providers offline, demoted or budget-locked",
                 demoted=tuple(demoted_now),
             )
 
@@ -622,11 +655,21 @@ class System1InstinctController:
         *,
         kill_latch: GlobalKillLatch | None = None,
         clock: Callable[[], int] = time.monotonic_ns,
+        ledger: Any | None = None,
+        transport_pool: Any | None = None,
     ) -> None:
         self.switchboard = switchboard or MultiLLMSwitchboard()
         self.lease_table = lease_table
         self.kill_latch = kill_latch
         self.clock = clock
+        self.ledger = ledger if ledger is not None else getattr(
+            self.switchboard, "ledger", None
+        )
+        self.transport_pool = (
+            transport_pool
+            if transport_pool is not None
+            else getattr(self.switchboard, "transport_pool", None)
+        )
         self._latencies_ms: list[float] = []
         self._decisions: list[InstinctDecision] = []
 
@@ -759,3 +802,12 @@ class System1InstinctController:
             "p99_ms": self.latency_percentile(0.99),
             "max_ms": max(self._latencies_ms) if self._latencies_ms else 0.0,
         }
+
+    def llm_state(self) -> dict[str, Any]:
+        """Live switchboard + transport + token-budget telemetry."""
+        state: dict[str, Any] = {"switchboard": self.switchboard.status()}
+        if self.transport_pool is not None:
+            state["transport"] = self.transport_pool.status()
+        if self.ledger is not None:
+            state["budget"] = self.ledger.snapshot()
+        return state

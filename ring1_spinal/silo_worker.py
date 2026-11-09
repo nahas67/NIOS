@@ -236,7 +236,7 @@ SILO_CONFIGS: dict[str, SiloConfig] = {
         silo_id=US_IBKR,
         label="US & Global Equities",
         venue="IBKR",
-        adapters=("interactive_brokers",),
+        adapters=("interactive_brokers", "alpaca"),
         cost_floor=SiloCostFloor(
             spread_bps=1.5,
             maker_fee_bps=0.5,
@@ -255,7 +255,7 @@ SILO_CONFIGS: dict[str, SiloConfig] = {
         silo_id=FX_MT5,
         label="Forex & Futures",
         venue="MT5",
-        adapters=("mt5", "ctp"),
+        adapters=("vnpy_mt5", "vnpy_ctp", "oanda"),
         cost_floor=SiloCostFloor(
             spread_bps=0.8,
             maker_fee_bps=0.4,
@@ -621,15 +621,13 @@ _ADAPTER_DIRS: tuple[str, ...] = (
     "okx",
     "bybit",
     "interactive_brokers",
+    "alpaca",
 )
 
-#: Recorded in ``AGENTS.md`` section 8.2 -- do not fabricate a wrapper.
-_KNOWN_GAPS: Mapping[str, str] = {
-    "alpaca": (
-        "not present in the harvested nautilus_trader HEAD; the US silo must "
-        "use IBKR until a wrapper is vendored"
-    ),
-}
+#: No remaining gaps.  Alpaca v2 is now a first-class adapter at
+#: ``ring1_spinal/nautilus_adapters/alpaca`` (Phase 2 -- Step 2), so the US silo
+#: runs IBKR *and* Alpaca instead of IBKR alone.
+_KNOWN_GAPS: Mapping[str, str] = {}
 
 
 def nautilus_adapter_status() -> dict[str, Any]:

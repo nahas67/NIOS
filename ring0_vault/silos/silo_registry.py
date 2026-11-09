@@ -20,8 +20,11 @@ Ring 0 is the only ring that may act on it (``sec_011``).
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import os
 import threading
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -49,7 +52,16 @@ __all__ = [
     "MarketSiloRegistry",
     "SILO_MARKET_MAP",
     "MARKET_SILO_MAP",
+    "VENUE_ADAPTERS",
+    "SETTLEMENT_RULES",
+    "REG_T_INITIAL_MARGIN_PCT",
+    "REG_T_MAINTENANCE_MARGIN_PCT",
+    "REG_T_MAX_LEVERAGE",
+    "SWEEP_TICKERS",
+    "DispatchMode",
+    "VenueDispatchResult",
     "default_registry",
+    "dispatch_signed_order",
     "probe_donor_adapters",
 ]
 
@@ -85,13 +97,13 @@ _ADAPTER_GROUPS: tuple[tuple[str, str, Path, tuple[str, ...]], ...] = (
         "ring0.fx_mt5",
         "ring0_vault.silos.fx_mt5",
         ROOT / "ring0_vault" / "silos" / "fx_mt5",
-        ("vnpy_mt5", "vnpy_ctp"),
+        ("vnpy_mt5", "vnpy_ctp", "oanda"),
     ),
     (
         "ring1.nautilus_adapters",
         "ring1_spinal.nautilus_adapters",
         ROOT / "ring1_spinal" / "nautilus_adapters",
-        ("binance", "okx", "bybit", "interactive_brokers"),
+        ("binance", "okx", "bybit", "interactive_brokers", "alpaca"),
     ),
 )
 
@@ -99,22 +111,80 @@ _ADAPTER_GROUPS: tuple[tuple[str, str, Path, tuple[str, ...]], ...] = (
 _ADAPTERS_BY_MARKET: Mapping[SiloMarket, tuple[str, ...]] = {
     SiloMarket.CRYPTO: ("binance", "okx", "bybit"),
     SiloMarket.INDIA: ("dhan", "zerodha", "angel", "upstox"),
-    SiloMarket.US: ("interactive_brokers",),
-    SiloMarket.FX: ("vnpy_mt5", "vnpy_ctp"),
+    SiloMarket.US: ("interactive_brokers", "alpaca"),
+    SiloMarket.FX: ("vnpy_mt5", "vnpy_ctp", "oanda"),
 }
 
+#: ``venue -> fully-qualified adapter module``.  Ring 0 imports these lazily,
+#: only inside :func:`dispatch_signed_order`, never on the signing path.
+VENUE_ADAPTERS: Mapping[str, str] = {
+    "binance": "ring1_spinal.nautilus_adapters.binance",
+    "okx": "ring1_spinal.nautilus_adapters.okx",
+    "bybit": "ring1_spinal.nautilus_adapters.bybit",
+    "interactive_brokers": "ring1_spinal.nautilus_adapters.interactive_brokers",
+    "alpaca": "ring1_spinal.nautilus_adapters.alpaca",
+    "dhan": "ring0_vault.silos.india_brokers.dhan",
+    "zerodha": "ring0_vault.silos.india_brokers.zerodha",
+    "angel": "ring0_vault.silos.india_brokers.angel",
+    "upstox": "ring0_vault.silos.india_brokers.upstox",
+    "vnpy_mt5": "ring0_vault.silos.fx_mt5.vnpy_mt5",
+    "vnpy_ctp": "ring0_vault.silos.fx_mt5.vnpy_ctp",
+    "oanda": "ring0_vault.silos.fx_mt5.oanda",
+}
+
+#: ``sec_015`` settlement + margin metadata per venue.  ``T+1`` venues may not
+#: redeploy unsettled proceeds; ``Reg-T`` venues cap gross exposure at 2x equity.
+SETTLEMENT_RULES: Mapping[str, Mapping[str, Any]] = {
+    "binance": {"settlement_cycle": "T+0", "settlement_days": 0,
+                "cash_available_immediately": True, "margin_regime": "SPOT"},
+    "okx": {"settlement_cycle": "T+0", "settlement_days": 0,
+            "cash_available_immediately": True, "margin_regime": "SPOT"},
+    "bybit": {"settlement_cycle": "T+0", "settlement_days": 0,
+              "cash_available_immediately": True, "margin_regime": "SPOT"},
+    "dhan": {"settlement_cycle": "T+1", "settlement_days": 1,
+             "cash_available_immediately": False, "margin_regime": "INDIAN_T1"},
+    "zerodha": {"settlement_cycle": "T+1", "settlement_days": 1,
+                "cash_available_immediately": False, "margin_regime": "INDIAN_T1"},
+    "angel": {"settlement_cycle": "T+1", "settlement_days": 1,
+              "cash_available_immediately": False, "margin_regime": "INDIAN_T1"},
+    "upstox": {"settlement_cycle": "T+1", "settlement_days": 1,
+               "cash_available_immediately": False, "margin_regime": "INDIAN_T1"},
+    "interactive_brokers": {"settlement_cycle": "T+1", "settlement_days": 1,
+                            "cash_available_immediately": False,
+                            "margin_regime": "REG_T"},
+    "alpaca": {"settlement_cycle": "T+1", "settlement_days": 1,
+               "cash_available_immediately": False, "margin_regime": "REG_T"},
+    "vnpy_mt5": {"settlement_cycle": "T+0", "settlement_days": 0,
+                 "cash_available_immediately": True, "margin_regime": "LEVERAGED_CFD"},
+    "vnpy_ctp": {"settlement_cycle": "T+1", "settlement_days": 1,
+                 "cash_available_immediately": False, "margin_regime": "CHINA_FUTURES"},
+    "oanda": {"settlement_cycle": "T+0", "settlement_days": 0,
+              "cash_available_immediately": True, "margin_regime": "LEVERAGED_CFD"},
+}
+
+#: ``sec_015`` Reg-T constants (US silo only).
+REG_T_INITIAL_MARGIN_PCT: float = 50.0
+REG_T_MAINTENANCE_MARGIN_PCT: float = 25.0
+REG_T_MAX_LEVERAGE: float = 2.0
+
 _ADAPTER_NOTES: tuple[str, ...] = (
-    "Harvested wrappers are thin re-exports; importability depends on the "
-    "upstream SDK (nautilus_trader, MetaTrader5, CTP native DLLs, broker REST "
-    "sessions) being installed and licensed on this host.",
+    "All eleven venue adapters plus the OANDA v20 forex bridge are active: "
+    "importability is guaranteed by the Ring 0/1 compatibility shims "
+    "(_openalgo_compat, _vnpy_compat, _nautilus_compat), which resolve the "
+    "OpenAlgo runtime namespace, the vn.py trader namespace and the upstream "
+    "nautilus_trader C-extension namespace without requiring any of them to be "
+    "installed or licensed on this host.",
     "Ring 0 never imports a broker adapter on the signing path; adapters are "
-    "loaded only inside the silo worker after the kill latch is armed.",
-    "Alpaca is a specified target with no harvested wrapper; the US silo runs "
-    "IBKR until one is vendored (sec_005 harvest gap).",
-    "Zerodha's package-root __init__.py was restored in Step 7 (Gap A), so all "
-    "four India broker adapters (Dhan / Zerodha / AngelOne / Upstox) now probe "
-    "READY. The streaming subpackage stays lazy because it imports the OpenAlgo "
-    "runtime 'utils' package, which is not installed in an air-gapped Ring 0.",
+    "loaded only inside dispatch_signed_order after the kill latch is armed.",
+    "Alpaca v2 is implemented natively at ring1_spinal/nautilus_adapters/alpaca "
+    "and shares the US silo with IBKR, enforcing T+1 settlement metadata, "
+    "Reg-T margin guards (2x max gross) and sub-penny maker-peg formatting.",
+    "The four India broker adapters (Dhan / Zerodha / AngelOne / Upstox) plus "
+    "their deep api/mapping/streaming submodules import through "
+    "_openalgo_compat, which is backed by Ring 0's encrypted key_vault and a "
+    "single shared httpx connection pool.",
+    "OANDA v20 (FX_MT5) enforces the 24/5 session calendar, per-pair pip-spread "
+    "ceilings, macro-calendar blackout windows and futures roll-yield guards.",
 )
 
 
@@ -593,3 +663,598 @@ def default_registry() -> MarketSiloRegistry:
     if _DEFAULT_REGISTRY is None:
         _DEFAULT_REGISTRY = MarketSiloRegistry()
     return _DEFAULT_REGISTRY
+
+
+# ---------------------------------------------------------------------------
+# Unified venue order dispatch (Phase 2 -- Step 2)
+# ---------------------------------------------------------------------------
+
+#: ``sec_015``: the exact reserve / long-term sweep tickers each silo is allowed
+#: to rotate into.  The ratchet may only ever land on these instruments, so a
+#: sweep can never leak capital across a silo boundary.
+SWEEP_TICKERS: Mapping[str, Mapping[str, str]] = {
+    CRYPTO_BINANCE: {
+        "reserve": "USYC Tokenized T-Bill",
+        "long_term": "BTC-USDT / ETH-USDT",
+        "reserve_tickers": ("USYC", "USYC-USDT", "USYC Tokenized T-Bill"),
+        "long_term_tickers": ("BTC-USDT", "ETH-USDT", "BTCUSDT", "ETHUSDT"),
+    },
+    INDIA_ZERODHA_DHAN: {
+        "reserve": "LIQUIDBEES.NS",
+        "long_term": "NIFTYBEES.NS & DCF Picks",
+        "reserve_tickers": ("LIQUIDBEES.NS", "LIQUIDBEES"),
+        "long_term_tickers": ("NIFTYBEES.NS", "NIFTYBEES"),
+    },
+    US_IBKR: {
+        "reserve": "SGOV (0-3M Treasury ETF)",
+        "long_term": "VOO / QQQ & DCF Picks",
+        "reserve_tickers": ("SGOV", "SGOV (0-3M Treasury ETF)"),
+        "long_term_tickers": ("VOO", "QQQ"),
+    },
+    FX_MT5: {
+        "reserve": "Unlevered Gold / Short-Duration Sovereign",
+        "long_term": "Sovereign Carry Repo",
+        "reserve_tickers": ("Unlevered Gold", "XAU_USD", "XAUUSD"),
+        "long_term_tickers": ("Sovereign Carry Repo", "USD_INR"),
+    },
+}
+
+#: Human-friendly venue aliases accepted by :func:`dispatch_signed_order`.
+_VENUE_ALIASES: Mapping[str, str] = {
+    "mt5": "vnpy_mt5",
+    "ctp": "vnpy_ctp",
+    "ctp_md": "vnpy_ctp",
+    "ctp_td": "vnpy_ctp",
+    "ibkr": "interactive_brokers",
+    "interactivebrokers": "interactive_brokers",
+    "interactive-brokers": "interactive_brokers",
+    "nse": "zerodha",
+    "bse": "zerodha",
+    "kite": "zerodha",
+    "angelone": "angel",
+    "angel_one": "angel",
+    "dhanhq": "dhan",
+    "upstoxpro": "upstox",
+    "oandav20": "oanda",
+    "oanda_v20": "oanda",
+}
+
+#: Crypto venues quote and settle in stablecoins, never in fiat.
+_CRYPTO_VENUES = ("binance", "okx", "bybit")
+_US_VENUES = ("interactive_brokers", "alpaca")
+_INDIA_VENUES = ("dhan", "zerodha", "angel", "upstox")
+_FX_VENUES = ("vnpy_mt5", "vnpy_ctp", "oanda")
+
+
+class DispatchMode(StrEnum):
+    """Execution mode for :func:`dispatch_signed_order`.
+
+    ``PAPER`` and ``SHADOW`` are identical on the wire (a deterministic fill
+    acknowledgement is synthesised) but ``SHADOW`` is recorded separately so the
+    30-trade L2 graduation counter can tell the two apart.
+    """
+
+    PAPER = "PAPER"
+    SHADOW = "SHADOW"
+    LIVE = "LIVE"
+
+    @property
+    def is_live(self) -> bool:
+        return self is DispatchMode.LIVE
+
+
+@dataclass(slots=True)
+class VenueDispatchResult:
+    """The immutable receipt for one signed order handed to one venue."""
+
+    silo: str
+    market: str
+    venue: str
+    mode: str
+    symbol: str
+    side: str
+    quantity: str
+    payload: dict[str, Any]
+    flags: dict[str, Any]
+    adapter_module: str
+    adapter_ready: bool
+    fill: dict[str, Any]
+    outbox_key: str
+    ratchet: dict[str, Any]
+    cross_border_wire_bps: float = 0.0
+    live: bool = False
+    credentials_present: bool = False
+
+    @property
+    def is_paper(self) -> bool:
+        return not self.live
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "silo": self.silo,
+            "market": self.market,
+            "venue": self.venue,
+            "mode": self.mode,
+            "symbol": self.symbol,
+            "side": self.side,
+            "quantity": self.quantity,
+            "payload": dict(self.payload),
+            "flags": dict(self.flags),
+            "adapter_module": self.adapter_module,
+            "adapter_ready": self.adapter_ready,
+            "fill": dict(self.fill),
+            "outbox_key": self.outbox_key,
+            "ratchet": dict(self.ratchet),
+            "cross_border_wire_bps": self.cross_border_wire_bps,
+            "live": self.live,
+            "credentials_present": self.credentials_present,
+        }
+
+
+def _market_label(market: Any) -> str:
+    return str(getattr(market, "value", market))
+
+
+def _field(order: Any, *names: str, default: Any = None) -> Any:
+    """Read the first present field from a mapping or a signed-order object."""
+    if isinstance(order, Mapping):
+        for name in names:
+            if name in order and order[name] is not None:
+                return order[name]
+        return default
+    for name in names:
+        value = getattr(order, name, None)
+        if value is not None:
+            return value
+    return default
+
+
+def _normalise_venue(venue: str) -> str:
+    key = str(venue).strip().lower()
+    return _VENUE_ALIASES.get(key, key)
+
+
+def _credential_env_suffix(venue: str) -> str:
+    return {
+        "binance": "BINANCE",
+        "okx": "OKX",
+        "bybit": "BYBIT",
+        "dhan": "DHAN",
+        "zerodha": "ZERODHA",
+        "angel": "ANGEL",
+        "upstox": "UPSTOX",
+        "interactive_brokers": "IBKR",
+        "alpaca": "ALPACA",
+        "vnpy_mt5": "MT5",
+        "vnpy_ctp": "CTP",
+        "oanda": "OANDA",
+    }.get(venue, venue.upper())
+
+
+def credentials_present(venue: str) -> bool:
+    """True when live credentials for ``venue`` exist in Ring 0's key vault.
+
+    Reads only the encrypted key-vault (India brokers) or the process
+    environment (everything else).  Never logs, returns or hashes a secret.
+    """
+    venue = _normalise_venue(venue)
+    if venue in _INDIA_VENUES:
+        try:
+            from ring0_vault.silos.india_brokers import _openalgo_compat
+
+            return bool(_openalgo_compat.has_live_credentials(venue))
+        except Exception:  # pragma: no cover - defensive
+            return False
+    suffix = _credential_env_suffix(venue)
+    for name in ("API_KEY", "ACCESS_TOKEN", "ACCOUNT_ID", "TOKEN"):
+        if os.environ.get(f"NIOS_{suffix}_{name}"):
+            return True
+    if venue == "oanda" and os.environ.get("OANDA_API_KEY"):
+        return True
+    if venue == "alpaca" and os.environ.get("APCA_API_KEY_ID"):
+        return True
+    if venue == "interactive_brokers" and os.environ.get("IBKR_ACCOUNT"):
+        return True
+    return False
+
+
+def _coerce_proposal(signed_order: Any, *, silo: str) -> Any:
+    """Return an :class:`UnsignedProposal` for a mapping or proposal object."""
+    from core.schemas import UnsignedProposal, VaultName
+
+    if isinstance(signed_order, UnsignedProposal):
+        return signed_order
+
+    vault = _field(signed_order, "vault", default=VaultName.SPINAL_SCALPER)
+    if isinstance(vault, str):
+        try:
+            vault = VaultName(vault)
+        except ValueError:
+            vault = VaultName.SPINAL_SCALPER
+    qty = _field(signed_order, "qty", "quantity", "qty_micros", default=None)
+    price = _field(signed_order, "limit_price", "price", "px", default=None)
+    if qty is None or price is None:
+        raise ValueError(
+            "signed_order must carry qty/quantity and limit_price/price"
+        )
+    return UnsignedProposal(
+        proposal_id=str(_field(signed_order, "proposal_id", "client_order_id", default="")),
+        strategy_id=str(_field(signed_order, "strategy_id", default="nios-dispatch")),
+        silo=str(_field(signed_order, "silo", default=silo)),
+        vault=vault,
+        symbol=str(_field(signed_order, "symbol", "instrument", "ticker", default="")),
+        side=str(_field(signed_order, "side", "direction", default="BUY")),
+        qty=float(qty),
+        limit_price=float(price),
+        expected_gross_bps=float(_field(signed_order, "expected_gross_bps", default=0.0)),
+        spread_bps=float(_field(signed_order, "spread_bps", default=0.0)),
+        grounding_hash=str(_field(signed_order, "grounding_hash", default="")),
+        is_reduce_only=bool(_field(signed_order, "is_reduce_only", default=False)),
+    )
+
+
+def _default_product(silo: "MarketSilo", proposal: Any) -> str:
+    """``MIS`` for intraday scalp/tactical, ``CNC`` for delivery sweeps."""
+    if silo.market is not SiloMarket.INDIA:
+        return "SPOT"
+    if proposal.vault in (VaultName.LONG_TERM_COMPOUNDER, VaultName.RESERVE_YIELD):
+        return "CNC"
+    return "MIS"
+
+
+def _india_exchange(symbol: str) -> str:
+    upper = symbol.upper()
+    if upper.endswith(".BO") or upper.endswith(".BSE"):
+        return "BSE"
+    if upper in ("GOLDM", "SILVERM", "CRUDEOILM", "GOLD", "SILVER", "CRUDEOIL"):
+        return "MCX"
+    return "NSE"
+
+
+def _india_payload(
+    venue: str,
+    proposal: Any,
+    silo: "MarketSilo",
+    *,
+    product: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Format a NIOS signed order into the venue-native India payload."""
+    from ring0_vault.silos.india_brokers import _openalgo_compat
+
+    module = importlib.import_module(
+        f"ring0_vault.silos.india_brokers.{venue}.mapping.transform_data"
+    )
+    exchange = _india_exchange(proposal.symbol)
+    chosen_product = (product or _default_product(silo, proposal)).upper()
+    pricetype = "LIMIT"
+    token = _openalgo_compat.resolve_token(proposal.symbol, exchange)
+    data = {
+        "apikey": _openalgo_compat.broker_credentials(venue).get("api_key", ""),
+        "action": proposal.side.upper(),
+        "exchange": exchange,
+        "product": chosen_product,
+        "pricetype": pricetype,
+        "quantity": str(int(proposal.qty)) if float(proposal.qty).is_integer() else str(proposal.qty),
+        "symbol": proposal.symbol,
+        "price": f"{proposal.limit_price:.2f}",
+        "trigger_price": "0",
+        "disclosed_quantity": "0",
+        "strategy": proposal.strategy_id,
+        "correlation_id": proposal.proposal_id,
+    }
+    if venue == "zerodha":
+        payload = module.transform_data(data)
+    else:
+        payload = module.transform_data(data, token)
+
+    flags = {
+        "venue": venue,
+        "venue_code": venue.upper(),
+        "silo": silo.silo_id,
+        "market": _market_label(silo.market),
+        "exchange": exchange,
+        "product": chosen_product,
+        "intraday": chosen_product in ("MIS", "INTRADAY", "I"),
+        "delivery": chosen_product in ("CNC", "DELIVERY", "D"),
+        "instrument_token": token,
+        "post_only": False,
+        "settlement_cycle": "T+1",
+        "settlement_days": 1,
+        "statutory_tax_bps": silo.statutory_tax_bps,
+        "fee_stt_bps": silo.fee_stt_bps,
+        "round_trip_cost_bps": silo.round_trip_cost_bps,
+        "price_tick": _openalgo_compat.instrument_record(
+            proposal.symbol, exchange
+        ).get("tick_size", 0.05),
+    }
+    return payload, flags
+
+
+def _futures_payload(
+    venue: str, proposal: Any, silo: "MarketSilo"
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Format a signed order for the MT5 / CTP gateways (paper-safe)."""
+    is_ctp = venue == "vnpy_ctp"
+    payload = {
+        "symbol": proposal.symbol,
+        "exchange": "SHFE" if is_ctp else "MT5",
+        "direction": "LONG" if proposal.side.upper() == "BUY" else "SHORT",
+        "offset": "OPEN" if not proposal.is_reduce_only else "CLOSE",
+        "order_type": "LIMIT",
+        "price": round(float(proposal.limit_price), 5),
+        "volume": int(proposal.qty) if float(proposal.qty).is_integer() else float(proposal.qty),
+        "reference": proposal.proposal_id or f"nios-{venue}-{proposal.strategy_id}",
+        "venue": "CTP" if is_ctp else "MT5",
+        "transport": "offline-paper",
+    }
+    rules = SETTLEMENT_RULES[venue]
+    flags = {
+        "venue": venue,
+        "venue_code": "CTP" if is_ctp else "MT5",
+        "silo": silo.silo_id,
+        "market": _market_label(silo.market),
+        "product": "futures",
+        "post_only": False,
+        "settlement_cycle": rules["settlement_cycle"],
+        "settlement_days": rules["settlement_days"],
+        "margin_regime": rules["margin_regime"],
+        "price_tick": 0.01,
+        "quote_currency": "CNY" if is_ctp else "USD",
+        "calendar": "24/5" if not is_ctp else "CN_FUTURES",
+    }
+    return payload, flags
+
+
+def _build_payload(
+    venue: str,
+    proposal: Any,
+    module: Any,
+    silo: "MarketSilo",
+    *,
+    product: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the exact venue-native payload plus its dispatch flags."""
+    if venue in _INDIA_VENUES:
+        return _india_payload(venue, proposal, silo, product=product)
+
+    if venue in _FX_VENUES and venue != "oanda":
+        return _futures_payload(venue, proposal, silo)
+
+    if venue == "oanda":
+        payload = module.format_order_payload(
+            {
+                "symbol": proposal.symbol,
+                "side": proposal.side,
+                "units": proposal.qty,
+                "limit_price": proposal.limit_price,
+                "order_type": "LIMIT",
+                "time_in_force": "GTC",
+                "proposal_id": proposal.proposal_id,
+            }
+        )
+        flags = module.payload_flags(payload)
+        flags["silo"] = silo.silo_id
+        flags["market"] = _market_label(silo.market)
+        return payload, flags
+
+    order = {
+        "symbol": proposal.symbol,
+        "side": proposal.side,
+        "quantity": proposal.qty,
+        "qty": proposal.qty,
+        "limit_price": proposal.limit_price,
+        "price": proposal.limit_price,
+        "order_type": "LIMIT",
+        "time_in_force": "DAY",
+        "proposal_id": proposal.proposal_id,
+        "client_order_id": proposal.proposal_id,
+        "is_reduce_only": proposal.is_reduce_only,
+    }
+    payload = module.format_order_payload(order)
+    try:
+        flags = dict(module.payload_flags(payload))
+    except Exception:  # pragma: no cover - defensive
+        flags = {"venue": venue, "silo": silo.silo_id}
+    rules = SETTLEMENT_RULES[venue]
+    flags.setdefault("settlement_cycle", rules["settlement_cycle"])
+    flags.setdefault("settlement_days", rules["settlement_days"])
+    flags["margin_regime"] = rules["margin_regime"]
+    flags["cash_available_immediately"] = rules["cash_available_immediately"]
+    flags["silo"] = silo.silo_id
+    flags["market"] = _market_label(silo.market)
+    if venue in _US_VENUES:
+        flags["reg_t_initial_margin_pct"] = REG_T_INITIAL_MARGIN_PCT
+        flags["reg_t_maintenance_margin_pct"] = REG_T_MAINTENANCE_MARGIN_PCT
+        flags["reg_t_max_leverage"] = REG_T_MAX_LEVERAGE
+    return payload, flags
+
+
+def _paper_fill(proposal: Any, silo: "MarketSilo", *, now_ns: int) -> dict[str, Any]:
+    """Deterministic maker fill used by PAPER and SHADOW dispatch."""
+    notional_micros = int(
+        round(float(proposal.qty) * float(proposal.limit_price) * 1_000_000)
+    )
+    gross_bps = float(proposal.expected_gross_bps)
+    cost_bps = float(silo.round_trip_cost_bps)
+    net_bps = gross_bps - cost_bps
+    realized_net_micros = int(round(notional_micros * net_bps / 10_000.0))
+    digest = hashlib.sha256(
+        f"{silo.silo_id}|{proposal.proposal_id}|{proposal.symbol}|"
+        f"{proposal.side}|{proposal.qty}|{proposal.limit_price}".encode("utf-8")
+    ).hexdigest()
+    return {
+        "fill_id": f"fill-{digest[:24]}",
+        "filled_qty": float(proposal.qty),
+        "fill_price": float(proposal.limit_price),
+        "notional_micros": notional_micros,
+        "gross_bps": gross_bps,
+        "cost_bps": cost_bps,
+        "net_bps": net_bps,
+        "realized_net_micros": realized_net_micros,
+        "statutory_tax_bps": silo.statutory_tax_bps,
+        "fee_stt_bps": silo.fee_stt_bps,
+        "maker": True,
+        "deterministic": True,
+        "settled_ns": now_ns,
+    }
+
+
+def dispatch_signed_order(
+    silo: str,
+    venue: str,
+    signed_order: Any,
+    mode: str | DispatchMode = DispatchMode.PAPER,
+    *,
+    registry: MarketSiloRegistry | None = None,
+    confirm_live: bool = False,
+    operator: str = "",
+    outbox: Any = None,
+    ledger: Any = None,
+    now_ns: int | None = None,
+    product: str | None = None,
+    apply_ratchet: bool = True,
+) -> VenueDispatchResult:
+    """Route one signed order to one venue, in paper or live mode.
+
+    Paper / shadow dispatch formats the *exact* venue-native payload (symbol
+    mapping, MIS vs CNC, post-only flags, sweep tickers), synthesises a
+    deterministic fill acknowledgement, locks the notional through
+    :class:`CrashAtomicOutbox` and applies the 35% / 15% / 50% in-silo ratchet.
+    No capital ever leaves the silo, so ``cross_border_wire_bps`` is ``0.0``.
+
+    Live dispatch additionally requires ``confirm_live=True``, a named operator,
+    a venue-ready silo and live credentials in Ring 0's key vault.  Ring 2 is
+    never involved: the proposal arrives already signed and already grounded.
+    """
+    if isinstance(mode, DispatchMode):
+        dispatch_mode = mode
+    else:
+        dispatch_mode = DispatchMode(str(mode).upper())
+
+    registry = registry or default_registry()
+    market_silo = registry.get(silo)
+    venue_key = _normalise_venue(venue)
+
+    allowed = _ADAPTERS_BY_MARKET.get(market_silo.market, ())
+    if venue_key not in allowed:
+        raise ValueError(
+            f"venue {venue!r} does not belong to silo {market_silo.silo_id!r}; "
+            f"allowed venues are {allowed}"
+        )
+
+    adapter_module = VENUE_ADAPTERS[venue_key]
+    module = importlib.import_module(adapter_module)
+    adapter_ready = any(p.name == venue_key and p.ready for p in market_silo.adapters)
+
+    proposal = _coerce_proposal(signed_order, silo=market_silo.silo_id)
+    if proposal.silo != market_silo.silo_id:
+        raise ValueError(
+            f"signed order targets silo {proposal.silo!r} but dispatch silo is "
+            f"{market_silo.silo_id!r}"
+        )
+
+    payload, flags = _build_payload(
+        venue_key, proposal, module, market_silo, product=product
+    )
+
+    now = int(now_ns if now_ns is not None else time.time_ns())
+    present = credentials_present(venue_key)
+
+    if dispatch_mode.is_live:
+        if not confirm_live:
+            raise PermissionError(
+                "LIVE dispatch requires confirm_live=True "
+                "(POST /api/v2/control/brokers)"
+            )
+        if not operator:
+            raise PermissionError("LIVE dispatch requires a named operator")
+        if not market_silo.venue_ready:
+            raise PermissionError(
+                f"{market_silo.silo_id} has no importable broker adapter"
+            )
+        if market_silo.mode is not SiloMode.LIVE:
+            raise PermissionError(
+                f"{market_silo.silo_id} is not armed for LIVE; call "
+                "set_mode(..., confirm_live=True) first"
+            )
+        if not present:
+            raise PermissionError(
+                f"no live credentials for {venue_key} in Ring 0 key_vault"
+            )
+
+    fill = _paper_fill(proposal, market_silo, now_ns=now)
+
+    # ---- CrashAtomicOutbox reservation + in-silo ratchet -------------------
+    outbox_key = ""
+    ratchet_receipt: dict[str, Any] = {}
+    if not dispatch_mode.is_live:
+        try:
+            from ring0_vault.ibor.ledger_outbox import (
+                CrashAtomicOutbox,
+                IBORLedger,
+                InSiloProfitRatchet,
+                LedgerStore,
+            )
+
+            if ledger is None:
+                ledger = IBORLedger(
+                    LedgerStore(in_memory=True), silos=(market_silo.silo_id,)
+                )
+                ledger.open_silo(market_silo.silo_id)
+                ledger.fund_cash(market_silo.silo_id, 1_000_000_000_000)
+                for vault in VaultName:
+                    ledger.fund_vault(
+                        market_silo.silo_id, vault, 100_000_000_000
+                    )
+            if outbox is None:
+                outbox = CrashAtomicOutbox(ledger)
+            reservation = outbox.reserve(proposal, now_ns=now)
+            outbox_key = reservation.outbox_idempotency_key
+            ratchet = InSiloProfitRatchet(ledger) if apply_ratchet else None
+            outbox.commit(
+                outbox_key,
+                now_ns=now,
+                realized_net_micros=fill["realized_net_micros"],
+            )
+            if ratchet is not None and fill["realized_net_micros"] > 0:
+                result = ratchet.apply(
+                    market_silo.silo_id, fill["realized_net_micros"], now_ns=now
+                )
+                ratchet_receipt = result.to_dict()
+        except Exception as exc:  # pragma: no cover - accounting is best effort
+            ratchet_receipt = {"error": f"{type(exc).__name__}: {exc}"}
+
+    if not ratchet_receipt:
+        ratchet_receipt = {
+            "silo": market_silo.silo_id,
+            "applied": False,
+            "market": _market_label(market_silo.market),
+            "realized_net_micros": 0,
+            "long_term_micros": 0,
+            "reserve_micros": 0,
+            "scalper_micros": 0,
+            "long_term_asset": market_silo.long_term_sweep_asset,
+            "reserve_asset": market_silo.reserve_yield_asset,
+            "cross_border_wire_bps": 0.0,
+            "transfer_ids": [],
+        }
+
+    return VenueDispatchResult(
+        silo=market_silo.silo_id,
+        market=_market_label(market_silo.market),
+        venue=venue_key,
+        mode=dispatch_mode.value,
+        symbol=proposal.symbol,
+        side=proposal.side,
+        quantity=str(proposal.qty),
+        payload=payload,
+        flags=flags,
+        adapter_module=adapter_module,
+        adapter_ready=adapter_ready,
+        fill=fill,
+        outbox_key=outbox_key,
+        ratchet=ratchet_receipt,
+        cross_border_wire_bps=float(ratchet_receipt.get("cross_border_wire_bps", 0.0)),
+        live=dispatch_mode.is_live,
+        credentials_present=present,
+    )

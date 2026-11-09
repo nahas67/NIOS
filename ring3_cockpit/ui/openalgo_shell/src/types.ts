@@ -327,6 +327,182 @@ export interface ExtensionsActionResponse {
   zero_restart: boolean
 }
 
+/* ------------------------------------------------------------------ *
+ * Phase 2 Step 4 · formal verification, VOPR and the options tail-hedger
+ * ------------------------------------------------------------------ */
+
+export interface TLAProofSpec {
+  name: string
+  states_explored: number
+  transitions: number
+  counterexamples: number
+  violations: Array<Record<string, unknown>>
+  invariants: string[]
+  duration_ms: number
+  terminal_states: number
+  liveness_violations: number
+  ok: boolean
+  details: Record<string, unknown>
+}
+
+export interface TLAProofSuite {
+  kind: string
+  mode: string
+  specs: TLAProofSpec[]
+  total_states: number
+  total_transitions: number
+  total_counterexamples: number
+  counterexamples: number
+  duration_ms: number
+  ok: boolean
+  spec_files: Record<string, { present?: boolean; bytes?: number; sha256?: string }>
+}
+
+export interface VOPRCampaign {
+  kind: string
+  seed: number
+  steps: number
+  fault_counts: Record<string, number>
+  double_entry_ok: boolean
+  at_most_once_ok: boolean
+  overdraft_violations: number
+  conservation_violations: number
+  ledger_violations: number
+  duplicate_executions: number
+  power_cycles: number
+  reservations: number
+  commits: number
+  voids: number
+  duration_ms: number
+  ok: boolean
+  errors: string[]
+  details: Record<string, unknown>
+}
+
+export interface GroundedFactPacket {
+  symbol: string
+  valid_time_ns: number
+  knowledge_ts_ns: number
+  as_of_ns: number
+  metrics: Record<string, number>
+  sha256_digest: string
+}
+
+export interface TailHedgeGreeks {
+  delta: number
+  gamma: number
+  vega: number
+  theta: number
+  rho: number
+}
+
+export interface TailHedgeProposal {
+  proposal_id: string
+  strategy_id: string
+  silo: string
+  vault: string
+  symbol: string
+  side: string
+  qty: number
+  limit_price: number
+  expected_gross_bps: number
+  spread_bps: number
+  grounding_hash: string
+  is_reduce_only: boolean
+  created_at_ns: number
+}
+
+export interface TailHedgePlan {
+  plan_id: string
+  symbol: string
+  silo: string
+  vault: string
+  side: string
+  spot: number
+  strike: number
+  years: number
+  volatility: number
+  risk_free_rate: number
+  contracts: number
+  contract_multiplier: number
+  premium_per_unit: number
+  premium_micros: number
+  premium_bps: number
+  hedge_notional_micros: number
+  hedge_ratio: number
+  cascade_fragility_index: number
+  tail_correlation: number
+  greeks: TailHedgeGreeks
+  packet: GroundedFactPacket
+  proposal: TailHedgeProposal
+  grounding_verified: boolean
+  grounding_claims_checked: number
+  reasons: string[]
+  valuation_source: string
+}
+
+export interface TailHedgeStatus {
+  triggered: boolean
+  cascade_fragility_index: number
+  tail_correlation: number
+  reasons: string[]
+  thresholds: { cascade_fragility_index: number; tail_correlation: number }
+  portfolio_notional_micros: number
+  tactical_vault_micros: number
+  as_of_ns: number
+  silos: string[]
+}
+
+export interface TailHedgerState {
+  kind: string
+  triggers: number
+  hedges_emitted: number
+  last_status: TailHedgeStatus | null
+  last_plan: TailHedgePlan | null
+  thresholds: {
+    cascade_fragility_index: number
+    tail_correlation: number
+    max_premium_bps: number
+  }
+  valuation_donor: unknown
+  contagion_attached: boolean
+  copula_attached: boolean
+}
+
+export interface TigerBeetleBackendStatus {
+  found?: boolean
+  version?: string
+  ready?: boolean
+  execution_blocked?: boolean
+  size_bytes?: number
+  sha256?: string
+}
+
+export interface PostgresBackendStatus {
+  ready?: boolean
+  schema?: { valid?: boolean; tables?: string[]; checks?: number; indexes?: number }
+}
+
+export interface FormalProofState {
+  kind: string
+  tla: TLAProofSuite | null
+  vopr: VOPRCampaign | null
+  tigerbeetle: TigerBeetleBackendStatus | null
+  postgres: PostgresBackendStatus | null
+  tail_hedger: TailHedgerState | null
+  summary: {
+    states_explored: number
+    counterexamples: number
+    tla_ok: boolean
+    vopr_ok: boolean
+    tigerbeetle_ready: boolean
+    postgres_ready: boolean
+    tail_hedger_ready: boolean
+  }
+  ok: boolean
+  checked_at_ns: number
+}
+
 export interface CockpitState {
   version: string
   system: SystemState
@@ -339,6 +515,7 @@ export interface CockpitState {
   cards: CockpitCard[]
   kill_switch: KillReport | null
   extensions: ExtensionsState
+  formal_proofs: FormalProofState
   streams: { cockpit: string; fps: number }
 }
 

@@ -1,6 +1,19 @@
-import { AlertTriangle, BrainCircuit, Clock3, Fingerprint, ShieldCheck } from 'lucide-react'
+import { useState } from 'react'
+import {
+  AlertTriangle,
+  BrainCircuit,
+  CheckCircle2,
+  Clock3,
+  Fingerprint,
+  GitBranch,
+  RefreshCw,
+  ShieldCheck,
+  ShieldQuestion,
+  Waves,
+} from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -12,8 +25,15 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { fetchFormalProofs } from '@/lib/api'
 import { formatBps, formatPct, truncateDigest } from '@/lib/format'
-import type { CockpitState, ContagionState, LeaseRow } from '@/types'
+import type {
+  CockpitState,
+  ContagionState,
+  FormalProofState,
+  LeaseRow,
+  TailHedgerState,
+} from '@/types'
 
 interface BrainXrayTabProps {
   state: CockpitState | null
@@ -26,131 +46,514 @@ const MODE_LABEL: Record<LeaseRow['mode'], string> = {
   MEAN_REV: 'MEAN-REV',
 }
 
+const DEFAULT_FRAGILITY_TRIGGER = 0.65
+const DEFAULT_COPULA_TRIGGER = 0.6
+
 export function BrainXrayTab({ state }: BrainXrayTabProps) {
   const leases = state?.leases ?? []
   const contagion = state?.contagion
+  const [proofs, setProofs] = useState<FormalProofState | null>(null)
+
+  // `/api/v2/cockpit/state` already hydrates the cached payload; the dedicated
+  // `/api/v2/cockpit/formal-proofs` endpoint lets an operator force a re-run.
+  const formal = proofs ?? state?.formal_proofs ?? null
 
   return (
-    <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
-      <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
-        <CardHeader className="px-4">
-          <div className="flex items-center justify-between gap-2">
-            <CardTitle className="flex items-center gap-2 text-sm">
-              <Clock3 className="size-4 text-primary" />
-              System 1 execution leases
-            </CardTitle>
-            <Badge variant="outline" className="font-mono text-[9px]">
-              60 s dead-man TTL
-            </Badge>
-          </div>
-          <p className="text-[11px] text-muted-foreground">
-            Ring 2 writes a permission, never an order. Ring 1 reads it in 0.005 ms
-            median / 0.008 ms p99.
-          </p>
-        </CardHeader>
-        <CardContent className="px-4">
-          <ScrollArea className="h-[430px]">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="text-[10px] uppercase tracking-wider">Symbol</TableHead>
-                  <TableHead className="text-[10px] uppercase tracking-wider">Mode</TableHead>
-                  <TableHead className="text-right text-[10px] uppercase tracking-wider">
-                    Target
-                  </TableHead>
-                  <TableHead className="text-right text-[10px] uppercase tracking-wider">
-                    Stop
-                  </TableHead>
-                  <TableHead className="w-[34%] text-[10px] uppercase tracking-wider">
-                    TTL
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {leases.map((lease) => (
-                  <TableRow key={`${lease.symbol}-${lease.expires_at_ns}`}>
-                    <TableCell className="font-mono text-xs">{lease.symbol}</TableCell>
-                    <TableCell>
-                      <Badge
-                        variant={
-                          lease.mode === 'DISARMED'
-                            ? 'secondary'
-                            : lease.mode === 'MEAN_REV'
-                              ? 'outline'
-                              : 'default'
-                        }
-                        className="text-[9px]"
-                      >
-                        {MODE_LABEL[lease.mode]}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs tabular-nums">
-                      {formatBps(lease.target_bps)}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs tabular-nums">
-                      {formatBps(lease.stop_bps)}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <Progress
-                          value={Math.max(0, Math.min(100, lease.ttl_pct * 100))}
-                          className="h-1.5"
-                        />
-                        <span className="w-12 text-right font-mono text-[10px] tabular-nums text-muted-foreground">
-                          {lease.ttl_seconds.toFixed(1)}s
-                        </span>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {leases.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={5} className="py-8 text-center text-xs text-muted-foreground">
-                      No active leases. The dead-man TTL has expired or System 1 is
-                      disarmed.
-                    </TableCell>
-                  </TableRow>
-                ) : null}
-              </TableBody>
-            </Table>
-          </ScrollArea>
-        </CardContent>
-      </Card>
+    <div className="space-y-4">
+      <FormalVerificationBanner formal={formal} onRefreshed={setProofs} />
 
-      <div className="space-y-4">
-        <ContagionCard contagion={contagion} />
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
         <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
           <CardHeader className="px-4">
-            <CardTitle className="flex items-center gap-2 text-sm">
-              <Fingerprint className="size-4 text-primary" />
-              SHA-256 Grounding Ledger
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="flex items-center justify-between gap-3 px-4">
-            <div className="text-[11px] text-muted-foreground">
-              <div>
-                <span className="font-mono text-base font-semibold text-foreground">
-                  {contagion?.grounding_ledger.entries ?? 0}
-                </span>{' '}
-                committed fact packets
-              </div>
-              <div className="mt-1 font-mono text-[10px]">
-                latest: {truncateDigest(contagion?.grounding_ledger.latest_digest ?? null)}
-              </div>
+            <div className="flex items-center justify-between gap-2">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <Clock3 className="size-4 text-primary" />
+                System 1 execution leases
+              </CardTitle>
+              <Badge variant="outline" className="font-mono text-[9px]">
+                60 s dead-man TTL
+              </Badge>
             </div>
-            <Badge
-              variant="outline"
-              className={
-                contagion?.grounding_ledger.verified
-                  ? 'border-emerald-400/40 text-emerald-300'
-                  : 'border-red-400/40 text-red-300'
-              }
-            >
-              <ShieldCheck className="size-3" />
-              {contagion?.grounding_ledger.verified ? 'VERIFIED' : 'UNVERIFIED'}
-            </Badge>
+            <p className="text-[11px] text-muted-foreground">
+              Ring 2 writes a permission, never an order. Ring 1 reads it in 0.005 ms
+              median / 0.008 ms p99.
+            </p>
+          </CardHeader>
+          <CardContent className="px-4">
+            <ScrollArea className="h-[430px]">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-[10px] uppercase tracking-wider">Symbol</TableHead>
+                    <TableHead className="text-[10px] uppercase tracking-wider">Mode</TableHead>
+                    <TableHead className="text-right text-[10px] uppercase tracking-wider">
+                      Target
+                    </TableHead>
+                    <TableHead className="text-right text-[10px] uppercase tracking-wider">
+                      Stop
+                    </TableHead>
+                    <TableHead className="w-[34%] text-[10px] uppercase tracking-wider">
+                      TTL
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {leases.map((lease) => (
+                    <TableRow key={`${lease.symbol}-${lease.expires_at_ns}`}>
+                      <TableCell className="font-mono text-xs">{lease.symbol}</TableCell>
+                      <TableCell>
+                        <Badge
+                          variant={
+                            lease.mode === 'DISARMED'
+                              ? 'secondary'
+                              : lease.mode === 'MEAN_REV'
+                                ? 'outline'
+                                : 'default'
+                          }
+                          className="text-[9px]"
+                        >
+                          {MODE_LABEL[lease.mode]}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">
+                        {formatBps(lease.target_bps)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">
+                        {formatBps(lease.stop_bps)}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2">
+                          <Progress
+                            value={Math.max(0, Math.min(100, lease.ttl_pct * 100))}
+                            className="h-1.5"
+                          />
+                          <span className="w-12 text-right font-mono text-[10px] tabular-nums text-muted-foreground">
+                            {lease.ttl_seconds.toFixed(1)}s
+                          </span>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {leases.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={5} className="py-8 text-center text-xs text-muted-foreground">
+                        No active leases. The dead-man TTL has expired or System 1 is
+                        disarmed.
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </TableBody>
+              </Table>
+            </ScrollArea>
           </CardContent>
         </Card>
+
+        <div className="space-y-4">
+          <ContagionCard contagion={contagion} />
+          <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
+            <CardHeader className="px-4">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <Fingerprint className="size-4 text-primary" />
+                SHA-256 Grounding Ledger
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="flex items-center justify-between gap-3 px-4">
+              <div className="text-[11px] text-muted-foreground">
+                <div>
+                  <span className="font-mono text-base font-semibold text-foreground">
+                    {contagion?.grounding_ledger.entries ?? 0}
+                  </span>{' '}
+                  committed fact packets
+                </div>
+                <div className="mt-1 font-mono text-[10px]">
+                  latest: {truncateDigest(contagion?.grounding_ledger.latest_digest ?? null)}
+                </div>
+              </div>
+              <Badge
+                variant="outline"
+                className={
+                  contagion?.grounding_ledger.verified
+                    ? 'border-emerald-400/40 text-emerald-300'
+                    : 'border-red-400/40 text-red-300'
+                }
+              >
+                <ShieldCheck className="size-3" />
+                {contagion?.grounding_ledger.verified ? 'VERIFIED' : 'UNVERIFIED'}
+              </Badge>
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+
+      <TailHedgerCard hedger={formal?.tail_hedger ?? null} />
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * Formal verification & VOPR badge
+ * ------------------------------------------------------------------ */
+
+function FormalVerificationBanner({
+  formal,
+  onRefreshed,
+}: {
+  formal: FormalProofState | null
+  onRefreshed: (next: FormalProofState) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const tla = formal?.tla ?? null
+  const vopr = formal?.vopr ?? null
+  const states = tla?.total_states ?? 0
+  const transitions = tla?.total_transitions ?? 0
+  const counterexamples = tla?.total_counterexamples ?? 0
+  const voprSteps = vopr?.steps ?? 0
+  const overdrafts = vopr?.overdraft_violations ?? 0
+  const faults = Object.values(vopr?.fault_counts ?? {}).reduce(
+    (sum, value) => sum + value,
+    0
+  )
+  const proven =
+    Boolean(tla?.ok) &&
+    Boolean(vopr?.ok) &&
+    counterexamples === 0 &&
+    overdrafts === 0
+
+  const reverify = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      onRefreshed(await fetchFormalProofs(true))
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'formal re-verification failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Card
+      className={`gap-3 py-4 shadow-none ${
+        proven
+          ? 'border-emerald-500/40 bg-emerald-500/[0.04]'
+          : 'border-amber-500/40 bg-amber-500/[0.04]'
+      }`}
+    >
+      <CardContent className="space-y-3 px-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <div
+              className={`mt-0.5 rounded-md p-1.5 ${
+                proven ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300'
+              }`}
+            >
+              {proven ? (
+                <ShieldCheck className="size-4" />
+              ) : (
+                <ShieldQuestion className="size-4" />
+              )}
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-semibold">
+                  Formal Verification &amp; VOPR
+                </span>
+                <Badge
+                  variant={proven ? 'secondary' : 'destructive'}
+                  className="text-[9px] tracking-wider"
+                >
+                  {proven ? 'PROVEN · 0 COUNTEREXAMPLES' : 'UNPROVEN'}
+                </Badge>
+                <Badge variant="outline" className="font-mono text-[9px]">
+                  exhaustive BFS
+                </Badge>
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Four TLA+ specifications model-checked to a fixed point, then the
+                TigerBeetle outbox replayed under deterministic fault injection.
+              </p>
+            </div>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => void reverify()}
+            className="gap-1.5"
+          >
+            <RefreshCw className={`size-3.5 ${busy ? 'animate-spin' : ''}`} />
+            {busy ? 'Re-running BFS…' : 'Re-verify'}
+          </Button>
+        </div>
+
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div className="rounded-md border border-border/60 bg-background/40 px-3 py-2">
+            <div className="flex items-center gap-1.5 text-[9px] uppercase tracking-wider text-muted-foreground">
+              <GitBranch className="size-3" />
+              TLA+ state space
+            </div>
+            <div className="mt-1 flex items-baseline gap-1.5">
+              <span className="font-mono text-lg font-semibold tabular-nums text-foreground">
+                {states.toLocaleString('en-US')}
+              </span>
+              <span className="text-[10px] text-muted-foreground">
+                states · {transitions.toLocaleString('en-US')} transitions
+              </span>
+            </div>
+            <div className="mt-1 font-mono text-[10px] text-muted-foreground">
+              counterexamples{' '}
+              <span className={counterexamples === 0 ? 'text-emerald-300' : 'text-red-300'}>
+                {counterexamples}
+              </span>{' '}
+              · {tla?.specs.length ?? 0}/4 specs
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border/60 bg-background/40 px-3 py-2">
+            <div className="flex items-center gap-1.5 text-[9px] uppercase tracking-wider text-muted-foreground">
+              <Waves className="size-3" />
+              VOPR fault injection
+            </div>
+            <div className="mt-1 flex items-baseline gap-1.5">
+              <span className="font-mono text-lg font-semibold tabular-nums text-foreground">
+                {voprSteps.toLocaleString('en-US')}
+              </span>
+              <span className="text-[10px] text-muted-foreground">
+                steps · {faults.toLocaleString('en-US')} faults injected
+              </span>
+            </div>
+            <div className="mt-1 font-mono text-[10px] text-muted-foreground">
+              overdrafts{' '}
+              <span className={overdrafts === 0 ? 'text-emerald-300' : 'text-red-300'}>
+                {overdrafts}
+              </span>{' '}
+              · at-most-once{' '}
+              <span className={vopr?.at_most_once_ok ? 'text-emerald-300' : 'text-red-300'}>
+                {vopr?.at_most_once_ok ? 'held' : 'violated'}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-1.5">
+          {(tla?.specs ?? []).map((spec) => (
+            <span
+              key={spec.name}
+              title={`${spec.invariants.join(', ')} · ${spec.transitions.toLocaleString('en-US')} transitions`}
+              className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[9px] ${
+                spec.ok
+                  ? 'border-emerald-500/40 text-emerald-300'
+                  : 'border-red-500/40 text-red-300'
+              }`}
+            >
+              <CheckCircle2 className="size-2.5" />
+              {spec.name}
+              <span className="text-muted-foreground">
+                {spec.states_explored.toLocaleString('en-US')}
+              </span>
+            </span>
+          ))}
+          {(formal?.tigerbeetle || formal?.postgres) ? (
+            <span className="ml-auto font-mono text-[9px] text-muted-foreground">
+              TigerBeetle {formal?.tigerbeetle?.ready ? 'ready' : 'down'} · PostgreSQL 16{' '}
+              {formal?.postgres?.ready ? 'ready' : 'down'}
+            </span>
+          ) : null}
+        </div>
+
+        {error ? (
+          <div className="flex items-center gap-1.5 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1 text-[10px] text-red-200">
+            <AlertTriangle className="size-3" />
+            {error}
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * TacticalVault options tail-hedger
+ * ------------------------------------------------------------------ */
+
+function TailHedgerCard({ hedger }: { hedger: TailHedgerState | null }) {
+  const plan = hedger?.last_plan ?? null
+  const status = hedger?.last_status ?? null
+  const fragility = status?.cascade_fragility_index ?? 0
+  const copula = status?.tail_correlation ?? 0
+  const fragilityTrigger =
+    status?.thresholds.cascade_fragility_index ??
+    hedger?.thresholds.cascade_fragility_index ??
+    DEFAULT_FRAGILITY_TRIGGER
+  const copulaTrigger =
+    status?.thresholds.tail_correlation ??
+    hedger?.thresholds.tail_correlation ??
+    DEFAULT_COPULA_TRIGGER
+  const armed = hedger !== null
+  const triggered = Boolean(status?.triggered)
+  const hedged = Boolean(plan)
+  const groundingOk = Boolean(plan?.grounding_verified)
+  const digest = plan?.packet.sha256_digest ?? null
+
+  const state = !armed
+    ? { label: 'NOT ATTACHED', tone: 'border-border text-muted-foreground', variant: 'outline' as const }
+    : hedged
+      ? { label: 'HEDGE ARMED', tone: 'border-emerald-500/40 text-emerald-300', variant: 'secondary' as const }
+      : triggered
+        ? { label: 'TRIGGERED · NO SIZE', tone: 'border-amber-500/40 text-amber-300', variant: 'outline' as const }
+        : { label: 'MONITORING · FLAT', tone: 'border-border text-muted-foreground', variant: 'outline' as const }
+
+  return (
+    <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
+      <CardHeader className="px-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Waves className="size-4 text-primary" />
+            TacticalVault options tail-hedger
+            <Badge variant="outline" className="font-mono text-[9px]">
+              protective puts
+            </Badge>
+          </CardTitle>
+          <Badge variant={state.variant} className={`text-[9px] tracking-wider ${state.tone}`}>
+            {state.label}
+          </Badge>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Ring 2 buys out-of-the-money puts inside the TacticalSwing vault when the
+          MiroFish cascade and the cross-silo copula both breach. Ring 0 sizes and signs.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3 px-4">
+        <div className="grid gap-2 sm:grid-cols-2">
+          <TriggerGauge
+            label="Cascade fragility"
+            value={fragility}
+            threshold={fragilityTrigger}
+            comparator=">="
+          />
+          <TriggerGauge
+            label="Tail copula correlation"
+            value={copula}
+            threshold={copulaTrigger}
+            comparator=">"
+          />
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <Metric label="Delta" value={plan ? plan.greeks.delta.toFixed(3) : '—'} />
+          <Metric label="Gamma" value={plan ? plan.greeks.gamma.toExponential(2) : '—'} />
+          <Metric label="Vega" value={plan ? plan.greeks.vega.toFixed(2) : '—'} />
+          <Metric
+            label="Premium"
+            value={plan ? `${plan.premium_bps.toFixed(1)} bps` : '—'}
+            danger={
+              plan !== null &&
+              hedger !== null &&
+              plan.premium_bps > hedger.thresholds.max_premium_bps
+            }
+          />
+        </div>
+
+        <div className="grid gap-2 border-t border-border/60 pt-2 sm:grid-cols-3">
+          <div className="text-[10px] text-muted-foreground">
+            Strike / spot{' '}
+            <span className="font-mono text-foreground">
+              {plan ? `${plan.strike.toLocaleString('en-US')} / ${plan.spot.toLocaleString('en-US')}` : '—'}
+            </span>
+          </div>
+          <div className="text-[10px] text-muted-foreground">
+            Contracts{' '}
+            <span className="font-mono text-foreground">
+              {plan ? plan.contracts.toLocaleString('en-US') : '—'}
+            </span>{' '}
+            · hedge ratio{' '}
+            <span className="font-mono text-foreground">
+              {plan ? formatPct(plan.hedge_ratio) : '—'}
+            </span>
+          </div>
+          <div className="text-[10px] text-muted-foreground">
+            Emitted{' '}
+            <span className="font-mono text-foreground">{hedger?.hedges_emitted ?? 0}</span>{' '}
+            · triggers{' '}
+            <span className="font-mono text-foreground">{hedger?.triggers ?? 0}</span>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/60 bg-muted/20 px-2 py-1.5">
+          <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+            <Fingerprint className="size-3" />
+            Packet SHA-256
+          </span>
+          <span className="font-mono text-[10px] text-foreground">{truncateDigest(digest)}</span>
+          <Badge
+            variant="outline"
+            className={`text-[9px] ${
+              groundingOk
+                ? 'border-emerald-400/40 text-emerald-300'
+                : 'border-border text-muted-foreground'
+            }`}
+          >
+            <ShieldCheck className="size-3" />
+            {groundingOk
+              ? `GROUNDED · ${plan?.grounding_claims_checked ?? 0} claims`
+              : 'NO OPEN PACKET'}
+          </Badge>
+        </div>
+
+        {plan?.reasons.length ? (
+          <div className="flex flex-wrap gap-1.5">
+            {plan.reasons.map((reason) => (
+              <span
+                key={reason}
+                className="rounded border border-amber-500/40 px-1.5 py-0.5 font-mono text-[9px] text-amber-200"
+              >
+                {reason}
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function TriggerGauge({
+  label,
+  value,
+  threshold,
+  comparator,
+}: {
+  label: string
+  value: number
+  threshold: number
+  comparator: '>=' | '>'
+}) {
+  const breached = comparator === '>=' ? value >= threshold : value > threshold
+  const ratio = threshold > 0 ? value / threshold : 0
+
+  return (
+    <div className="rounded-md border border-border/60 bg-muted/20 px-2 py-1.5">
+      <div className="flex items-center justify-between text-[9px] uppercase tracking-wider text-muted-foreground">
+        <span>{label}</span>
+        <span className={breached ? 'font-mono text-amber-300' : 'font-mono'}>
+          {comparator} {threshold.toFixed(2)}
+        </span>
+      </div>
+      <div className="mt-1 flex items-center gap-2">
+        <Progress
+          value={Math.max(0, Math.min(100, ratio * 100))}
+          className={`h-1.5 ${breached ? 'text-amber-300' : ''}`}
+        />
+        <span
+          className={`w-12 text-right font-mono text-xs tabular-nums ${
+            breached ? 'text-amber-300' : 'text-foreground'
+          }`}
+        >
+          {value.toFixed(2)}
+        </span>
       </div>
     </div>
   )

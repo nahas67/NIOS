@@ -1,7 +1,42 @@
+# ---------------------------------------------------------------------------
+# NIOS release hygiene
+# ---------------------------------------------------------------------------
 
-node_modules/
+# Python bytecode / build artefacts
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*.so
+build/
+*.egg-info/
 
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
 
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node / cockpit build inputs (the compiled dist/ IS tracked and served)
 node_modules/
 **/node_modules/
 
+# Runtime state, workspaces and secrets
+data/
+*.log
+.env
+.env.*
+
+# Donor harvest staging -- reference only, never imported by runtime code
+_donor_staging/
+
+# Scratch
+temp_sections.txt

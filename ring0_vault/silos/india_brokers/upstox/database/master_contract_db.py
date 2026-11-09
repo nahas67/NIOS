@@ -7,7 +7,7 @@ import shutil
 import pandas as pd
 import requests
 from sqlalchemy import Column, Float, Index, Integer, Sequence, String
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.engine_factory import create_db_engine

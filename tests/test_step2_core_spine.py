@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import math
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -424,6 +425,115 @@ def test_3b_tier0_ring_buffer_and_shadow_book() -> None:
         book.close()
         reset_named_segment("nios-ofi-cancel-ring")
         reset_named_segment("nios-shadow-book")
+
+
+def test_3c_tier0_create_on_existing_segment_and_prefix_isolation(monkeypatch) -> None:
+    """Operator Note #1: concurrent ``pytest`` + live server are collision-free.
+
+    ``create=True`` against a segment that already exists must attach and reset
+    in place (never ``FileExistsError``), and ``NIOS_SHM_PREFIX`` must keep a
+    test process out of the live server's namespace entirely.
+    """
+    from core import shm_ipc
+
+    original_prefix = os.environ.get(shm_ipc.SHM_PREFIX_ENV)
+    live_prefix = f"nios-live-{os.getpid()}"
+    test_prefix = f"nios-test-{os.getpid()}-iso"
+    opened: list[tuple[str, object]] = []
+
+    def open_in(prefix: str, factory):
+        monkeypatch.setenv(shm_ipc.SHM_PREFIX_ENV, prefix)
+        handle = factory()
+        opened.append((prefix, handle))
+        return handle
+
+    try:
+        # ---- live namespace: the three hot segments already exist ----------
+        live_latch = open_in(live_prefix, lambda: GlobalKillLatch(reset=True))
+        live_table = open_in(
+            live_prefix, lambda: LeaseTableSHM(reset=True, kill_latch=live_latch)
+        )
+        live_ring = open_in(live_prefix, lambda: OfiRingBuffer(reset=True, n_slots=32))
+
+        assert live_latch.name == f"{live_prefix}-global-kill-latch"
+        assert live_table.name == f"{live_prefix}-active-leases"
+        assert live_ring.uri == f"shm://{live_prefix}-ofi-cancel-ring"
+        assert shm_ipc.segment_name(shm_ipc.KILL_LATCH_SHM_NAME) == live_latch.name
+        # Idempotent: an already-namespaced name is never prefixed twice.
+        assert shm_ipc.segment_name(live_latch.name) == live_latch.name
+
+        now_ns = time.monotonic_ns()
+        lease = System1Lease(
+            symbol=SYMBOL,
+            mode=LeaseMode.LONG_ONLY,
+            target_bps=12.0,
+            stop_bps=6.0,
+            expires_at_ns=now_ns + 30_000_000_000,
+            strategy_id_hash=0x5EED5EED5EED5EED,
+        )
+        live_table.write_lease(lease, now_ns=now_ns)
+        live_ring.append(_flow_tick(), now_ns=BASE_NS)
+        live_latch.halt(HaltReason.MANUAL_KILL_SWITCH, now_ns=now_ns)
+        assert live_latch.is_halted is True
+        assert live_table.slots_written == 1
+        assert live_ring.cursor == 1
+
+        # ---- create=True on existing segments: attach + reset, no crash ----
+        # This is the exact call that raised FileExistsError on Windows before
+        # Operator Note #1: pytest must be able to do it while a live server --
+        # or simply these handles -- already own the names.
+        try:
+            reset_latch = open_in(live_prefix, lambda: GlobalKillLatch(reset=True))
+            reset_table = open_in(
+                live_prefix, lambda: LeaseTableSHM(reset=True, kill_latch=reset_latch)
+            )
+            reset_ring = open_in(
+                live_prefix, lambda: OfiRingBuffer(reset=True, n_slots=32)
+            )
+        except FileExistsError as exc:  # pragma: no cover - regression guard
+            pytest.fail(f"create=True on an existing segment raised: {exc}")
+
+        assert reset_latch.is_halted is False          # header + payload zeroed
+        assert reset_table.slots_written == 0
+        assert reset_table.read_lease(SYMBOL, now_ns).mode is LeaseMode.DISARMED
+        assert reset_ring.cursor == 0
+        assert reset_ring.latest() is None
+
+        # ---- prefix isolation ---------------------------------------------
+        # Re-halt and re-publish in the live namespace, then prove the test
+        # namespace sees none of it.
+        reset_latch.halt(HaltReason.MANUAL_KILL_SWITCH, now_ns=now_ns)
+        reset_table.write_lease(lease, now_ns=now_ns)
+
+        test_latch = open_in(test_prefix, lambda: GlobalKillLatch(reset=True))
+        test_table = open_in(
+            test_prefix, lambda: LeaseTableSHM(reset=True, kill_latch=test_latch)
+        )
+        test_ring = open_in(test_prefix, lambda: OfiRingBuffer(reset=True, n_slots=32))
+
+        assert test_latch.name != reset_latch.name
+        assert test_table.name != reset_table.name
+        assert test_ring.uri != reset_ring.uri
+        assert test_latch.is_halted is False           # live halt is invisible
+        assert test_table.read_lease(SYMBOL, now_ns).mode is LeaseMode.DISARMED
+        assert test_ring.cursor == 0
+        assert reset_latch.is_halted is True           # live state untouched
+        assert reset_table.slots_written == 1          # live lease still published
+        reset_latch.arm(now_ns=now_ns)                 # re-arm for the read path
+        assert reset_table.read_lease(SYMBOL, now_ns).is_active(now_ns) is True
+    finally:
+        for _prefix, handle in reversed(opened):
+            try:
+                handle.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+        for prefix in {prefix for prefix, _ in opened}:
+            monkeypatch.setenv(shm_ipc.SHM_PREFIX_ENV, prefix)
+            shm_ipc.unlink_all()
+        if original_prefix is None:
+            monkeypatch.delenv(shm_ipc.SHM_PREFIX_ENV, raising=False)
+        else:
+            monkeypatch.setenv(shm_ipc.SHM_PREFIX_ENV, original_prefix)
 
 
 # ---------------------------------------------------------------------------

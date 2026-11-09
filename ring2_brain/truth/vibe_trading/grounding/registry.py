@@ -63,8 +63,13 @@ class GroundingRegistry:
     def register(self, check: GroundingCheck) -> GroundingCheck:
         if check.severity not in {"block", "warn", "log"}:
             raise ValueError(f"invalid grounding severity: {check.severity}")
-        if check.name in self._checks:
-            raise ValueError(f"duplicate grounding check: {check.name}")
+        existing = self._checks.get(check.name)
+        if existing is not None:
+            # The same file can be reached through the canonical import path
+            # and the upstream ``src.agent.grounding`` alias.  Registration is
+            # a declaration, so the second arrival is the same declaration --
+            # keep the first rather than failing the import.
+            return existing
         self._checks[check.name] = check
         return check
 

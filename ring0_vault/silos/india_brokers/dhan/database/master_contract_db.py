@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import requests
 from sqlalchemy import Column, Float, Index, Integer, Sequence, String
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.auth_db import get_auth_token

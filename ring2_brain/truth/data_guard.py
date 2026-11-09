@@ -40,7 +40,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Protocol, Sequence
 
 import duckdb
 
@@ -69,6 +69,10 @@ __all__ = [
     "FilingRecord",
     "SecEdgarPITGuard",
     "VendorRouterBridge",
+    "LoaderBinding",
+    "VendorTick",
+    "CallableLoader",
+    "DualVendorLoaderRouter",
     "OrderflowNormalizer",
     "FlushReport",
     "SelfHealingDataGuard",
@@ -730,6 +734,410 @@ class VendorRouterBridge:
             return {m: self._router.get_category_for_method(m) for m in methods}
         except Exception:  # pragma: no cover - donor schema drift
             return {}
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 -> Stage 2 -- dual-vendor loader router
+# ---------------------------------------------------------------------------
+
+
+class LoaderBinding(Protocol):
+    """Minimal loader contract consumed by :class:`DualVendorLoaderRouter`.
+
+    The harvested loaders all expose ``DataLoader.fetch(code, start, end,
+    interval)`` returning an OHLCV ``pandas.DataFrame``.  A binding may also be
+    a plain callable or an object exposing the same ``fetch`` method, which is
+    what the deterministic offline tests use.
+    """
+
+    def fetch(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        interval: str = "1d",
+    ) -> Any: ...
+
+
+@dataclass(slots=True, frozen=True)
+class VendorTick:
+    """One vendor's observation of a symbol, with explicit time semantics."""
+
+    vendor: str
+    symbol: str
+    price: float
+    valid_time_ns: int
+    knowledge_ts_ns: int
+    received_ns: int
+    lag_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        price = float(self.price)
+        if not math.isfinite(price) or price <= 0.0:
+            raise ValueError(f"{self.vendor}: price must be finite and positive")
+        object.__setattr__(self, "price", price)
+        object.__setattr__(self, "valid_time_ns", int(self.valid_time_ns))
+        object.__setattr__(self, "knowledge_ts_ns", int(self.knowledge_ts_ns))
+        object.__setattr__(self, "received_ns", int(self.received_ns))
+        lag = float(self.lag_ms)
+        if not math.isfinite(lag) or lag < 0.0:
+            lag = 0.0
+        object.__setattr__(self, "lag_ms", lag)
+
+
+@dataclass(slots=True)
+class CallableLoader:
+    """Deterministic offline loader used by tests and replay harnesses.
+
+    ``fetch_fn`` receives ``(symbol, start_date, end_date, interval)`` and may
+    return a price, a mapping, a :class:`VendorTick`, or a DataFrame-like
+    object.  It never performs I/O unless the caller's function does.
+    """
+
+    name: str
+    fetch_fn: Callable[..., Any]
+
+    def fetch(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        interval: str = "1d",
+    ) -> Any:
+        try:
+            return self.fetch_fn(code, start_date, end_date, interval)
+        except TypeError:
+            try:
+                return self.fetch_fn(code, start_date, end_date)
+            except TypeError:
+                return self.fetch_fn(code)
+
+
+class DualVendorLoaderRouter:
+    """Stage 1: fetch the same bar from two independent vendor loaders.
+
+    The router is deliberately *dumb* about market data quality: it only
+    produces the :class:`~core.schemas.DualVendorBar` contract and hands it to
+    :class:`SelfHealingDataGuard`, which owns every Stage-2 gate.  Keeping the
+    two responsibilities separate means a new vendor cannot bypass quarantine
+    by "normalizing" its own numbers.
+
+    Parameters
+    ----------
+    guard:
+        The Stage-2/3 :class:`SelfHealingDataGuard` that accepts or rejects the
+        bar.  Ring 2 never writes a bar anywhere else.
+    primary / secondary:
+        Loader instances, loader classes, registry source names (``"yfinance"``,
+        ``"stooq"``, ...), or callables.  Strings are resolved through the
+        harvested :mod:`...loaders.registry` fallback chain.
+    price_field:
+        DataFrame column used as the observed price (default ``"close"``).
+    """
+
+    def __init__(
+        self,
+        guard: "SelfHealingDataGuard",
+        primary: Any,
+        secondary: Any,
+        *,
+        primary_symbol: str | None = None,
+        secondary_symbol: str | None = None,
+        lag_gate_ms: float = FEED_LAG_GATE_MS,
+        price_field: str = "close",
+        clock: Callable[[], int] = time.time_ns,
+    ) -> None:
+        if guard is None:
+            raise ValueError("DualVendorLoaderRouter requires a SelfHealingDataGuard")
+        self.guard = guard
+        self.primary_name = self._binding_name(primary, "primary")
+        self.secondary_name = self._binding_name(secondary, "secondary")
+        self._primary = self._resolve_binding(primary)
+        self._secondary = self._resolve_binding(secondary)
+        self.primary_symbol = primary_symbol
+        self.secondary_symbol = secondary_symbol
+        self.lag_gate_ms = float(lag_gate_ms)
+        self.price_field = str(price_field)
+        self.clock = clock
+        self.bars = 0
+        self.rejected = 0
+
+    # -- binding resolution ----------------------------------------------
+    @staticmethod
+    def _binding_name(binding: Any, fallback: str) -> str:
+        if isinstance(binding, str):
+            return binding
+        name = getattr(binding, "name", None) or getattr(binding, "__name__", None)
+        return str(name or fallback)
+
+    @staticmethod
+    def _resolve_binding(binding: Any) -> Any:
+        """Resolve a registry source name into an instantiated loader."""
+        if not isinstance(binding, str):
+            if isinstance(binding, type):
+                return binding()
+            return binding
+        try:
+            from ring2_brain.quant.vibe_trading.loaders import registry as loader_registry
+
+            loader_registry._ensure_registered()
+            cls = loader_registry.get_loader_cls_with_fallback(binding)
+            return cls()
+        except Exception:
+            # A registry miss is reported by the guard's quarantine record when
+            # the caller actually routes a bar; resolution itself must not
+            # crash an ingestion process.
+            return None
+
+    # -- payload coercion -------------------------------------------------
+    def _call_loader(
+        self,
+        loader: Any,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        interval: str,
+    ) -> Any:
+        if loader is None:
+            raise RuntimeError("loader binding could not be resolved")
+        fetch = getattr(loader, "fetch", None)
+        if fetch is None:
+            if not callable(loader):
+                raise TypeError(
+                    f"loader {type(loader).__name__} exposes neither fetch() nor __call__"
+                )
+            fetch = loader
+        try:
+            return fetch(symbol, start_date, end_date, interval)
+        except TypeError:
+            try:
+                return fetch(symbol, start_date, end_date)
+            except TypeError:
+                return fetch(symbol)
+
+    def _coerce_tick(
+        self,
+        vendor: str,
+        symbol: str,
+        payload: Any,
+        received_ns: int,
+        lag_ms: float | None,
+    ) -> VendorTick:
+        if isinstance(payload, VendorTick):
+            return VendorTick(
+                vendor=payload.vendor or vendor,
+                symbol=payload.symbol or symbol,
+                price=payload.price,
+                valid_time_ns=payload.valid_time_ns,
+                knowledge_ts_ns=payload.knowledge_ts_ns,
+                received_ns=payload.received_ns,
+                lag_ms=payload.lag_ms if lag_ms is None else lag_ms,
+            )
+
+        if isinstance(payload, Mapping):
+            price = next(
+                (
+                    payload[key]
+                    for key in ("price", "p1", "close", "last", "mark")
+                    if key in payload
+                ),
+                None,
+            )
+            if price is None:
+                raise ValueError(f"{vendor}: payload has no price field")
+            valid_ns = int(payload.get("valid_time_ns") or received_ns)
+            knowledge_ns = int(payload.get("knowledge_ts_ns") or received_ns)
+            observed_ns = int(payload.get("received_ns") or received_ns)
+            payload_lag = payload.get("lag_ms", lag_ms)
+            effective_lag = (
+                max(0.0, (observed_ns - knowledge_ns) / 1e6)
+                if payload_lag is None
+                else float(payload_lag)
+            )
+            return VendorTick(
+                vendor=str(payload.get("vendor") or vendor),
+                symbol=str(payload.get("symbol") or symbol),
+                price=float(price),
+                valid_time_ns=valid_ns,
+                knowledge_ts_ns=knowledge_ns,
+                received_ns=observed_ns,
+                lag_ms=effective_lag,
+            )
+
+        if isinstance(payload, (tuple, list)):
+            if not payload:
+                raise ValueError(f"{vendor}: empty tuple payload")
+            price = float(payload[0])
+            valid_ns = int(payload[1]) if len(payload) > 1 else received_ns
+            knowledge_ns = int(payload[2]) if len(payload) > 2 else received_ns
+            return VendorTick(
+                vendor=vendor,
+                symbol=symbol,
+                price=price,
+                valid_time_ns=valid_ns,
+                knowledge_ts_ns=knowledge_ns,
+                received_ns=received_ns,
+                lag_ms=max(0.0, (received_ns - knowledge_ns) / 1e6)
+                if lag_ms is None
+                else float(lag_ms),
+            )
+
+        if isinstance(payload, (int, float)) and not isinstance(payload, bool):
+            return VendorTick(
+                vendor=vendor,
+                symbol=symbol,
+                price=float(payload),
+                valid_time_ns=received_ns,
+                knowledge_ts_ns=received_ns,
+                received_ns=received_ns,
+                lag_ms=0.0 if lag_ms is None else float(lag_ms),
+            )
+
+        # DataFrame-like: last row's configured price column.
+        if hasattr(payload, "empty") and hasattr(payload, "index"):
+            if bool(payload.empty):
+                raise ValueError(f"{vendor}: empty OHLCV frame for {symbol}")
+            row = payload.iloc[-1]
+            if self.price_field in getattr(payload, "columns", ()):
+                price = row[self.price_field]
+            else:
+                price = row.iloc[-1] if hasattr(row, "iloc") else row[-1]
+            index = payload.index[-1]
+            valid_ns = int(getattr(index, "value", received_ns))
+            return VendorTick(
+                vendor=vendor,
+                symbol=symbol,
+                price=float(price),
+                valid_time_ns=valid_ns,
+                knowledge_ts_ns=received_ns,
+                received_ns=received_ns,
+                lag_ms=0.0 if lag_ms is None else float(lag_ms),
+            )
+
+        raise TypeError(f"{vendor}: unsupported loader payload {type(payload).__name__}")
+
+    # -- public API -------------------------------------------------------
+    def quote(
+        self,
+        symbol: str,
+        *,
+        start_date: str = "",
+        end_date: str = "",
+        interval: str = "1d",
+        as_of_ns: int | None = None,
+        primary_symbol: str | None = None,
+        secondary_symbol: str | None = None,
+        primary_lag_ms: float | None = None,
+        secondary_lag_ms: float | None = None,
+    ) -> DualVendorBar:
+        """Fetch both vendors and return the raw dual-vendor contract."""
+        token = str(symbol).strip().upper()
+        if not token:
+            raise ValueError("symbol must be non-empty")
+        received = int(as_of_ns) if as_of_ns is not None else int(self.clock())
+        p_symbol = str(primary_symbol or self.primary_symbol or token)
+        s_symbol = str(secondary_symbol or self.secondary_symbol or token)
+
+        p_payload = self._call_loader(
+            self._primary, p_symbol, start_date, end_date, interval
+        )
+        s_payload = self._call_loader(
+            self._secondary, s_symbol, start_date, end_date, interval
+        )
+        p_tick = self._coerce_tick(
+            self.primary_name, token, p_payload, received, primary_lag_ms
+        )
+        s_tick = self._coerce_tick(
+            self.secondary_name, token, s_payload, received, secondary_lag_ms
+        )
+
+        self.bars += 1
+        return DualVendorBar(
+            symbol=token,
+            p1=float(p_tick.price),
+            p2=float(s_tick.price),
+            feed_lag_ms=float(max(p_tick.lag_ms, s_tick.lag_ms)),
+            valid_time_ns=int(max(p_tick.valid_time_ns, s_tick.valid_time_ns)),
+            knowledge_ts_ns=int(
+                max(p_tick.knowledge_ts_ns, s_tick.knowledge_ts_ns)
+            ),
+        )
+
+    def route(
+        self,
+        symbol: str,
+        *,
+        start_date: str = "",
+        end_date: str = "",
+        interval: str = "1d",
+        as_of_ns: int | None = None,
+        primary_symbol: str | None = None,
+        secondary_symbol: str | None = None,
+        primary_lag_ms: float | None = None,
+        secondary_lag_ms: float | None = None,
+        currency: str | None = None,
+        raise_on_lookahead: bool = True,
+    ) -> NormalizedBar | None:
+        """Stage 1 -> Stage 2: feed the dual-vendor bar into the guard."""
+        bar = self.quote(
+            symbol,
+            start_date=start_date,
+            end_date=end_date,
+            interval=interval,
+            as_of_ns=as_of_ns,
+            primary_symbol=primary_symbol,
+            secondary_symbol=secondary_symbol,
+            primary_lag_ms=primary_lag_ms,
+            secondary_lag_ms=secondary_lag_ms,
+        )
+        as_of = int(as_of_ns) if as_of_ns is not None else int(bar.knowledge_ts_ns)
+        normalized = self.guard.ingest_bar(
+            bar,
+            as_of_ns=as_of,
+            currency=currency,
+            raise_on_lookahead=raise_on_lookahead,
+        )
+        if normalized is None:
+            self.rejected += 1
+        return normalized
+
+    def route_many(
+        self,
+        symbols: Iterable[str],
+        *,
+        start_date: str = "",
+        end_date: str = "",
+        interval: str = "1d",
+        as_of_ns: int | None = None,
+        currency: str | None = None,
+    ) -> list[NormalizedBar]:
+        out: list[NormalizedBar] = []
+        for symbol in symbols:
+            normalized = self.route(
+                symbol,
+                start_date=start_date,
+                end_date=end_date,
+                interval=interval,
+                as_of_ns=as_of_ns,
+                currency=currency,
+                raise_on_lookahead=False,
+            )
+            if normalized is not None:
+                out.append(normalized)
+        return out
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "primary": self.primary_name,
+            "secondary": self.secondary_name,
+            "primary_resolved": self._primary is not None,
+            "secondary_resolved": self._secondary is not None,
+            "lag_gate_ms": self.lag_gate_ms,
+            "bars": self.bars,
+            "rejected": self.rejected,
+            "guard_accepted": int(self.guard.stats.accepted),
+            "guard_rejected": int(self.guard.stats.rejected),
+        }
 
 
 # ---------------------------------------------------------------------------

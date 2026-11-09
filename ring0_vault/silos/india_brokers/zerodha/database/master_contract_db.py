@@ -9,7 +9,7 @@ import shutil
 import numpy as np
 import pandas as pd
 from sqlalchemy import Column, Float, Index, Integer, Sequence, String
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from broker.zerodha.mapping.mcx_contract_size import get_contract_size

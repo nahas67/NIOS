@@ -76,18 +76,24 @@ def donor_grounding_status() -> dict[str, Any]:
     report: dict[str, Any] = {"modules": {}, "available": False}
     import importlib
 
+    active = 0
     for name, path in candidates.items():
         entry = {"path": str(path), "harvested": path.exists(), "importable": False, "reason": ""}
         if path.exists():
             try:
                 importlib.import_module(f"ring2_brain.truth.vibe_trading.grounding.{name}")
                 entry["importable"] = True
+                active += 1
             except Exception as exc:  # pragma: no cover - donor vendoring
                 entry["reason"] = f"{type(exc).__name__}: {exc}"
         else:
             entry["reason"] = "not harvested"
         report["modules"][name] = entry
-    report["available"] = any(m["importable"] for m in report["modules"].values())
+    total = len(candidates)
+    report["active"] = active
+    report["total"] = total
+    report["percent"] = round(100.0 * active / total, 1) if total else 0.0
+    report["available"] = active > 0
     return report
 
 

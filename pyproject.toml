@@ -1,0 +1,43 @@
+# NIOS build / test configuration.
+#
+# This file intentionally declares only tool configuration. NIOS is executed
+# straight from the repository root (`python scripts/run_nios.py`), not installed
+# as a distribution, so no build backend is declared.
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# The donor tree is reference material only and must never be collected.
+norecursedirs = [
+    "_donor_staging",
+    "node_modules",
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+]
+# Release policy: a warning is a defect.  The suite must emit zero warnings.
+# Third-party stacks that we vendor (donor harvest) are exempted explicitly and
+# narrowly, by module path, so a first-party regression still fails the run.
+filterwarnings = [
+    "error",
+    "default::DeprecationWarning:sqlalchemy.*",
+    "default::PendingDeprecationWarning:sqlalchemy.*",
+    "default::DeprecationWarning:backtest.*",
+    "default::DeprecationWarning:nautilus_trader.*",
+    "default::DeprecationWarning:tigerbeetle.*",
+    "default::ResourceWarning:asyncio.*",
+    "default::ResourceWarning:multiprocessing.*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["_donor_staging", "ring3_cockpit/ui/openalgo_shell/node_modules"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

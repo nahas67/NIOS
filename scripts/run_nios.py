@@ -8,8 +8,10 @@ Two modes, one process model:
   control plane, five MCP tools, static React bundle), prints a health table and
   exits ``0`` only when every check passes.
 * ``python scripts/run_nios.py`` serves the unified FastAPI app (``/api/v2/*``
-  REST + SSE + MCP + the compiled React 19 bundle at ``/``) with uvicorn on
-  ``0.0.0.0:8000``.
+  REST + SSE + MCP + the compiled React 19 bundle at ``/``) with uvicorn.  The
+  bind port is ``--port`` or ``$NIOS_PORT`` when the operator forces one;
+  otherwise a busy ``8000`` falls back to the first free port in
+  ``8000..8010`` and the exact live URL is printed (Operator Note #2).
 
 The four ``--role`` modes exist for the network-segmented docker-compose
 topology: each ring process boots only its own dependencies, prints a health
@@ -34,9 +36,13 @@ if str(ROOT) not in sys.path:
 __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "PORT_SCAN_START",
+    "PORT_SCAN_END",
     "build_runtime",
     "fastapi_app",
+    "live_url",
     "main",
+    "resolve_port",
     "run_role",
     "run_smoke",
     "run_server",
@@ -44,7 +50,51 @@ __all__ = [
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
+
+#: Operator Note #2: when the default port is busy and no port was forced,
+#: the launcher takes the first free port in this inclusive range.
+PORT_SCAN_START = 8000
+PORT_SCAN_END = 8010
+
 SMOKE_UI_ROOT = ROOT / "ring3_cockpit" / "ui" / "openalgo_shell" / "dist"
+
+# ``scripts/`` is ``sys.path[0]`` when this file is executed directly; it is a
+# namespace package under the repository root when imported as a module.
+try:  # pragma: no cover - import shim
+    from nios_port_check import PortUnavailable
+    from nios_port_check import resolve_port as _resolve_port
+except ImportError:  # pragma: no cover - ``python -m scripts.run_nios``
+    from scripts.nios_port_check import PortUnavailable
+    from scripts.nios_port_check import resolve_port as _resolve_port
+
+
+def resolve_port(
+    host: str,
+    requested: int = DEFAULT_PORT,
+    *,
+    allow_fallback: bool = True,
+) -> int:
+    """Port this launch will bind (Operator Note #2 fallback included).
+
+    ``allow_fallback=False`` is used when the operator explicitly forced a port
+    via ``--port`` / ``NIOS_PORT``: the launch then fails loudly instead of
+    moving a pinned service.
+    """
+    return _resolve_port(
+        host,
+        requested,
+        allow_fallback=allow_fallback,
+        start=PORT_SCAN_START,
+        end=PORT_SCAN_END,
+    )
+
+
+def live_url(host: str, port: int) -> str:
+    """Human-clickable URL for a bind host (``0.0.0.0`` -> ``127.0.0.1``)."""
+    display = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+    if ":" in display and not display.startswith("["):
+        display = f"[{display}]"
+    return f"http://{display}:{int(port)}"
 
 
 def build_runtime(
@@ -202,6 +252,80 @@ def run_smoke(
 
         table.check("Ring 2 progressive SKILL.md registry", ring2_skills)
 
+        # ---- Phase 2 Step 4: formal proofs / VOPR / backends / hedger ---
+        def formal_tla() -> str:
+            result = runtime.formal_verifier.run()
+            tla = result["tla"]
+            assert tla["total_states"] > 500, tla["total_states"]
+            assert tla["total_counterexamples"] == 0, tla["total_counterexamples"]
+            names = {spec["name"] for spec in tla["specs"]}
+            assert names == {"KillSwitch", "OrderLifecycle", "Outbox", "Reconciliation"}, names
+            return (
+                f"{tla['total_states']} states, "
+                f"{tla['total_transitions']} transitions, 0 counterexamples"
+            )
+
+        table.check("Phase 2 TLA+ exhaustive BFS proofs", formal_tla)
+
+        def vopr_campaign() -> str:
+            result = runtime.formal_verifier.vopr.run_campaign()
+            assert result.ok, result.to_dict()
+            faults = sum(result.fault_counts.values())
+            return (
+                f"seed={result.seed}, {result.steps} steps, {faults} faults, "
+                f"{result.power_cycles} power cycles, 0 overdrafts"
+            )
+
+        table.check("Phase 2 VOPR deterministic fault injection", vopr_campaign)
+
+        def backend_provisioning() -> str:
+            from ring0_vault.ibor.tb_pg_provisioner import TigerBeetlePG16Provisioner
+
+            provisioner = runtime.tb_pg_provisioner or TigerBeetlePG16Provisioner()
+            formatted = provisioner.format_temporary_replica(
+                Path(tempfile.mkdtemp(prefix="nios-smoke-tb-"))
+            )
+            status = provisioner.status()
+            assert status["tigerbeetle"]["found"], status["tigerbeetle"]
+            assert status["tigerbeetle"]["version"] == "0.17.9", status["tigerbeetle"]
+            schema = status["postgres"]["schema"]
+            assert schema["valid"], schema
+            assert len(schema["tables"]) == 7, schema["tables"]
+            assert formatted.formatted and Path(formatted.path).exists(), formatted
+            return (
+                f"TigerBeetle {status['tigerbeetle']['version']} "
+                f"({'emulated' if formatted.emulated else 'live'}), "
+                f"PG16 {len(schema['tables'])} tables / {schema['checks']} checks"
+            )
+
+        table.check("Phase 2 TigerBeetle replica + PG16 DDL", backend_provisioning)
+
+        def tail_hedger() -> str:
+            from core.schemas import VaultName
+
+            status, plan = runtime.tail_hedger.monitor_and_hedge(
+                cascade_fragility_index=0.72,
+                tail_correlation=0.68,
+                spot=50_000.0,
+                portfolio_notional_micros=runtime.ledger.total_nav_micros(runtime.silos),
+                tactical_vault_micros=max(
+                    1, runtime.ledger.balance("US_IBKR", VaultName.TACTICAL_SWING)
+                ),
+            )
+            assert status.triggered, status.to_dict()
+            assert plan is not None, "tail hedger emitted no plan"
+            assert plan.proposal.vault is VaultName.TACTICAL_SWING
+            assert plan.grounding_verified, plan.grounding_claims_checked
+            assert plan.delta < 0.0 and plan.premium_bps > 0.0
+            return (
+                f"fragility={plan.cascade_fragility_index:.2f}, "
+                f"tail_corr={plan.tail_correlation:.2f}, "
+                f"strike={plan.strike:.0f}, delta={plan.delta:+.3f}, "
+                f"premium={plan.premium_bps:.1f} bps"
+            )
+
+        table.check("Phase 2 TacticalSwing options tail-hedger", tail_hedger)
+
         # ---- Ring 3: cockpit / MCP / static UI -------------------------
         client = TestClient(fastapi_app(runtime))
 
@@ -217,11 +341,13 @@ def run_smoke(
             response = client.get("/api/v2/cockpit/state")
             assert response.status_code == 200, response.text
             payload = response.json()
-            for key in ("silos", "leases", "contagion", "extensions"):
+            for key in ("silos", "leases", "contagion", "extensions", "formal_proofs"):
                 assert key in payload, key
+            assert payload["formal_proofs"]["summary"]["counterexamples"] == 0
             return (
                 f"silos={len(payload['silos'])}, cards={len(payload['cards'])}, "
-                f"extensions={payload['extensions']['counts']}"
+                f"extensions={payload['extensions']['counts']}, "
+                f"proofs={payload['formal_proofs']['summary']['states_explored']} states"
             )
 
         table.check("Ring 3 cockpit state hydration", ring3_state)
@@ -311,15 +437,23 @@ def run_smoke(
 def run_server(
     *,
     host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    port: int | None = None,
     workspace: str | Path | None = None,
+    allow_port_fallback: bool = True,
 ) -> int:
     import uvicorn
+
+    requested = DEFAULT_PORT if port is None else int(port)
+    resolved = resolve_port(host, requested, allow_fallback=allow_port_fallback)
+    if resolved != requested:
+        print(f"[NIOS] port {requested} is busy -> auto-selected {resolved}")
+    print(f"[NIOS] live cockpit: {live_url(host, resolved)}")
+    sys.stdout.flush()
 
     runtime = build_runtime(workspace)
     try:
         app = fastapi_app(runtime)
-        uvicorn.run(app, host=host, port=int(port), log_level="info")
+        uvicorn.run(app, host=host, port=resolved, log_level="info")
     finally:
         runtime.close()
     return 0
@@ -372,7 +506,14 @@ def run_role(role: str, *, workspace: str | Path | None = None) -> int:
                 )
             )
         elif token == "ring3-cockpit":
-            return run_server(workspace=workspace)
+            env_port = os.environ.get("NIOS_PORT", "").strip()
+            requested = int(env_port) if env_port else DEFAULT_PORT
+            return run_server(
+                host=os.environ.get("NIOS_HOST", DEFAULT_HOST),
+                port=requested,
+                workspace=workspace,
+                allow_port_fallback=not bool(env_port),
+            )
         else:
             raise SystemExit(f"unknown role {role!r}")
         sys.stdout.flush()
@@ -394,7 +535,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--smoke-test", action="store_true", help="boot all rings and self-check")
     parser.add_argument("--host", default=os.environ.get("NIOS_HOST", DEFAULT_HOST))
     parser.add_argument(
-        "--port", type=int, default=int(os.environ.get("NIOS_PORT", DEFAULT_PORT))
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "force a port (otherwise $NIOS_PORT, otherwise the first free port "
+            f"in {PORT_SCAN_START}..{PORT_SCAN_END})"
+        ),
     )
     parser.add_argument("--workspace", default=None)
     parser.add_argument(
@@ -404,11 +551,33 @@ def main(argv: list[str] | None = None) -> int:
         help="run one ring node for the segmented compose topology",
     )
     args = parser.parse_args(argv)
+
+    env_port = os.environ.get("NIOS_PORT", "").strip()
+    if args.port is not None:
+        requested, forced = int(args.port), True
+    elif env_port:
+        try:
+            requested, forced = int(env_port), True
+        except ValueError:
+            print(f"[NIOS] FATAL: invalid NIOS_PORT={env_port!r}", file=sys.stderr)
+            return 2
+    else:
+        requested, forced = DEFAULT_PORT, False
+
     if args.smoke_test:
-        return run_smoke(host=args.host, port=args.port, workspace=args.workspace)
+        return run_smoke(host=args.host, port=requested, workspace=args.workspace)
     if args.role:
         return run_role(args.role, workspace=args.workspace)
-    return run_server(host=args.host, port=args.port, workspace=args.workspace)
+    try:
+        return run_server(
+            host=args.host,
+            port=requested,
+            workspace=args.workspace,
+            allow_port_fallback=not forced,
+        )
+    except PortUnavailable as exc:
+        print(f"[NIOS] FATAL: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

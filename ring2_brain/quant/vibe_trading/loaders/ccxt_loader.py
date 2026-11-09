@@ -35,16 +35,19 @@ _INTERVAL_MAP = {
     "1D": "1d", "1d": "1d", "1W": "1w", "1w": "1w", "1M": "1M",
 }
 
+# Positional value + explicit unit string.  The keyword form
+# (``pd.Timedelta(minutes=1)``) reaches NumPy's deprecated "generic" timedelta
+# unit on pandas >= 2.3 with NumPy >= 2.5, so the explicit-unit form is used.
 _TIMEFRAME_DELTA = {
-    "1m": pd.Timedelta(minutes=1),
-    "5m": pd.Timedelta(minutes=5),
-    "15m": pd.Timedelta(minutes=15),
-    "30m": pd.Timedelta(minutes=30),
-    "1h": pd.Timedelta(hours=1),
-    "4h": pd.Timedelta(hours=4),
-    "1d": pd.Timedelta(days=1),
-    "1w": pd.Timedelta(weeks=1),
-    "1M": pd.Timedelta(days=31),
+    "1m": pd.Timedelta(1, "m"),
+    "5m": pd.Timedelta(5, "m"),
+    "15m": pd.Timedelta(15, "m"),
+    "30m": pd.Timedelta(30, "m"),
+    "1h": pd.Timedelta(1, "h"),
+    "4h": pd.Timedelta(4, "h"),
+    "1d": pd.Timedelta(1, "D"),
+    "1w": pd.Timedelta(1, "W"),
+    "1M": pd.Timedelta(31, "D"),
 }
 
 

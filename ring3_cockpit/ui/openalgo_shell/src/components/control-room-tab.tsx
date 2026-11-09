@@ -4,8 +4,10 @@ import {
   CheckCircle2,
   Cpu,
   DollarSign,
+  Gauge,
   KeyRound,
   Moon,
+  Network,
   Package,
   Save,
   ServerCog,
@@ -18,6 +20,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Progress } from '@/components/ui/progress'
 import {
   Select,
   SelectContent,
@@ -42,6 +45,9 @@ interface ControlRoomTabProps {
   onSaved: () => Promise<void>
 }
 
+/** Constitutional token ceiling (`sec_013`): $86.40/day -> $3.10/day. */
+const DAILY_TOKEN_BUDGET_USD = 3.1
+
 const VAULTS: { key: VaultKey; label: string; tag: string }[] = [
   { key: 'ReserveYield', label: 'Reserve Yield', tag: '15%' },
   { key: 'LongTermCompounder', label: 'Long-Term', tag: '35%' },
@@ -53,6 +59,8 @@ export function ControlRoomTab({ state, onSaved }: ControlRoomTabProps) {
   const silos = state ? Object.values(state.silos) : []
   return (
     <div className="space-y-4">
+      <ReleaseStatusPanel state={state} />
+
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
         <div className="space-y-4">
         <div>
@@ -131,6 +139,165 @@ export function ControlRoomTab({ state, onSaved }: ControlRoomTabProps) {
         extensions={state?.extensions ?? null}
         onSaved={onSaved}
       />
+    </div>
+  )
+}
+
+function ReleaseStatusPanel({ state }: { state: CockpitState | null }) {
+  const silos = state ? Object.values(state.silos) : []
+  const readyCount = silos.reduce((sum, silo) => sum + silo.ready_adapters.length, 0)
+  const probeCount = silos.reduce((sum, silo) => sum + silo.adapters.length, 0)
+  const allReady = probeCount > 0 && readyCount === probeCount
+
+  const spend = state?.llm.daily_spend_usd ?? 0
+  const cap = state?.llm.daily_spend_cap_usd ?? DAILY_TOKEN_BUDGET_USD
+  const utilization = cap > 0 ? Math.min(100, (spend / cap) * 100) : 0
+  const overBudget = spend > cap
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-2">
+      <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
+        <CardHeader className="px-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <Gauge className="size-4 text-primary" />
+              Token budget
+            </CardTitle>
+            <Badge
+              variant={overBudget ? 'destructive' : 'secondary'}
+              className="font-mono text-[9px]"
+            >
+              {overBudget ? 'CAP BREACHED' : `${utilization.toFixed(1)}% used`}
+            </Badge>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            The LLM never enters the microsecond loop. Paid cloud inference is metered
+            per call and hard-capped at the constitutional daily ceiling.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-3 px-4">
+          <div className="flex items-end justify-between gap-3">
+            <div>
+              <div className="font-mono text-2xl font-semibold tabular-nums text-foreground">
+                ${DAILY_TOKEN_BUDGET_USD.toFixed(2)}
+                <span className="ml-1 text-[11px] font-normal text-muted-foreground">
+                  / day ceiling
+                </span>
+              </div>
+              <div className="mt-1 text-[10px] text-muted-foreground">
+                from $86.40/day ·{' '}
+                <span className="font-mono text-emerald-300">−96.4%</span> ·{' '}
+                <span className="font-mono text-foreground">2,140×</span> faster ticks
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="font-mono text-sm font-semibold tabular-nums">
+                {formatUsd(spend, 2)}
+              </div>
+              <div className="text-[9px] uppercase tracking-wider text-muted-foreground">
+                spent today
+              </div>
+            </div>
+          </div>
+
+          <Progress
+            value={utilization}
+            className={`h-2 ${overBudget ? 'text-red-400' : ''}`}
+          />
+
+          <div className="grid grid-cols-2 gap-2 border-t border-border/60 pt-2">
+            <div className="text-[10px] text-muted-foreground">
+              System 1 ·{' '}
+              <span className="font-mono text-foreground">
+                {formatUsd(state?.llm.system1.daily_spend_cap_usd ?? 0, 2)}
+              </span>{' '}
+              cap
+            </div>
+            <div className="text-right text-[10px] text-muted-foreground">
+              System 2 ·{' '}
+              <span className="font-mono text-foreground">
+                {formatUsd(state?.llm.system2.daily_spend_cap_usd ?? 0, 2)}
+              </span>{' '}
+              cap
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
+        <CardHeader className="px-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <Network className="size-4 text-primary" />
+              Venue adapter readiness
+            </CardTitle>
+            <Badge
+              variant={allReady ? 'secondary' : 'destructive'}
+              className="font-mono text-[9px] tracking-wider"
+            >
+              {probeCount === 0
+                ? 'AWAITING PROBES'
+                : `${readyCount} / ${probeCount} READY`}
+            </Badge>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Every silo holds its own encrypted adapters. Ring 3 reads readiness only — it
+            never imports a broker module.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-2 px-4">
+          {silos.map((silo) => (
+            <div
+              key={silo.silo_id}
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/60 bg-muted/20 px-2 py-1.5"
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-[11px] font-medium">
+                  {silo.market}
+                  <Badge variant="outline" className="font-mono text-[8px]">
+                    {silo.silo_id}
+                  </Badge>
+                </div>
+                <div className="mt-0.5 flex flex-wrap gap-1">
+                  {silo.adapters.map((adapter) => (
+                    <span
+                      key={adapter.name}
+                      title={adapter.reason || adapter.status}
+                      className={`rounded border px-1 py-0.5 font-mono text-[8px] ${
+                        adapter.ready
+                          ? 'border-emerald-500/40 text-emerald-300'
+                          : 'border-border text-muted-foreground'
+                      }`}
+                    >
+                      {adapter.name}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <span
+                className={`font-mono text-[10px] tabular-nums ${
+                  silo.ready_adapters.length === silo.adapters.length
+                    ? 'text-emerald-300'
+                    : 'text-amber-300'
+                }`}
+              >
+                {silo.ready_adapters.length}/{silo.adapters.length}
+              </span>
+            </div>
+          ))}
+          {silos.length === 0 ? (
+            <div className="rounded-md border border-dashed border-border/70 px-2 py-4 text-center text-[10px] text-muted-foreground">
+              Waiting for the silo registry probe…
+            </div>
+          ) : null}
+          <div className="flex items-center gap-1.5 border-t border-border/60 pt-2 text-[10px] text-muted-foreground">
+            <ShieldCheck className="size-3" />
+            {allReady
+              ? 'All harvested venue adapters import cleanly across the four silos.'
+              : 'Unready adapters are quarantined; the affected silo cannot arm live.'}
+          </div>
+        </CardContent>
+      </Card>
     </div>
   )
 }

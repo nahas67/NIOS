@@ -1,29 +1,20 @@
-# -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
-#  https://nautechsystems.io
-#
-#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-#  You may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-# -------------------------------------------------------------------------------------------------
-"""
-Integration adapter for the Binance exchange.
+"""Binance adapter for Ring 1 (NIOS compatibility build).
+
+Harvested from ``nautilus_trader.adapters.binance``.  The upstream module
+imports ``nautilus_trader._fixup`` and ``nautilus_trader._libnautilus.binance``,
+neither of which exists in nautilus_trader 1.231.0, and both of which are
+unavailable on hosts where the compiled extensions are policy-blocked.  The
+public surface is preserved here through
+:mod:`ring1_spinal.nautilus_adapters._nautilus_compat`.
+
+This module is import-safe, allocation-free at import time and carries no
+credentials.  It only describes and formats Binance orders; Ring 0 signs and
+sends them.
 """
 
 from __future__ import annotations
 
-from nautilus_trader._fixup import fixup_module_names
-from nautilus_trader._libnautilus.binance import *  # noqa: F403 (undefined-local-with-import-star)
-from nautilus_trader.adapters.binance.instruments import (
-    load_binance_instruments as load_binance_instruments,
-)
-
+from .._nautilus_compat import adapter_exports
 
 __all__ = [
     "BINANCE",
@@ -54,5 +45,9 @@ __all__ = [
     "load_binance_order_book_deltas",
 ]
 
-fixup_module_names(globals(), __name__)
-del fixup_module_names
+globals().update(adapter_exports("binance", __all__))
+
+#: Ring 1 venue metadata used by ``ring0_vault.silos.silo_registry``.
+VENUE = "BINANCE"
+SILO = "CRYPTO_BINANCE"
+SUPPORTS_POST_ONLY = True

@@ -778,17 +778,20 @@ def test_cpu_affinity_pinning_and_restore():
 
 def test_nautilus_adapter_status_is_honest():
     status = nautilus_adapter_status()
-    assert status["harvested_count"] == 4
-    assert status["total"] == 4
+    assert status["harvested_count"] == 5
+    assert status["total"] == 5
     assert set(status["adapters"]) == {
         "binance",
         "okx",
         "bybit",
         "interactive_brokers",
+        "alpaca",
     }
     for entry in status["adapters"].values():
         assert entry["harvested"] is True
-        # Importability depends on nautilus_trader; if it failed we must say why.
-        if not entry["importable"]:
-            assert entry["reason"]
-    assert "alpaca" in status["gaps"]
+        # Phase 2 -- Step 2 activated every adapter through _nautilus_compat, so
+        # importability no longer depends on the upstream C extensions loading.
+        assert entry["importable"] is True, entry["reason"]
+        assert entry["reason"] == ""
+    assert status["importable_count"] == status["total"] == 5
+    assert status["gaps"] == {}

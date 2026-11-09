@@ -222,6 +222,9 @@ class System2InvestmentCommittee:
         tax_bps: float = 1.5,
         cold_start_q98_bps: float = 10.0,
         debate_rounds: int = 2,
+        transport_pool: Any | None = None,
+        token_ledger: Any | None = None,
+        reasoning_effort: str = "high",
     ) -> None:
         if float(nav) <= 0.0:
             raise ValueError("nav must be positive")
@@ -237,6 +240,13 @@ class System2InvestmentCommittee:
         self.tax_bps = float(tax_bps)
         self.cold_start_q98_bps = float(cold_start_q98_bps)
         self.debate_rounds = int(debate_rounds)
+        self.transport_pool = transport_pool
+        self.token_ledger = (
+            token_ledger
+            if token_ledger is not None
+            else getattr(transport_pool, "ledger", None)
+        )
+        self.reasoning_effort = str(reasoning_effort)
         self.donor = donor_committee_status()
 
     # -- public API -------------------------------------------------------
@@ -392,6 +402,54 @@ class System2InvestmentCommittee:
                 )
             )
         return outcomes
+
+    # -- System 2 LLM transport ------------------------------------------
+    def route_system2(
+        self,
+        prompt: str,
+        *,
+        reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
+    ) -> Any:
+        """Route a deliberative turn across DeepSeek -> Claude -> OpenRouter.
+
+        The grounding gate still owns every number: this method returns prose,
+        never an executable claim.  When no transport is wired (the default
+        deterministic committee) it returns a zero-cost local placeholder.
+        """
+        if self.transport_pool is None:
+            if self.token_ledger is not None:
+                self.token_ledger.set_active(2, "deterministic-local")
+            return {
+                "provider": "deterministic-local",
+                "model": "nios-native-committee",
+                "system": 2,
+                "text": "",
+                "usd_cost": 0.0,
+                "used_fallback": True,
+                "reasoning_effort": str(reasoning_effort or self.reasoning_effort),
+            }
+        completion = self.transport_pool.complete_system2(
+            prompt,
+            reasoning_effort=reasoning_effort or self.reasoning_effort,
+            max_tokens=max_tokens,
+        )
+        if hasattr(completion, "to_dict"):
+            payload = completion.to_dict()
+            payload["used_fallback"] = completion.provider == "deterministic-local"
+            return payload
+        return completion
+
+    def llm_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "reasoning_effort": self.reasoning_effort,
+            "transport_wired": self.transport_pool is not None,
+        }
+        if self.transport_pool is not None:
+            state["transport"] = self.transport_pool.status()
+        if self.token_ledger is not None:
+            state["budget"] = self.token_ledger.snapshot()
+        return state
 
     # -- derived numbers --------------------------------------------------
     def _derive_metrics(

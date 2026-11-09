@@ -4,6 +4,7 @@ import type {
   ExtensionsActionResponse,
   ExtensionsControlPayload,
   ExtensionsState,
+  FormalProofState,
   KillReport,
   LLMControlPayload,
 } from '@/types'
@@ -49,6 +50,19 @@ export function streamUrl(): string {
 
 export function fetchState(): Promise<CockpitState> {
   return request<CockpitState>('/api/v2/cockpit/state')
+}
+
+/**
+ * Phase 2 Step 4 telemetry: the four TLA+ state-space proofs, the deterministic
+ * 1,000-step VOPR campaign, the TigerBeetle/PostgreSQL backends and the
+ * TacticalSwing options tail-hedger.
+ *
+ * `refresh` re-runs the exhaustive BFS and the VOPR campaign server-side; without
+ * it the gateway replays its cached result so the 5 s hydration poll stays cheap.
+ */
+export function fetchFormalProofs(refresh = false): Promise<FormalProofState> {
+  const query = refresh ? '?refresh=true' : ''
+  return request<FormalProofState>(`/api/v2/cockpit/formal-proofs${query}`)
 }
 
 export function postBroker(payload: BrokerControlPayload): Promise<unknown> {

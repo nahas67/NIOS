@@ -316,6 +316,12 @@ class ControlPlane:
         plugins: Any = None,
         skills: Any = None,
         mcp_bridge: Any = None,
+        token_ledger: Any = None,
+        llm_transport: Any = None,
+        formal_verifier: Any = None,
+        vopr_simulator: Any = None,
+        tb_pg_provisioner: Any = None,
+        tail_hedger: Any = None,
     ) -> None:
         self.ledger = ledger
         self.firewall = firewall
@@ -338,6 +344,21 @@ class ControlPlane:
         self.scanner = scanner
         self.shadow_twin = shadow_twin
         self.cascade_runner = cascade_runner
+        self.llm_transport = llm_transport
+        self.formal_verifier = formal_verifier
+        self.vopr_simulator = vopr_simulator
+        self.tb_pg_provisioner = tb_pg_provisioner
+        self.tail_hedger = tail_hedger
+        self._formal_cache: dict[str, Any] | None = None
+        if token_ledger is not None:
+            self.token_ledger = token_ledger
+        else:
+            try:
+                from core.llm_transport import TokenBudgetLedger
+
+                self.token_ledger = TokenBudgetLedger(daily_usd_cap=self.llm_budget_usd)
+            except Exception:  # pragma: no cover - Ring 2 optional in isolation
+                self.token_ledger = None
 
         self._llm: dict[str, _LLMSlot] = {
             "1": _LLMSlot(
@@ -581,10 +602,50 @@ class ControlPlane:
 
     def _llm_state(self) -> dict[str, Any]:
         total_spend = sum(slot.spend_usd for slot in self._llm.values())
+        ledger = (
+            self.token_ledger.snapshot()
+            if self.token_ledger is not None
+            else {}
+        )
+        transport = (
+            self.llm_transport.status()
+            if self.llm_transport is not None
+            else {}
+        )
         return {
             "daily_spend_cap_usd": self.llm_budget_usd,
-            "daily_spend_usd": round(total_spend, 6),
-            "budget_remaining_usd": round(max(0.0, self.llm_budget_usd - total_spend), 6),
+            "daily_cap_usd": ledger.get("daily_cap_usd", self.llm_budget_usd),
+            "daily_spend_usd": ledger.get(
+                "daily_spend_usd", round(total_spend, 6)
+            ),
+            "budget_remaining_usd": ledger.get(
+                "budget_remaining_usd",
+                round(max(0.0, self.llm_budget_usd - total_spend), 6),
+            ),
+            "baseline_usd_per_day": ledger.get("baseline_usd_per_day"),
+            "cost_reduction_pct": ledger.get("cost_reduction_pct", 0.0),
+            "realized_cost_reduction_pct": ledger.get(
+                "realized_cost_reduction_pct", 0.0
+            ),
+            "active_system1_provider": ledger.get(
+                "active_system1_provider", self._llm["1"].provider
+            ),
+            "active_system2_provider": ledger.get(
+                "active_system2_provider", self._llm["2"].provider
+            ),
+            "demoted_providers": ledger.get("demoted_providers", []),
+            "demotion_reasons": ledger.get("demotion_reasons", {}),
+            "locked": ledger.get("locked", False),
+            "locked_reason": ledger.get("locked_reason", ""),
+            "locked_providers": ledger.get("locked_providers", []),
+            "calls": ledger.get("calls", 0),
+            "prompt_tokens": ledger.get("prompt_tokens", 0),
+            "completion_tokens": ledger.get("completion_tokens", 0),
+            "total_tokens": ledger.get("total_tokens", 0),
+            "system_spend_usd": ledger.get("system_spend_usd", {}),
+            "system_tokens": ledger.get("system_tokens", {}),
+            "by_provider": ledger.get("by_provider", {}),
+            "transport": transport,
             "write_only_credentials": True,
             "system1": self._llm["1"].to_dict(),
             "system2": self._llm["2"].to_dict(),
@@ -707,6 +768,70 @@ class ControlPlane:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         raise HTTPException(status_code=400, detail=f"unsupported target {target!r}")
 
+    def formal_proofs(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Live status of the four TLA+ proofs, VOPR, backends and hedger.
+
+        The heavy campaigns are cached after the first invocation so the 60 FPS
+        SSE loop and the hydration snapshot stay inexpensive.  ``refresh=True``
+        re-runs all four state-space explorations and the 1,000-step VOPR.
+        """
+
+        if self._formal_cache is not None and not refresh:
+            return self._formal_cache
+
+        formal: dict[str, Any] | None = None
+        if self.formal_verifier is not None:
+            formal = self.formal_verifier.run(refresh=refresh)
+        elif self.vopr_simulator is not None:
+            formal = {
+                "tla": None,
+                "vopr": self.vopr_simulator.run_campaign(refresh=refresh).to_dict(),
+                "ok": False,
+            }
+
+        if self.tb_pg_provisioner is None:
+            from ring0_vault.ibor.tb_pg_provisioner import TigerBeetlePG16Provisioner
+
+            self.tb_pg_provisioner = TigerBeetlePG16Provisioner()
+        backend = self.tb_pg_provisioner.status(refresh=refresh)
+        hedger = self.tail_hedger.status() if self.tail_hedger is not None else None
+
+        tla = formal.get("tla") if formal else None
+        vopr = formal.get("vopr") if formal else None
+        counterexamples = int((tla or {}).get("total_counterexamples", 0))
+        states = int((tla or {}).get("total_states", 0))
+        payload = {
+            "kind": "nios_phase2_step4_formal_proofs",
+            "tla": tla,
+            "vopr": vopr,
+            "tigerbeetle": backend.get("tigerbeetle"),
+            "postgres": backend.get("postgres"),
+            "tail_hedger": hedger,
+            "summary": {
+                "states_explored": states,
+                "counterexamples": counterexamples,
+                "tla_ok": bool((tla or {}).get("ok", False)),
+                "vopr_ok": bool((vopr or {}).get("ok", False)),
+                "tigerbeetle_ready": bool(
+                    (backend.get("tigerbeetle") or {}).get("ready", False)
+                ),
+                "postgres_ready": bool(
+                    (backend.get("postgres") or {}).get("ready", False)
+                ),
+                "tail_hedger_ready": hedger is not None,
+            },
+            "ok": bool(
+                (tla or {}).get("ok", False)
+                and (vopr or {}).get("ok", False)
+                and (backend.get("tigerbeetle") or {}).get("ready", False)
+                and (backend.get("postgres") or {}).get("ready", False)
+                and hedger is not None
+            ),
+            "checked_at_ns": time.time_ns(),
+        }
+        self._formal_cache = payload
+        return payload
+
     def state(self) -> dict[str, Any]:
         silos = {
             silo_id: {
@@ -727,6 +852,7 @@ class ControlPlane:
             "cards": self.recent_cards(limit=20),
             "kill_switch": self._kill_report,
             "extensions": self._extensions_state(),
+            "formal_proofs": self.formal_proofs(),
             "streams": {
                 "cockpit": STREAM_RING3_COCKPIT,
                 "fps": 60,
@@ -853,6 +979,11 @@ class ControlPlane:
         if request.daily_spend_cap_usd is not None:
             slot.daily_spend_cap_usd = float(request.daily_spend_cap_usd)
             updated.append("daily_spend_cap_usd")
+            if self.token_ledger is not None and hasattr(
+                self.token_ledger, "set_daily_cap"
+            ):
+                self.token_ledger.set_daily_cap(float(request.daily_spend_cap_usd))
+                updated.append("daily_cap_usd")
 
         if request.api_key is not None:
             raw = request.api_key.get_secret_value()
@@ -873,6 +1004,11 @@ class ControlPlane:
             "updated": updated,
             "system": int(slot_key),
             "config": slot.to_dict(),
+            "budget": (
+                self.token_ledger.snapshot()
+                if self.token_ledger is not None
+                else None
+            ),
             "write_only_credentials": True,
             "zero_restart": True,
         }
@@ -880,6 +1016,15 @@ class ControlPlane:
     def record_llm_spend(self, usd: float, *, system: int | str = 1) -> None:
         slot = self._llm[str(system)]
         slot.spend_usd = max(0.0, slot.spend_usd + float(usd))
+        if self.token_ledger is not None:
+            self.token_ledger.record(
+                system=int(str(system)),
+                provider=slot.provider,
+                model=slot.model,
+                prompt_tokens=0,
+                completion_tokens=0,
+                usd_cost=max(0.0, float(usd)),
+            )
 
     def kill(self, request: KillSwitchRequest) -> dict[str, Any]:
         """Preempt Ring 1 + Ring 0 in ``< 1.0 ms`` and flatten ADR-009.
@@ -1160,6 +1305,10 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.get("/api/v2/cockpit/state")
     def state() -> dict[str, Any]:
         return control.state()
+
+    @app.get("/api/v2/cockpit/formal-proofs")
+    def formal_proofs(refresh: bool = Query(False)) -> dict[str, Any]:
+        return control.formal_proofs(refresh=refresh)
 
     @app.get("/api/v2/cockpit/stream")
     async def stream(

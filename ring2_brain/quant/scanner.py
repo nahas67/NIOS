@@ -1122,16 +1122,27 @@ class ValuationLab:
             "quantlib.valuation.comps": "ring2_brain.quant.vibe_trading.quantlib.valuation.comps",
             "quantlib.valuation.threestatement": "ring2_brain.quant.vibe_trading.quantlib.valuation.threestatement",
             "trading_r1.compute": "ring2_brain.quant.trading_r1.compute",
+            "factors.alpha101": "ring2_brain.quant.vibe_trading.factors.zoo.alpha101.alpha_001",
+            "factors.gtja191": "ring2_brain.quant.vibe_trading.factors.zoo.gtja191.alpha_001",
+            "factors.qlib158": "ring2_brain.quant.vibe_trading.factors.zoo.qlib158.beta10",
+            "factors.fundamental": "ring2_brain.quant.vibe_trading.factors.zoo.fundamental.accruals",
+            "factors.academic": "ring2_brain.quant.vibe_trading.factors.zoo.academic.bab",
         }
         report: dict[str, Any] = {}
+        active = 0
         for label, module in targets.items():
             entry = {"module": module, "importable": False, "reason": ""}
             try:
                 importlib.import_module(module)
                 entry["importable"] = True
+                active += 1
             except Exception as exc:
                 entry["reason"] = f"{type(exc).__name__}: {exc}"
             report[label] = entry
+        total = len(targets)
+        report["active"] = active
+        report["total"] = total
+        report["percent"] = round(100.0 * active / total, 1) if total else 0.0
         return report
 
     def donor_status(self) -> dict[str, Any]:
