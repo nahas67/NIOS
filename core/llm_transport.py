@@ -48,6 +48,9 @@ __all__ = [
     "DEFAULT_DAILY_USD_CAP",
     "HARD_TIMEOUT_MS",
     "LOCAL_PROVIDERS",
+    "LLM_PROBE_FALLBACK",
+    "LLM_PROBE_LOCAL_LIVE",
+    "OLLAMA_TAGS_PATH",
     "PAID_PROVIDERS",
     "BudgetExceeded",
     "LLMCompletion",
@@ -61,6 +64,7 @@ __all__ = [
     "TokenBudgetLedger",
     "default_provider_specs",
     "parse_instinct_response",
+    "probe_llm_endpoints",
     "reasoning_budget_tokens",
 ]
 
@@ -1273,3 +1277,216 @@ def _percentile(ordered: Sequence[float], q: float) -> float:
     high = min(low + 1, len(ordered) - 1)
     fraction = position - low
     return float(ordered[low]) + (float(ordered[high]) - float(ordered[low])) * fraction
+
+
+# ---------------------------------------------------------------------------
+# Live local Ollama / LLM probe (``sec_016`` 250 ms hard timeout)
+# ---------------------------------------------------------------------------
+
+#: The local System 1 endpoint answered inside budget.
+LLM_PROBE_LOCAL_LIVE = "LOCAL_OLLAMA_LIVE"
+#: The local endpoint did not answer: System 1 abstains deterministically and
+#: spends zero tokens (``sec_018`` Law 2).
+LLM_PROBE_FALLBACK = "DETERMINISTIC_INSTINCT_FALLBACK"
+
+#: Default local Ollama tag listing endpoint.
+OLLAMA_TAGS_PATH = "/api/tags"
+
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
+
+def _is_local_url(url: str) -> bool:
+    """True when ``url`` points at this host (no outbound network at all)."""
+
+    try:
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(str(url)).hostname or "").strip().lower()
+    except Exception:  # pragma: no cover - malformed URL
+        return False
+    return host in _LOCAL_HOSTS
+
+
+def _probe_http_json(url: str, timeout_s: float) -> Any:
+    """Blocking JSON GET with a hard socket timeout (stdlib only)."""
+
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(url, headers={"User-Agent": "nios-llm-probe/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            body = response.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+        raise ProviderUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError as exc:
+        raise ProviderUnavailable("non-JSON probe response") from exc
+
+
+def _discovered_models(payload: Any) -> list[dict[str, Any]]:
+    """Normalise Ollama ``/api/tags`` (or an OpenAI ``/models``) body."""
+
+    if not isinstance(payload, Mapping):
+        return []
+    rows = payload.get("models")
+    if rows is None:
+        rows = payload.get("data")
+    if not isinstance(rows, Iterable) or isinstance(rows, (str, bytes)):
+        return []
+    models: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("name") or row.get("model") or row.get("id") or "").strip()
+        if not name:
+            continue
+        details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
+        models.append(
+            {
+                "name": name,
+                "size_bytes": int(row.get("size") or 0),
+                "parameter_size": str(details.get("parameter_size") or ""),
+                "quantization": str(details.get("quantization_level") or ""),
+            }
+        )
+    return sorted(models, key=lambda item: item["name"])
+
+
+def _probe_one(
+    fetcher: Callable[[str, float], Any],
+    url: str,
+    *,
+    hard_timeout_ms: float,
+    clock: Callable[[], float],
+) -> dict[str, Any]:
+    budget_s = max(0.001, float(hard_timeout_ms) / 1000.0)
+    started = clock()
+    try:
+        payload = fetcher(url, budget_s)
+    except Exception as exc:  # noqa: BLE001 - a probe never raises
+        elapsed_ms = round((clock() - started) * 1e3, 3)
+        return {
+            "url": url,
+            "reachable": False,
+            "latency_ms": elapsed_ms,
+            "within_budget": False,
+            "models": [],
+            "model_count": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    elapsed_ms = round((clock() - started) * 1e3, 3)
+    models = _discovered_models(payload)
+    return {
+        "url": url,
+        "reachable": True,
+        "latency_ms": elapsed_ms,
+        "within_budget": elapsed_ms <= float(hard_timeout_ms),
+        "models": models,
+        "model_count": len(models),
+        "error": "",
+    }
+
+
+def probe_llm_endpoints(
+    *,
+    system1: Mapping[str, Any] | None = None,
+    system2: Mapping[str, Any] | None = None,
+    hard_timeout_ms: float = HARD_TIMEOUT_MS,
+    fetcher: Callable[[str, float], Any] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+    now_ns: int | None = None,
+) -> dict[str, Any]:
+    """Ping the configured System 1 / System 2 endpoints inside 250 ms.
+
+    The probe is deliberately cheap and side-effect free: it lists the local
+    Ollama tags (or the remote ``/models`` surface), measures wall-clock latency
+    and then decides the System 1 status.  A slow or absent local model engages
+    ``DETERMINISTIC_INSTINCT_FALLBACK`` — Ring 1 then abstains on a dead-man
+    lease and burns **zero** LLM tokens rather than waiting on a timeout inside
+    the hot path (``sec_018`` Law 2).
+    """
+
+    fetch = fetcher or _probe_http_json
+    cap = float(hard_timeout_ms)
+    started = clock()
+
+    slot1: Mapping[str, Any] = dict(system1 or {})
+    slot2: Mapping[str, Any] = dict(system2 or {})
+    provider1 = str(slot1.get("provider") or "ollama").strip().lower()
+    provider2 = str(slot2.get("provider") or "").strip().lower()
+    base1 = str(slot1.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
+    base2 = str(slot2.get("base_url") or "").rstrip("/")
+
+    ollama_style = provider1 in {"ollama", "local", "deterministic-local"} or _is_local_url(
+        base1
+    )
+    url1 = base1 + OLLAMA_TAGS_PATH if ollama_style and base1 else base1
+    probe1 = _probe_one(fetch, url1, hard_timeout_ms=cap, clock=clock)
+
+    if ollama_style:
+        local_live = bool(probe1["reachable"] and probe1["within_budget"])
+    else:
+        # A non-Ollama System 1 still gets a reachability reading, but only a
+        # live local daemon can satisfy the LOCAL_OLLAMA_LIVE contract.
+        local_live = False
+
+    probe2: dict[str, Any] | None = None
+    if base2:
+        url2 = base2 + (OLLAMA_TAGS_PATH if _is_local_url(base2) else "")
+        probe2 = _probe_one(fetch, url2, hard_timeout_ms=cap, clock=clock)
+
+    elapsed_ms = round((clock() - started) * 1e3, 3)
+    status = LLM_PROBE_LOCAL_LIVE if local_live else LLM_PROBE_FALLBACK
+    within_budget = bool(probe1["within_budget"]) and (
+        probe2 is None or bool(probe2["within_budget"])
+    )
+
+    return {
+        "status": status,
+        "local_ollama_live": local_live,
+        "fallback_active": not local_live,
+        "fallback_mode": LLM_PROBE_FALLBACK,
+        "fallback_reason": (
+            ""
+            if local_live
+            else (
+                probe1.get("error")
+                or (
+                    f"probe {probe1['latency_ms']}ms > {cap:.0f}ms hard cap"
+                    if probe1["reachable"]
+                    else "local endpoint unreachable"
+                )
+            )
+        ),
+        "hard_timeout_ms": cap,
+        "within_budget": within_budget,
+        "circuit_breaker": {
+            "hard_timeout_ms": cap,
+            "tripped": not local_live,
+            "zero_tokens_on_fallback": True,
+        },
+        "models": list(probe1["models"]),
+        "model_count": int(probe1["model_count"]),
+        "system1": {
+            "provider": provider1,
+            "model": str(slot1.get("model") or ""),
+            "base_url": base1,
+            "local": _is_local_url(base1),
+            **probe1,
+        },
+        "system2": (
+            {
+                "provider": provider2,
+                "model": str(slot2.get("model") or ""),
+                "base_url": base2,
+                "local": _is_local_url(base2),
+                **probe2,
+            }
+            if probe2 is not None
+            else None
+        ),
+        "elapsed_ms": elapsed_ms,
+        "probed_at_ns": int(now_ns if now_ns is not None else time.time_ns()),
+    }

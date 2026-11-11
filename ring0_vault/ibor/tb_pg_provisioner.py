@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -510,6 +511,173 @@ class TigerBeetleReplicaManager:
             amount_micros=int(amount_micros),
             code=int(code),
         )
+
+    # -- live replica lifecycle (Phase 3 / sec_009) -------------------------
+
+    def format_and_start_live_replica(
+        self,
+        data_dir: str | Path | None = None,
+        port: int = 3000,
+        *,
+        force: bool = False,
+        health_timeout_s: float = 3.0,
+        host: str = "127.0.0.1",
+    ) -> dict[str, Any]:
+        """Format ``<cluster>_<replica>.tigerbeetle`` and start a live replica.
+
+        The real ``tigerbeetle format`` / ``tigerbeetle start`` CLI is used
+        whenever the binary is executable, so the artifact is a genuine
+        TigerBeetle data file (``emulated=False``).  When host policy blocks
+        execution the deterministic emulated artifact is written instead and
+        ``started`` stays ``False``; callers then fall back to the in-process
+        SQLite ACID journal.  The method never raises and never hangs: the TCP
+        health probe is bounded by ``health_timeout_s``.
+        """
+
+        if data_dir is not None:
+            directory = Path(data_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            self.replica_path = directory / f"{self.cluster}_{self.replica}.tigerbeetle"
+            self._format = None
+
+        fmt = format_replica(
+            self.replica_path,
+            cluster=self.cluster,
+            replica=self.replica,
+            replica_count=self.replica_count,
+            force=force,
+            binary=self.probe,
+        )
+        self._format = fmt
+        self.addresses = f"{host}:{int(port)}"
+
+        if fmt.emulated or not self.probe.executable:
+            return {
+                "formatted": True,
+                "data_file": str(self.replica_path),
+                "size_bytes": fmt.size_bytes,
+                "emulated": True,
+                "executable": bool(self.probe.executable),
+                "started": False,
+                "healthy": False,
+                "port": int(port),
+                "addresses": self.addresses,
+                "pid": None,
+                "journal": "sqlite-acid-journal",
+                "message": fmt.message,
+            }
+
+        start = self.start()
+        healthy = False
+        listener: dict[str, Any] = {}
+        if start.get("started"):
+            healthy, listener = self._probe_listener(host, int(port), health_timeout_s)
+        return {
+            "formatted": True,
+            "data_file": str(self.replica_path),
+            "size_bytes": fmt.size_bytes,
+            "emulated": False,
+            "executable": True,
+            "started": bool(start.get("started")) and self.running,
+            "healthy": healthy,
+            "port": int(port),
+            "addresses": self.addresses,
+            "pid": start.get("pid"),
+            "journal": "tigerbeetle-live+sqlite-acid-journal",
+            "message": (
+                "live replica listening"
+                if healthy
+                else fmt.message if not start.get("started") else "live replica started, listener not yet accepting"
+            ),
+            "listener": listener,
+        }
+
+    def _probe_listener(
+        self,
+        host: str,
+        port: int,
+        timeout_s: float,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Poll a bounded TCP connect on the replica address (no fixed sleep)."""
+
+        deadline = time.monotonic() + max(0.05, float(timeout_s))
+        attempts = 0
+        last_error = ""
+        while True:
+            attempts += 1
+            if not self.running:
+                last_error = "process exited before the listener accepted"
+                break
+            try:
+                with socket.create_connection((host, port), timeout=0.2):
+                    return True, {"attempts": attempts, "host": host, "port": port}
+            except OSError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        return False, {"attempts": attempts, "host": host, "port": port, "error": last_error}
+
+    def live_replica_status(self) -> dict[str, Any]:
+        """Compact live-replica descriptor for the cockpit / health surface."""
+
+        body = self.health()
+        body["addresses"] = self.addresses
+        body["live_transfers"] = bool(self.running and self._client is not None)
+        return body
+
+    def commit_two_phase_live(
+        self,
+        *,
+        silo: str,
+        debit: str,
+        credit: str,
+        amount_micros: int,
+        code: int = 1,
+    ) -> dict[str, Any]:
+        """Run pending -> post against the live replica, reporting the backend.
+
+        A ``None`` from :meth:`two_phase_transfer` is not an error: it means the
+        caller must rely on the in-process ACID journal instead.
+        """
+
+        pending = self.two_phase_transfer(
+            silo=silo,
+            debit=debit,
+            credit=credit,
+            amount_micros=amount_micros,
+            code=code,
+        )
+        if pending is None:
+            return {
+                "backend": "sqlite-acid-journal",
+                "live": False,
+                "silo": silo,
+                "debit": debit,
+                "credit": credit,
+                "amount_micros": int(amount_micros),
+            }
+        poster = getattr(self._client, "post_pending_transfer", None)
+        transfer_id = getattr(pending, "id", None) or (
+            pending.get("id") if isinstance(pending, dict) else None
+        )
+        posted = poster(transfer_id) if (poster is not None and transfer_id is not None) else None
+        return {
+            "backend": "tigerbeetle-live",
+            "live": True,
+            "silo": silo,
+            "debit": debit,
+            "credit": credit,
+            "amount_micros": int(amount_micros),
+            "pending": pending,
+            "posted": posted,
+        }
+
+    def teardown(self) -> None:
+        """Stop the daemon and release the client handle."""
+
+        self._client = None
+        self.stop()
 
 
 # ---------------------------------------------------------------------------

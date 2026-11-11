@@ -1,11 +1,14 @@
 import { useState } from 'react'
 import {
   AlertTriangle,
+  Boxes,
   BrainCircuit,
   CheckCircle2,
   Clock3,
+  Cpu,
   Fingerprint,
   GitBranch,
+  HeartPulse,
   RefreshCw,
   ShieldCheck,
   ShieldQuestion,
@@ -30,8 +33,10 @@ import { formatBps, formatPct, truncateDigest } from '@/lib/format'
 import type {
   CockpitState,
   ContagionState,
+  FeedState,
   FormalProofState,
   LeaseRow,
+  RingProcessesState,
   TailHedgerState,
 } from '@/types'
 
@@ -61,6 +66,8 @@ export function BrainXrayTab({ state }: BrainXrayTabProps) {
   return (
     <div className="space-y-4">
       <FormalVerificationBanner formal={formal} onRefreshed={setProofs} />
+
+      <RingProcessMatrix rings={state?.ring_processes ?? null} feed={state?.feed ?? null} />
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
         <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
@@ -187,6 +194,201 @@ export function BrainXrayTab({ state }: BrainXrayTabProps) {
 
       <TailHedgerCard hedger={formal?.tail_hedger ?? null} />
     </div>
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 2 · 4-ring OS process isolation matrix
+ * ------------------------------------------------------------------ */
+
+const RING_ROWS: { worker: string; ring: string; role: string }[] = [
+  {
+    worker: 'ring0-vault-worker',
+    ring: 'Ring 0',
+    role: 'Sovereign vault · signer · IBOR · outbox',
+  },
+  {
+    worker: 'ring1-spinal-worker',
+    ring: 'Ring 1',
+    role: '0.14 ms scalper · breaker · shadow twin',
+  },
+  {
+    worker: 'ring2-brain-worker',
+    ring: 'Ring 2',
+    role: 'System 1 lease · contagion · factor scan',
+  },
+  {
+    worker: 'ring3-cockpit-gateway',
+    ring: 'Ring 3',
+    role: 'Kill switch · rearm · control plane',
+  },
+]
+
+const HEARTBEAT_STALE_MS = 5_000
+
+function RingProcessMatrix({
+  rings,
+  feed,
+}: {
+  rings: RingProcessesState | null
+  feed: FeedState | null
+}) {
+  const available = Boolean(rings?.available)
+  const byWorker = new Map(
+    (rings?.rings ?? []).map((ring) => [ring.worker, ring] as const)
+  )
+  const feedMode = feed?.feed_mode ?? 'PAPER_AUTOPILOT'
+  const liveFeed = feedMode === 'LIVE_PUBLIC_DUAL_VENDOR'
+  const siloModes = feed?.silo_modes ?? {}
+  const lastCycle = feed?.last_cycle
+
+  return (
+    <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
+      <CardHeader className="px-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Boxes className="size-4 text-primary" />
+            4-Ring OS Process Isolation Matrix
+          </CardTitle>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge
+              variant={available ? 'secondary' : 'outline'}
+              className="font-mono text-[9px] tracking-wider"
+            >
+              {available
+                ? `${rings?.distinct_os_processes ?? 0} DISTINCT OS PROCESSES`
+                : 'SINGLE-PROCESS MODE'}
+            </Badge>
+            <Badge
+              variant="outline"
+              className={`font-mono text-[9px] ${
+                liveFeed
+                  ? 'border-emerald-500/40 text-emerald-300'
+                  : 'text-muted-foreground'
+              }`}
+            >
+              {liveFeed ? 'LIVE DUAL-VENDOR' : 'PAPER AUTOPILOT'}
+            </Badge>
+            <Badge variant="outline" className="font-mono text-[9px]">
+              SHM SeqLock heartbeat
+            </Badge>
+          </div>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Four physically separate OS processes share nothing but the lock-free
+          shared-memory spine. Ring 2 has no broker key and Ring 1 has no LLM
+          client, so the air-gap is enforced by the kernel, not by prompt text.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3 px-4">
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          {RING_ROWS.map((row) => {
+            const ring = byWorker.get(row.worker)
+            const alive = Boolean(ring?.alive)
+            const beatAge = ring?.heartbeat_age_ms
+            const stale =
+              beatAge !== null && beatAge !== undefined && beatAge > HEARTBEAT_STALE_MS
+            return (
+              <div
+                key={row.worker}
+                className={`rounded-md border px-3 py-2 ${
+                  !available
+                    ? 'border-dashed border-border/60 bg-muted/10'
+                    : alive && !stale
+                      ? 'border-emerald-500/35 bg-emerald-500/[0.05]'
+                      : 'border-amber-500/40 bg-amber-500/[0.05]'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    <Cpu className="size-3" />
+                    {row.ring}
+                  </span>
+                  <Badge
+                    variant={alive && !stale ? 'secondary' : 'outline'}
+                    className={`text-[8px] tracking-wider ${
+                      !available
+                        ? 'text-muted-foreground'
+                        : alive && !stale
+                          ? 'text-emerald-300'
+                          : 'text-amber-300'
+                    }`}
+                  >
+                    {!available ? 'NOT ATTACHED' : alive ? (stale ? 'STALE' : 'ALIVE') : 'DOWN'}
+                  </Badge>
+                </div>
+                <div className="mt-1 truncate font-mono text-[10px] text-foreground">
+                  {row.worker}
+                </div>
+                <div className="mt-1 flex items-baseline justify-between gap-2">
+                  <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+                    PID{' '}
+                    <span className="text-foreground">{ring?.pid ?? '—'}</span>
+                  </span>
+                  <span className="flex items-center gap-1 font-mono text-[10px] tabular-nums text-muted-foreground">
+                    <HeartPulse
+                      className={`size-3 ${
+                        stale ? 'text-amber-300' : alive ? 'text-emerald-300' : 'text-muted-foreground'
+                      }`}
+                    />
+                    {beatAge === null || beatAge === undefined
+                      ? '—'
+                      : `${beatAge.toFixed(1)} ms`}
+                  </span>
+                </div>
+                <div className="mt-1 truncate text-[9px] text-muted-foreground">
+                  {row.role}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        {!available ? (
+          <div className="rounded-md border border-dashed border-border/60 bg-muted/10 px-3 py-2 text-[10px] text-muted-foreground">
+            Supervisor not attached: {rings?.reason ?? 'single-process mode'}. Launch
+            with <span className="font-mono">python scripts/run_nios.py --multiprocess</span>{' '}
+            to prove four distinct PIDs.
+          </div>
+        ) : null}
+
+        <div className="grid gap-2 sm:grid-cols-4">
+          {Object.entries(siloModes).length === 0 ? (
+            <div className="sm:col-span-4 rounded-md border border-border/60 bg-background/40 px-3 py-2 text-[10px] text-muted-foreground">
+              No live dual-vendor cycle yet — toggle the feed switch in the top bar.
+            </div>
+          ) : (
+            Object.entries(siloModes).map(([silo, mode]) => (
+              <div
+                key={silo}
+                className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5"
+              >
+                <div className="truncate text-[9px] uppercase tracking-wider text-muted-foreground">
+                  {silo}
+                </div>
+                <div
+                  className={`font-mono text-[10px] ${
+                    mode === 'LIVE_PUBLIC_DUAL_VENDOR'
+                      ? 'text-emerald-300'
+                      : 'text-amber-300'
+                  }`}
+                >
+                  {mode === 'LIVE_PUBLIC_DUAL_VENDOR' ? 'LIVE' : 'SYNTHETIC'}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+        {lastCycle ? (
+          <div className="font-mono text-[10px] text-muted-foreground">
+            last cycle · {lastCycle.frames ?? 0} frames ·{' '}
+            <span className="text-emerald-300">{lastCycle.accepted ?? 0} accepted</span> ·{' '}
+            {lastCycle.rejected ?? 0} rejected · round {lastCycle.round ?? 0}
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
   )
 }
 

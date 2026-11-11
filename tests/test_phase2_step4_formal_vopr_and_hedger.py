@@ -308,11 +308,21 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
     assert violations == [], violations
 
 
-def test_gate5_full_test_inventory_is_twelve_files() -> None:
+def test_gate5_full_test_inventory_is_fourteen_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 12, [path.name for path in test_files]
+    assert len(test_files) == 14, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
     assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
+    # Phase 3 Step 1 adds process isolation, the live TigerBeetle replica and the
+    # live dual-vendor public feed gates.
+    assert (
+        ROOT / "tests" / "test_phase3_step1_multiprocess_and_live_daemons.py"
+    ) in test_files
+    # Phase 3 Step 2 adds the feed hot-swap, write-only broker credential vault
+    # and live local Ollama probe gates.
+    assert (
+        ROOT / "tests" / "test_phase3_step2_live_cutover_and_cockpit.py"
+    ) in test_files
 
 
 # ---------------------------------------------------------------------------

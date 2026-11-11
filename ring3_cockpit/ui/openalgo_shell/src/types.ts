@@ -549,6 +549,11 @@ export interface CockpitState {
   extensions: ExtensionsState
   formal_proofs: FormalProofState
   autopilot: AutopilotState
+  ring_processes?: RingProcessesState
+  feed_mode?: FeedMode | string
+  feed?: FeedState
+  broker_credentials?: BrokerCredentialState
+  llm_probe?: LLMProbeReport | Record<string, never>
   streams: { cockpit: string; fps: number }
 }
 
@@ -585,3 +590,221 @@ export interface LLMControlPayload {
   daily_spend_cap_usd?: number
   timeout_ms?: number
 }
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 2 · feed hot-swap, broker credential vault, LLM probe
+ * ------------------------------------------------------------------ */
+
+export type FeedMode = 'PAPER_AUTOPILOT' | 'LIVE_PUBLIC_DUAL_VENDOR'
+
+/** One ring worker inside the 4-ring OS process isolation matrix. */
+export interface RingProcess {
+  index: number
+  worker: string
+  pid: number | null
+  alive: boolean
+  spawned: boolean
+  /** Shared-memory heartbeat age; `null` when the slot was never written. */
+  heartbeat_age_ms: number | null
+  heartbeat_pid?: number | null
+  last_beat_ns?: number | null
+  restarts: number
+  cpu_core: number | null
+  exit_code: number | null
+}
+
+export interface RingProcessesState {
+  available: boolean
+  reason?: string
+  rings: RingProcess[]
+  pids: Record<string, number | null>
+  distinct_os_processes: number
+  feed_mode?: string
+  shm_prefix?: string
+  heartbeat_shm?: string
+  running?: boolean
+}
+
+/** Per-silo receipt for one dual-vendor public feed poll. */
+export interface FeedSiloCycle {
+  mode: string
+  symbols: string[]
+  venues: string[]
+  frames: number
+  accepted: number
+  rejected: number
+  synthetic: number
+  live: number
+  max_divergence_pct: number
+  last_error: string
+}
+
+export interface FeedCycleReport {
+  round?: number
+  cycle_at_ns?: number
+  frames: number
+  accepted?: number
+  rejected?: number
+  all_live?: boolean
+  silos: Record<string, FeedSiloCycle>
+  skipped?: boolean
+  reason?: string
+}
+
+export interface FeedState {
+  feed_mode: FeedMode | string
+  live_public_dual_vendor: boolean
+  paper_autopilot: boolean
+  available_modes: string[]
+  silo_modes?: Record<string, string>
+  last_cycle?: FeedCycleReport
+  law?: string
+}
+
+export interface FeedControlResponse {
+  feed_mode: FeedMode
+  previous_feed_mode: FeedMode
+  changed: boolean
+  operator: string
+  zero_restart: boolean
+  live_public_dual_vendor: boolean
+  cycle?: FeedCycleReport
+  feed: FeedState
+  timestamp_ns: number
+}
+
+/** Write-only credential payload; the secret never returns from the API. */
+export interface BrokerCredentialPayload {
+  silo: string
+  venue: string
+  api_key: string
+  api_secret: string
+  sandbox?: boolean
+  operator?: string
+}
+
+export interface BrokerDryRun {
+  signature_alg: string
+  signature_hex: string
+  public_key_hex: string
+  payload_digest_sha256: string
+  fernet_roundtrip_ok: boolean
+  schema_ok: boolean
+  required_fields: string[]
+  payload_keys: string[]
+  payload_field_count: number
+  order_type: string
+  instrument: string
+  adapter_module: string
+  adapter_ready: boolean
+  post_only: boolean
+  settlement_cycle: string
+  elapsed_us: number
+  socket_opened: boolean
+  order_placed: boolean
+}
+
+export interface BrokerCredentialReport {
+  silo: string
+  market: string
+  venue: string
+  sandbox: boolean
+  environment: string
+  ring?: string
+  vault?: string
+  credential_configured: boolean
+  write_only: boolean
+  api_key_masked: string
+  api_secret_masked: string
+  masked?: { api_key: string; api_secret: string }
+  dry_run_verified: boolean
+  dry_run: BrokerDryRun
+  stored_at_ns: number
+  operator?: string
+  zero_restart?: boolean
+}
+
+export interface BrokerCredentialVenueState {
+  venue: string
+  credential_configured: boolean
+  dry_run_verified: boolean
+  api_key_masked: string | null
+  api_secret_masked: string | null
+  environment: string | null
+}
+
+export interface BrokerCredentialSiloState {
+  silo_id: string
+  market: string
+  venues: BrokerCredentialVenueState[]
+  configured: number
+  adapter_count: number
+}
+
+export interface BrokerCredentialState {
+  write_only: boolean
+  available?: boolean
+  reason?: string
+  ring?: string
+  vault?: string
+  venues_supported: string[]
+  silos: Record<string, BrokerCredentialSiloState>
+  last_verification?: Record<
+    string,
+    {
+      venue: string
+      silo: string
+      dry_run_verified: boolean
+      api_key_masked: string
+      sandbox: boolean
+      stored_at_ns: number
+    }
+  >
+}
+
+export interface LLMProbeModel {
+  name: string
+  size_bytes: number
+  parameter_size: string
+  quantization: string
+}
+
+export interface LLMProbeEndpoint {
+  provider: string
+  model: string
+  base_url: string
+  local: boolean
+  url: string
+  reachable: boolean
+  latency_ms: number
+  within_budget: boolean
+  models: LLMProbeModel[]
+  model_count: number
+  error: string
+}
+
+export type LLMProbeStatus = 'LOCAL_OLLAMA_LIVE' | 'DETERMINISTIC_INSTINCT_FALLBACK'
+
+export interface LLMProbeReport {
+  status: LLMProbeStatus
+  local_ollama_live: boolean
+  fallback_active: boolean
+  fallback_mode: string
+  fallback_reason: string
+  hard_timeout_ms: number
+  within_budget: boolean
+  circuit_breaker: {
+    hard_timeout_ms: number
+    tripped: boolean
+    zero_tokens_on_fallback: boolean
+  }
+  models: LLMProbeModel[]
+  model_count: number
+  system1: LLMProbeEndpoint
+  system2: LLMProbeEndpoint | null
+  elapsed_ms: number
+  probed_at_ns: number
+  operator?: string
+  zero_restart?: boolean
+}
+

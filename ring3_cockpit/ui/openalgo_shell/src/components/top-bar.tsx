@@ -1,10 +1,22 @@
-import { Activity, CircleDollarSign, Radio, ShieldAlert, ShieldCheck, Skull, Zap } from 'lucide-react'
+import { useState } from 'react'
+import {
+  Activity,
+  CircleDollarSign,
+  Radio,
+  Satellite,
+  ShieldAlert,
+  ShieldCheck,
+  Skull,
+  Zap,
+} from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
+import { Switch } from '@/components/ui/switch'
+import { postFeedMode } from '@/lib/api'
 import { formatPct, formatUsd, timeAgo } from '@/lib/format'
-import type { CockpitState, KillReport, RearmReport } from '@/types'
+import type { CockpitState, FeedMode, KillReport, RearmReport } from '@/types'
 
 interface TopBarProps {
   state: CockpitState | null
@@ -14,6 +26,7 @@ interface TopBarProps {
   lastFrameAt: number
   onKill: () => void
   onRearm: () => void
+  onFeedChanged?: () => void | Promise<void>
 }
 
 export function TopBar({
@@ -24,6 +37,7 @@ export function TopBar({
   lastFrameAt,
   onKill,
   onRearm,
+  onFeedChanged,
 }: TopBarProps) {
   const status = state?.system.status ?? 'HALTED'
   const armed = status === 'ARMED'
@@ -32,6 +46,48 @@ export function TopBar({
   const spend = llm?.daily_spend_usd ?? 0
   const cap = llm?.daily_spend_cap_usd ?? 3.1
   const spendPct = cap > 0 ? Math.min(100, (spend / cap) * 100) : 0
+
+  // ---- Phase 3 Step 2: feed mode hot-swap ----------------------------
+  const [feedBusy, setFeedBusy] = useState(false)
+  const [feedOverride, setFeedOverride] = useState<FeedMode | null>(null)
+  const [feedNotice, setFeedNotice] = useState<string | null>(null)
+  const [feedFailed, setFeedFailed] = useState(false)
+
+  const serverMode = (state?.feed?.feed_mode ??
+    state?.feed_mode ??
+    'PAPER_AUTOPILOT') as FeedMode
+  const feedMode: FeedMode = feedOverride ?? serverMode
+  const liveFeed = feedMode === 'LIVE_PUBLIC_DUAL_VENDOR'
+  const lastCycle = state?.feed?.last_cycle
+  const cycleAccepted = lastCycle?.accepted ?? 0
+  const cycleFrames = lastCycle?.frames ?? 0
+
+  const toggleFeed = async (checked: boolean) => {
+    const next: FeedMode = checked
+      ? 'LIVE_PUBLIC_DUAL_VENDOR'
+      : 'PAPER_AUTOPILOT'
+    setFeedBusy(true)
+    setFeedNotice(null)
+    setFeedFailed(false)
+    try {
+      const report = await postFeedMode(next, true)
+      setFeedOverride(report.feed_mode)
+      const cycle = report.cycle
+      setFeedNotice(
+        next === 'LIVE_PUBLIC_DUAL_VENDOR'
+          ? `Live dual-vendor armed · ${cycle?.accepted ?? 0}/${cycle?.frames ?? 0} frames accepted across ${Object.keys(cycle?.silos ?? {}).length} silos`
+          : 'Paper autopilot tape restored · zero restart'
+      )
+      await onFeedChanged?.()
+    } catch (cause) {
+      setFeedFailed(true)
+      setFeedNotice(
+        cause instanceof Error ? cause.message : 'feed hot-swap failed'
+      )
+    } finally {
+      setFeedBusy(false)
+    }
+  }
 
   return (
     <header className="sticky top-0 z-40 border-b border-border/80 bg-background/85 backdrop-blur-xl">
@@ -60,6 +116,41 @@ export function TopBar({
         </div>
 
         <div className="hidden h-9 w-px bg-border lg:block" />
+
+        {/* Feed mode hot-swap (Phase 3 Step 2) */}
+        <div
+          className={`flex items-center gap-2 rounded-xl border px-3 py-1.5 ${
+            liveFeed
+              ? 'border-emerald-500/40 bg-emerald-500/10'
+              : 'border-border/70 bg-muted/30'
+          }`}
+          data-testid="feed-mode-toggle"
+        >
+          <Satellite
+            className={`size-4 ${liveFeed ? 'text-emerald-300' : 'text-muted-foreground'}`}
+          />
+          <div className="leading-tight">
+            <div className="text-[9px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+              Feed mode
+            </div>
+            <div
+              className={`font-mono text-[10px] ${
+                liveFeed ? 'text-emerald-200' : 'text-foreground'
+              }`}
+            >
+              {liveFeed ? 'LIVE DUAL-VENDOR' : 'PAPER AUTOPILOT'}
+            </div>
+          </div>
+          <Switch
+            checked={liveFeed}
+            disabled={feedBusy || !state}
+            onCheckedChange={(checked) => void toggleFeed(checked)}
+            aria-label="Hot-swap between the paper autopilot tape and the live multi-silo dual-vendor public feed"
+          />
+          <span className="font-mono text-[9px] tabular-nums text-muted-foreground">
+            {feedBusy ? '…' : `${cycleAccepted}/${cycleFrames}`}
+          </span>
+        </div>
 
         <div className="flex min-w-[190px] flex-1 items-center gap-3">
           <div className="flex size-8 items-center justify-center rounded-lg bg-muted">
@@ -138,6 +229,20 @@ export function TopBar({
           </Button>
         )}
       </div>
+
+      {feedNotice ? (
+        <div
+          data-testid="feed-mode-notice"
+          className={`border-t px-4 py-1.5 text-[11px] lg:px-6 ${
+            feedFailed
+              ? 'border-red-500/30 bg-red-500/10 text-red-200'
+              : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+          }`}
+        >
+          {feedFailed ? <ShieldAlert className="mr-1 inline size-3" /> : null}
+          {feedNotice}
+        </div>
+      ) : null}
 
       {rearmReport ? (
         <div className="border-t border-emerald-500/30 bg-emerald-500/10 px-4 py-1.5 text-[11px] text-emerald-200 lg:px-6">

@@ -468,6 +468,7 @@ class InstinctContext:
     normal_vol_1m: float = 0.0
     spread_bps: float = 0.0
     taker_buy_ratio: float = 0.5
+    dislocation_bps: float = 0.0
     contagion: ContagionFeatures | None = None
     headline_shock: bool = False
     max_spread_bps: float = 25.0
@@ -488,6 +489,10 @@ class InstinctContext:
             raise ValueError("taker_buy_ratio must be within [0, 1]")
         object.__setattr__(self, "taker_buy_ratio", ratio)
         object.__setattr__(self, "max_spread_bps", float(self.max_spread_bps))
+        dislocation = float(self.dislocation_bps)
+        if not math.isfinite(dislocation) or dislocation < 0.0:
+            raise ValueError("dislocation_bps must be finite and non-negative")
+        object.__setattr__(self, "dislocation_bps", dislocation)
         object.__setattr__(self, "headline_shock", bool(self.headline_shock))
 
     @property
@@ -517,6 +522,7 @@ class InstinctContext:
         headline_shock: bool = False,
         max_spread_bps: float = 25.0,
         strategy_id: str = "system1_instinct",
+        dislocation_bps: float = 0.0,
     ) -> "InstinctContext":
         """Build the 1-minute digest from an ``ExecutedFlowTick`` frame.
 
@@ -536,6 +542,7 @@ class InstinctContext:
                 else float(normal_vol_1m)
             ),
             spread_bps=float(tick.spread_bps),
+            dislocation_bps=float(dislocation_bps),
             taker_buy_ratio=float(tick.taker_buy_ratio_5s),
             contagion=contagion,
             headline_shock=headline_shock,
@@ -581,6 +588,15 @@ class InstinctDecision:
 # ---------------------------------------------------------------------------
 
 
+#: ``sec_006`` / ``sec_018`` Law 1: a *measured* cross-venue executed-flow
+#: dislocation is the only signal allowed to raise the gross-edge ceiling above
+#: the conservative 20 bps microstructure ladder.  Ring 1 turns the lease
+#: ``target_bps`` into ``UnsignedProposal.expected_gross_bps`` verbatim, and the
+#: 98% split-conformal gate in Ring 0 still has to clear the silo cost floor.
+DISLOCATION_MIN_BPS = 18.0
+DISLOCATION_MAX_BPS = 34.0
+
+
 def deterministic_instinct(context: InstinctContext) -> ProviderResponse:
     """Fail-safe local evaluator used whenever no LLM is healthy.
 
@@ -612,6 +628,21 @@ def deterministic_instinct(context: InstinctContext) -> ProviderResponse:
     if context.spread_bps > context.max_spread_bps:
         return ProviderResponse(
             LeaseMode.DISARMED, 0.0, 0.0, confidence=1.0, rationale="spread cap"
+        )
+    if context.dislocation_bps >= DISLOCATION_MIN_BPS and vol < 2.0:
+        # A measured cross-venue dislocation on a calm tape is the one regime
+        # where a gross edge may exceed the microstructure ladder's 20 bps
+        # ceiling.  The lease still carries the exact measured value and Ring 0
+        # independently re-derives the net lower bound before signing.
+        target = _clamp(
+            float(context.dislocation_bps), DISLOCATION_MIN_BPS, DISLOCATION_MAX_BPS
+        )
+        return ProviderResponse(
+            LeaseMode.LONG_ONLY,
+            target_bps=target,
+            stop_bps=max(3.0, target * 0.5),
+            confidence=0.7,
+            rationale="cross-venue liquidity dislocation",
         )
     ratio = context.taker_buy_ratio
     if ratio >= 0.65 and vol < 2.0:

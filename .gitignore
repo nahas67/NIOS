@@ -35,6 +35,13 @@ data/
 .env
 .env.*
 
+# Ring 0 credential custody: never commit key material
+ring0_vault/silos/key_vault/.secrets/
+ring0_vault/silos/key_vault/.broker_secrets/
+**/.broker_secrets/
+**/.secrets/
+*.key
+
 # Donor harvest staging -- reference only, never imported by runtime code
 _donor_staging/
 

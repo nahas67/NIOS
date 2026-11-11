@@ -34,6 +34,7 @@ export default function App() {
           lastFrameAt={lastFrameAt}
           onKill={() => void kill()}
           onRearm={() => void rearm()}
+          onFeedChanged={refresh}
         />
 
         {error ? (

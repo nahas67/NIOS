@@ -43,6 +43,7 @@ __all__ = [
     "live_url",
     "main",
     "resolve_port",
+    "run_multiprocess",
     "run_role",
     "run_smoke",
     "run_server",
@@ -527,6 +528,65 @@ def run_role(role: str, *, workspace: str | Path | None = None) -> int:
         runtime.close()
 
 
+def run_multiprocess(
+    *,
+    host: str = DEFAULT_HOST,
+    port: int | None = None,
+    workspace: str | Path | None = None,
+    silo: str = "CRYPTO_BINANCE",
+    feed_mode: str = "PAPER_AUTOPILOT",
+    seconds: float | None = None,
+    allow_port_fallback: bool = True,
+) -> int:
+    """Boot the four rings as four physically separate OS worker processes.
+
+    ``sec_004`` requires strict OS process isolation: Ring 0 (vault + signer),
+    Ring 1 (spinal), Ring 2 (brain) and Ring 3 (cockpit) each get their own PID
+    and communicate only through the shared-memory spine and the JetStream bus.
+    The FastAPI cockpit keeps running in this (parent) process, and it is handed
+    the supervisor so ``/api/v2/cockpit/state`` can prove the PID topology.
+    """
+
+    import json
+    import time as _time
+
+    from core.process_supervisor import RingProcessSupervisor
+
+    supervisor = RingProcessSupervisor(
+        workspace=workspace,
+        silo=silo,
+        feed_mode=feed_mode,
+    )
+    supervisor.start()
+    runtime = None
+    try:
+        runtime = build_runtime(workspace=getattr(supervisor, "workspace", workspace))
+        control = getattr(runtime, "control", None)
+        if control is not None:
+            control.process_supervisor = supervisor
+            control._feed_mode = feed_mode
+        if seconds is not None:
+            deadline = _time.monotonic() + max(0.0, float(seconds))
+            while _time.monotonic() < deadline:
+                supervisor.poll()
+                _time.sleep(0.05)
+            print(json.dumps(supervisor.describe(), indent=2, default=str))
+            return 0
+        return run_server(
+            host=host,
+            port=port,
+            workspace=getattr(supervisor, "workspace", workspace),
+            allow_port_fallback=allow_port_fallback,
+        )
+    finally:
+        supervisor.stop()
+        if runtime is not None:
+            try:
+                runtime.close()
+            except Exception:  # pragma: no cover - shutdown is best effort
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="run_nios.py",
@@ -544,6 +604,37 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--workspace", default=None)
+    parser.add_argument(
+        "--multiprocess",
+        action="store_true",
+        help=(
+            "run Ring 0/1/2/3 as four separate OS worker processes "
+            "(sec_004 process isolation)"
+        ),
+    )
+    parser.add_argument(
+        "--silo",
+        default="CRYPTO_BINANCE",
+        choices=[
+            "CRYPTO_BINANCE",
+            "INDIA_ZERODHA_DHAN",
+            "US_IBKR",
+            "FX_MT5",
+        ],
+        help="silo the Ring 1 worker pins to (ignored without --multiprocess)",
+    )
+    parser.add_argument(
+        "--feed-mode",
+        default="PAPER_AUTOPILOT",
+        choices=["PAPER_AUTOPILOT", "LIVE_PUBLIC_DUAL_VENDOR"],
+        help="market-data path advertised to the cockpit",
+    )
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="run the supervisor headless for N seconds instead of serving HTTP",
+    )
     parser.add_argument(
         "--role",
         default=None,
@@ -568,6 +659,20 @@ def main(argv: list[str] | None = None) -> int:
         return run_smoke(host=args.host, port=requested, workspace=args.workspace)
     if args.role:
         return run_role(args.role, workspace=args.workspace)
+    if args.multiprocess:
+        try:
+            return run_multiprocess(
+                host=args.host,
+                port=requested,
+                workspace=args.workspace,
+                silo=args.silo,
+                feed_mode=args.feed_mode,
+                seconds=args.seconds,
+                allow_port_fallback=not forced,
+            )
+        except PortUnavailable as exc:
+            print(f"[NIOS] FATAL: {exc}", file=sys.stderr)
+            return 1
     try:
         return run_server(
             host=args.host,

@@ -1,12 +1,17 @@
 import type {
   BrokerControlPayload,
+  BrokerCredentialPayload,
+  BrokerCredentialReport,
   CockpitState,
   ExtensionsActionResponse,
   ExtensionsControlPayload,
   ExtensionsState,
+  FeedControlResponse,
+  FeedMode,
   FormalProofState,
   KillReport,
   LLMControlPayload,
+  LLMProbeReport,
   RearmReport,
 } from '@/types'
 
@@ -110,5 +115,52 @@ export function postExtensions(
   return request<ExtensionsActionResponse>('/api/v2/control/extensions', {
     method: 'POST',
     body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 2 · feed hot-swap, write-only broker vault, LLM probe
+ * ------------------------------------------------------------------ */
+
+/**
+ * Hot-swap the market-data path without restarting any worker.
+ *
+ * `LIVE_PUBLIC_DUAL_VENDOR` runs one immediate four-silo dual-vendor poll, so
+ * the response carries the per-silo receipt rather than a promise.
+ */
+export function postFeedMode(
+  feedMode: FeedMode,
+  ingestCycle = true
+): Promise<FeedControlResponse> {
+  return request<FeedControlResponse>('/api/v2/control/feeds', {
+    method: 'POST',
+    body: JSON.stringify({
+      feed_mode: feedMode,
+      ingest_cycle: ingestCycle,
+      operator: 'ring3.cockpit',
+    }),
+  })
+}
+
+/**
+ * Store a testnet / sandbox venue credential in Ring 0.
+ *
+ * The API key and secret are write-only: the response carries only `***last4`
+ * plus the dry-run Ed25519 handshake receipt.
+ */
+export function postBrokerCredentials(
+  payload: BrokerCredentialPayload
+): Promise<BrokerCredentialReport> {
+  return request<BrokerCredentialReport>('/api/v2/control/brokers/credentials', {
+    method: 'POST',
+    body: JSON.stringify({ sandbox: true, operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/** Probe every configured LLM endpoint under the strict 250 ms hard cap. */
+export function postLLMProbe(): Promise<LLMProbeReport> {
+  return request<LLMProbeReport>('/api/v2/control/llms/probe', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit' }),
   })
 }

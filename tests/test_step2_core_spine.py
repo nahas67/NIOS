@@ -810,11 +810,13 @@ def test_6_four_ring_air_gap_ast_guard() -> None:
     ) == ["ring0_vault.silos.key_vault", "ring0_vault.silos.key_vault.KeyVault"]
     assert _forbidden_imports("import core.schemas\n") == []
 
-    # Step 7 adds the process composition root.  It is deliberately the ONE
-    # file allowed to import every ring: it constructs the four processes in a
-    # single deterministic harness and is never imported by Ring 2.  It is
-    # still checked below for broker-adapter leakage.
-    composition_root = "core/orchestrator.py"
+    # The process composition roots.  They are deliberately the only files
+    # allowed to import every ring: each constructs the four ring processes in a
+    # single deterministic harness and neither is ever imported by Ring 2.
+    # ``core/orchestrator.py`` boots them in-process; ``core/process_supervisor.py``
+    # boots them as four separate OS processes (``sec_004``).  Both are still
+    # checked below for broker-adapter leakage.
+    composition_roots = ("core/orchestrator.py", "core/process_supervisor.py")
 
     scanned = 0
     violations: list[tuple[str, str]] = []
@@ -833,7 +835,7 @@ def test_6_four_ring_air_gap_ast_guard() -> None:
             except SyntaxError:  # pragma: no cover - donor syntax
                 continue
 
-            if relative == composition_root:
+            if relative in composition_roots:
                 continue
 
             for module in modules:
@@ -852,9 +854,8 @@ def test_6_four_ring_air_gap_ast_guard() -> None:
     assert violations == [], f"Ring 0 vault leaked into the air-gap: {violations[:10]}"
     assert ring2_violations == []
 
-    # The composition root may compose rings, but it still may not import a
+    # A composition root may compose rings, but it still may not import a
     # broker adapter or exchange client (Ring 0 adapters stay in silo workers).
-    root_source = (REPO_ROOT / composition_root).read_text(encoding="utf-8")
     broker_tokens = {
         "india_brokers",
         "nautilus_adapters",
@@ -863,13 +864,15 @@ def test_6_four_ring_air_gap_ast_guard() -> None:
         "MetaTrader5",
         "ccxt",
     }
-    root_imports = _imported_modules(root_source)
-    leaked = [
-        module
-        for module in root_imports
-        if broker_tokens & set(_module_parts(module))
-    ]
-    assert leaked == [], f"composition root imported a broker adapter: {leaked}"
+    for composition_root in composition_roots:
+        root_source = (REPO_ROOT / composition_root).read_text(encoding="utf-8")
+        root_imports = _imported_modules(root_source)
+        leaked = [
+            module
+            for module in root_imports
+            if broker_tokens & set(_module_parts(module))
+        ]
+        assert leaked == [], f"{composition_root} imported a broker adapter: {leaked}"
 
     # No *unreviewed* credential surface.  The pinned set is exactly the
     # harvested read-only market-data loader allowlist; drift fails the gate.

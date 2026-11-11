@@ -9,6 +9,7 @@ import {
   Moon,
   Network,
   Package,
+  RefreshCw,
   Save,
   ServerCog,
   ShieldCheck,
@@ -30,11 +31,14 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { postBroker, postExtensions, postLLM } from '@/lib/api'
+import { postBroker, postBrokerCredentials, postExtensions, postLLM, postLLMProbe } from '@/lib/api'
 import { formatPct, formatUsd } from '@/lib/format'
 import type {
+  BrokerCredentialReport,
+  BrokerCredentialSiloState,
   CockpitState,
   ExtensionsState,
+  LLMProbeReport,
   LLMSlot,
   SiloState,
   VaultKey,
@@ -130,10 +134,13 @@ export function ControlRoomTab({ state, onSaved }: ControlRoomTabProps) {
                 </span>
               </CardContent>
             </Card>
+            <LLMProbeCard initial={asProbeReport(state?.llm_probe)} />
           </>
         ) : null}
         </div>
       </div>
+
+      <BrokerCredentialVault state={state} onSaved={onSaved} />
 
       <ExtensionsPanel
         extensions={state?.extensions ?? null}
@@ -744,11 +751,15 @@ function Field({
   value,
   onChange,
   hint,
+  type = 'text',
+  placeholder,
 }: {
   label: string
   value: string
   onChange: (value: string) => void
   hint?: string
+  type?: 'text' | 'password'
+  placeholder?: string
 }) {
   return (
     <div className="space-y-1">
@@ -757,12 +768,358 @@ function Field({
       </Label>
       <Input
         value={value}
-        inputMode="decimal"
+        type={type}
+        placeholder={placeholder}
+        inputMode={type === 'password' ? 'text' : 'decimal'}
+        autoComplete={type === 'password' ? 'off' : undefined}
         onChange={(event) => onChange(event.target.value)}
         className="h-7 font-mono text-xs tabular-nums"
       />
       {hint ? <div className="text-[9px] text-muted-foreground">{hint}</div> : null}
     </div>
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 2 · write-only broker testnet credential vault
+ * ------------------------------------------------------------------ */
+
+function BrokerCredentialVault({
+  state,
+  onSaved,
+}: {
+  state: CockpitState | null
+  onSaved: () => Promise<void>
+}) {
+  const credentialState = state?.broker_credentials
+  const silos: BrokerCredentialSiloState[] = Object.values(credentialState?.silos ?? {})
+  const configured = silos.reduce((sum, silo) => sum + (silo.configured ?? 0), 0)
+  const supported = credentialState?.venues_supported?.length ?? 0
+
+  return (
+    <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
+      <CardHeader className="px-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <ShieldCheck className="size-4 text-primary" />
+            Broker testnet credential vault
+          </CardTitle>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="outline" className="font-mono text-[9px]">
+              WRITE-ONLY · {supported} VENUES
+            </Badge>
+            <Badge
+              variant={configured > 0 ? 'secondary' : 'outline'}
+              className="font-mono text-[9px]"
+            >
+              {configured} CONFIGURED
+            </Badge>
+            <Badge variant="outline" className="font-mono text-[9px]">
+              Ed25519 + Fernet · Ring 0
+            </Badge>
+          </div>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Secrets are encrypted inside <span className="font-mono">ring0_vault/silos/key_vault</span>{' '}
+          and never returned. Each save runs a deterministic venue-native payload
+          preflight, signs a SHA-256 digest with Ed25519 and proves the Fernet
+          envelope round-trips — no socket is opened and no order is placed.
+        </p>
+      </CardHeader>
+      <CardContent className="grid gap-3 px-4 xl:grid-cols-2">
+        {silos.map((silo) => (
+          <VenueCredentialCard
+            key={`${silo.silo_id}-${silo.configured}`}
+            silo={silo}
+            onSaved={onSaved}
+          />
+        ))}
+        {silos.length === 0 ? (
+          <div className="rounded-md border border-dashed border-border/60 bg-muted/10 px-3 py-6 text-center text-xs text-muted-foreground xl:col-span-2">
+            Waiting for the Ring 0 credential inventory…
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function VenueCredentialCard({
+  silo,
+  onSaved,
+}: {
+  silo: BrokerCredentialSiloState
+  onSaved: () => Promise<void>
+}) {
+  const [venue, setVenue] = useState(silo.venues[0]?.venue ?? '')
+  const [apiKey, setApiKey] = useState('')
+  const [apiSecret, setApiSecret] = useState('')
+  const [sandbox, setSandbox] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [report, setReport] = useState<BrokerCredentialReport | null>(null)
+  const [message, setMessage] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  const existing = silo.venues.find((entry) => entry.venue === venue)
+  const configured = Boolean(existing?.credential_configured)
+  const masked = report?.api_key_masked ?? existing?.api_key_masked ?? null
+
+  const submit = async () => {
+    setBusy(true)
+    setMessage(null)
+    setFailed(false)
+    try {
+      const next = await postBrokerCredentials({
+        silo: silo.silo_id,
+        venue,
+        api_key: apiKey.trim(),
+        api_secret: apiSecret.trim(),
+        sandbox,
+      })
+      setReport(next)
+      setApiKey('')
+      setApiSecret('')
+      setMessage(
+        `Encrypted in Ring 0 · ${next.api_key_masked} · dry-run signed over ${next.dry_run.payload_field_count} fields in ${next.dry_run.elapsed_us.toFixed(0)} µs`
+      )
+      await onSaved()
+    } catch (cause) {
+      setFailed(true)
+      setMessage(cause instanceof Error ? cause.message : 'credential handshake failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="space-y-2 rounded-md border border-border/60 bg-background/40 px-3 py-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          {silo.market}
+          <span className="ml-1.5 font-mono normal-case text-foreground/70">
+            {silo.silo_id}
+          </span>
+        </span>
+        <div className="flex items-center gap-1.5">
+          <Badge
+            variant={configured ? 'secondary' : 'outline'}
+            className="font-mono text-[9px]"
+          >
+            {configured ? `CONFIGURED ${masked ?? ''}` : 'NOT CONFIGURED'}
+          </Badge>
+          {report?.dry_run_verified ? (
+            <Badge
+              variant="secondary"
+              className="border-emerald-500/40 font-mono text-[9px] text-emerald-300"
+            >
+              DRY-RUN VERIFIED
+            </Badge>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <div className="col-span-2">
+          <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            Venue
+          </Label>
+          <Select value={venue} onValueChange={setVenue}>
+            <SelectTrigger className="h-7 text-xs">
+              <SelectValue placeholder="select venue" />
+            </SelectTrigger>
+            <SelectContent>
+              {silo.venues.map((entry) => (
+                <SelectItem key={entry.venue} value={entry.venue} className="text-xs">
+                  {entry.venue}
+                  {entry.credential_configured ? ' · configured' : ''}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <Field
+          label="API key"
+          value={apiKey}
+          onChange={setApiKey}
+          type="password"
+          placeholder={masked ?? 'write-only'}
+        />
+        <Field
+          label="API secret"
+          value={apiSecret}
+          onChange={setApiSecret}
+          type="password"
+          placeholder="write-only"
+        />
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <label className="flex items-center gap-2 text-[10px] text-muted-foreground">
+          <Switch checked={sandbox} onCheckedChange={setSandbox} aria-label="sandbox credential" />
+          Sandbox / testnet host
+        </label>
+        <Button
+          type="button"
+          size="sm"
+          onClick={() => void submit()}
+          disabled={busy || !venue || !apiKey.trim() || !apiSecret.trim()}
+          className="gap-1.5"
+        >
+          <KeyRound className="size-3.5" />
+          {busy ? 'Signing…' : 'Encrypt + dry-run sign'}
+        </Button>
+      </div>
+
+      {report ? (
+        <div className="rounded-md border border-emerald-500/30 bg-emerald-500/[0.06] px-2 py-1 font-mono text-[9px] text-emerald-200">
+          {report.dry_run.signature_alg} sig {report.dry_run.signature_hex.slice(0, 16)}… · schema{' '}
+          {report.dry_run.schema_ok ? 'OK' : 'FAIL'} · fernet{' '}
+          {report.dry_run.fernet_roundtrip_ok ? 'OK' : 'FAIL'} · socket{' '}
+          {report.dry_run.socket_opened ? 'OPENED' : 'CLOSED'}
+        </div>
+      ) : null}
+
+      {message ? (
+        <div
+          className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-[10px] ${
+            failed
+              ? 'border border-red-500/30 bg-red-500/10 text-red-200'
+              : 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+          }`}
+        >
+          {failed ? <AlertTriangle className="size-3" /> : <CheckCircle2 className="size-3" />}
+          {message}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 2 · live local Ollama / LLM probe (<250 ms)
+ * ------------------------------------------------------------------ */
+
+/** The gateway returns `{}` before the first probe; narrow it honestly. */
+function asProbeReport(
+  value: CockpitState['llm_probe'] | undefined
+): LLMProbeReport | null {
+  if (!value) return null
+  const candidate = value as Partial<LLMProbeReport>
+  return typeof candidate.status === 'string' && candidate.system1
+    ? (value as LLMProbeReport)
+    : null
+}
+
+function LLMProbeCard({ initial }: { initial: LLMProbeReport | null }) {
+  const [report, setReport] = useState<LLMProbeReport | null>(initial)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  const probe = async () => {
+    setBusy(true)
+    setMessage(null)
+    setFailed(false)
+    try {
+      const next = await postLLMProbe()
+      setReport(next)
+      setMessage(
+        next.status === 'LOCAL_OLLAMA_LIVE'
+          ? `Local daemon answered in ${next.system1.latency_ms.toFixed(1)} ms · ${next.model_count} models`
+          : `Fallback engaged after ${next.system1.latency_ms.toFixed(1)} ms · zero tokens spent`
+      )
+    } catch (cause) {
+      setFailed(true)
+      setMessage(cause instanceof Error ? cause.message : 'LLM probe failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const live = report?.status === 'LOCAL_OLLAMA_LIVE'
+
+  return (
+    <Card className="gap-2 border-border/70 bg-card/60 py-3 shadow-none">
+      <CardContent className="space-y-2 px-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-[11px]">
+            <Gauge className="size-3.5 text-muted-foreground" />
+            <span className="text-muted-foreground">Live local LLM probe</span>
+            <Badge
+              variant={live ? 'secondary' : 'outline'}
+              className={`font-mono text-[9px] ${
+                live ? 'border-emerald-500/40 text-emerald-300' : 'text-amber-300'
+              }`}
+            >
+              {report?.status ?? 'NOT PROBED'}
+            </Badge>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => void probe()}
+            disabled={busy}
+            className="gap-1.5"
+          >
+            <RefreshCw className={`size-3.5 ${busy ? 'animate-spin' : ''}`} />
+            {busy ? 'Probing…' : 'Probe LLMs (<250ms)'}
+          </Button>
+        </div>
+
+        {report ? (
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1">
+              <div className="text-[9px] uppercase tracking-wider text-muted-foreground">
+                System 1 · {report.system1.provider}
+              </div>
+              <div className="font-mono text-[10px] tabular-nums">
+                {report.system1.latency_ms.toFixed(2)} ms ·{' '}
+                <span className={report.system1.within_budget ? 'text-emerald-300' : 'text-amber-300'}>
+                  {report.system1.within_budget ? 'in budget' : 'over cap'}
+                </span>
+              </div>
+              <div className="truncate font-mono text-[9px] text-muted-foreground">
+                {report.model_count > 0
+                  ? report.models.map((model) => model.name).join(' · ')
+                  : report.system1.error || 'no models discovered'}
+              </div>
+            </div>
+            <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1">
+              <div className="text-[9px] uppercase tracking-wider text-muted-foreground">
+                System 2 · {report.system2?.provider ?? 'not configured'}
+              </div>
+              <div className="font-mono text-[10px] tabular-nums">
+                {report.system2
+                  ? `${report.system2.latency_ms.toFixed(2)} ms · ${
+                      report.system2.reachable ? 'reachable' : 'unreachable'
+                    }`
+                  : '—'}
+              </div>
+              <div className="font-mono text-[9px] text-muted-foreground">
+                hard cap {report.hard_timeout_ms.toFixed(0)} ms · circuit{' '}
+                {report.circuit_breaker.tripped ? 'TRIPPED' : 'CLOSED'}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {message ? (
+          <div
+            className={`text-[10px] ${
+              failed ? 'text-red-300' : 'text-emerald-300'
+            }`}
+          >
+            {message}
+          </div>
+        ) : null}
+
+        <div className="font-mono text-[9px] text-muted-foreground">
+          LOCAL_OLLAMA_LIVE · DETERMINISTIC_INSTINCT_FALLBACK · zero tokens on
+          fallback
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 

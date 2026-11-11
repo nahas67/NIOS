@@ -15,6 +15,9 @@ surfaces (extensions + read-only MCP) without granting order authority:
 ``POST /api/v2/control/extensions`` toggle an extension or run a Forge audit
 ``GET  /api/v2/mcp/tools``       five read-only MCP tools + air-gap audit
 ``POST /api/v2/mcp/call``        invoke one read-only tool
+``POST /api/v2/control/feeds``   hot-swap PAPER_AUTOPILOT / LIVE dual-vendor
+``POST /api/v2/control/brokers/credentials`` write-only testnet handshake
+``POST /api/v2/control/llms/probe``          live Ollama probe under 250 ms
 ======================  =====================================================
 
 Design notes
@@ -68,7 +71,9 @@ from ring0_vault.silos.key_vault.llm_credentials import LLMKeyVault
 from ring0_vault.silos.silo_registry import (
     MarketSiloRegistry,
     SiloMode,
+    broker_credential_state,
     default_registry,
+    store_and_verify_broker_credentials,
 )
 from ring1_spinal.silo_worker import SiloCostFloor
 
@@ -77,7 +82,10 @@ __all__ = [
     "ARCHETYPE_WEIGHTS",
     "ControlPlane",
     "BrokerControlRequest",
+    "BrokerCredentialRequest",
+    "FeedControlRequest",
     "LLMControlRequest",
+    "LLMProbeRequest",
     "KillSwitchRequest",
     "RearmRequest",
     "ExtensionsControlRequest",
@@ -242,6 +250,69 @@ class ExtensionsControlRequest(BaseModel):
         return token
 
 
+class FeedControlRequest(BaseModel):
+    """``POST /api/v2/control/feeds`` payload (Phase 3 Step 2).
+
+    Hot-swaps the market-data path between the deterministic paper autopilot and
+    the live multi-silo dual-vendor public feed.  ``ingest_cycle`` runs one
+    immediate four-silo poll so the operator sees proof instead of a promise.
+    """
+
+    feed_mode: str = Field(..., min_length=1)
+    ingest_cycle: bool = True
+    operator: str = "ring3.operator"
+
+    @field_validator("feed_mode")
+    @classmethod
+    def _feed_mode_ok(cls, value: str) -> str:
+        token = str(value).strip().upper().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "PAPER": "PAPER_AUTOPILOT",
+            "PAPER_AUTOPILOT": "PAPER_AUTOPILOT",
+            "LIVE": "LIVE_PUBLIC_DUAL_VENDOR",
+            "LIVE_PUBLIC": "LIVE_PUBLIC_DUAL_VENDOR",
+            "LIVE_PUBLIC_DUAL_VENDOR": "LIVE_PUBLIC_DUAL_VENDOR",
+        }
+        if token not in aliases:
+            raise ValueError("feed_mode must be PAPER_AUTOPILOT or LIVE_PUBLIC_DUAL_VENDOR")
+        return aliases[token]
+
+
+class BrokerCredentialRequest(BaseModel):
+    """``POST /api/v2/control/brokers/credentials`` payload (``sec_011``).
+
+    ``api_key`` and ``api_secret`` are :class:`SecretStr`, so Pydantic never
+    renders them in ``repr``, validation errors or structured logs.  They are
+    encrypted inside Ring 0 before any response object exists.
+    """
+
+    silo: str = Field(..., min_length=1)
+    venue: str = Field(..., min_length=1)
+    api_key: SecretStr
+    api_secret: SecretStr
+    sandbox: bool = True
+    operator: str = "ring3.operator"
+
+    @field_validator("silo", "venue")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        token = str(value).strip()
+        if not token:
+            raise ValueError("must be non-empty")
+        return token
+
+
+class LLMProbeRequest(BaseModel):
+    """``POST /api/v2/control/llms/probe`` payload (``sec_016``).
+
+    The probe is read-only: it measures reachability and latency under the
+    strict 250 ms hard cap and never mutates the active provider.
+    """
+
+    timeout_ms: int | None = Field(default=None, ge=1, le=5_000)
+    operator: str = "ring3.operator"
+
+
 # ---------------------------------------------------------------------------
 # Mutable control state
 # ---------------------------------------------------------------------------
@@ -344,6 +415,12 @@ class ControlPlane:
         tail_hedger: Any = None,
         autopilot_runner: Any = None,
         autopilot_provider: Any = None,
+        process_supervisor: Any = None,
+        feed_mode: str | None = None,
+        feed_connector: Any = None,
+        feed_guard: Any = None,
+        broker_vault: Any = None,
+        llm_probe_fetcher: Any = None,
     ) -> None:
         self.ledger = ledger
         self.firewall = firewall
@@ -375,6 +452,29 @@ class ControlPlane:
         # schedules it inside the FastAPI lifespan and never trades directly.
         self.autopilot_runner = autopilot_runner
         self.autopilot_provider = autopilot_provider
+        # ``sec_004``: the 4-ring topology is only real if the cockpit can prove
+        # four distinct OS processes are alive.  The supervisor is injected so
+        # single-process mode still renders (with an explicit "not attached").
+        self.process_supervisor = process_supervisor
+        self._feed_mode = str(feed_mode) if feed_mode else None
+        # Phase 3 Step 2: the multi-silo public dual-vendor connector and the
+        # write-only broker credential vault are injected so tests and the
+        # 4-ring supervisor can each supply their own instance.
+        self.feed_connector = feed_connector
+        # ``guard`` above is Ring 0's SiloGuard (reconciliation drift).  The
+        # feed cross-check needs Ring 2's SelfHealingDataGuard, which is a
+        # different object with a different contract.
+        if feed_guard is not None:
+            self.feed_guard = feed_guard
+        elif hasattr(guard, "ingest_bar"):
+            self.feed_guard = guard
+        else:
+            self.feed_guard = None
+        self.broker_vault = broker_vault
+        self._llm_probe_fetcher = llm_probe_fetcher
+        self._feed_report: dict[str, Any] = {}
+        self._credential_reports: dict[str, dict[str, Any]] = {}
+        self._llm_probe: dict[str, Any] = {}
         self.autopilot_interval_s = AUTOPILOT_INTERVAL_S
         self._bus_cursor = 0
         self._formal_cache: dict[str, Any] | None = None
@@ -860,6 +960,242 @@ class ControlPlane:
         self._formal_cache = payload
         return payload
 
+    def ring_processes(self) -> dict[str, Any]:
+        """Four-ring OS process table with shared-memory heartbeat ages.
+
+        Returns ``available: False`` (never an exception) when the cockpit runs
+        in single-process mode, so the UI can say "not attached" instead of
+        implying the rings are down.
+        """
+
+        try:
+            from core.process_supervisor import ring_process_snapshot
+        except Exception as exc:  # pragma: no cover - supervisor is optional
+            return {
+                "available": False,
+                "reason": f"process supervisor unavailable: {type(exc).__name__}",
+                "rings": [],
+                "pids": {},
+                "distinct_os_processes": 0,
+            }
+        return ring_process_snapshot(self.process_supervisor)
+
+    def feed_state(self) -> dict[str, Any]:
+        """Which market-data path is live: public dual-vendor or paper autopilot."""
+
+        supervisor = self.process_supervisor
+        mode = self._feed_mode
+        if mode is None and supervisor is not None:
+            mode = getattr(supervisor, "feed_mode", None)
+        if mode is None:
+            mode = "PAPER_AUTOPILOT"
+        body: dict[str, Any] = {
+            "feed_mode": str(mode),
+            "live_public_dual_vendor": str(mode) == "LIVE_PUBLIC_DUAL_VENDOR",
+            "paper_autopilot": str(mode) == "PAPER_AUTOPILOT",
+            "available_modes": ["PAPER_AUTOPILOT", "LIVE_PUBLIC_DUAL_VENDOR"],
+            "silo_modes": {},
+            "law": "sec_018 Law 1 - no single venue is ever trusted",
+        }
+        connector = getattr(self, "feed_connector", None)
+        if connector is not None and hasattr(connector, "status"):
+            try:
+                body["connector"] = connector.status()
+            except Exception:  # pragma: no cover - telemetry is non-fatal
+                body["connector"] = {"status": "unavailable"}
+            body["silo_modes"] = (
+                dict(connector.mode) if hasattr(connector, "mode") else {}
+            )
+        if self._feed_report:
+            body["last_cycle"] = self._feed_report
+        return body
+
+    # -- Phase 3 Step 2: feed hot-swap --------------------------------
+    def set_feed_mode(self, request: FeedControlRequest) -> dict[str, Any]:
+        """Hot-swap the market-data path without restarting any worker.
+
+        ``PAPER_AUTOPILOT`` is the deterministic in-process rehearsal tape.
+        ``LIVE_PUBLIC_DUAL_VENDOR`` polls two independent public venues per silo
+        and degrades *per silo* to labelled synthetic ticks if a venue is
+        unreachable or the market is closed (``sec_018`` Law 1).
+        """
+
+        previous = self.feed_state()["feed_mode"]
+        mode = str(request.feed_mode)
+        self._feed_mode = mode
+
+        # Propagate to the 4-ring supervisor so freshly respawned Ring 1/2
+        # workers inherit the same feed path (no restart of the gateway).
+        supervisor = self.process_supervisor
+        if supervisor is not None and hasattr(supervisor, "feed_mode"):
+            supervisor.feed_mode = mode
+
+        response: dict[str, Any] = {
+            "feed_mode": mode,
+            "previous_feed_mode": previous,
+            "changed": mode != previous,
+            "operator": str(request.operator),
+            "zero_restart": True,
+            "live_public_dual_vendor": mode == "LIVE_PUBLIC_DUAL_VENDOR",
+            "timestamp_ns": time.time_ns(),
+        }
+
+        if mode == "LIVE_PUBLIC_DUAL_VENDOR" and request.ingest_cycle:
+            response["cycle"] = self._run_feed_cycle()
+        elif mode == "LIVE_PUBLIC_DUAL_VENDOR":
+            response["cycle"] = {
+                "skipped": True,
+                "reason": "ingest_cycle disabled by the operator",
+                "round": 0,
+                "frames": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "silos": {},
+            }
+        else:
+            response["cycle"] = {
+                "skipped": True,
+                "reason": "paper autopilot drives its own deterministic tape",
+                "round": 0,
+                "frames": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "silos": {},
+            }
+        response["feed"] = self.feed_state()
+        return response
+
+    def _ensure_feed_connector(self) -> Any:
+        if self.feed_connector is not None:
+            return self.feed_connector
+        from ring2_brain.truth.live_public_feeds import MultiSiloFeedConnector
+
+        self.feed_connector = MultiSiloFeedConnector(guard=self.feed_guard)
+        return self.feed_connector
+
+    def _run_feed_cycle(self) -> dict[str, Any]:
+        """One immediate dual-vendor fetch/ingest cycle across all 4 silos."""
+
+        connector = self._ensure_feed_connector()
+        try:
+            report = connector.ingest_cycle()
+        except Exception as exc:  # pragma: no cover - feed must never 500
+            report = {
+                "error": f"{type(exc).__name__}: {exc}",
+                "frames": 0,
+                "silos": {},
+                "all_live": False,
+            }
+        self._feed_report = dict(report)
+        return report
+
+    # -- Phase 3 Step 2: write-only broker credentials ----------------
+    def broker_credentials(self) -> dict[str, Any]:
+        """Masked per-venue credential inventory (never a raw secret)."""
+
+        try:
+            state = broker_credential_state(
+                registry=self.registry, vault=self.broker_vault
+            )
+        except Exception as exc:  # pragma: no cover - vault is optional
+            return {
+                "write_only": True,
+                "available": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "silos": {},
+            }
+        state["available"] = True
+        if self._credential_reports:
+            state["last_verification"] = {
+                key: {
+                    "venue": report.get("venue"),
+                    "silo": report.get("silo"),
+                    "dry_run_verified": report.get("dry_run_verified"),
+                    "api_key_masked": report.get("api_key_masked"),
+                    "sandbox": report.get("sandbox"),
+                    "stored_at_ns": report.get("stored_at_ns"),
+                }
+                for key, report in self._credential_reports.items()
+            }
+        return state
+
+    def store_broker_credentials(
+        self, request: BrokerCredentialRequest
+    ) -> dict[str, Any]:
+        """Encrypt a testnet credential in Ring 0 and return only masked proof.
+
+        Ring 3 never sees the plaintext: it hands the two ``SecretStr`` values to
+        Ring 0, which stores them under ``ring0_vault/silos/key_vault`` and
+        returns ``***last4`` plus the dry-run handshake receipt (``sec_011``).
+        """
+
+        api_key = request.api_key.get_secret_value()
+        api_secret = request.api_secret.get_secret_value()
+        if not api_key.strip() or not api_secret.strip():
+            raise HTTPException(
+                status_code=422, detail="api_key and api_secret must be non-empty"
+            )
+        try:
+            report = store_and_verify_broker_credentials(
+                request.silo,
+                request.venue,
+                api_key,
+                api_secret,
+                sandbox=bool(request.sandbox),
+                registry=self.registry,
+                vault=self.broker_vault,
+            )
+        except ValueError as exc:
+            # The message names the silo/venue only; it never contains a secret.
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        finally:
+            # Drop the plaintext references before building the response.
+            del api_key
+            del api_secret
+
+        report["operator"] = str(request.operator)
+        report["zero_restart"] = True
+        self._credential_reports[f"{report['silo']}:{report['venue']}"] = dict(report)
+        return report
+
+    # -- Phase 3 Step 2: live local LLM probe ------------------------
+    def probe_llms(self, request: LLMProbeRequest | None = None) -> dict[str, Any]:
+        """Ping System 1 / System 2 under the strict 250 ms hard cap."""
+
+        from core.llm_transport import HARD_TIMEOUT_MS, probe_llm_endpoints
+
+        timeout_ms = (
+            float(request.timeout_ms)
+            if request is not None and request.timeout_ms is not None
+            else float(HARD_TIMEOUT_MS)
+        )
+        # System 1 must always honour the constitutional 250 ms ceiling.
+        cap = min(timeout_ms, float(HARD_TIMEOUT_MS))
+        report = probe_llm_endpoints(
+            system1=self._llm["1"].to_dict(),
+            system2=self._llm["2"].to_dict(),
+            hard_timeout_ms=cap,
+            fetcher=self._llm_probe_fetcher,
+        )
+        report["operator"] = str(request.operator) if request is not None else "ring3.operator"
+        report["zero_restart"] = True
+        report["write_only_credentials"] = True
+        self._llm_probe = dict(report)
+
+        # Reflect the measured latency on the cockpit slot so the operator sees
+        # the number that actually drove the fallback decision.
+        slot1 = self._llm["1"]
+        slot1.last_latency_ms = float(report["system1"]["latency_ms"])
+        slot1.circuit_open = bool(report["fallback_active"])
+        slot1.updated_at_ns = int(report["probed_at_ns"])
+        system2 = report.get("system2")
+        if system2:
+            slot2 = self._llm["2"]
+            slot2.last_latency_ms = float(system2["latency_ms"])
+            slot2.circuit_open = not bool(system2["reachable"])
+            slot2.updated_at_ns = int(report["probed_at_ns"])
+        return report
+
     def state(self) -> dict[str, Any]:
         silos = {
             silo_id: {
@@ -883,6 +1219,11 @@ class ControlPlane:
             "extensions": self._extensions_state(),
             "formal_proofs": self.formal_proofs(),
             "autopilot": self.autopilot_state(),
+            "ring_processes": self.ring_processes(),
+            "feed_mode": self.feed_state()["feed_mode"],
+            "feed": self.feed_state(),
+            "broker_credentials": self.broker_credentials(),
+            "llm_probe": self._llm_probe,
             "streams": {
                 "cockpit": STREAM_RING3_COCKPIT,
                 "fps": 60,
@@ -1451,12 +1792,34 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
 
     @app.get("/api/v2/cockpit/health")
     def health() -> dict[str, Any]:
+        rings = control.ring_processes()
+        feed = control.feed_state()
+        credentials = control.broker_credentials()
+        configured = sum(
+            int(entry.get("configured", 0))
+            for entry in (credentials.get("silos") or {}).values()
+        )
         return {
             "ok": True,
             "status": control.system_status()["status"],
             "version": PLATFORM_VERSION,
             "document_id": DOCUMENT_ID,
             "autopilot": control.autopilot_state().get("enabled", False),
+            "feed_mode": feed["feed_mode"],
+            "ring_processes": {
+                "available": rings.get("available", False),
+                "distinct_os_processes": rings.get("distinct_os_processes", 0),
+                "pids": rings.get("pids", {}),
+                "rings": rings.get("rings", []),
+            },
+            "broker_credentials": {
+                "write_only": True,
+                "configured_venues": configured,
+            },
+            "llm_probe": {
+                "status": control._llm_probe.get("status"),
+                "hard_timeout_ms": control._llm_probe.get("hard_timeout_ms"),
+            },
         }
 
     @app.get("/api/v2/cockpit/state")
@@ -1496,9 +1859,36 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def control_brokers(request: BrokerControlRequest) -> dict[str, Any]:
         return control.update_broker(request)
 
+    # ---- Phase 3 Step 2: write-only broker testnet credentials ---------
+    @app.post("/api/v2/control/brokers/credentials")
+    def control_broker_credentials(
+        request: BrokerCredentialRequest,
+    ) -> dict[str, Any]:
+        return control.store_broker_credentials(request)
+
+    @app.get("/api/v2/control/brokers/credentials")
+    def control_broker_credentials_state() -> dict[str, Any]:
+        return control.broker_credentials()
+
+    # ---- Phase 3 Step 2: feed mode hot-swap ----------------------------
+    @app.post("/api/v2/control/feeds")
+    def control_feeds(request: FeedControlRequest) -> dict[str, Any]:
+        return control.set_feed_mode(request)
+
+    @app.get("/api/v2/control/feeds")
+    def control_feeds_state() -> dict[str, Any]:
+        return control.feed_state()
+
     @app.post("/api/v2/control/llms")
     def control_llms(request: LLMControlRequest) -> dict[str, Any]:
         return control.update_llm(request)
+
+    # ---- Phase 3 Step 2: live local Ollama / LLM probe (<250 ms) -------
+    @app.post("/api/v2/control/llms/probe")
+    def control_llms_probe(
+        request: LLMProbeRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.probe_llms(request)
 
     @app.post("/api/v2/control/killswitch")
     def control_killswitch(request: KillSwitchRequest) -> dict[str, Any]:

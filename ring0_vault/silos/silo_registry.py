@@ -60,9 +60,14 @@ __all__ = [
     "SWEEP_TICKERS",
     "DispatchMode",
     "VenueDispatchResult",
+    "BROKER_CREDENTIAL_VENUES",
+    "broker_credentials_present",
+    "broker_credential_state",
+    "broker_payload_schema",
     "default_registry",
     "dispatch_signed_order",
     "probe_donor_adapters",
+    "store_and_verify_broker_credentials",
 ]
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -834,10 +839,14 @@ def _credential_env_suffix(venue: str) -> str:
 def credentials_present(venue: str) -> bool:
     """True when live credentials for ``venue`` exist in Ring 0's key vault.
 
-    Reads only the encrypted key-vault (India brokers) or the process
-    environment (everything else).  Never logs, returns or hashes a secret.
+    Checks, in order: the write-only broker credential vault
+    (:mod:`ring0_vault.silos.key_vault.broker_credentials`), the India broker
+    key vault, then the process environment.  Never logs, returns or hashes a
+    secret.
     """
     venue = _normalise_venue(venue)
+    if broker_credentials_present(venue):
+        return True
     if venue in _INDIA_VENUES:
         try:
             from ring0_vault.silos.india_brokers import _openalgo_compat
@@ -856,6 +865,300 @@ def credentials_present(venue: str) -> bool:
     if venue == "interactive_brokers" and os.environ.get("IBKR_ACCOUNT"):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Broker testnet / sandbox credential vault + Ring 0 dry-run handshake
+# ---------------------------------------------------------------------------
+
+#: Every venue the cockpit may store a testnet / sandbox credential for.
+BROKER_CREDENTIAL_VENUES: tuple[str, ...] = (
+    "binance",
+    "okx",
+    "bybit",
+    "dhan",
+    "zerodha",
+    "angel",
+    "upstox",
+    "interactive_brokers",
+    "alpaca",
+    "vnpy_mt5",
+    "vnpy_ctp",
+    "oanda",
+)
+
+#: Vault key template.  ``broker.<venue>.api_key`` / ``.api_secret`` / ``.env``.
+_CREDENTIAL_KEY_TEMPLATE = "broker.{venue}.{field}"
+_CREDENTIAL_FIELDS: tuple[str, ...] = ("api_key", "api_secret", "env")
+
+#: The one instrument each silo's dry-run preflight prices.
+_DRY_RUN_INSTRUMENTS: Mapping[str, tuple[str, float, float]] = {
+    "CRYPTO_BINANCE": ("BTCUSDT", 64_250.0, 0.01),
+    "INDIA_ZERODHA_DHAN": ("RELIANCE.NS", 2_942.5, 10.0),
+    "US_IBKR": ("NVDA", 121.4, 10.0),
+    "FX_MT5": ("EURUSD", 1.0842, 10_000.0),
+}
+
+#: Venue-native payload contract, per venue (``sec_015`` integration surface).
+#:
+#: Crypto / US venues resolve this from :mod:`ring1_spinal.nautilus_adapters`
+#: ``AdapterSpec.required_fields``; India and FX are declared here because their
+#: harvested donors expose no machine-readable spec object.
+_NON_NAUTILUS_SCHEMA: Mapping[str, tuple[str, ...]] = {
+    "dhan": (
+        "dhanClientId", "transactionType", "exchangeSegment", "productType",
+        "orderType", "securityId", "quantity", "price", "validity",
+    ),
+    "zerodha": (
+        "tradingsymbol", "transaction_type", "exchange", "order_type",
+        "product", "quantity", "price", "validity",
+    ),
+    "angel": (
+        "tradingsymbol", "transactiontype", "exchange", "ordertype",
+        "producttype", "quantity", "price", "variety", "symboltoken",
+    ),
+    "upstox": (
+        "instrument_token", "transaction_type", "order_type", "product",
+        "quantity", "price", "validity",
+    ),
+    "vnpy_mt5": (
+        "symbol", "exchange", "direction", "order_type", "volume", "price",
+        "offset", "reference",
+    ),
+    "vnpy_ctp": (
+        "symbol", "exchange", "direction", "order_type", "volume", "price",
+        "offset", "reference",
+    ),
+    "oanda": ("order",),
+}
+
+
+def _broker_vault(vault: Any | None = None) -> Any:
+    """Resolve the Ring 0 write-only broker credential vault."""
+
+    if vault is not None:
+        return vault
+    from ring0_vault.silos.key_vault.broker_credentials import default_broker_vault
+
+    return default_broker_vault()
+
+
+def _credential_key(venue: str, field: str) -> str:
+    return _CREDENTIAL_KEY_TEMPLATE.format(venue=_normalise_venue(venue), field=field)
+
+
+def broker_credentials_present(venue: str, *, vault: Any | None = None) -> bool:
+    """True when the write-only broker vault holds a key for ``venue``."""
+
+    try:
+        store = _broker_vault(vault)
+        return bool(store.has(_credential_key(venue, "api_key")))
+    except Exception:  # pragma: no cover - vault is optional at import time
+        return False
+
+
+def broker_payload_schema(venue: str) -> tuple[str, ...]:
+    """The exact field names a venue-native order body must carry."""
+
+    key = _normalise_venue(venue)
+    if key in _NON_NAUTILUS_SCHEMA:
+        return _NON_NAUTILUS_SCHEMA[key]
+    from ring1_spinal.nautilus_adapters._nautilus_compat import adapter_spec
+
+    return tuple(adapter_spec(key).required_fields)
+
+
+def store_and_verify_broker_credentials(
+    silo: str,
+    venue: str,
+    api_key: str,
+    api_secret: str,
+    sandbox: bool = True,
+    *,
+    registry: MarketSiloRegistry | None = None,
+    vault: Any | None = None,
+    now_ns: int | None = None,
+) -> dict[str, Any]:
+    """Encrypt a venue credential in Ring 0 and prove it with a dry-run order.
+
+    Constitutional contract (``sec_011`` / ``sec_016``)
+    --------------------------------------------------
+    * The raw ``api_key`` / ``api_secret`` are encrypted by Fernet inside
+      ``ring0_vault/silos/key_vault`` and are **never** returned.  The response
+      carries only ``***`` + last four characters.
+    * The dry-run handshake is deterministic: it builds the exact venue-native
+      order body for the silo's whitelisted instrument, verifies it against the
+      venue's declared field schema, signs a SHA-256 digest with the vault's
+      Ed25519 key and proves the Fernet envelope round-trips.  No socket is
+      opened and no order is placed.
+    * ``sandbox=True`` (the default) records that the credential targets a
+      testnet / paper host, so a LIVE dispatch can never mistake it for
+      production capital.
+    """
+
+    started = time.perf_counter()
+    registry = registry or default_registry()
+    market_silo = registry.get(silo)
+    venue_key = _normalise_venue(venue)
+
+    if venue_key not in BROKER_CREDENTIAL_VENUES:
+        raise ValueError(
+            f"unsupported broker venue {venue!r}; known venues are "
+            f"{', '.join(BROKER_CREDENTIAL_VENUES)}"
+        )
+    allowed = _ADAPTERS_BY_MARKET.get(market_silo.market, ())
+    if venue_key not in allowed:
+        raise ValueError(
+            f"venue {venue_key!r} does not belong to silo {market_silo.silo_id!r}; "
+            f"allowed venues are {allowed}"
+        )
+
+    key_token = str(api_key or "").strip()
+    secret_token = str(api_secret or "").strip()
+    if not key_token or not secret_token:
+        raise ValueError("api_key and api_secret must both be non-empty")
+
+    store = _broker_vault(vault)
+    key_meta = store.put(_credential_key(venue_key, "api_key"), key_token)
+    secret_meta = store.put(_credential_key(venue_key, "api_secret"), secret_token)
+    store.put(_credential_key(venue_key, "env"), "SANDBOX" if sandbox else "LIVE")
+
+    # ---- dry-run preflight: payload -> schema -> Ed25519 -> Fernet ---------
+    instrument, price, quantity = _DRY_RUN_INSTRUMENTS.get(
+        market_silo.silo_id, ("BTCUSDT", 64_250.0, 0.01)
+    )
+    from core.schemas import UnsignedProposal, VaultName
+
+    from ring0_vault.silos.key_vault.broker_credentials import digest_payload
+
+    proposal = UnsignedProposal(
+        proposal_id=f"dryrun-{market_silo.silo_id}-{venue_key}",
+        strategy_id="credential-preflight-v1",
+        silo=market_silo.silo_id,
+        vault=VaultName.SPINAL_SCALPER,
+        symbol=instrument,
+        side="BUY",
+        qty=float(quantity),
+        limit_price=float(price),
+        expected_gross_bps=20.0,
+        spread_bps=float(market_silo.spread_bps),
+        grounding_hash=hashlib.sha256(
+            f"dryrun|{market_silo.silo_id}|{venue_key}".encode("utf-8")
+        ).hexdigest(),
+    )
+    adapter_module = VENUE_ADAPTERS[venue_key]
+    module = importlib.import_module(adapter_module)
+    payload, flags = _build_payload(venue_key, proposal, module, market_silo)
+
+    required = broker_payload_schema(venue_key)
+    missing = [name for name in required if name not in payload]
+    if venue_key == "oanda":
+        nested = payload.get("order")
+        missing = [] if isinstance(nested, Mapping) and nested else ["order"]
+    schema_ok = not missing
+    if not schema_ok:
+        raise ValueError(
+            f"{venue_key} payload is missing required fields: {', '.join(missing)}"
+        )
+
+    digest = digest_payload(payload)
+    signature = store.sign(digest)
+    signature_ok = bool(store.verify(digest, signature))
+    fernet_ok = bool(store.fernet_roundtrip(digest))
+    if not (signature_ok and fernet_ok):
+        raise RuntimeError("Ring 0 dry-run signing preflight failed")
+
+    elapsed_us = round((time.perf_counter() - started) * 1_000_000.0, 3)
+    stamp = int(now_ns if now_ns is not None else time.time_ns())
+    return {
+        "silo": market_silo.silo_id,
+        "market": _market_label(market_silo.market),
+        "venue": venue_key,
+        "sandbox": bool(sandbox),
+        "environment": "SANDBOX" if sandbox else "LIVE",
+        "ring": "ring0_vault",
+        "vault": "ring0_vault/silos/key_vault",
+        # ---- write-only surface: masked tokens only, never the raw secret --
+        "credential_configured": True,
+        "write_only": True,
+        "api_key_masked": key_meta["masked"],
+        "api_secret_masked": secret_meta["masked"],
+        "masked": {
+            "api_key": key_meta["masked"],
+            "api_secret": secret_meta["masked"],
+        },
+        # ---- deterministic dry-run handshake -------------------------------
+        "dry_run_verified": True,
+        "dry_run": {
+            "signature_alg": "Ed25519",
+            "signature_hex": signature.hex(),
+            "public_key_hex": store.public_key_hex,
+            "payload_digest_sha256": digest.hex(),
+            "fernet_roundtrip_ok": fernet_ok,
+            "schema_ok": schema_ok,
+            "required_fields": list(required),
+            "payload_keys": sorted(str(name) for name in payload),
+            "payload_field_count": len(payload),
+            "order_type": "LIMIT",
+            "instrument": instrument,
+            "adapter_module": adapter_module,
+            "adapter_ready": any(
+                probe.name == venue_key and probe.ready
+                for probe in market_silo.adapters
+            ),
+            "post_only": bool(flags.get("post_only", False)),
+            "settlement_cycle": str(flags.get("settlement_cycle", "")),
+            "elapsed_us": elapsed_us,
+            "socket_opened": False,
+            "order_placed": False,
+        },
+        "stored_at_ns": stamp,
+    }
+
+
+def broker_credential_state(
+    *, registry: MarketSiloRegistry | None = None, vault: Any | None = None
+) -> dict[str, Any]:
+    """Masked credential inventory for the cockpit.  Never decrypts to Ring 3."""
+
+    registry = registry or default_registry()
+    store = _broker_vault(vault)
+    silos: dict[str, Any] = {}
+    for market_silo in registry.silos:
+        venues: list[dict[str, Any]] = []
+        for venue in _ADAPTERS_BY_MARKET.get(market_silo.market, ()):
+            key_masked = store.masked(_credential_key(venue, "api_key"))
+            secret_masked = store.masked(_credential_key(venue, "api_secret"))
+            environment = None
+            if store.has(_credential_key(venue, "env")):
+                environment = store._raw_for_test_only(  # noqa: SLF001 - Ring 0 internal
+                    _credential_key(venue, "env")
+                )
+            venues.append(
+                {
+                    "venue": venue,
+                    "credential_configured": key_masked is not None,
+                    "dry_run_verified": key_masked is not None,
+                    "api_key_masked": key_masked,
+                    "api_secret_masked": secret_masked,
+                    "environment": environment,
+                }
+            )
+        silos[market_silo.silo_id] = {
+            "silo_id": market_silo.silo_id,
+            "market": _market_label(market_silo.market),
+            "venues": venues,
+            "configured": sum(1 for entry in venues if entry["credential_configured"]),
+            "adapter_count": len(venues),
+        }
+    return {
+        "write_only": True,
+        "ring": "ring0_vault",
+        "vault": "ring0_vault/silos/key_vault",
+        "venues_supported": list(BROKER_CREDENTIAL_VENUES),
+        "silos": silos,
+    }
+
 
 
 def _coerce_proposal(signed_order: Any, *, silo: str) -> Any:
