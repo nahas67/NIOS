@@ -2447,6 +2447,12 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     ) -> dict[str, Any]:
         return control.apply_extension(request)
 
+    # ---- Phase 3 Step 4: Prometheus / OpenTelemetry metrics exporter -----
+    # Registered before the SPA mount at "/" so /metrics is never shadowed.
+    from ring3_cockpit.gateway.metrics_exporter import register_metrics_routes
+
+    register_metrics_routes(app, control)
+
     # ---- Step 8: read-only MCP bridge (5 tools, no order/key surface) ----
     if getattr(control, "mcp", None) is not None:
         control.mcp.register_routes(app)

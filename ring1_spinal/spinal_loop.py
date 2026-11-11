@@ -552,10 +552,29 @@ class ZeroGCSpinalEngine:
     ) -> int:
         """Run a tick window inside :meth:`gc_guard`; returns trades taken."""
         trades = 0
+        # Thin telemetry tap: one observation per batch (the worst tick in the
+        # window) keeps the hot path free of per-tick float work while still
+        # giving the Ring 3 exporter a conservative latency sample.
+        worst_ns = 0
+        observed = 0
+        try:
+            from core.telemetry import observe_tick_latency_ns as _observe
+
+            observe = _observe
+        except Exception:  # pragma: no cover - telemetry is never load-bearing
+            observe = None
         with self.gc_guard():
             for tick in ticks:
-                if self.on_tick(tick, now_ns).is_trade:
+                outcome = self.on_tick(tick, now_ns)
+                if observe is not None:
+                    elapsed = outcome.elapsed_ns
+                    if elapsed > worst_ns:
+                        worst_ns = elapsed
+                    observed += 1
+                if outcome.is_trade:
                     trades += 1
+        if observe is not None and observed:
+            observe(worst_ns)
         return trades
 
     # -- Ring 0 / cockpit emission -----------------------------------------

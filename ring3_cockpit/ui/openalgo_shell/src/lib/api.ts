@@ -12,6 +12,7 @@ import type {
   KillReport,
   LLMControlPayload,
   LLMProbeReport,
+  MetricsSnapshot,
   RearmReport,
   SupervisorControlResponse,
 } from '@/types'
@@ -188,4 +189,27 @@ export function postSupervisor(
       operator: 'ring3.cockpit',
     }),
   })
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 4 — Prometheus / OpenTelemetry metrics exporter
+ * ------------------------------------------------------------------ */
+
+/** Standard Prometheus / OpenMetrics scrape target (text exposition). */
+export function metricsUrl(): string {
+  return `${API_BASE}/api/v2/metrics`
+}
+
+/** Alias scrape path (`/metrics`) for a stock Prometheus job config. */
+export function metricsAliasUrl(): string {
+  return `${API_BASE}/metrics`
+}
+
+/** JSON telemetry consumed by the live cockpit memory/telemetry chip. */
+export function metricsJsonUrl(): string {
+  return `${API_BASE}/api/v2/metrics/json`
+}
+
+export function fetchMetrics(): Promise<MetricsSnapshot> {
+  return request<MetricsSnapshot>('/api/v2/metrics/json')
 }

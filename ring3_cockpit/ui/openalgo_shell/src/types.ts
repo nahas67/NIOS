@@ -830,3 +830,95 @@ export interface LLMProbeReport {
   zero_restart?: boolean
 }
 
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 4 · Prometheus / OpenTelemetry metrics exporter
+ * ------------------------------------------------------------------ */
+
+export interface MetricsLatencyBucket {
+  le: number
+  count: number
+}
+
+export interface MetricsTickLatency {
+  count: number
+  sum_seconds: number
+  mean_seconds: number
+  buckets: MetricsLatencyBucket[]
+  quantiles: Record<string, number>
+  quantiles_ns: Record<string, number>
+  p99_budget_seconds: number
+  p99_within_budget: boolean
+}
+
+export interface MetricsRingHeartbeat {
+  ring: number
+  worker: string
+  pid: number
+  alive: boolean
+  heartbeat_age_ms: number
+}
+
+export interface MetricsSiloNav {
+  silo: string
+  vaults: Record<VaultKey, number>
+  nav_micros: number
+  nav_total_micros: number
+}
+
+export interface MetricsSnapshot {
+  generated_at_ns: number
+  generated_at: string
+  uptime_seconds: number
+  node: string
+  version: string
+  document_id: string
+  exposition: {
+    prometheus: string
+    alias: string
+    json: string
+    content_type: string
+  }
+  tick_latency: MetricsTickLatency
+  rings: MetricsRingHeartbeat[]
+  conformal: {
+    strategy: string
+    q98_bps: number
+    effective_q98_bps: number
+    samples: number
+    coverage_target: number
+  }
+  outbox: {
+    pending: number
+    committed: number
+    voided: number
+    total: number
+  }
+  tokens: {
+    spend_usd: number
+    cap_usd: number
+    remaining_usd: number
+    utilization: number
+  }
+  leases: {
+    active: number
+    slots_written: number
+    shm_uri: string
+  }
+  silos: MetricsSiloNav[]
+  process: {
+    rss_mb: number | null
+    python_heap_mb: number | null
+    threads: number | null
+  }
+  ring1: {
+    ticks: number
+    abstentions: number
+    abstention_ratio: number
+    shadow_fills: number
+    live_proposals: number
+    ring0_rejects: number
+    breaker_trips: number
+  }
+  scrape_duration_seconds: number
+}
+

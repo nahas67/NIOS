@@ -1,9 +1,11 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
+  Activity,
   AlertTriangle,
   CheckCircle2,
   Cpu,
   DollarSign,
+  ExternalLink,
   Gauge,
   KeyRound,
   Moon,
@@ -31,7 +33,7 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { postBroker, postBrokerCredentials, postExtensions, postLLM, postLLMProbe } from '@/lib/api'
+import { postBroker, postBrokerCredentials, postExtensions, postLLM, postLLMProbe, fetchMetrics, metricsAliasUrl, metricsJsonUrl, metricsUrl } from '@/lib/api'
 import { formatPct, formatUsd } from '@/lib/format'
 import type {
   BrokerCredentialReport,
@@ -40,6 +42,7 @@ import type {
   ExtensionsState,
   LLMProbeReport,
   LLMSlot,
+  MetricsSnapshot,
   SiloState,
   VaultKey,
 } from '@/types'
@@ -64,6 +67,7 @@ export function ControlRoomTab({ state, onSaved }: ControlRoomTabProps) {
   return (
     <div className="space-y-4">
       <ReleaseStatusPanel state={state} />
+      <TelemetryMetricsPanel />
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
         <div className="space-y-4">
@@ -1306,6 +1310,168 @@ function LLMControlCard({
             {message}
           </div>
         ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 4 · live memory / telemetry chip + Prometheus links
+ * ------------------------------------------------------------------ */
+
+function TelemetryMetricsPanel() {
+  const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        const next = await fetchMetrics()
+        if (!cancelled) {
+          setMetrics(next)
+          setError(null)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(
+            err instanceof Error ? err.message : 'metrics endpoint unavailable'
+          )
+        }
+      }
+    }
+    void load()
+    const timer = window.setInterval(() => void load(), 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  const p99Ms = (metrics?.tick_latency.quantiles_ns.p99 ?? 0) / 1_000_000
+  const p99WithinBudget = metrics?.tick_latency.p99_within_budget ?? false
+  const pending = metrics?.outbox.pending ?? 0
+  const healthy = Boolean(metrics) && p99WithinBudget && pending === 0 && !error
+
+  const chips: { label: string; value: string; tone?: 'ok' | 'warn' }[] = [
+    {
+      label: 'Gateway RSS',
+      value:
+        metrics?.process.rss_mb != null
+          ? `${metrics.process.rss_mb.toFixed(1)} MB`
+          : 'n/a',
+    },
+    {
+      label: 'Python heap',
+      value:
+        metrics?.process.python_heap_mb != null
+          ? `${metrics.process.python_heap_mb.toFixed(2)} MB`
+          : 'off',
+    },
+    {
+      label: 'Tick p99',
+      value: `${p99Ms.toFixed(3)} ms`,
+      tone: p99WithinBudget ? 'ok' : 'warn',
+    },
+    { label: 'Armed leases', value: String(metrics?.leases.active ?? 0) },
+    {
+      label: 'Outbox pending',
+      value: String(pending),
+      tone: pending === 0 ? 'ok' : 'warn',
+    },
+    {
+      label: 'Q98 bound',
+      value: `${(metrics?.conformal.q98_bps ?? 0).toFixed(1)} bps`,
+    },
+    {
+      label: 'Token spend',
+      value: `${formatUsd(metrics?.tokens.spend_usd ?? 0)} / ${formatUsd(
+        metrics?.tokens.cap_usd ?? DAILY_TOKEN_BUDGET_USD
+      )}`,
+    },
+    { label: 'Ticks', value: String(metrics?.ring1.ticks ?? 0) },
+  ]
+
+  return (
+    <Card className="gap-2 border-border/70 bg-card/60 py-3 shadow-none">
+      <CardContent className="space-y-3 px-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+            <Activity className="size-3.5 text-primary" />
+            Prometheus / OpenTelemetry telemetry
+          </span>
+          <span
+            className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-[10px] ${
+              healthy
+                ? 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                : 'border border-amber-500/30 bg-amber-500/10 text-amber-200'
+            }`}
+          >
+            {healthy ? (
+              <CheckCircle2 className="size-3" />
+            ) : (
+              <AlertTriangle className="size-3" />
+            )}
+            {error ? 'SCRAPE ERROR' : healthy ? 'TELEMETRY LIVE' : 'DEGRADED'}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {chips.map((chip) => (
+            <div
+              key={chip.label}
+              className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5"
+            >
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                {chip.label}
+              </div>
+              <div
+                className={`font-mono text-xs tabular-nums ${
+                  chip.tone === 'warn'
+                    ? 'text-amber-300'
+                    : chip.tone === 'ok'
+                      ? 'text-emerald-300'
+                      : 'text-foreground'
+                }`}
+              >
+                {chip.value}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
+          <a
+            className="flex items-center gap-1 font-mono text-primary hover:underline"
+            href={metricsUrl()}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <ExternalLink className="size-3" />
+            {metrics?.exposition.prometheus ?? '/api/v2/metrics'}
+          </a>
+          <a
+            className="font-mono text-primary hover:underline"
+            href={metricsAliasUrl()}
+            target="_blank"
+            rel="noreferrer"
+          >
+            /metrics
+          </a>
+          <a
+            className="font-mono text-primary hover:underline"
+            href={metricsJsonUrl()}
+            target="_blank"
+            rel="noreferrer"
+          >
+            /api/v2/metrics/json
+          </a>
+          <span>
+            scrape {((metrics?.scrape_duration_seconds ?? 0) * 1000).toFixed(2)} ms
+          </span>
+        </div>
+
+        {error ? <p className="text-[10px] text-red-300">{error}</p> : null}
       </CardContent>
     </Card>
   )

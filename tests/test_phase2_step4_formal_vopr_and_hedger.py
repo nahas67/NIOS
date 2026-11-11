@@ -308,9 +308,9 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
     assert violations == [], violations
 
 
-def test_gate5_full_test_inventory_is_fifteen_files() -> None:
+def test_gate5_full_test_inventory_is_sixteen_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 15, [path.name for path in test_files]
+    assert len(test_files) == 16, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
     assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
     # Phase 3 Step 1 adds process isolation, the live TigerBeetle replica and the
@@ -328,6 +328,12 @@ def test_gate5_full_test_inventory_is_fifteen_files() -> None:
     # permanent git-index secret guard.
     assert (
         ROOT / "tests" / "test_phase3_step3_testnet_supervisor_and_security.py"
+    ) in test_files
+    # Phase 3 Step 4 adds the Prometheus/OpenTelemetry exporter, the accelerated
+    # soak + memory-leak auditor and the deterministic chaos SIGKILL recovery
+    # engine.
+    assert (
+        ROOT / "tests" / "test_phase3_step4_soak_metrics_and_chaos.py"
     ) in test_files
 
 

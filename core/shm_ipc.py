@@ -551,6 +551,38 @@ class LeaseTableSHM:
                 count += 1
         return count
 
+    # -- reboot hygiene ----------------------------------------------------
+    def sweep_expired(self, now_ns: int | None = None) -> int:
+        """Fail closed every armed lease whose dead-man TTL has elapsed.
+
+        Called on process boot / post-crash recovery.  A lease written by a
+        dead System 1 can still sit in shared memory with ``mode != DISARMED``;
+        this sweep detects the stale ``expires_at_ns`` and rewrites the slot as
+        :class:`System1Lease.disarmed`, so a reboot can never inherit trading
+        authority (``sec_004`` dead-man lease, ``sec_018`` Law 2).
+
+        Returns the number of slots swept.
+        """
+        stamp = time.monotonic_ns() if now_ns is None else int(now_ns)
+        indices = sorted(self._written_indices) or list(range(self.n_slots))
+        swept = 0
+        for index in indices:
+            off = self.slot_offset(index)
+            seq = _U64.unpack_from(self._seg.buf, off)[0]
+            if seq == 0 or seq & 1:
+                continue
+            lease = System1Lease.unpack(
+                self._seg.buf, off + _LEASE_PAYLOAD_OFFSET
+            )
+            if not lease.symbol or lease.mode is LeaseMode.DISARMED:
+                continue
+            if lease.is_active(stamp):
+                continue
+            self._lease_cache.pop(off, None)
+            self.write_lease(System1Lease.disarmed(lease.symbol), stamp)
+            swept += 1
+        return swept
+
     # -- read path (Ring 1 hot loop) ---------------------------------------
     def read_lease(
         self,
@@ -575,7 +607,12 @@ class LeaseTableSHM:
                 continue
             cached = self._lease_cache.get(off)
             if cached is not None and cached[0] == seq_before:
-                return cached[1]
+                # A cached lease is only authoritative while its dead-man
+                # window is open; an expired entry must never be served as
+                # live authority (Law 2).
+                if cached[1].is_active(now_ns):
+                    return cached[1]
+                self._lease_cache.pop(off, None)
             raw = struct.unpack_from("<16sB7xddQQ", buf, off + _LEASE_PAYLOAD_OFFSET)
             if _U64.unpack_from(buf, off)[0] != seq_before:
                 continue

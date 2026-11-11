@@ -1049,9 +1049,13 @@ def test_gate4_control_endpoint_dispatches_a_sandbox_order(
 
 def test_gate5_test_inventory_and_rebuilt_cockpit_bundle() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 15, [path.name for path in test_files]
+    assert len(test_files) == 16, [path.name for path in test_files]
     assert (
         ROOT / "tests" / "test_phase3_step3_testnet_supervisor_and_security.py"
+        in test_files
+    )
+    assert (
+        ROOT / "tests" / "test_phase3_step4_soak_metrics_and_chaos.py"
         in test_files
     )
 
@@ -1063,6 +1067,9 @@ def test_gate5_test_inventory_and_rebuilt_cockpit_bundle() -> None:
     assert "START 4 RINGS" in bundle
     assert "RESTART RING 1" in bundle
     assert "/api/v2/control/supervisor" in bundle
+    # Phase 3 Step 4 telemetry surface.
+    assert "Prometheus / OpenTelemetry telemetry" in bundle
+    assert "/api/v2/metrics" in bundle
 
 
 def test_gate5_release_tag_is_annotated_when_present() -> None:

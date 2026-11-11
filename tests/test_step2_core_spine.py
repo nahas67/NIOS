@@ -815,8 +815,16 @@ def test_6_four_ring_air_gap_ast_guard() -> None:
     # single deterministic harness and neither is ever imported by Ring 2.
     # ``core/orchestrator.py`` boots them in-process; ``core/process_supervisor.py``
     # boots them as four separate OS processes (``sec_004``).  Both are still
-    # checked below for broker-adapter leakage.
-    composition_roots = ("core/orchestrator.py", "core/process_supervisor.py")
+    # checked below for broker-adapter leakage.  ``core/chaos_recovery.py`` is
+    # the deterministic crash-recovery harness (``sec_012``): it must reopen a
+    # real Ring 0 IBOR journal and outbox to prove ``NoOrphanedOrders`` and
+    # double-entry conservation, so it is a composition root by construction and
+    # is likewise still scanned for credential/broker-adapter leakage.
+    composition_roots = (
+        "core/orchestrator.py",
+        "core/process_supervisor.py",
+        "core/chaos_recovery.py",
+    )
 
     scanned = 0
     violations: list[tuple[str, str]] = []
