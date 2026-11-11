@@ -6,7 +6,7 @@ Five gates, matching the constitutional acceptance criteria:
 2. Deterministic 1,000-step VOPR fault-injection campaign.
 3. TigerBeetle binary probe / replica formatting + PostgreSQL 16 DDL.
 4. TacticalSwing Black-Scholes tail hedge + SHA-256 grounding + Ring 0 signing.
-5. Air-gap AST audit and the complete 11-file test inventory.
+5. Air-gap AST audit and the complete 15-file test inventory.
 """
 
 from __future__ import annotations
@@ -308,9 +308,9 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
     assert violations == [], violations
 
 
-def test_gate5_full_test_inventory_is_fourteen_files() -> None:
+def test_gate5_full_test_inventory_is_fifteen_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 14, [path.name for path in test_files]
+    assert len(test_files) == 15, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
     assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
     # Phase 3 Step 1 adds process isolation, the live TigerBeetle replica and the
@@ -322,6 +322,12 @@ def test_gate5_full_test_inventory_is_fourteen_files() -> None:
     # and live local Ollama probe gates.
     assert (
         ROOT / "tests" / "test_phase3_step2_live_cutover_and_cockpit.py"
+    ) in test_files
+    # Phase 3 Step 3 adds the live supervisor control plane, the Lee-Ready
+    # dual-quote flow estimator, the Ring 0 sandbox execution bridge and the
+    # permanent git-index secret guard.
+    assert (
+        ROOT / "tests" / "test_phase3_step3_testnet_supervisor_and_security.py"
     ) in test_files
 
 

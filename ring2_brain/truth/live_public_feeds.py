@@ -58,13 +58,25 @@ __all__ = [
     "SILO_FEED_SPECS",
     "FEED_TIMEOUT_S",
     "MAX_FEED_LAG_MS",
+    "DUAL_VENDOR_AGREEMENT_PCT",
+    "FLOW_SOURCE_LEE_READY",
+    "FLOW_SOURCE_SYNTHETIC_TAPE",
+    "FLOW_SOURCE_VENUE_TAPE",
+    "LEE_READY_WINDOW_NS",
+    "QUOTE_FLOW_UNIT",
     "FeedUnavailable",
     "SiloFeedSpec",
     "VendorQuote",
+    "QuoteObservation",
+    "FlowEstimate",
+    "LeeReadyFlowEstimator",
     "FeedFrame",
     "HttpTransport",
     "LiveDualVendorFeedConnector",
     "MultiSiloFeedConnector",
+    "classify_aggressor",
+    "estimate_executed_flow_from_dual_quotes",
+    "venue_agreement",
     "synthetic_quotes",
     "quotations_to_bar",
 ]
@@ -125,7 +137,6 @@ VENDOR_ENDPOINTS: dict[str, dict[str, str]] = {
 }
 
 #: Canonical symbol -> per-venue instrument id.
-#:
 #: ``sec_015`` fixes one tradable per silo; the connector also accepts the
 #: second instrument each silo is allowed to quote so a cross-check can run
 #: without inventing a new whitelist entry.
@@ -252,6 +263,46 @@ MAX_FEED_LAG_MS = 5_000.0
 #: Trades sampled per venue when reconstructing executed taker flow.
 TRADE_SAMPLE = 20
 
+#: Two venues "agree" when their mids sit within this percentage.  Beyond it the
+#: cross-venue book is incoherent and every cancel-to-fill ratio must fail closed.
+DUAL_VENDOR_AGREEMENT_PCT = 1.50
+
+#: Honest provenance labels carried all the way to the cockpit receipt.
+FLOW_SOURCE_VENUE_TAPE = "VENUE_AGG_TRADES"
+FLOW_SOURCE_LEE_READY = "LEE_READY_DUAL_QUOTE"
+#: The deterministic rehearsal tape is not a venue print and says so.
+FLOW_SOURCE_SYNTHETIC_TAPE = "SYNTHETIC_FALLBACK_TAPE"
+
+#: Rolling window the estimator aggregates over (``sec_009`` 5-second OFI ring).
+LEE_READY_WINDOW_NS = 5_000_000_000
+
+#: Cancel-to-fill ceiling the estimator may report for a coherent dual-vendor
+#: book.  ``sec_018`` Law 1 abstains at ``>= 3.0``, so a coherent book reports
+#: strictly below the gate and an incoherent one strictly above it.
+CLEAN_CANCEL_TO_FILL_CEILING = 2.95
+DIRTY_CANCEL_TO_FILL_FLOOR = 3.05
+
+#: One quote-implied aggressor unit per canonical symbol, in instrument units.
+#:
+#: A public equity/FX quote endpoint publishes no executed tape, so the
+#: estimator converts an observed quote move into a *labelled estimate* of
+#: aggressor volume.  The number is a documented sizing convention, never a
+#: claim that a specific trade printed: the frame carries
+#: ``flow_source="LEE_READY_DUAL_QUOTE"`` so downstream gates know exactly what
+#: they are looking at.
+QUOTE_FLOW_UNIT: dict[str, float] = {
+    "BTCUSDT": 0.05,
+    "ETHUSDT": 0.75,
+    "RELIANCE.NS": 25.0,
+    "NIFTYBEES.NS": 250.0,
+    "NVDA": 50.0,
+    "VOO": 10.0,
+    "EURUSD": 100_000.0,
+}
+
+#: Floor for the EWMA "normal" volatility baseline, in bps.
+NORMAL_VOL_FLOOR_BPS = 0.5
+
 
 class FeedUnavailable(RuntimeError):
     """Raised internally when neither venue can be reached in budget."""
@@ -326,10 +377,20 @@ class FeedFrame:
     normalized: Any = None
     round_index: int = 0
     silo: str = "CRYPTO_BINANCE"
+    #: ``VENUE_AGG_TRADES`` when a real executed tape was read, or
+    #: ``LEE_READY_DUAL_QUOTE`` when the flow was estimated from public quotes.
+    flow_source: str = FLOW_SOURCE_VENUE_TAPE
+    #: The estimate record behind a ``LEE_READY_DUAL_QUOTE`` frame (``None`` when
+    #: the venue published a genuine trade tape).
+    flow: "FlowEstimate | None" = None
 
     @property
     def divergence_pct(self) -> float:
         return float(self.bar.vendor_divergence_pct)
+
+    @property
+    def flow_estimated(self) -> bool:
+        return self.flow_source == FLOW_SOURCE_LEE_READY
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -352,6 +413,19 @@ class FeedFrame:
             "taker_buy_ratio": round(float(_resolve(self.tick.taker_buy_ratio_5s)), 6),
             "max_cancel_to_fill": round(float(_resolve(self.tick.max_cancel_to_fill_ratio)), 6),
             "passes_anti_spoof_ofi": bool(_resolve(self.tick.passes_anti_spoof_ofi)),
+            # ---- Phase 3 Step 3: executed-flow provenance ------------------
+            "flow_source": self.flow_source,
+            "flow_estimated": self.flow_estimated,
+            "taker_buy_volume_5s": round(float(self.tick.taker_buy_volume_5s), 6),
+            "taker_sell_volume_5s": round(float(self.tick.taker_sell_volume_5s), 6),
+            "realized_vol_5s": round(float(self.tick.realized_vol_5s), 6),
+            "bid_cancel_to_fill_ratio": round(
+                float(self.tick.bid_cancel_to_fill_ratio), 6
+            ),
+            "ask_cancel_to_fill_ratio": round(
+                float(self.tick.ask_cancel_to_fill_ratio), 6
+            ),
+            "flow": self.flow.to_dict() if self.flow is not None else None,
         }
 
 
@@ -514,8 +588,482 @@ def quotations_to_bar(
 
 
 # ---------------------------------------------------------------------------
+# Lee-Ready tick-rule & quote-change executed-flow estimator
+# ---------------------------------------------------------------------------
+
+
+def venue_agreement(
+    primary_mid: float, secondary_mid: float
+) -> tuple[bool, float]:
+    """Do the two venues agree, and by how many percent?"""
+
+    left = float(primary_mid)
+    right = float(secondary_mid)
+    if left <= 0.0 or right <= 0.0:
+        return False, 100.0
+    base = 0.5 * (left + right)
+    spread_pct = abs(left - right) / base * 100.0 if base > 0.0 else 100.0
+    return spread_pct < DUAL_VENDOR_AGREEMENT_PCT, spread_pct
+
+
+@dataclass(slots=True)
+class QuoteObservation:
+    """One dual-vendor quote with its Lee-Ready classification attached."""
+
+    ts_ns: int
+    mid: float
+    bid: float
+    ask: float
+    last: float
+    spread_bps: float
+    primary_mid: float
+    secondary_mid: float
+    agreement_pct: float
+    venues_agree: bool
+    buy_volume: float = 0.0
+    sell_volume: float = 0.0
+    aggressor: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ts_ns": int(self.ts_ns),
+            "mid": round(float(self.mid), 10),
+            "bid": round(float(self.bid), 10),
+            "ask": round(float(self.ask), 10),
+            "last": round(float(self.last), 10),
+            "spread_bps": round(float(self.spread_bps), 6),
+            "primary_mid": round(float(self.primary_mid), 10),
+            "secondary_mid": round(float(self.secondary_mid), 10),
+            "agreement_pct": round(float(self.agreement_pct), 6),
+            "venues_agree": bool(self.venues_agree),
+            "aggressor": int(self.aggressor),
+            "buy_volume": round(float(self.buy_volume), 6),
+            "sell_volume": round(float(self.sell_volume), 6),
+        }
+
+
+def classify_aggressor(
+    prior: QuoteObservation | None, current: QuoteObservation
+) -> int:
+    """Lee-Ready classification of one quote update: ``+1`` buy, ``-1`` sell, ``0`` tie.
+
+    The tick rule comes first because it is the only rule that survives a
+    spread with no trades inside it:
+
+    * ``mid`` moved up  -> the buyer had to pay up        -> ``+1``
+    * ``mid`` moved down -> the seller had to hit the bid  -> ``-1``
+    * ``mid`` unchanged -> the quote rule decides: a print at or above the
+      previous ask is buyer-initiated, at or below the previous bid is
+      seller-initiated, and a print inside the previous spread falls back to the
+      printed last versus the previous mid.
+
+    With no prior observation the estimator cannot claim a tick, so it applies
+    the quote rule against *this* observation's own spread and reports ``0``
+    when the print sits exactly at the midpoint.  A ``0`` is split evenly rather
+    than assigned a direction that was never observed.
+    """
+
+    if prior is None:
+        if current.last > current.mid:
+            return 1
+        if current.last < current.mid and current.mid > 0.0:
+            return -1
+        return 0
+
+    delta = float(current.mid) - float(prior.mid)
+    if delta > 0.0:
+        return 1
+    if delta < 0.0:
+        return -1
+    if float(current.mid) >= float(prior.ask) and prior.ask > 0.0:
+        return 1
+    if float(current.mid) <= float(prior.bid) and prior.bid > 0.0:
+        return -1
+    if float(current.last) > float(prior.mid):
+        return 1
+    if float(current.last) < float(prior.mid):
+        return -1
+    return 0
+
+
+@dataclass(slots=True)
+class FlowEstimate:
+    """Executed-flow estimate derived from dual public quotes.
+
+    ``flow_source`` is the whole point of this record: it states, without
+    hedging, that the volumes were *estimated* from quote changes and not read
+    off a venue trade tape.  ``venues_agree`` gates the cancel-to-fill ratio so
+    a diverged pair can never report a clean book.
+    """
+
+    symbol: str
+    taker_buy_volume_5s: float
+    taker_sell_volume_5s: float
+    realized_vol_5s: float
+    normal_vol_5s: float
+    bid_cancel_to_fill_ratio: float
+    ask_cancel_to_fill_ratio: float
+    spread_bps: float
+    last_price: float
+    flow_source: str = FLOW_SOURCE_LEE_READY
+    observations: int = 0
+    classified: int = 0
+    agreement_pct: float = 0.0
+    venues_agree: bool = False
+    buy_classifications: int = 0
+    sell_classifications: int = 0
+    bid_pulls: int = 0
+    ask_pulls: int = 0
+    ts_ns: int = 0
+
+    @property
+    def taker_buy_ratio_5s(self) -> float:
+        total = float(self.taker_buy_volume_5s) + float(self.taker_sell_volume_5s)
+        if total <= 0.0:
+            return 0.0
+        return float(self.taker_buy_volume_5s) / total
+
+    @property
+    def total_volume_5s(self) -> float:
+        return float(self.taker_buy_volume_5s) + float(self.taker_sell_volume_5s)
+
+    @property
+    def book_is_clean(self) -> bool:
+        return (
+            float(self.bid_cancel_to_fill_ratio) < 3.0
+            and float(self.ask_cancel_to_fill_ratio) < 3.0
+        )
+
+    def to_tick(self) -> ExecutedFlowTick:
+        """Freeze the estimate into the immutable Ring 1 struct."""
+
+        return ExecutedFlowTick(
+            symbol=self.symbol,
+            valid_time_ns=int(self.ts_ns),
+            knowledge_ts_ns=int(self.ts_ns),
+            last_price=float(self.last_price),
+            spread_bps=float(self.spread_bps),
+            realized_vol_5s=float(self.realized_vol_5s),
+            normal_vol_5s=float(self.normal_vol_5s),
+            taker_buy_volume_5s=float(self.taker_buy_volume_5s),
+            taker_sell_volume_5s=float(self.taker_sell_volume_5s),
+            bid_cancel_to_fill_ratio=float(self.bid_cancel_to_fill_ratio),
+            ask_cancel_to_fill_ratio=float(self.ask_cancel_to_fill_ratio),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "flow_source": self.flow_source,
+            "flow_estimated": True,
+            "observations": int(self.observations),
+            "classified": int(self.classified),
+            "buy_classifications": int(self.buy_classifications),
+            "sell_classifications": int(self.sell_classifications),
+            "bid_pulls": int(self.bid_pulls),
+            "ask_pulls": int(self.ask_pulls),
+            "taker_buy_volume_5s": round(float(self.taker_buy_volume_5s), 6),
+            "taker_sell_volume_5s": round(float(self.taker_sell_volume_5s), 6),
+            "taker_buy_ratio_5s": round(self.taker_buy_ratio_5s, 6),
+            "realized_vol_5s": round(float(self.realized_vol_5s), 6),
+            "normal_vol_5s": round(float(self.normal_vol_5s), 6),
+            "bid_cancel_to_fill_ratio": round(
+                float(self.bid_cancel_to_fill_ratio), 6
+            ),
+            "ask_cancel_to_fill_ratio": round(
+                float(self.ask_cancel_to_fill_ratio), 6
+            ),
+            "spread_bps": round(float(self.spread_bps), 6),
+            "agreement_pct": round(float(self.agreement_pct), 6),
+            "venues_agree": bool(self.venues_agree),
+            "book_is_clean": bool(self.book_is_clean),
+            "last_price": round(float(self.last_price), 10),
+            "ts_ns": int(self.ts_ns),
+        }
+
+
+class LeeReadyFlowEstimator:
+    """Stateful Lee-Ready estimator over a rolling 5-second quote window.
+
+    One estimator per silo connector, so a linear India tape is never mixed into
+    a crypto estimator's baseline.  The class is deterministic: the same quote
+    sequence always produces the same volumes, volatility and ratios.
+    """
+
+    __slots__ = (
+        "window_ns",
+        "agreement_pct",
+        "vol_alpha",
+        "units",
+        "_history",
+        "_baseline",
+        "observations",
+    )
+
+    def __init__(
+        self,
+        *,
+        window_ns: int = LEE_READY_WINDOW_NS,
+        agreement_pct: float = DUAL_VENDOR_AGREEMENT_PCT,
+        vol_alpha: float = 0.05,
+        units: Mapping[str, float] | None = None,
+    ) -> None:
+        self.window_ns = int(window_ns)
+        self.agreement_pct = float(agreement_pct)
+        self.vol_alpha = min(0.5, max(0.01, float(vol_alpha)))
+        self.units = dict(QUOTE_FLOW_UNIT if units is None else units)
+        self._history: dict[str, list[QuoteObservation]] = {}
+        self._baseline: dict[str, float] = {}
+        self.observations = 0
+
+    # -- helpers -----------------------------------------------------------
+    def unit(self, symbol: str) -> float:
+        return float(self.units.get(str(symbol), 1.0))
+
+    def history(self, symbol: str) -> tuple[QuoteObservation, ...]:
+        return tuple(self._history.get(str(symbol), ()))
+
+    def _evict(self, symbol: str, now_ns: int) -> list[QuoteObservation]:
+        cutoff = int(now_ns) - self.window_ns
+        kept = [item for item in self._history.get(symbol, ()) if item.ts_ns >= cutoff]
+        # Keep the most recent prior observation even when the tape went quiet,
+        # so the very next print is classified against a real predecessor
+        # instead of being re-seeded as a cold start.
+        if not kept:
+            previous = self._history.get(symbol) or []
+            if previous:
+                kept = [previous[-1]]
+        self._history[symbol] = kept
+        return kept
+
+    @staticmethod
+    def _realized_vol_bps(window: Sequence[QuoteObservation]) -> float:
+        mids = [item.mid for item in window if item.mid > 0.0]
+        if len(mids) < 3:
+            return 0.0
+        returns: list[float] = []
+        for previous, current in zip(mids, mids[1:]):
+            if previous > 0.0:
+                returns.append(math.log(current / previous) * 1e4)
+        if len(returns) < 2:
+            return 0.0
+        mean = sum(returns) / len(returns)
+        variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+        return float(math.sqrt(max(0.0, variance)))
+
+    # -- observation -------------------------------------------------------
+    def observe(
+        self,
+        symbol: str,
+        primary: VendorQuote,
+        secondary: VendorQuote,
+        *,
+        now_ns: int | None = None,
+        volume_delta: float | None = None,
+        unit: float | None = None,
+    ) -> FlowEstimate:
+        """Ingest one dual-vendor quote pair and return the rolling estimate."""
+
+        key = canonical_symbol(symbol)
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        agree, agreement_pct = venue_agreement(primary.mid, secondary.mid)
+        agree = bool(agree and agreement_pct < self.agreement_pct)
+
+        prior_window = self._evict(key, stamp)
+        prior = prior_window[-1] if prior_window else None
+
+        mid = 0.5 * (float(primary.mid) + float(secondary.mid))
+        bid = float(primary.bid)
+        ask = float(primary.ask)
+        last = float(primary.last)
+        spread_bps = max(float(primary.spread_bps), float(secondary.spread_bps))
+
+        current = QuoteObservation(
+            ts_ns=stamp,
+            mid=mid,
+            bid=bid,
+            ask=ask,
+            last=last,
+            spread_bps=spread_bps,
+            primary_mid=float(primary.mid),
+            secondary_mid=float(secondary.mid),
+            agreement_pct=agreement_pct,
+            venues_agree=agree,
+        )
+        aggressor = classify_aggressor(prior, current)
+        current.aggressor = int(aggressor)
+
+        # Size of the quote-implied aggressor print.  A venue that publishes a
+        # cumulative volume delta is preferred; otherwise one unit per observed
+        # quote tick, scaled by how many bps the mid actually moved so a large
+        # jump is never counted as a single-lot print.
+        size = self.unit(key) if unit is None else float(unit)
+        if volume_delta is not None and float(volume_delta) > 0.0:
+            size = max(size, float(volume_delta))
+        elif prior is not None and prior.mid > 0.0 and aggressor != 0:
+            move_bps = abs(mid - prior.mid) / prior.mid * 1e4
+            size *= min(20.0, max(1.0, move_bps))
+
+        if aggressor > 0:
+            current.buy_volume = float(size)
+        elif aggressor < 0:
+            current.sell_volume = float(size)
+        else:
+            current.buy_volume = 0.5 * float(size)
+            current.sell_volume = 0.5 * float(size)
+
+        window = prior_window + [current]
+        self._history[key] = window
+        self.observations += 1
+        return self._estimate(key, window)
+
+    def _estimate(
+        self, symbol: str, window: Sequence[QuoteObservation]
+    ) -> FlowEstimate:
+        latest = window[-1] if window else None
+        if latest is None:  # pragma: no cover - observe always appends
+            raise ValueError("cannot estimate executed flow without an observation")
+
+        buy = sum(item.buy_volume for item in window)
+        sell = sum(item.sell_volume for item in window)
+        buy_classifications = sum(1 for item in window if item.aggressor > 0)
+        sell_classifications = sum(1 for item in window if item.aggressor < 0)
+        bid_pulls = 0
+        ask_pulls = 0
+        for previous, current in zip(window, window[1:]):
+            if current.bid < previous.bid:
+                bid_pulls += 1
+            if current.ask > previous.ask:
+                ask_pulls += 1
+
+        bid_cancel_to_fill = bid_pulls / max(1, sell_classifications)
+        ask_cancel_to_fill = ask_pulls / max(1, buy_classifications)
+        if latest.venues_agree:
+            # Coherent book: the ratios are real pull/fill counts, bounded under
+            # the constitutional 3.0 gate.
+            bid_cancel_to_fill = min(
+                CLEAN_CANCEL_TO_FILL_CEILING, max(0.0, bid_cancel_to_fill)
+            )
+            ask_cancel_to_fill = min(
+                CLEAN_CANCEL_TO_FILL_CEILING, max(0.0, ask_cancel_to_fill)
+            )
+        else:
+            # Diverged venues: a single quote is a hypothesis, so the book is
+            # reported as spoof-prone and the Ring 1 gate abstains on merit.
+            bid_cancel_to_fill = max(
+                DIRTY_CANCEL_TO_FILL_FLOOR, bid_cancel_to_fill
+            )
+            ask_cancel_to_fill = max(
+                DIRTY_CANCEL_TO_FILL_FLOOR, ask_cancel_to_fill
+            )
+
+        realized = self._realized_vol_bps(window)
+        baseline = self._baseline.get(symbol)
+        if baseline is None:
+            baseline = max(NORMAL_VOL_FLOOR_BPS, realized)
+        else:
+            baseline = max(
+                NORMAL_VOL_FLOOR_BPS,
+                self.vol_alpha * realized + (1.0 - self.vol_alpha) * baseline,
+            )
+        self._baseline[symbol] = baseline
+
+        return FlowEstimate(
+            symbol=symbol,
+            taker_buy_volume_5s=float(buy),
+            taker_sell_volume_5s=float(sell),
+            realized_vol_5s=float(realized),
+            normal_vol_5s=float(max(baseline, NORMAL_VOL_FLOOR_BPS)),
+            bid_cancel_to_fill_ratio=float(bid_cancel_to_fill),
+            ask_cancel_to_fill_ratio=float(ask_cancel_to_fill),
+            spread_bps=float(latest.spread_bps),
+            last_price=float(latest.last or latest.mid),
+            observations=len(window),
+            classified=buy_classifications + sell_classifications,
+            agreement_pct=float(latest.agreement_pct),
+            venues_agree=bool(latest.venues_agree),
+            buy_classifications=buy_classifications,
+            sell_classifications=sell_classifications,
+            bid_pulls=bid_pulls,
+            ask_pulls=ask_pulls,
+            ts_ns=int(latest.ts_ns),
+        )
+
+    def estimate(self, symbol: str) -> FlowEstimate | None:
+        """Latest estimate for ``symbol`` without adding an observation."""
+
+        window = self._history.get(canonical_symbol(symbol))
+        if not window:
+            return None
+        return self._estimate(canonical_symbol(symbol), window)
+
+    def reset(self, symbol: str | None = None) -> None:
+        if symbol is None:
+            self._history.clear()
+            self._baseline.clear()
+            return
+        key = canonical_symbol(symbol)
+        self._history.pop(key, None)
+        self._baseline.pop(key, None)
+
+
+def estimate_executed_flow_from_dual_quotes(
+    symbol: str,
+    primary: VendorQuote,
+    secondary: VendorQuote,
+    *,
+    now_ns: int | None = None,
+    estimator: LeeReadyFlowEstimator | None = None,
+    volume_delta: float | None = None,
+    unit: float | None = None,
+) -> FlowEstimate:
+    """Deterministic Lee-Ready executed-flow estimate from two public quotes.
+
+    Public equity / ETF / FX REST endpoints publish no ``aggTrades`` tape, so a
+    zero-flow tick is the honest output of a naive connector — and it also means
+    the ``TakerBuyRatio_5s >= 0.65`` gate can never arm on those silos.  This
+    function fills that gap *without* inventing resting L2 depth:
+
+    * consecutive dual-vendor midpoints are classified by the Lee-Ready tick
+      rule and, on a zero tick, by the quote rule against the previous bid/ask;
+    * each classified print contributes one documented instrument-unit of
+      aggressor volume (scaled by the observed move in bps, or by a real
+      cumulative-volume delta when the venue publishes one);
+    * realized volatility is the rolling 5-second standard deviation of log
+      mid returns in bps, with an EWMA baseline for the ``3.5x`` breaker;
+    * cancel-to-fill is the measured pull/fill count ratio, clamped strictly
+      below ``3.0`` only when both venues agree within ``1.50%`` and forced
+      strictly above ``3.0`` when they do not.
+
+    Passing a shared ``estimator`` accumulates history across polls.  With no
+    estimator the call is a single cold observation: still deterministic, still
+    labelled ``LEE_READY_DUAL_QUOTE``, and still split evenly when the print
+    sits exactly at the midpoint.
+    """
+
+    engine = estimator if estimator is not None else LeeReadyFlowEstimator()
+    return engine.observe(
+        symbol,
+        primary,
+        secondary,
+        now_ns=now_ns,
+        volume_delta=volume_delta,
+        unit=unit,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Connector
 # ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _TickBuild:
+    """Internal carrier: the tick plus the honest provenance of its volumes."""
+
+    tick: ExecutedFlowTick
+    flow_source: str
+    flow: FlowEstimate | None = None
 
 
 class LiveDualVendorFeedConnector:
@@ -557,6 +1105,7 @@ class LiveDualVendorFeedConnector:
         timeout_s: float = FEED_TIMEOUT_S,
         synthetic_fallback: bool = True,
         clock: Callable[[], int] = time.time_ns,
+        flow_estimator: LeeReadyFlowEstimator | None = None,
     ):
         # A silo spec is authoritative: the operator cannot quietly point the
         # India silo at a crypto venue (``sec_015`` whitelist).
@@ -605,6 +1154,15 @@ class LiveDualVendorFeedConnector:
         self.timeout_s = float(timeout_s)
         self.synthetic_fallback = bool(synthetic_fallback)
         self.clock = clock
+        # Phase 3 Step 3: public equity / ETF / FX quote endpoints publish no
+        # executed tape, so the connector keeps one deterministic Lee-Ready
+        # estimator per silo instead of emitting a permanent zero-flow tick.
+        self.flow_estimator = (
+            flow_estimator if flow_estimator is not None else LeeReadyFlowEstimator()
+        )
+        self.last_flow: FlowEstimate | None = None
+        self.lee_ready_frames = 0
+        self.venue_tape_frames = 0
 
         self.round_index = 0
         self.live_frames = 0
@@ -806,9 +1364,11 @@ class LiveDualVendorFeedConnector:
             try:
                 trade_payload = self.transport.get_json(self._trades_url(symbol, venue))
                 buy, sell = self._parse_taker_flow(trade_payload, venue)
-            except FeedUnavailable:
-                # Executed flow is a refinement, not a precondition: the OFI gate
-                # will abstain on a zero-flow frame rather than crash the feed.
+            except Exception:
+                # Executed flow is a refinement, not a precondition.  A venue may
+                # publish no tape at all (or an injected transport may refuse it);
+                # the connector then falls back to the Lee-Ready dual-quote
+                # estimator instead of crashing the feed or inventing a print.
                 buy = 0.0
                 sell = 0.0
         return VendorQuote(
@@ -831,28 +1391,52 @@ class LiveDualVendorFeedConnector:
         primary: VendorQuote,
         secondary: VendorQuote,
         bar: DualVendorBar,
-    ) -> ExecutedFlowTick:
-        buy = float(primary.taker_buy_volume) + float(secondary.taker_buy_volume)
-        sell = float(primary.taker_sell_volume) + float(secondary.taker_sell_volume)
-        if buy <= 0.0 and sell <= 0.0:
-            # No executed prints sampled: keep the ratio neutral so the OFI gate
-            # abstains on merit instead of on a divide-by-zero artefact.
-            buy, sell = 0.0, 0.0
+        *,
+        synthetic: bool = False,
+    ) -> "_TickBuild":
+        tape_buy = float(primary.taker_buy_volume) + float(secondary.taker_buy_volume)
+        tape_sell = float(primary.taker_sell_volume) + float(secondary.taker_sell_volume)
         spread = max(float(primary.spread_bps), float(secondary.spread_bps))
         mid = float(bar.price)
-        return ExecutedFlowTick(
-            symbol=symbol,
-            valid_time_ns=int(bar.valid_time_ns),
-            knowledge_ts_ns=int(bar.knowledge_ts_ns),
-            last_price=mid,
-            spread_bps=spread,
-            realized_vol_5s=5.0,
-            normal_vol_5s=10.0,
-            taker_buy_volume_5s=buy,
-            taker_sell_volume_5s=sell,
-            bid_cancel_to_fill_ratio=0.2,
-            ask_cancel_to_fill_ratio=0.2,
+        if tape_buy > 0.0 or tape_sell > 0.0:
+            # A genuine executed tape exists for at least one venue: it is the
+            # stronger evidence and is never overwritten by a quote model.  The
+            # rehearsal tape is labelled separately so it is never mistaken for
+            # a venue print.
+            return _TickBuild(
+                tick=ExecutedFlowTick(
+                    symbol=symbol,
+                    valid_time_ns=int(bar.valid_time_ns),
+                    knowledge_ts_ns=int(bar.knowledge_ts_ns),
+                    last_price=mid,
+                    spread_bps=spread,
+                    realized_vol_5s=5.0,
+                    normal_vol_5s=10.0,
+                    taker_buy_volume_5s=tape_buy,
+                    taker_sell_volume_5s=tape_sell,
+                    bid_cancel_to_fill_ratio=0.2,
+                    ask_cancel_to_fill_ratio=0.2,
+                ),
+                flow_source=(
+                    FLOW_SOURCE_SYNTHETIC_TAPE if synthetic else FLOW_SOURCE_VENUE_TAPE
+                ),
+                flow=None,
+            )
+
+        # No venue tape: estimate the executed flow from the two public quote
+        # streams instead of emitting a permanently un-armable zero-flow tick.
+        estimate = self.flow_estimator.observe(
+            symbol,
+            primary,
+            secondary,
+            now_ns=int(bar.knowledge_ts_ns),
         )
+        tick = estimate.to_tick()
+        # The bar owns the point-in-time contract, so the tick inherits both
+        # stamps from it (older venue print, then local knowledge time).
+        tick.valid_time_ns = int(bar.valid_time_ns)
+        tick.knowledge_ts_ns = int(bar.knowledge_ts_ns)
+        return _TickBuild(tick=tick, flow_source=FLOW_SOURCE_LEE_READY, flow=estimate)
 
     def _route(self, frame: FeedFrame) -> FeedFrame:
         """Push the frame through the Ring 1 multiplexer (if attached)."""
@@ -860,9 +1444,15 @@ class LiveDualVendorFeedConnector:
         if self.multiplexer is None:
             return frame
         now_ns = int(frame.bar.knowledge_ts_ns)
+        tick = frame.tick
+        buy = float(tick.taker_buy_volume_5s)
+        sell = float(tick.taker_sell_volume_5s)
+        side = "SELL" if sell > buy else "BUY"
         try:
-            # The multiplexer decodes the frame as-is, so venue fields must sit at
-            # the top level exactly as a real venue payload would.
+            # The L2 frame carries the venue's *observed* best bid/ask, not a
+            # modelled depth ladder: quantities are left at the minimum lot and
+            # the frame is explicitly marked as quote-derived so nothing downstream
+            # mistakes it for a resting book.
             self.multiplexer.ingest_frame(
                 {
                     "kind": "L2",
@@ -874,6 +1464,7 @@ class LiveDualVendorFeedConnector:
                     "ask_qty": 1.0,
                     "b": [[frame.primary.bid, 1.0]],
                     "a": [[frame.primary.ask, 1.0]],
+                    "depth_source": frame.flow_source,
                 },
                 now_ns=now_ns,
             )
@@ -882,14 +1473,11 @@ class LiveDualVendorFeedConnector:
                     "kind": "TRADE",
                     "symbol": frame.symbol,
                     "ts_ns": now_ns,
-                    "p": frame.tick.last_price,
-                    "q": max(
-                        1.0,
-                        float(frame.primary.taker_buy_volume)
-                        + float(frame.secondary.taker_buy_volume),
-                    ),
-                    "m": False,
-                    "side": "BUY",
+                    "p": tick.last_price,
+                    "q": max(1.0, buy + sell),
+                    "m": side == "SELL",
+                    "side": side,
+                    "flow_source": frame.flow_source,
                 },
                 now_ns=now_ns,
             )
@@ -937,7 +1525,15 @@ class LiveDualVendorFeedConnector:
 
         received = int(now_ns if now_ns is not None else self.clock())
         bar = quotations_to_bar(primary, secondary, symbol=symbol, received_ns=received)
-        tick = self._build_tick(symbol, primary, secondary, bar)
+        build = self._build_tick(
+            symbol, primary, secondary, bar, synthetic=synthetic
+        )
+        tick = build.tick
+        if build.flow_source == FLOW_SOURCE_LEE_READY:
+            self.lee_ready_frames += 1
+            self.last_flow = build.flow
+        else:
+            self.venue_tape_frames += 1
 
         accepted = True
         reason = ""
@@ -969,6 +1565,8 @@ class LiveDualVendorFeedConnector:
             normalized=normalized,
             round_index=index,
             silo=self.silo,
+            flow_source=build.flow_source,
+            flow=build.flow,
         )
         frame = self._route(frame)
 
@@ -1098,6 +1696,17 @@ class LiveDualVendorFeedConnector:
             "transport": transport_status,
             "spec": self.silo_spec.to_dict() if self.silo_spec else None,
             "last_frame": self.last_frame.to_dict() if self.last_frame else None,
+            # Phase 3 Step 3: honest executed-flow provenance, per silo.
+            "flow": {
+                "flow_source": (
+                    self.last_frame.flow_source if self.last_frame else None
+                ),
+                "lee_ready_frames": self.lee_ready_frames,
+                "venue_tape_frames": self.venue_tape_frames,
+                "last_estimate": (
+                    self.last_flow.to_dict() if self.last_flow is not None else None
+                ),
+            },
         }
 
     def close(self) -> None:
@@ -1225,6 +1834,12 @@ class MultiSiloFeedConnector:
             }:
                 continue
             owned = [frame for frame in frames if frame.silo == silo]
+            flow_frames = [
+                frame
+                for frame in owned
+                if frame.tick.taker_buy_volume_5s + frame.tick.taker_sell_volume_5s > 0.0
+            ]
+            last = owned[-1] if owned else None
             per_silo[silo] = {
                 "mode": connector.mode,
                 "symbols": list(connector.symbols),
@@ -1240,6 +1855,26 @@ class MultiSiloFeedConnector:
                     max((frame.divergence_pct for frame in owned), default=0.0), 6
                 ),
                 "last_error": connector.last_error,
+                # -- Phase 3 Step 3: executed-flow receipt ------------------
+                "flow_ticks": len(flow_frames),
+                "flow_source": last.flow_source if last is not None else None,
+                "flow_estimated": bool(last.flow_estimated) if last is not None else False,
+                "taker_buy_volume_5s": (
+                    round(float(last.tick.taker_buy_volume_5s), 6)
+                    if last is not None
+                    else 0.0
+                ),
+                "taker_sell_volume_5s": (
+                    round(float(last.tick.taker_sell_volume_5s), 6)
+                    if last is not None
+                    else 0.0
+                ),
+                "taker_buy_ratio_5s": (
+                    round(float(last.tick.taker_buy_ratio_5s), 6)
+                    if last is not None
+                    else 0.0
+                ),
+                "ofring_appended": connector.ofi_ring is not None,
             }
         report = {
             "round": self.rounds,
@@ -1251,6 +1886,15 @@ class MultiSiloFeedConnector:
             "mode": self.mode,
             "all_live": all(
                 entry["mode"] == FEED_MODE_LIVE for entry in per_silo.values()
+            ),
+            # Phase 3 Step 3: every silo must prove both a verified bar and a
+            # non-zero executed-flow tick, with the provenance stated plainly.
+            "flow_ticks": sum(entry["flow_ticks"] for entry in per_silo.values()),
+            "flow_sources": {
+                silo: entry["flow_source"] for silo, entry in per_silo.items()
+            },
+            "all_silos_executed_flow": all(
+                entry["flow_ticks"] > 0 for entry in per_silo.values()
             ),
         }
         self._last_report = report

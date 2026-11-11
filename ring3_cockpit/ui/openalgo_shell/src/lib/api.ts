@@ -13,6 +13,7 @@ import type {
   LLMControlPayload,
   LLMProbeReport,
   RearmReport,
+  SupervisorControlResponse,
 } from '@/types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? ''
@@ -162,5 +163,29 @@ export function postLLMProbe(): Promise<LLMProbeReport> {
   return request<LLMProbeReport>('/api/v2/control/llms/probe', {
     method: 'POST',
     body: JSON.stringify({ operator: 'ring3.cockpit' }),
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 3 — 4-ring OS supervisor control
+ * ------------------------------------------------------------------ */
+
+/**
+ * Start / stop / crash-restart the four OS worker processes.
+ *
+ * `restart_ring` needs `ringIndex`; the response carries the previous and the
+ * new PID so the cockpit can prove the worker really was replaced.
+ */
+export function postSupervisor(
+  action: 'start' | 'stop' | 'restart_ring' | 'status',
+  ringIndex?: number
+): Promise<SupervisorControlResponse> {
+  return request<SupervisorControlResponse>('/api/v2/control/supervisor', {
+    method: 'POST',
+    body: JSON.stringify({
+      action,
+      ring_index: ringIndex ?? null,
+      operator: 'ring3.cockpit',
+    }),
   })
 }

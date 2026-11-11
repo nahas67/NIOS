@@ -89,6 +89,8 @@ __all__ = [
     "KillSwitchRequest",
     "RearmRequest",
     "ExtensionsControlRequest",
+    "SupervisorControlRequest",
+    "TestnetOrderRequest",
     "autopilot_paper_loop",
     "create_app",
     "DEFAULT_DAILY_LLM_BUDGET_USD",
@@ -313,6 +315,117 @@ class LLMProbeRequest(BaseModel):
     operator: str = "ring3.operator"
 
 
+class SupervisorControlRequest(BaseModel):
+    """``POST /api/v2/control/supervisor`` payload (``sec_004``).
+
+    ``action`` is one of ``start`` / ``stop`` / ``restart_ring`` / ``status``.
+    ``ring_index`` identifies the ring for ``restart_ring``; ``rings`` narrows
+    which workers ``start`` spawns (default: all four).
+    """
+
+    action: str = Field(..., min_length=1)
+    ring_index: int | None = Field(default=None, ge=0, le=3)
+    rings: list[int] | None = None
+    silo: str | None = None
+    symbol: str | None = None
+    feed_mode: str | None = None
+    operator: str = "ring3.operator"
+
+    @field_validator("action")
+    @classmethod
+    def _action_ok(cls, value: str) -> str:
+        token = str(value).strip().lower().replace("-", "_")
+        aliases = {
+            "start": "start",
+            "spawn": "start",
+            "stop": "stop",
+            "shutdown": "stop",
+            "restart": "restart_ring",
+            "restart_ring": "restart_ring",
+            "restart_worker": "restart_ring",
+            "status": "status",
+        }
+        if token not in aliases:
+            raise ValueError("action must be start, stop, restart_ring or status")
+        return aliases[token]
+
+    @field_validator("rings")
+    @classmethod
+    def _rings_ok(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        clean = sorted({int(item) for item in value})
+        if not clean or any(index < 0 or index > 3 for index in clean):
+            raise ValueError("rings must be a non-empty subset of 0..3")
+        return clean
+
+    @field_validator("feed_mode")
+    @classmethod
+    def _feed_mode_ok(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        token = str(value).strip().upper().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "PAPER": "PAPER_AUTOPILOT",
+            "PAPER_AUTOPILOT": "PAPER_AUTOPILOT",
+            "LIVE": "LIVE_PUBLIC_DUAL_VENDOR",
+            "LIVE_PUBLIC": "LIVE_PUBLIC_DUAL_VENDOR",
+            "LIVE_PUBLIC_DUAL_VENDOR": "LIVE_PUBLIC_DUAL_VENDOR",
+        }
+        if token not in aliases:
+            raise ValueError("feed_mode must be PAPER_AUTOPILOT or LIVE_PUBLIC_DUAL_VENDOR")
+        return aliases[token]
+
+
+class TestnetOrderRequest(BaseModel):
+    """``POST /api/v2/control/brokers/testnet-order`` payload (``sec_011``).
+
+    Sandbox-only by construction: ``sandbox`` must be ``True`` and
+    ``confirm_sandbox`` is the explicit human acknowledgement that this is a
+    testnet/paper venue, never production capital.
+    """
+
+    silo: str = Field(..., min_length=1)
+    venue: str = Field(..., min_length=1)
+    symbol: str = Field(..., min_length=1)
+    side: str = "BUY"
+    qty: float = Field(..., gt=0.0)
+    limit_price: float = Field(..., gt=0.0)
+    proposal_id: str | None = None
+    strategy_id: str = "ring3-testnet-dispatch-v1"
+    expected_gross_bps: float = 18.0
+    spread_bps: float = 1.2
+    account_id: str | None = None
+    sandbox: bool = True
+    confirm_sandbox: bool = True
+    operator: str = "ring3.operator"
+
+    @field_validator("side")
+    @classmethod
+    def _side_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if token not in ("BUY", "SELL"):
+            raise ValueError("side must be BUY or SELL")
+        return token
+
+    @field_validator("sandbox")
+    @classmethod
+    def _sandbox_only(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError(
+                "the testnet bridge only dispatches sandbox=True orders; live "
+                "capital requires POST /api/v2/control/brokers"
+            )
+        return True
+
+    @field_validator("confirm_sandbox")
+    @classmethod
+    def _confirm(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("confirm_sandbox must be true to acknowledge a paper venue")
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Mutable control state
 # ---------------------------------------------------------------------------
@@ -421,6 +534,7 @@ class ControlPlane:
         feed_guard: Any = None,
         broker_vault: Any = None,
         llm_probe_fetcher: Any = None,
+        testnet_bridge: Any = None,
     ) -> None:
         self.ledger = ledger
         self.firewall = firewall
@@ -475,6 +589,11 @@ class ControlPlane:
         self._feed_report: dict[str, Any] = {}
         self._credential_reports: dict[str, dict[str, Any]] = {}
         self._llm_probe: dict[str, Any] = {}
+        # Phase 3 Step 3: the Ring 0 sandbox execution bridge.  Injected so tests
+        # can supply a mock httpx transport, or built lazily on first use.
+        self.testnet_bridge = testnet_bridge
+        self._testnet_receipts: list[dict[str, Any]] = []
+        self._supervisor_action_log: list[dict[str, Any]] = []
         self.autopilot_interval_s = AUTOPILOT_INTERVAL_S
         self._bus_cursor = 0
         self._formal_cache: dict[str, Any] | None = None
@@ -980,6 +1099,361 @@ class ControlPlane:
             }
         return ring_process_snapshot(self.process_supervisor)
 
+    # -- Phase 3 Step 3: live 4-ring supervisor control -------------------
+    def supervisor_state(self) -> dict[str, Any]:
+        """Live four-ring OS process table plus the control-surface contract."""
+
+        rings = self.ring_processes()
+        attached = self.process_supervisor is not None
+        distinct = int(rings.get("distinct_os_processes", 0) or 0)
+        return {
+            "available": bool(rings.get("available", False)),
+            "attached": attached,
+            "running": bool(rings.get("running", False)),
+            "distinct_os_processes": distinct,
+            "four_ring_isolation": distinct == 4,
+            "pids": rings.get("pids", {}),
+            "rings": rings.get("rings", []),
+            "heartbeat_shm": rings.get("heartbeat_shm"),
+            "shm_prefix": rings.get("shm_prefix"),
+            "silo": rings.get("silo"),
+            "symbol": rings.get("symbol"),
+            "feed_mode": rings.get("feed_mode") or self.feed_state()["feed_mode"],
+            "reason": rings.get("reason"),
+            "actions": ["start", "stop", "restart_ring", "status"],
+            "workers": [
+                "ring0-vault-worker",
+                "ring1-spinal-worker",
+                "ring2-brain-worker",
+                "ring3-cockpit-gateway",
+            ],
+            "last_actions": list(self._supervisor_action_log[-8:]),
+            "law": "sec_004 - four physically separate OS processes, SHM heartbeats",
+        }
+
+    def _ensure_supervisor(self, request: SupervisorControlRequest) -> Any:
+        """Attach a supervisor on first use, preserving any injected instance."""
+
+        if self.process_supervisor is not None:
+            return self.process_supervisor
+        from core.process_supervisor import RING_SYMBOLS, RingProcessSupervisor
+
+        silo = str(request.silo or "CRYPTO_BINANCE").strip().upper()
+        self.process_supervisor = RingProcessSupervisor(
+            silo=silo,
+            symbol=request.symbol or RING_SYMBOLS.get(silo),
+            feed_mode=request.feed_mode
+            or self._feed_mode
+            or "PAPER_AUTOPILOT",
+            rings=tuple(request.rings or (0, 1, 2, 3)),
+            fresh_heartbeats=True,
+        )
+        return self.process_supervisor
+
+    def control_supervisor(self, request: SupervisorControlRequest) -> dict[str, Any]:
+        """Start / stop / crash-restart the four OS worker processes.
+
+        Ring 3 only supervises processes: it still cannot sign an order or read
+        a broker key, and the kill switch continues to travel through the
+        shared-memory latch rather than through this endpoint.
+        """
+
+        action = str(request.action)
+        stamp = time.time_ns()
+
+        if action == "status":
+            return {
+                "action": action,
+                "changed": False,
+                "operator": str(request.operator),
+                "timestamp_ns": stamp,
+                **self.supervisor_state(),
+            }
+
+        if action == "start":
+            supervisor = self._ensure_supervisor(request)
+            already = bool(self.ring_processes().get("running", False))
+            if not already:
+                supervisor.start()
+            body = {
+                "action": action,
+                "changed": not already,
+                "already_running": already,
+                "started_rings": list(getattr(supervisor, "rings", ())),
+                "operator": str(request.operator),
+                "timestamp_ns": stamp,
+            }
+            # Give the freshly spawned workers a bounded window to write their
+            # first SHM heartbeat so the caller sees PIDs, not zeroes.
+            self._await_heartbeats(timeout_s=3.0)
+            body.update(self.supervisor_state())
+            self._supervisor_action_log.append(
+                {
+                    "action": action,
+                    "changed": not already,
+                    "distinct_os_processes": body["distinct_os_processes"],
+                    "at_ns": stamp,
+                }
+            )
+            return body
+
+        if action == "stop":
+            supervisor = self.process_supervisor
+            if supervisor is None:
+                return {
+                    "action": action,
+                    "changed": False,
+                    "stopped": False,
+                    "error": "supervisor not attached (single-process mode)",
+                    "operator": str(request.operator),
+                    "timestamp_ns": stamp,
+                    **self.supervisor_state(),
+                }
+            running = bool(self.ring_processes().get("running", False))
+            try:
+                supervisor.stop()
+            except Exception as exc:  # pragma: no cover - teardown is best effort
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"supervisor stop failed: {type(exc).__name__}: {exc}",
+                ) from None
+            body = {
+                "action": action,
+                "changed": running,
+                "stopped": not bool(self.ring_processes().get("running", False)),
+                "operator": str(request.operator),
+                "timestamp_ns": stamp,
+            }
+            body.update(self.supervisor_state())
+            self._supervisor_action_log.append(
+                {"action": action, "changed": running, "at_ns": stamp}
+            )
+            return body
+
+        # action == "restart_ring"
+        supervisor = self.process_supervisor
+        if supervisor is None or not bool(self.ring_processes().get("running", False)):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "supervisor is not running; POST action=start before "
+                    "restart_ring"
+                ),
+            )
+        index = 0 if request.ring_index is None else int(request.ring_index)
+        previous_pid = None
+        try:
+            previous_pid = supervisor.pid(index)
+        except Exception:  # pragma: no cover - telemetry only
+            previous_pid = None
+        if previous_pid is None:
+            try:
+                table = supervisor.heartbeat_table_snapshot()
+            except Exception:  # pragma: no cover
+                table = {}
+            for name, entry in table.items():
+                if str(name).startswith(f"ring{index}-"):
+                    previous_pid = entry.get("pid")
+                    break
+        result = supervisor.restart(index, reason=f"operator restart via {request.operator}")
+        self._await_heartbeats(timeout_s=3.0)
+        body = {
+            "action": action,
+            "changed": bool(result.get("restarted", False)),
+            "ring_index": index,
+            "restart": dict(result),
+            "previous_pid": previous_pid,
+            "new_pid": result.get("pid"),
+            "pid_changed": bool(previous_pid) and previous_pid != result.get("pid"),
+            "operator": str(request.operator),
+            "timestamp_ns": stamp,
+        }
+        body.update(self.supervisor_state())
+        self._supervisor_action_log.append(
+            {
+                "action": action,
+                "ring_index": index,
+                "restarted": bool(result.get("restarted", False)),
+                "previous_pid": previous_pid,
+                "new_pid": result.get("pid"),
+                "at_ns": stamp,
+            }
+        )
+        return body
+
+    def _await_heartbeats(self, *, timeout_s: float = 3.0) -> bool:
+        """Bounded wait for four live PIDs with fresh sub-second heartbeats."""
+
+        deadline = time.monotonic() + max(0.2, float(timeout_s))
+        while time.monotonic() < deadline:
+            rings = self.ring_processes()
+            entries = rings.get("rings") or []
+            live = [
+                entry
+                for entry in entries
+                if entry.get("alive") and entry.get("pid")
+            ]
+            fresh = [
+                entry
+                for entry in live
+                if entry.get("heartbeat_age_ms") is not None
+                and float(entry["heartbeat_age_ms"]) < 1_000.0
+            ]
+            # Every ring must be alive *and* beating: a freshly respawned worker
+            # that has not written its first beat is not yet proven healthy.
+            if len(live) == 4 and len(fresh) == 4:
+                return True
+            time.sleep(0.05)
+        return False
+
+    # -- Phase 3 Step 3: Ring 0 sandbox execution bridge -----------------
+    def _ensure_testnet_bridge(self) -> Any:
+        if self.testnet_bridge is not None:
+            return self.testnet_bridge
+        from ring0_vault.silos.testnet_bridge import TestnetExecutionBridge
+
+        self.testnet_bridge = TestnetExecutionBridge(
+            self.outbox,
+            self.ledger,
+            vault=self.broker_vault,
+            registry=self.registry,
+            allow_network=False,
+        )
+        return self.testnet_bridge
+
+    def testnet_state(self) -> dict[str, Any]:
+        """Sandbox dispatch targets + the last receipts (never a raw key)."""
+
+        from ring0_vault.silos.testnet_bridge import SANDBOX_VENUE_SPECS
+
+        bridge = self.testnet_bridge
+        body: dict[str, Any] = {
+            "ring": "ring0_vault",
+            "write_only_credentials": True,
+            "sandbox_only": True,
+            "bridge_attached": bridge is not None,
+            "targets": {
+                venue: spec.to_dict() for venue, spec in SANDBOX_VENUE_SPECS.items()
+            },
+            "receipts": list(self._testnet_receipts[-8:]),
+            "law": "sec_016 - sandbox dispatch only; live capital is a separate endpoint",
+        }
+        if bridge is not None and hasattr(bridge, "status"):
+            try:
+                body["bridge"] = bridge.status()
+            except Exception:  # pragma: no cover - telemetry is non-fatal
+                body["bridge"] = {"status": "unavailable"}
+        return body
+
+    def _testnet_summary(self) -> dict[str, Any]:
+        """Cheap hydration view of the sandbox bridge (no decryption)."""
+
+        try:
+            from ring0_vault.silos.testnet_bridge import SANDBOX_VENUE_SPECS
+        except Exception:  # pragma: no cover - optional surface
+            return {"sandbox_only": True, "venues": [], "receipts": []}
+        return {
+            "sandbox_only": True,
+            "write_only_credentials": True,
+            "bridge_attached": self.testnet_bridge is not None,
+            "venues": {
+                venue: {
+                    "environment": spec.environment,
+                    "base_url": spec.base_url,
+                    "signing": spec.signing,
+                }
+                for venue, spec in SANDBOX_VENUE_SPECS.items()
+            },
+            "receipts": list(self._testnet_receipts[-5:]),
+        }
+
+    def dispatch_testnet_order(self, request: TestnetOrderRequest) -> dict[str, Any]:
+        """Dispatch one signed sandbox order through the Ring 0 bridge."""
+
+        from ring0_vault.silos.silo_registry import broker_credentials_present
+
+        if not broker_credentials_present(request.venue, vault=self.broker_vault):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Ring 0 holds no sandbox credential for {request.venue!r}; "
+                    "POST /api/v2/control/brokers/credentials first"
+                ),
+            )
+        bridge = self._ensure_testnet_bridge()
+
+        from core.schemas import UnsignedProposal, VaultName
+
+        proposal_id = request.proposal_id or (
+            f"testnet-{request.silo.lower()}-{request.venue}-{time.time_ns()}"
+        )
+        proposal = UnsignedProposal(
+            proposal_id=proposal_id,
+            strategy_id=str(request.strategy_id),
+            silo=str(request.silo).strip().upper(),
+            vault=VaultName.SPINAL_SCALPER,
+            symbol=str(request.symbol).strip(),
+            side=str(request.side),
+            qty=float(request.qty),
+            limit_price=float(request.limit_price),
+            expected_gross_bps=float(request.expected_gross_bps),
+            spread_bps=float(request.spread_bps),
+            grounding_hash=_sha256_hex(
+                f"{proposal_id}|{request.venue}|{request.symbol}|{request.limit_price}"
+            ),
+        )
+        try:
+            receipt = bridge.dispatch(
+                request.silo,
+                request.venue,
+                proposal,
+                sandbox=True,
+                account_id=request.account_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a bridge failure is a 502, never a 500
+            raise HTTPException(
+                status_code=502,
+                detail=f"sandbox dispatch failed: {type(exc).__name__}: {exc}",
+            ) from None
+
+        body = receipt.to_dict()
+        body["operator"] = str(request.operator)
+        body["zero_restart"] = True
+        body["order"] = {
+            "proposal_id": proposal.proposal_id,
+            "symbol": proposal.symbol,
+            "side": proposal.side,
+            "qty": proposal.qty,
+            "limit_price": proposal.limit_price,
+            "grounding_hash": proposal.grounding_hash,
+        }
+        self._testnet_receipts.append(
+            {
+                key: body[key]
+                for key in (
+                    "venue",
+                    "silo",
+                    "environment",
+                    "endpoint",
+                    "http_status",
+                    "accepted",
+                    "committed",
+                    "voided",
+                    "broker_order_id",
+                    "outbox_state",
+                    "attempts",
+                    "latency_ms",
+                    "error",
+                )
+            }
+        )
+        if len(self._testnet_receipts) > 64:
+            del self._testnet_receipts[:-64]
+        return body
+
+
     def feed_state(self) -> dict[str, Any]:
         """Which market-data path is live: public dual-vendor or paper autopilot."""
 
@@ -1220,6 +1694,9 @@ class ControlPlane:
             "formal_proofs": self.formal_proofs(),
             "autopilot": self.autopilot_state(),
             "ring_processes": self.ring_processes(),
+            # Phase 3 Step 3: supervisor control surface + sandbox receipts.
+            "supervisor": self.supervisor_state(),
+            "testnet": self._testnet_summary(),
             "feed_mode": self.feed_state()["feed_mode"],
             "feed": self.feed_state(),
             "broker_credentials": self.broker_credentials(),
@@ -1687,6 +2164,42 @@ def autopilot_enabled(control: ControlPlane) -> bool:
         return False
 
 
+def _multiprocess_enabled() -> bool:
+    """``NIOS_MULTIPROCESS=1`` opts the FastAPI lifespan into 4-ring spawn."""
+
+    return os.environ.get("NIOS_MULTIPROCESS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _start_lifespan_supervisor(
+    control: ControlPlane, *, timeout_s: float = 5.0
+) -> Any | None:
+    """Spawn the four ring workers from the ASGI lifespan when opted in.
+
+    Returns the supervisor only when this lifespan started it, so a runtime that
+    was handed an already-running supervisor never tears it down on shutdown.
+    """
+
+    if not _multiprocess_enabled():
+        return None
+    try:
+        already = bool(control.ring_processes().get("running", False))
+        supervisor = control._ensure_supervisor(  # noqa: SLF001 - Ring 3 internal
+            SupervisorControlRequest(action="start")
+        )
+        if already:
+            return None
+        supervisor.start()
+        control._await_heartbeats(timeout_s=float(timeout_s))  # noqa: SLF001
+        return supervisor
+    except Exception:  # pragma: no cover - a spawn failure must not kill Ring 3
+        return None
+
+
 async def autopilot_paper_loop(
     control: ControlPlane,
     *,
@@ -1739,9 +2252,17 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
                 name="nios-autopilot-paper",
             )
         _app.state.autopilot_task = autopilot
+        # ``sec_004``: with NIOS_MULTIPROCESS=1 the FastAPI lifespan itself owns
+        # the four OS worker processes, so a plain ``uvicorn`` launch proves the
+        # same PID topology as ``scripts/run_nios.py --multiprocess``.
+        supervisor = _start_lifespan_supervisor(control)
+        _app.state.process_supervisor = supervisor
         try:
             yield
         finally:
+            if supervisor is not None:
+                with contextlib.suppress(Exception):
+                    supervisor.stop()
             if autopilot is not None:
                 autopilot.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -1893,6 +2414,24 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.post("/api/v2/control/killswitch")
     def control_killswitch(request: KillSwitchRequest) -> dict[str, Any]:
         return control.kill(request)
+
+    # ---- Phase 3 Step 3: 4-ring OS supervisor control ------------------
+    @app.get("/api/v2/control/supervisor")
+    def control_supervisor_state() -> dict[str, Any]:
+        return control.supervisor_state()
+
+    @app.post("/api/v2/control/supervisor")
+    def control_supervisor(request: SupervisorControlRequest) -> dict[str, Any]:
+        return control.control_supervisor(request)
+
+    # ---- Phase 3 Step 3: Ring 0 sandbox order dispatch -----------------
+    @app.get("/api/v2/control/brokers/testnet")
+    def control_testnet_state() -> dict[str, Any]:
+        return control.testnet_state()
+
+    @app.post("/api/v2/control/brokers/testnet-order")
+    def control_testnet_order(request: TestnetOrderRequest) -> dict[str, Any]:
+        return control.dispatch_testnet_order(request)
 
     @app.post("/api/v2/control/rearm")
     def control_rearm(request: RearmRequest | None = None) -> dict[str, Any]:

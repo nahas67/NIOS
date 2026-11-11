@@ -65,7 +65,7 @@ import struct
 import time
 import uuid
 from dataclasses import dataclass, field
-from multiprocessing import Event, Process, Queue
+from multiprocessing import Process, Queue, RawValue
 from multiprocessing.shared_memory import SharedMemory
 from queue import Empty
 from typing import Any, Callable, Mapping, Sequence
@@ -442,7 +442,8 @@ def _ctx(
     symbol: str,
     strategy_id: str,
     feed_mode: str,
-    stop_event: Any,
+    stop_flag: Any,
+    global_stop: Any,
     event_queue: Any,
     ring0_queue: Any,
     control_queue: Any,
@@ -457,13 +458,37 @@ def _ctx(
         "symbol": str(symbol),
         "strategy_id": str(strategy_id),
         "feed_mode": str(feed_mode),
-        "stop_event": stop_event,
+        "stop_flag": stop_flag,
+        "global_stop": global_stop,
         "event_queue": event_queue,
         "ring0_queue": ring0_queue,
         "control_queue": control_queue,
         "tick_interval_s": float(tick_interval_s),
         "lease_interval_s": float(lease_interval_s),
     }
+
+
+def _stopping(ctx: Mapping[str, Any]) -> bool:
+    """Lock-free shutdown check.
+
+    A ``multiprocessing.Event`` would be the obvious choice, but its condition
+    variable lives in shared memory: terminating a worker while it happens to be
+    inside ``Event.wait`` leaves that cross-process lock permanently held and the
+    next ``Event.set()`` blocks forever.  A ``RawValue`` is a plain ctypes integer
+    with no lock, so an abrupt termination can never poison shutdown.
+    """
+
+    flag = ctx.get("stop_flag")
+    if flag is not None and flag.value:
+        return True
+    global_flag = ctx.get("global_stop")
+    return bool(global_flag is not None and global_flag.value)
+
+
+def _pause(ctx: Mapping[str, Any], seconds: float) -> None:
+    """Paced sleep; the stop flag is re-checked on the next loop iteration."""
+
+    time.sleep(max(0.0, float(seconds)))
 
 
 def _emit(ctx: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
@@ -499,7 +524,7 @@ def ring0_vault_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - pr
     )
     from ring1_spinal.silo_worker import SILO_ORDER, silo_cost_floor
 
-    stop_event = ctx["stop_event"]
+
     heart = RingHeartbeatTable()
     pid = os.getpid()
     latch = GlobalKillLatch()
@@ -562,11 +587,11 @@ def ring0_vault_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - pr
     )
 
     heart.write(0, pid)
-    while not stop_event.is_set():
+    while not _stopping(ctx):
         heart.write(0, pid)
         if latch.is_halted:
             outbox.expire_timeouts()
-            stop_event.wait(0.002)
+            _pause(ctx, 0.002)
             continue
         try:
             payload = ctx["ring0_queue"].get(timeout=0.02)
@@ -636,7 +661,7 @@ def ring1_spinal_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - p
     from ring1_spinal.silo_worker import pin_cpu_core, silo_cost_floor
     from ring1_spinal.spinal_loop import ZeroGCSpinalEngine
 
-    stop_event = ctx["stop_event"]
+
     heart = RingHeartbeatTable()
     pid = os.getpid()
     latch = GlobalKillLatch()
@@ -723,7 +748,7 @@ def ring1_spinal_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - p
     halt_wall_ns: int | None = None
     sequence = 0
     heart.write(1, pid)
-    while not stop_event.is_set():
+    while not _stopping(ctx):
         heart.write(1, pid)
         # ---- cross-process kill latch -----------------------------------
         read_started = time.perf_counter_ns()
@@ -759,7 +784,7 @@ def ring1_spinal_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - p
                 )
             else:
                 leases.disarm_all()
-            stop_event.wait(0.002)
+            _pause(ctx, 0.002)
             continue
         halt_latency_ns = None
 
@@ -782,7 +807,7 @@ def ring1_spinal_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - p
             spread_bps=1.2,
         )
         engine.on_tick(tick)
-        stop_event.wait(tick_interval)
+        _pause(ctx, tick_interval)
 
     leases.close()
     book.close()
@@ -802,7 +827,7 @@ def ring2_brain_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - pr
         System1InstinctController,
     )
 
-    stop_event = ctx["stop_event"]
+
     heart = RingHeartbeatTable()
     pid = os.getpid()
     latch = GlobalKillLatch()
@@ -842,7 +867,7 @@ def ring2_brain_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - pr
     )
 
     heart.write(2, pid)
-    while not stop_event.is_set():
+    while not _stopping(ctx):
         heart.write(2, pid)
         tick = make_flow_tick(
             symbol,
@@ -883,7 +908,7 @@ def ring2_brain_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - pr
                     "error": f"{type(exc).__name__}: {exc}",
                 },
             )
-        stop_event.wait(interval)
+        _pause(ctx, interval)
 
     leases.close()
     latch.close()
@@ -902,7 +927,7 @@ def ring3_cockpit_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - 
     the OS-isolated owner of the shared-memory kill latch so a Ring 3 control
     action never has to touch Ring 1 or Ring 0 directly.
     """
-    stop_event = ctx["stop_event"]
+
     heart = RingHeartbeatTable()
     pid = os.getpid()
     latch = GlobalKillLatch()
@@ -926,7 +951,7 @@ def ring3_cockpit_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - 
         },
     )
     heart.write(3, pid)
-    while not stop_event.is_set():
+    while not _stopping(ctx):
         heart.write(3, pid)
         try:
             command = ctx["control_queue"].get(timeout=0.02)
@@ -1034,7 +1059,12 @@ class RingProcessSupervisor:
         }
         self._processes: dict[int, Process] = {}
         self._heartbeats: RingHeartbeatTable | None = None
-        self._stop_event = Event()
+        # Lock-free stop signalling: one flag per ring plus a global latch.  A
+        # ``multiprocessing.Event`` is deliberately *not* used because its
+        # shared condition variable is not robust against a terminated worker
+        # that happens to die inside ``Event.wait`` -- see :func:`_stopping`.
+        self._stop_flags = [RawValue("i", 0) for _ in range(4)]
+        self._global_stop = RawValue("i", 0)
         self._event_queue = Queue()
         self._ring0_queue = Queue()
         self._control_queue = Queue()
@@ -1083,7 +1113,8 @@ class RingProcessSupervisor:
             symbol=self.symbol,
             strategy_id=self.strategy_id,
             feed_mode=self.feed_mode,
-            stop_event=self._stop_event,
+            stop_flag=self._stop_flags[int(ring_index)],
+            global_stop=self._global_stop,
             event_queue=self._event_queue,
             ring0_queue=self._ring0_queue,
             control_queue=self._control_queue,
@@ -1104,8 +1135,10 @@ class RingProcessSupervisor:
     def start(self) -> "RingProcessSupervisor":
         if self._running:
             return self
-        if self._stop_event.is_set():
-            self._stop_event = Event()
+        # Re-arm the lock-free stop latches before respawning.
+        self._global_stop.value = 0
+        for flag in self._stop_flags:
+            flag.value = 0
         self.heartbeat_table()
         for index in self.rings:
             self._spawn(index)
@@ -1113,15 +1146,28 @@ class RingProcessSupervisor:
         return self
 
     def stop(self, *, timeout_s: float = 3.0) -> None:
-        self._stop_event.set()
-        deadline = time.monotonic() + float(timeout_s)
-        for process in list(self._processes.values()):
-            remaining = max(0.05, deadline - time.monotonic())
-            process.join(timeout=remaining)
+        """Stop every worker, producer-first, inside a bounded window.
+
+        Ring 1 is the only ring that *feeds* another ring, so it is stopped
+        before Ring 0 (which may otherwise keep draining proposals and never
+        reach its exit check).  Each process gets its own slice of the budget and
+        a straggler is terminated rather than allowed to hold shutdown open.
+        """
+
+        self._global_stop.value = 1
+        for flag in self._stop_flags:
+            flag.value = 1
+        order = sorted(self._processes, reverse=True)
+        per_process = max(0.25, float(timeout_s) / max(1, len(order)))
+        for index in order:
+            process = self._processes.get(index)
+            if process is None:
+                continue
+            process.join(timeout=per_process)
             if process.is_alive():  # pragma: no cover - hard teardown
                 process.terminate()
                 process.join(timeout=1.0)
-            spec = self._specs.get(RING_INDEX.get(process.name, -1))
+            spec = self._specs.get(index)
             if spec is not None:
                 spec.exit_code = process.exitcode
         self._processes.clear()
@@ -1143,12 +1189,23 @@ class RingProcessSupervisor:
 
     # -- crash recovery -------------------------------------------------
     def restart(self, ring_index: int, *, reason: str = "manual restart") -> dict[str, Any]:
+        """Cooperative restart of one ring: ask, then terminate only if needed.
+
+        Asking first matters on Windows: an abrupt ``TerminateProcess`` while a
+        worker is inside a shared-memory synchronisation primitive can leave that
+        lock held by a dead process.  The per-ring latch therefore gets a short
+        grace period before the hard kill.
+        """
+
         index = int(ring_index)
         spec = self._specs[index]
         process = self._processes.pop(index, None)
         if process is not None and process.is_alive():
-            process.terminate()
-            process.join(timeout=1.0)
+            self._stop_flags[index].value = 1
+            process.join(timeout=0.5)
+            if process.is_alive():  # pragma: no cover - unresponsive worker
+                process.terminate()
+                process.join(timeout=1.0)
         spec.restarts += 1
         if spec.restarts > self.restart_limit:
             return {
@@ -1159,6 +1216,7 @@ class RingProcessSupervisor:
             }
         table = self.heartbeat_table()
         table.clear(index)
+        self._stop_flags[index].value = 0
         self._spawn(index)
         return {
             "worker": spec.name,

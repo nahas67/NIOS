@@ -64,6 +64,9 @@ __all__ = [
     "broker_credentials_present",
     "broker_credential_state",
     "broker_payload_schema",
+    "build_venue_payload",
+    "silo_for_venue",
+    "sandbox_dispatch_target",
     "default_registry",
     "dispatch_signed_order",
     "probe_donor_adapters",
@@ -968,6 +971,59 @@ def broker_payload_schema(venue: str) -> tuple[str, ...]:
     return tuple(adapter_spec(key).required_fields)
 
 
+def silo_for_venue(venue: str) -> str:
+    """The one silo that owns ``venue`` (``sec_015`` market whitelist)."""
+
+    key = _normalise_venue(venue)
+    for market, venues in _ADAPTERS_BY_MARKET.items():
+        if key in venues:
+            return MARKET_SILO_MAP[market]
+    raise ValueError(f"unsupported broker venue: {venue!r}")
+
+
+def build_venue_payload(
+    venue: str,
+    proposal: Any,
+    *,
+    silo: str | "MarketSilo" | None = None,
+    registry: MarketSiloRegistry | None = None,
+    product: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Public, side-effect-free entry point to the venue-native order body.
+
+    ``store_and_verify_broker_credentials`` uses this for its dry-run handshake
+    and the Ring 0 sandbox bridge uses it for the real (testnet) dispatch, so a
+    single builder defines what "the correct payload for this venue" means.
+    No socket is opened here and no credential is read.
+    """
+
+    key = _normalise_venue(venue)
+    if key not in VENUE_ADAPTERS:
+        raise ValueError(f"unsupported broker venue: {venue!r}; known venues are "
+                         f"{', '.join(sorted(VENUE_ADAPTERS))}")
+    if silo is None:
+        market_silo = (registry or default_registry()).get(silo_for_venue(key))
+    elif isinstance(silo, MarketSilo):
+        market_silo = silo
+    else:
+        market_silo = (registry or default_registry()).get(str(silo))
+    module = importlib.import_module(VENUE_ADAPTERS[key])
+    return _build_payload(key, proposal, module, market_silo, product=product)
+
+
+def sandbox_dispatch_target(silo: str, venue: str) -> dict[str, Any]:
+    """Where the Ring 0 sandbox bridge would send this venue's next order.
+
+    Returns the endpoint, transport and auth scheme only -- never a credential,
+    a header value or a signature.  Ring 3 renders this so an operator can see
+    exactly which testnet host a paper order is aimed at.
+    """
+
+    from ring0_vault.silos.testnet_bridge import sandbox_target
+
+    return sandbox_target(silo, venue)
+
+
 def store_and_verify_broker_credentials(
     silo: str,
     venue: str,
@@ -1112,6 +1168,13 @@ def store_and_verify_broker_credentials(
             "socket_opened": False,
             "order_placed": False,
         },
+        # Where a sandbox order for this venue would actually be sent.  Endpoint
+        # and scheme only: no key, no header value, no signature.
+        "sandbox_endpoint": (
+            sandbox_dispatch_target(market_silo.silo_id, venue_key)
+            if sandbox
+            else None
+        ),
         "stored_at_ns": stamp,
     }
 

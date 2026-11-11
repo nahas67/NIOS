@@ -673,6 +673,28 @@ export interface FeedControlResponse {
   timestamp_ns: number
 }
 
+/** One `POST /api/v2/control/supervisor` receipt. */
+export interface SupervisorControlResponse {
+  action: string
+  changed: boolean
+  running: boolean
+  available?: boolean
+  attached?: boolean
+  distinct_os_processes: number
+  four_ring_isolation?: boolean
+  pids: Record<string, number | null>
+  rings: RingProcess[]
+  ring_index?: number
+  previous_pid?: number | null
+  new_pid?: number | null
+  pid_changed?: boolean
+  restart?: Record<string, unknown>
+  stopped?: boolean
+  error?: string
+  operator?: string
+  timestamp_ns?: number
+}
+
 /** Write-only credential payload; the secret never returns from the API. */
 export interface BrokerCredentialPayload {
   silo: string

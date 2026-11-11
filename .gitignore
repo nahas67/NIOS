@@ -41,6 +41,11 @@ ring0_vault/silos/key_vault/.broker_secrets/
 **/.broker_secrets/
 **/.secrets/
 *.key
+*.pem
+# Write-only LLM key dumps and TigerBeetle data files are never source
+llm_keys.json
+*.tigerbeetle
+*.tigerbeetle.replica
 
 # Donor harvest staging -- reference only, never imported by runtime code
 _donor_staging/

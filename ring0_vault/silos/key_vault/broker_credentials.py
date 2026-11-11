@@ -194,6 +194,18 @@ class BrokerCredentialVault:
 
         return self._decrypt(name)
 
+    def reveal(self, name: str) -> str | None:
+        """Decrypt a value for *Ring 0 signing* only.
+
+        This is the single sanctioned plaintext accessor.  It exists so
+        :mod:`ring0_vault.silos.testnet_bridge` can sign a venue request at the
+        instant of dispatch without the key ever crossing a process boundary or
+        entering a receipt.  Ring 3 has no code path that calls it: the control
+        plane only ever reads :meth:`masked`.
+        """
+
+        return self._decrypt(name)
+
 
 _DEFAULT_VAULT: BrokerCredentialVault | None = None
 _DEFAULT_LOCK = threading.Lock()

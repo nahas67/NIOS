@@ -28,7 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { fetchFormalProofs } from '@/lib/api'
+import { fetchFormalProofs, postSupervisor } from '@/lib/api'
 import { formatBps, formatPct, truncateDigest } from '@/lib/format'
 import type {
   CockpitState,
@@ -241,6 +241,46 @@ function RingProcessMatrix({
   const liveFeed = feedMode === 'LIVE_PUBLIC_DUAL_VENDOR'
   const siloModes = feed?.silo_modes ?? {}
   const lastCycle = feed?.last_cycle
+  const [busy, setBusy] = useState<'start' | 'restart' | null>(null)
+  const [note, setNote] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const startSupervisor = async () => {
+    setBusy('start')
+    setError(null)
+    setNote(null)
+    try {
+      const report = await postSupervisor('start')
+      setNote(
+        `${report.distinct_os_processes} distinct OS processes · ` +
+          Object.entries(report.pids ?? {})
+            .map(([worker, pid]) => `${worker.split('-')[0]}:${pid ?? '—'}`)
+            .join(' · ')
+      )
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const restartRing1 = async () => {
+    setBusy('restart')
+    setError(null)
+    setNote(null)
+    try {
+      const report = await postSupervisor('restart_ring', 1)
+      setNote(
+        report.changed
+          ? `Ring 1 respawned: PID ${report.previous_pid ?? '—'} → ${report.new_pid ?? '—'}`
+          : `Ring 1 restart refused: ${String(report.restart?.reason ?? 'unknown')}`
+      )
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(null)
+    }
+  }
 
   return (
     <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
@@ -272,6 +312,29 @@ function RingProcessMatrix({
             <Badge variant="outline" className="font-mono text-[9px]">
               SHM SeqLock heartbeat
             </Badge>
+            {/* Phase 3 Step 3: start the four OS workers from the cockpit. */}
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 font-mono text-[9px]"
+              disabled={busy !== null}
+              onClick={startSupervisor}
+            >
+              <Cpu className="mr-1 size-3" />
+              {busy === 'start' ? 'STARTING…' : 'START 4 RINGS'}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 font-mono text-[9px]"
+              disabled={busy !== null || !available}
+              onClick={restartRing1}
+            >
+              <RefreshCw
+                className={`mr-1 size-3 ${busy === 'restart' ? 'animate-spin' : ''}`}
+              />
+              RESTART RING 1
+            </Button>
           </div>
         </div>
         <p className="text-[11px] text-muted-foreground">
@@ -279,6 +342,12 @@ function RingProcessMatrix({
           shared-memory spine. Ring 2 has no broker key and Ring 1 has no LLM
           client, so the air-gap is enforced by the kernel, not by prompt text.
         </p>
+        {note ? (
+          <p className="font-mono text-[9px] text-emerald-300">{note}</p>
+        ) : null}
+        {error ? (
+          <p className="font-mono text-[9px] text-amber-300">{error}</p>
+        ) : null}
       </CardHeader>
       <CardContent className="space-y-3 px-4">
         <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
@@ -346,8 +415,9 @@ function RingProcessMatrix({
 
         {!available ? (
           <div className="rounded-md border border-dashed border-border/60 bg-muted/10 px-3 py-2 text-[10px] text-muted-foreground">
-            Supervisor not attached: {rings?.reason ?? 'single-process mode'}. Launch
-            with <span className="font-mono">python scripts/run_nios.py --multiprocess</span>{' '}
+            Supervisor not attached: {rings?.reason ?? 'single-process mode'}. Press{' '}
+            <span className="font-mono">START 4 RINGS</span> above (or launch with{' '}
+            <span className="font-mono">python scripts/run_nios.py --multiprocess</span>)
             to prove four distinct PIDs.
           </div>
         ) : null}
