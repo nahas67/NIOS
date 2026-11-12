@@ -1289,3 +1289,380 @@ def test_interactive_workstation_actions_across_pages_on_v1(cockpit: Any) -> Non
     ):
         assert label in bundle, f"rebuilt bundle is missing {label!r}"
 
+
+
+def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) -> None:
+    """Phase 4 Step 6: the last three pages get live workstation actions.
+
+    Six new control endpoints are exercised end to end:
+
+    * ``POST /api/v2/control/verification/chaos-drill`` -- deterministic SIGKILL
+      recovery proving ``pending_after == 0``, ``duplicate_transfer_ids == 0``,
+      a stale lease swept to ``DISARMED`` and ``sum(debits) == sum(credits)``;
+    * ``POST /api/v2/control/verification/vopr`` -- the seeded fault campaign
+      with its power-loss cycles and an overdraft-free conservation proof;
+    * ``POST /api/v2/control/verification/os-tune`` -- the applied OS/socket
+      audit with ``error_count == 0``;
+    * ``POST /api/v2/control/brain/mirofish-shock`` -- a five-archetype,
+      three-tick cascade under the 1.8 ms SLA with a deterministic digest;
+    * ``POST /api/v2/control/brain/committee-debate`` -- the grounded System 2
+      debate and its SHA-256 ``GroundedFactPacket``;
+    * ``POST /api/v2/control/forge/evaluate-challenger`` -- the nursery gates
+      (``DSR >= 1.50`` and ``>= 30`` shadow fills) on both sides of the line.
+
+    The rebuilt ``dist/`` bundle must carry every control, so all nine cockpit
+    pages ship with a live workstation action.
+    """
+
+    operator = "pytest.step6"
+
+    # --------------------------------------------------- 1. chaos SIGKILL drill
+    drill = cockpit.post(
+        "/api/v2/control/verification/chaos-drill",
+        json={
+            "iterations": 80,
+            "hold_ms": 90.0,
+            "seed": 11,
+            "silo": SILO,
+            "symbol": SYMBOL,
+            "operator": operator,
+        },
+    )
+    assert drill.status_code == 200, drill.text
+    body = drill.json()
+    assert body["kind"] == "nios_chaos_recovery_drill"
+    assert body["page"] == "verification"
+    assert body["status"] == "PASSED"
+    assert body["target"] == "outbox_reservation"
+    assert body["killed"] is True
+    assert body["sigkill_delivered"] is True
+    assert body["returncode"] not in (0, None)
+    assert body["inflight_reservation_observed"] is True
+    assert body["reservation_key"]
+
+    recovery = body["recovery"]
+    assert recovery["reservations_pending_before"] >= 1
+    assert recovery["reservations_pending_after"] == 0
+    assert recovery["orphaned_orders"] == 0
+    assert recovery["duplicate_transfer_ids"] == 0
+    assert recovery["invariant_holds"] is True
+
+    invariants = body["invariants"]
+    assert invariants == {
+        "no_orphaned_orders": True,
+        "at_most_once_execution": True,
+        "stale_lease_swept_to_disarmed": True,
+        "double_entry_conservation": True,
+    }
+    assert body["all_invariants_hold"] is True
+
+    proof = body["proof"]
+    assert proof["pending_after"] == 0
+    assert proof["duplicate_transfer_ids"] == 0
+    assert proof["orphaned_orders"] == 0
+    assert proof["sum_debits_micros"] == proof["sum_credits_micros"]
+    assert proof["sum_debits_micros"] > 0
+
+    lease = body["lease_reboot"]
+    assert lease["stale_lease_armed"] is True
+    assert lease["swept"] >= 1
+    assert lease["active_after_reboot"] == 0
+    assert lease["mode_after_reboot"] == 0  # LeaseMode.DISARMED
+    assert lease["disarmed"] is True
+    assert lease["passed"] is True
+    # The drill must never reset the live Ring 1 lease segment.
+    assert lease["segment"] != "nios-active-leases"
+    assert lease["segment"].startswith("nios-chaos-lease-")
+    assert body["elapsed_ms"] > 0.0
+    assert body["operator"] == operator
+
+    # ------------------------------------------------------- 2. VOPR campaign
+    vopr_request = {"seed": 7, "steps": 250, "operator": operator}
+    vopr = cockpit.post("/api/v2/control/verification/vopr", json=vopr_request)
+    assert vopr.status_code == 200, vopr.text
+    campaign = vopr.json()
+    assert campaign["kind"] == "nios_vopr_fault_campaign"
+    assert campaign["page"] == "verification"
+    assert campaign["status"] == "PASSED"
+    assert campaign["seed"] == 7
+    assert campaign["steps"] == 250
+    assert campaign["fault_counts"]
+    assert campaign["injected_faults"] == sum(campaign["fault_counts"].values())
+    assert campaign["injected_faults"] > 0
+    assert campaign["power_cycles"] >= 1
+    assert campaign["overdrafts"] == 0
+    assert campaign["conservation_violations"] == 0
+    assert campaign["ledger_violations"] == 0
+    assert campaign["duplicate_executions"] == 0
+    assert campaign["double_entry_ok"] is True
+    assert campaign["at_most_once_ok"] is True
+    assert campaign["conservation_proof"] == {
+        "overdrafts": 0,
+        "double_entry_ok": True,
+        "at_most_once_ok": True,
+    }
+    assert campaign["all_invariants_hold"] is True
+
+    # Same seed => same fault histogram: a red row is always reproducible.
+    repeat = cockpit.post("/api/v2/control/verification/vopr", json=vopr_request)
+    assert repeat.status_code == 200
+    repeated = repeat.json()
+    assert repeated["fault_counts"] == campaign["fault_counts"]
+    assert repeated["power_cycles"] == campaign["power_cycles"]
+    assert repeated["injected_faults"] == campaign["injected_faults"]
+
+    # A step count below the floor is rejected, never silently clamped.
+    assert (
+        cockpit.post(
+            "/api/v2/control/verification/vopr", json={"seed": 7, "steps": 1}
+        ).status_code
+        == 422
+    )
+
+    # ------------------------------------------------------ 3. OS tuning audit
+    tune = cockpit.post(
+        "/api/v2/control/verification/os-tune",
+        json={"apply": True, "ring": "ring1", "operator": operator},
+    )
+    assert tune.status_code == 200, tune.text
+    tuning = tune.json()
+    assert tuning["kind"] == "nios_os_low_latency_audit"
+    assert tuning["page"] == "verification"
+    assert tuning["status"] == "PASSED"
+    assert tuning["error_count"] == 0
+    assert tuning["all_invariants_hold"] is True
+    assert tuning["apply_requested"] is True
+    assert tuning["checks"]
+    assert len(tuning["checks"]) == len(tuning["groups"]["socket"]) + len(
+        tuning["groups"]["timer"]
+    ) + len(tuning["groups"]["affinity"]) + len(tuning["groups"]["shm"]) + len(
+        tuning["groups"]["sysctl"]
+    ) + len(tuning["groups"]["other"])
+    assert tuning["applied_count"] + tuning["recommended_count"] <= len(
+        tuning["checks"]
+    )
+    telemetry = tuning["socket_telemetry"]
+    assert telemetry["transport"] == "tcp-loopback"
+    assert telemetry["tcp_nodelay"] == 1
+    assert telemetry["so_keepalive"] == 1
+    assert telemetry["recv_buffer_bytes"] >= 1_048_576
+    assert telemetry["send_buffer_bytes"] >= 1_048_576
+    assert telemetry["errors"] == []
+
+    # ------------------------------------------------- 4. MiroFish shock drill
+    shock_request = {
+        "symbol": SYMBOL,
+        "shock_bps": -180.0,
+        "sentiment_tag": "panic",
+        "volatility_ratio": 2.0,
+        "spread_bps": 6.0,
+        "gamma_flip_proximity": 0.2,
+        "operator": operator,
+    }
+    shock = cockpit.post("/api/v2/control/brain/mirofish-shock", json=shock_request)
+    assert shock.status_code == 200, shock.text
+    cascade = shock.json()
+    assert cascade["kind"] == "nios_mirofish_shock_cascade"
+    assert cascade["page"] == "brain"
+    assert cascade["symbol"] == SYMBOL
+    assert cascade["archetype_count"] == 5
+    assert len(cascade["archetypes"]) == 5
+    assert cascade["tick_count"] == 3
+    assert len(cascade["tick_flows"]) == 3
+    assert len(cascade["tick_breakdown"]) == 3
+    for tick in cascade["tick_breakdown"]:
+        assert len(tick["archetypes"]) == 5
+        allocated = sum(row["flow"] for row in tick["archetypes"])
+        assert allocated == pytest.approx(tick["net_flow"], abs=1e-6)
+        assert abs(sum(row["weight"] for row in tick["archetypes"]) - 1.0) < 1e-6
+    assert 0.0 <= cascade["cascade_fragility_index"] <= 1.0
+    assert -1.0 <= cascade["crowd_asymmetry_score"] <= 1.0
+    assert cascade["fragility_halt_threshold"] == 0.75
+    assert cascade["requires_ring1_halt"] is (
+        cascade["cascade_fragility_index"] >= cascade["fragility_halt_threshold"]
+    )
+    assert cascade["latency_ms"] < 1.8
+    assert cascade["within_sla"] is True
+    digest = cascade["sha256_digest"]
+    assert isinstance(digest, str) and len(digest) == 64
+    int(digest, 16)
+    assert cascade["packet"]["sha256_digest"]
+    assert cascade["grounding"]["cascade_digest"] == digest
+    assert cascade["operator"] == operator
+
+    # Deterministic for a given shock vector: same digest, same tick flows.
+    replay = cockpit.post("/api/v2/control/brain/mirofish-shock", json=shock_request)
+    assert replay.status_code == 200
+    replayed = replay.json()
+    assert replayed["sha256_digest"] == digest
+    assert replayed["tick_flows"] == cascade["tick_flows"]
+    assert (
+        replayed["cascade_fragility_index"] == cascade["cascade_fragility_index"]
+    )
+
+    # ------------------------------------------------- 5. Committee debate turn
+    debate = cockpit.post(
+        "/api/v2/control/brain/committee-debate",
+        json={"silo": SILO, "symbol": "AUTO", "operator": operator},
+    )
+    assert debate.status_code == 200, debate.text
+    committee = debate.json()
+    assert committee["kind"] == "nios_system2_committee_debate"
+    assert committee["page"] == "brain"
+    assert committee["silo"] == SILO
+    assert committee["verdict"] in {"CONVICTED", "ABSTAINED"}
+    assert committee["symbol"]
+    assert committee["universe_size"] == 500
+    assert committee["stage_count"] == len(committee["transcript"])
+    assert committee["stage_count"] >= 13
+    assert all(row["verified"] is True for row in committee["transcript"])
+    assert all(row["claims_checked"] >= 0 for row in committee["transcript"])
+    packet_digest = committee["sha256_digest"]
+    assert isinstance(packet_digest, str) and len(packet_digest) == 64
+    int(packet_digest, 16)
+    assert committee["grounding"]["sha256_digest"] == packet_digest
+    assert committee["contagion"]["cascade_fragility_index"] >= 0.0
+
+    stage_names = [row["stage"] for row in committee["transcript"]]
+    if committee["verdict"] == "CONVICTED":
+        assert committee["abstention_reason"] == ""
+        assert committee["packet"]["sha256_digest"] == packet_digest
+        assert committee["report"]["packet_digest"] == packet_digest
+        assert committee["report"]["all_stages_verified"] is True
+        assert committee["proposal"]
+        assert {"debate_bull_r1", "debate_bear_r1"} <= set(stage_names)
+        assert {"risk_aggressive", "risk_neutral", "risk_conservative"} <= set(
+            stage_names
+        )
+    else:
+        assert committee["abstention_reason"]
+        assert committee["packet"] == {}
+    assert committee["elapsed_ms"] > 0.0
+
+    # A silo outside the registry is refused rather than silently rerouted.
+    assert (
+        cockpit.post(
+            "/api/v2/control/brain/committee-debate",
+            json={"silo": "NOT_A_SILO", "symbol": "AUTO"},
+        ).status_code
+        == 422
+    )
+
+    # ------------------------------------------------ 6. Challenger evaluation
+    promoted = cockpit.post(
+        "/api/v2/control/forge/evaluate-challenger",
+        json={
+            "plugin_name": "genome_step6_alpha",
+            "candidate_sharpe": 1.92,
+            "shadow_fills": 34,
+            "silo": SILO,
+            "operator": operator,
+        },
+    )
+    assert promoted.status_code == 200, promoted.text
+    receipt = promoted.json()
+    assert receipt["kind"] == "nios_challenger_evaluation"
+    assert receipt["page"] == "forge"
+    assert receipt["status"] == "PROMOTED"
+    assert receipt["promotion_ready"] is True
+    assert receipt["plugin_name"] == "genome_step6_alpha"
+    assert receipt["genome_id"] == "plugin:genome_step6_alpha"
+    assert receipt["gate_results"] == {
+        "dsr_floor_met": True,
+        "shadow_nursery_met": True,
+        "nursery_graduated": True,
+    }
+    assert receipt["gates"]["deflated_sharpe"]["required"] == 1.5
+    assert receipt["gates"]["shadow_fills"]["required"] == 30
+    assert receipt["rejection_reasons"] == []
+    assert receipt["nursery"]["graduated"] is True
+    assert receipt["nursery"]["required_shadow_fills"] == 30
+    assert receipt["genome"]["deflated_sharpe"] == 1.92
+    assert receipt["genome"]["shadow_fills"] == 34
+    assert receipt["forge"]["challenger_count"] >= 1
+    assert receipt["activation"] == "SHADOW"
+    assert receipt["operator"] == operator
+
+    rejected = cockpit.post(
+        "/api/v2/control/forge/evaluate-challenger",
+        json={
+            "plugin_name": "genome_step6_beta",
+            "candidate_sharpe": 1.10,
+            "shadow_fills": 12,
+            "silo": SILO,
+        },
+    )
+    assert rejected.status_code == 200, rejected.text
+    failure = rejected.json()
+    assert failure["status"] == "REJECTED"
+    assert failure["promotion_ready"] is False
+    assert failure["gate_results"] == {
+        "dsr_floor_met": False,
+        "shadow_nursery_met": False,
+        "nursery_graduated": False,
+    }
+    assert len(failure["rejection_reasons"]) == 2
+    assert "1.1000" in failure["rejection_reasons"][0]
+    assert "12" in failure["rejection_reasons"][1]
+    assert failure["hold_reason"]
+
+    # The gates are inclusive: exactly 1.50 and exactly 30 clears both.
+    edge = cockpit.post(
+        "/api/v2/control/forge/evaluate-challenger",
+        json={
+            "plugin_name": "genome_step6_edge",
+            "candidate_sharpe": 1.5,
+            "shadow_fills": 30,
+            "silo": SILO,
+        },
+    )
+    assert edge.status_code == 200, edge.text
+    asserted = edge.json()
+    assert asserted["status"] == "PROMOTED"
+    assert asserted["gate_results"]["dsr_floor_met"] is True
+    assert asserted["gate_results"]["shadow_nursery_met"] is True
+
+    # A path-traversing plugin name never reaches the registry.
+    assert (
+        cockpit.post(
+            "/api/v2/control/forge/evaluate-challenger",
+            json={
+                "plugin_name": "../etc/passwd",
+                "candidate_sharpe": 2.0,
+                "shadow_fills": 40,
+            },
+        ).status_code
+        == 422
+    )
+
+    # The forge page lists the promoted challenger on the next read.
+    forge_page = cockpit.get("/api/v2/cockpit/forge")
+    assert forge_page.status_code == 200
+    assert forge_page.json()["plugins"]["count"] >= 1
+
+    # --------------------------------------- 7. rebuilt bundle carries all six
+    response = cockpit.get("/")
+    assert response.status_code == 200
+    assert "/assets/" in response.text
+
+    bundle_js = sorted((FRONTEND / "dist" / "assets").glob("*.js"))
+    assert bundle_js, "compiled cockpit bundle has no JavaScript chunk"
+    bundle = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
+    )
+    for label in (
+        "Run Chaos SIGKILL Recovery Drill",
+        "Run Seeded VOPR Fault Campaign",
+        "Apply & Audit OS Low-Latency Tuning",
+        "MiroFish Shock Simulator",
+        "Run System 2 Committee Debate",
+        "Evaluate Challenger Genome / Plugin",
+        "PAPER CONTROL",
+        "/api/v2/control/verification/chaos-drill",
+        "/api/v2/control/verification/vopr",
+        "/api/v2/control/verification/os-tune",
+        "/api/v2/control/brain/mirofish-shock",
+        "/api/v2/control/brain/committee-debate",
+        "/api/v2/control/forge/evaluate-challenger",
+    ):
+        assert label in bundle, f"rebuilt bundle is missing {label!r}"

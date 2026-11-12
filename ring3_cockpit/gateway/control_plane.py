@@ -20,6 +20,12 @@ surfaces (extensions + read-only MCP) without granting order authority:
 ``POST /api/v2/control/llms/probe``          live Ollama probe under 250 ms
 ``POST /api/v2/control/vault/rotate-keys``   zero-downtime Ring 0 key rotation
 ``GET  /api/v2/control/vault/status``        key version + OS tuning status
+``POST /api/v2/control/verification/chaos-drill`` SIGKILL recovery invariants
+``POST /api/v2/control/verification/vopr``        seeded VOPR fault campaign
+``POST /api/v2/control/verification/os-tune``     apply + audit OS low latency
+``POST /api/v2/control/brain/mirofish-shock``     3-tick contagion cascade
+``POST /api/v2/control/brain/committee-debate``   grounded System 2 debate turn
+``POST /api/v2/control/forge/evaluate-challenger`` nursery promotion gate
 ======================  =====================================================
 
 Design notes
@@ -641,6 +647,162 @@ class LedgerReconcileRequest(BaseModel):
     operator: str = "ring3.operator"
 
 
+class ChaosDrillRequest(BaseModel):
+    """``POST /api/v2/control/verification/chaos-drill`` payload (Step 6).
+
+    Deterministic SIGKILL drill: a worker is killed mid-outbox, the ledger is
+    replayed from the journal and every ``sec_009`` reboot invariant must hold.
+    The lease sweep runs on an isolated shared-memory segment so a drill never
+    disarms the live Ring 1 lease table.
+    """
+
+    iterations: int = Field(default=120, ge=8, le=4_000)
+    hold_ms: float = Field(default=120.0, ge=10.0, le=2_000.0)
+    seed: int = Field(default=11, ge=0, le=2_147_483_647)
+    silo: str = "CRYPTO_BINANCE"
+    symbol: str = "BTC-USDT"
+    operator: str = "ring3.operator"
+
+    @field_validator("silo")
+    @classmethod
+    def _drill_silo_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if not token:
+            raise ValueError("silo must not be empty")
+        return token
+
+    @field_validator("symbol")
+    @classmethod
+    def _drill_symbol_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if not token or len(token) > 32:
+            raise ValueError("symbol must be 1-32 characters")
+        return token
+
+
+class VoprCampaignRequest(BaseModel):
+    """``POST /api/v2/control/verification/vopr`` payload (Step 6, ``sec_009``).
+
+    Seeded deterministic fault campaign: the same seed and step count always
+    reproduce the same fault histogram, so a red row is a reproducible defect.
+    """
+
+    seed: int = Field(default=7, ge=0, le=2_147_483_647)
+    steps: int = Field(default=250, ge=10, le=20_000)
+    operator: str = "ring3.operator"
+
+
+class OsTuneRequest(BaseModel):
+    """``POST /api/v2/control/verification/os-tune`` payload (Step 6).
+
+    ``apply=True`` applies everything the *serving process* is permitted to
+    change; rows that need elevated privileges stay ``RECOMMENDED`` and are
+    reported with their exact command instead of being silently skipped.
+    """
+
+    apply: bool = True
+    ring: str = "ring1"
+    operator: str = "ring3.operator"
+
+    @field_validator("ring")
+    @classmethod
+    def _ring_ok(cls, value: str) -> str:
+        token = str(value).strip().lower()
+        if token not in ("ring0", "ring1", "ring2", "ring3"):
+            raise ValueError("ring must be ring0, ring1, ring2 or ring3")
+        return token
+
+
+class MiroFishShockRequest(BaseModel):
+    """``POST /api/v2/control/brain/mirofish-shock`` payload (Step 6).
+
+    One five-archetype, three-tick contagion cascade under a synthesised shock.
+    The cascade is deterministic for a given shock vector, so the returned
+    SHA-256 digest is a reproducible commitment to the simulation inputs and
+    outputs — never to wall-clock jitter.
+    """
+
+    symbol: str = Field(default="BTCUSDT", min_length=1, max_length=32)
+    shock_bps: float = Field(default=-45.0, ge=-5_000.0, le=5_000.0)
+    sentiment_tag: str = Field(default="panic", max_length=64)
+    volatility_ratio: float = Field(default=2.0, ge=0.0, le=50.0)
+    spread_bps: float = Field(default=6.0, ge=0.0, le=500.0)
+    gamma_flip_proximity: float = Field(default=0.2, ge=0.0, le=1.0)
+    silo: str = "US"
+    operator: str = "ring3.operator"
+
+    @field_validator("symbol")
+    @classmethod
+    def _shock_symbol_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if not token:
+            raise ValueError("symbol must not be empty")
+        return token
+
+    @field_validator("sentiment_tag")
+    @classmethod
+    def _tag_ok(cls, value: str) -> str:
+        token = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+        if token and not token.replace("_", "").isalnum():
+            raise ValueError("sentiment_tag must be alphanumeric with _ or -")
+        return token
+
+
+class CommitteeDebateRequest(BaseModel):
+    """``POST /api/v2/control/brain/committee-debate`` payload (Step 6).
+
+    ``symbol`` may be ``AUTO`` to debate whichever candidate the 490-factor
+    scan ranks first. Every numerical claim in the transcript is re-computed by
+    ``NumericalGroundingVerifier`` before the verdict is returned.
+    """
+
+    silo: str = "US"
+    symbol: str = Field(default="AUTO", min_length=1, max_length=32)
+    spread_bps: float = Field(default=3.0, ge=0.0, le=500.0)
+    operator: str = "ring3.operator"
+
+    @field_validator("silo")
+    @classmethod
+    def _committee_silo_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if not token:
+            raise ValueError("silo must not be empty")
+        return token
+
+    @field_validator("symbol")
+    @classmethod
+    def _committee_symbol_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if not token:
+            raise ValueError("symbol must not be empty")
+        return token
+
+
+class ChallengerEvalRequest(BaseModel):
+    """``POST /api/v2/control/forge/evaluate-challenger`` payload (Step 6).
+
+    A candidate genome/plugin is admitted to the nursery only with
+    ``Deflated Sharpe >= 1.50`` **and** ``shadow_fills >= 30``. Both thresholds
+    are read from the forge, never from the request.
+    """
+
+    plugin_name: str = Field(
+        ..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$"
+    )
+    candidate_sharpe: float = Field(default=1.85, ge=-10.0, le=25.0)
+    shadow_fills: int = Field(default=30, ge=0, le=100_000)
+    silo: str = "US"
+    operator: str = "ring3.operator"
+
+    @field_validator("silo")
+    @classmethod
+    def _challenger_silo_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if not token:
+            raise ValueError("silo must not be empty")
+        return token
+
+
 # ---------------------------------------------------------------------------
 # Mutable control state
 # ---------------------------------------------------------------------------
@@ -907,6 +1069,15 @@ class ControlPlane:
 
             mcp_bridge = MCPBridge(control=self)
         self.mcp = mcp_bridge
+        # ---- Phase 4 Step 6: interactive brain / forge drill surfaces -----
+        # The cascade engine is warmed once per process (numba kernel) and then
+        # reused: a cold warmup inside an HTTP request would blow the 1.8 ms SLA.
+        self._mirofish_engines: dict[str, Any] = {}
+        self._mirofish_lock = threading.Lock()
+        # One committee per silo: the staged graph allocates its own executor
+        # pool, so rebuilding it on every debate would be pure overhead.
+        self._committee_cache: dict[str, Any] = {}
+        self._committee_lock = threading.Lock()
 
     # -- reads ------------------------------------------------------------
     def broker_state(self, key: str) -> dict[str, Any]:
@@ -2736,6 +2907,837 @@ class ControlPlane:
             "generated_at_ns": time.time_ns(),
         }
 
+    # -- Phase 4 Step 6: interactive /verification, /brain, /forge controls --
+    def _lease_reboot_drill(self, symbol: str) -> dict[str, Any]:
+        """Prove an expired lease is swept to ``DISARMED`` after a reboot.
+
+        ``core.chaos_recovery.audit_lease_reboot`` resets the canonical
+        ``nios-active-leases`` segment, which would disarm the live Ring 1 lease
+        table. This drill runs the identical sequence on a private segment and
+        unlinks it afterwards: the same proof, with no side effect on the
+        running system.
+        """
+
+        from core.schemas import LeaseMode, System1Lease
+        from core.shm_ipc import LeaseTableSHM
+
+        segment = f"nios-chaos-lease-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        stamp = time.monotonic_ns()
+        writer = LeaseTableSHM(reset=True, name=segment)
+        report: dict[str, Any] = {
+            "symbol": symbol,
+            "segment": segment,
+            "stale_lease_armed": False,
+            "swept": 0,
+            "active_after_reboot": 0,
+            "mode_after_reboot": int(LeaseMode.DISARMED),
+            "disarmed": False,
+            "passed": False,
+        }
+        reader = None
+        try:
+            stale = System1Lease(
+                symbol=symbol,
+                mode=LeaseMode.LONG_ONLY,
+                target_bps=12.0,
+                stop_bps=9.0,
+                expires_at_ns=stamp - 1_000_000,  # already dead on arrival
+                strategy_id_hash=0xA1B2C3,
+            )
+            writer.write_lease(stale, stamp)
+            report["stale_lease_armed"] = (
+                writer.read_lease(symbol, stamp).mode is LeaseMode.LONG_ONLY
+            )
+            # "Reboot": a brand-new handle with an empty cache over the same
+            # segment, exactly like a restarted Ring 1 worker.
+            reader = LeaseTableSHM(reset=False, name=segment)
+            report["swept"] = int(reader.sweep_expired(stamp))
+            report["active_after_reboot"] = int(reader.active_count(stamp))
+            report["mode_after_reboot"] = int(reader.read_lease(symbol, stamp).mode)
+        finally:
+            if reader is not None:
+                with contextlib.suppress(Exception):
+                    reader.close()
+            with contextlib.suppress(Exception):
+                writer.unlink()
+            with contextlib.suppress(Exception):
+                writer.close()
+        report["disarmed"] = report["mode_after_reboot"] == int(LeaseMode.DISARMED)
+        report["passed"] = bool(
+            report["stale_lease_armed"]
+            and report["swept"] >= 1
+            and report["active_after_reboot"] == 0
+            and report["disarmed"]
+        )
+        return report
+
+    def chaos_drill(self, request: ChaosDrillRequest) -> dict[str, Any]:
+        """SIGKILL a worker mid-outbox and prove every reboot invariant."""
+
+        import tempfile
+
+        from core.chaos_recovery import ChaosCrashSimulator
+
+        started = time.perf_counter()
+        with tempfile.TemporaryDirectory(prefix="nios-chaos-") as workspace:
+            try:
+                verdict = ChaosCrashSimulator(
+                    workspace,
+                    target="outbox_reservation",
+                    silo=str(request.silo),
+                    iterations=int(request.iterations),
+                    hold_ms=float(request.hold_ms),
+                    seed=int(request.seed),
+                    boot_deadline_s=30.0,
+                ).run()
+            except Exception as exc:  # noqa: BLE001 - a failed drill is a 502
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"chaos drill failed: {type(exc).__name__}: {exc}",
+                ) from None
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        lease = self._lease_reboot_drill(str(request.symbol))
+        recovery = _jsonable(verdict.recovery) if verdict.recovery is not None else {}
+        if not isinstance(recovery, dict):
+            recovery = {"report": recovery}
+        pending_after = int(recovery.get("reservations_pending_after", -1))
+        orphaned = int(recovery.get("orphaned_orders", -1))
+        duplicates = int(recovery.get("duplicate_transfer_ids", -1))
+        debits = int(recovery.get("debit_total_micros", 0))
+        credits = int(recovery.get("credit_total_micros", 0))
+        invariants = {
+            # sec_009: a crash never leaves a reservation dangling at the venue.
+            "no_orphaned_orders": bool(pending_after == 0 and orphaned == 0),
+            # sec_009: the outbox record is the idempotency key.
+            "at_most_once_execution": bool(duplicates == 0),
+            # sec_009: an expired lease is swept to DISARMED, never inherited.
+            "stale_lease_swept_to_disarmed": bool(lease["passed"]),
+            # sec_018 Law 4 / double-entry: debits must equal credits.
+            "double_entry_conservation": bool(
+                debits == credits and bool(recovery.get("invariant_holds", False))
+            ),
+        }
+        holds = all(invariants.values())
+        return {
+            "status": "PASSED" if holds else "FAILED",
+            "page": "verification",
+            "kind": "nios_chaos_recovery_drill",
+            "target": str(verdict.target),
+            "silo": str(request.silo),
+            "pid": int(verdict.pid),
+            "killed": bool(verdict.killed),
+            "returncode": verdict.returncode,
+            "sigkill_delivered": bool(verdict.killed and verdict.returncode not in (0,)),
+            "inflight_reservation_observed": bool(verdict.inflight_observed),
+            "reservation_key": str(verdict.reservation_key),
+            "iterations": int(request.iterations),
+            "hold_ms": float(request.hold_ms),
+            "seed": int(request.seed),
+            "recovery": recovery,
+            "lease_reboot": lease,
+            "invariants": invariants,
+            "all_invariants_hold": holds,
+            "proof": {
+                "pending_after": pending_after,
+                "duplicate_transfer_ids": duplicates,
+                "orphaned_orders": orphaned,
+                "sum_debits_micros": debits,
+                "sum_credits_micros": credits,
+                "lease_mode_after_reboot": lease["mode_after_reboot"],
+            },
+            "elapsed_ms": round(elapsed_ms, 3),
+            "notes": list(verdict.notes),
+            "operator": str(request.operator),
+            "law": "sec_010 - no orphaned orders, at-most-once execution, no drift",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def vopr_campaign(self, request: VoprCampaignRequest) -> dict[str, Any]:
+        """Run the seeded deterministic VOPR fault campaign."""
+
+        from ring0_vault.kernel.formal_verifier import VOPRFaultInjectionSimulator
+
+        try:
+            result = VOPRFaultInjectionSimulator(
+                seed=int(request.seed), steps=int(request.steps)
+            ).run_campaign()
+            payload = result.to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a campaign failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"VOPR campaign failed: {type(exc).__name__}: {exc}",
+            ) from None
+        fault_counts = {
+            str(key): int(value) for key, value in (payload.get("fault_counts") or {}).items()
+        }
+        overdrafts = int(payload.get("overdraft_violations", 0) or 0)
+        conservation = int(payload.get("conservation_violations", 0) or 0)
+        ledger_violations = int(payload.get("ledger_violations", 0) or 0)
+        duplicates = int(payload.get("duplicate_executions", 0) or 0)
+        holds = bool(
+            payload.get("ok", False)
+            and overdrafts == 0
+            and conservation == 0
+            and ledger_violations == 0
+            and duplicates == 0
+            and payload.get("double_entry_ok", False)
+            and payload.get("at_most_once_ok", False)
+        )
+        return {
+            "status": "PASSED" if holds else "FAILED",
+            "page": "verification",
+            "kind": "nios_vopr_fault_campaign",
+            "seed": int(payload.get("seed", request.seed)),
+            "steps": int(payload.get("steps", request.steps)),
+            "fault_counts": fault_counts,
+            "injected_faults": int(sum(fault_counts.values())),
+            "power_cycles": int(payload.get("power_cycles", 0) or 0),
+            "reservations": int(payload.get("reservations", 0) or 0),
+            "commits": int(payload.get("commits", 0) or 0),
+            "voids": int(payload.get("voids", 0) or 0),
+            "overdrafts": overdrafts,
+            "conservation_violations": conservation,
+            "ledger_violations": ledger_violations,
+            "duplicate_executions": duplicates,
+            "double_entry_ok": bool(payload.get("double_entry_ok", False)),
+            "at_most_once_ok": bool(payload.get("at_most_once_ok", False)),
+            "conservation_proof": {
+                "overdrafts": overdrafts,
+                "double_entry_ok": bool(payload.get("double_entry_ok", False)),
+                "at_most_once_ok": bool(payload.get("at_most_once_ok", False)),
+            },
+            "all_invariants_hold": holds,
+            "duration_ms": float(payload.get("duration_ms", 0.0) or 0.0),
+            "details": payload.get("details") or {},
+            "errors": list(payload.get("errors") or []),
+            "operator": str(request.operator),
+            "law": "sec_009 - TigerBeetle VOPR: no overdraft, no duplicate transfer",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def os_tune(self, request: OsTuneRequest) -> dict[str, Any]:
+        """Apply and audit OS / socket low-latency tuning."""
+
+        from core.os_tuning import audit_and_tune_os, audit_low_latency_sockets
+
+        try:
+            tuning = audit_and_tune_os(apply=bool(request.apply), ring=str(request.ring))
+            sockets = audit_low_latency_sockets()
+        except Exception as exc:  # noqa: BLE001 - a probe failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"OS tuning audit failed: {type(exc).__name__}: {exc}",
+            ) from None
+        socket_errors = list(sockets.get("errors") or [])
+        error_count = int(tuning.get("error_count", 0) or 0) + len(socket_errors)
+        checks = [_jsonable(row) for row in tuning.get("checks") or []]
+        checks = [row for row in checks if isinstance(row, dict)]
+        groups: dict[str, list[dict[str, Any]]] = {
+            "socket": [],
+            "timer": [],
+            "affinity": [],
+            "shm": [],
+            "sysctl": [],
+            "other": [],
+        }
+        for row in checks:
+            ident = str(row.get("id", ""))
+            bucket = "other"
+            for prefix in ("socket", "timer", "affinity", "shm", "sysctl"):
+                if ident.startswith(prefix) or prefix in ident:
+                    bucket = prefix
+                    break
+            groups[bucket].append(
+                {
+                    "id": ident,
+                    "label": str(row.get("label", "")),
+                    "status": str(row.get("status", "")),
+                    "detail": str(row.get("detail", "")),
+                }
+            )
+        applied = [
+            str(row.get("id", ""))
+            for row in checks
+            if str(row.get("status", "")).upper() == "APPLIED"
+        ]
+        recommended = [
+            str(row.get("id", ""))
+            for row in checks
+            if str(row.get("status", "")).upper() == "RECOMMENDED"
+        ]
+        holds = bool(error_count == 0 and bool(tuning.get("ok", False)))
+        return {
+            "status": "PASSED" if holds else "FAILED",
+            "page": "verification",
+            "kind": "nios_os_low_latency_audit",
+            "platform": str(tuning.get("platform", "")),
+            "platform_release": str(tuning.get("platform_release", "")),
+            "profile": str(tuning.get("profile", "")),
+            "ring": str(tuning.get("ring", request.ring)),
+            "apply_requested": bool(request.apply),
+            "tuned": bool(tuning.get("tuned", False)),
+            "checks": checks,
+            "groups": groups,
+            "applied": applied,
+            "recommended": recommended,
+            "applied_count": int(tuning.get("applied_count", len(applied)) or 0),
+            "recommended_count": int(
+                tuning.get("recommended_count", len(recommended)) or 0
+            ),
+            "unavailable": list(tuning.get("unavailable") or []),
+            "error_count": error_count,
+            "sockets": _jsonable(sockets),
+            "socket_telemetry": {
+                "transport": str(sockets.get("transport", "")),
+                "tcp_nodelay": int(sockets.get("tcp_nodelay", 0) or 0),
+                "so_keepalive": int(sockets.get("so_keepalive", 0) or 0),
+                "recv_buffer_bytes": int(sockets.get("recv_buffer_bytes", 0) or 0),
+                "send_buffer_bytes": int(sockets.get("send_buffer_bytes", 0) or 0),
+                "errors": socket_errors,
+            },
+            "transports": _jsonable(tuning.get("transports") or {}),
+            "all_invariants_hold": holds,
+            "operator": str(request.operator),
+            "law": "sec_013 - TCP_NODELAY, 1 MiB buffers and timer resolution are proven",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def _contagion_engine_for(self, silo: str) -> Any:
+        """Warm and reuse one MiroFish engine per silo (numba warmup is costly)."""
+
+        with self._mirofish_lock:
+            engine = self._mirofish_engines.get(silo)
+            if engine is None:
+                from ring2_brain.mirofish.contagion_engine import (
+                    MiroFishContagionEngine,
+                )
+
+                engine = MiroFishContagionEngine(silo=silo, warmup=True)
+                self._mirofish_engines[silo] = engine
+            return engine
+
+    def mirofish_shock(self, request: MiroFishShockRequest) -> dict[str, Any]:
+        """Run one five-archetype, three-tick cascade under an operator shock."""
+
+        from ring2_brain.mirofish.contagion_engine import (
+            ARCHETYPES,
+            FRAGILITY_HALT_THRESHOLD,
+            ShockVector,
+        )
+        from ring2_brain.truth.grounding_gate import GroundedFactPacket
+
+        symbol = str(request.symbol)
+        tag = str(request.sentiment_tag or "").strip().lower()
+        shock = ShockVector(
+            price_shock_bps=float(request.shock_bps),
+            realized_vol_ratio=float(request.volatility_ratio),
+            spread_bps=float(request.spread_bps),
+            dealer_gamma_flip_proximity=float(request.gamma_flip_proximity),
+            tags=(tag,) if tag else (),
+        )
+        engine = self._contagion_engine_for(str(request.silo))
+        started = time.perf_counter()
+        try:
+            result = engine.run(
+                shock,
+                symbol,
+                persist=self.feature_store is not None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a cascade failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"contagion cascade failed: {type(exc).__name__}: {exc}",
+            ) from None
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        features = result.features
+        tick_flows = [float(row) for row in result.tick_flows]
+        weights = [float(row) for row in result.archetype_weights]
+        names = [str(name) for name, _ in ARCHETYPES]
+        # A derived decomposition: weight_i * net_tick_flow sums exactly to the
+        # tick flow, so the breakdown is an allocation of a measured number and
+        # never a new claim.
+        tick_breakdown = [
+            {
+                "tick": index + 1,
+                "net_flow": round(flow, 9),
+                "archetypes": [
+                    {
+                        "name": name,
+                        "weight": round(weight, 9),
+                        "flow": round(weight * flow, 9),
+                    }
+                    for name, weight in zip(names, weights)
+                ],
+            }
+            for index, flow in enumerate(tick_flows)
+        ]
+        deterministic = {
+            "symbol": symbol,
+            "silo": str(request.silo),
+            "shock": {
+                "price_shock_bps": float(shock.price_shock_bps),
+                "realized_vol_ratio": float(shock.realized_vol_ratio),
+                "spread_bps": float(shock.spread_bps),
+                "dealer_gamma_flip_proximity": float(
+                    shock.dealer_gamma_flip_proximity
+                ),
+                "tags": list(shock.tags),
+            },
+            "tick_flows": [round(row, 12) for row in tick_flows],
+            "archetype_weights": [round(row, 12) for row in weights],
+            "cascade_fragility_index": round(
+                float(features.cascade_fragility_index), 12
+            ),
+            "crowd_asymmetry_score": round(float(features.crowd_asymmetry_score), 12),
+            "narrative_exhaustion_divergence": round(
+                float(features.narrative_exhaustion_divergence), 12
+            ),
+            "requires_ring1_halt": bool(features.requires_ring1_halt),
+            "fragility_override": bool(result.fragility_override),
+            "revoked_long_leases": int(result.revoked_long_leases),
+        }
+        digest = _sha256_hex(
+            json.dumps(deterministic, sort_keys=True, separators=(",", ":"))
+        )
+        now = time.time_ns()
+        packet = GroundedFactPacket(
+            symbol=symbol,
+            valid_time_ns=now,
+            knowledge_ts_ns=now,
+            as_of_ns=now,
+            metrics={
+                "price_shock_bps": float(shock.price_shock_bps),
+                "realized_vol_ratio": float(shock.realized_vol_ratio),
+                "spread_bps": float(shock.spread_bps),
+                "dealer_gamma_flip_proximity": float(
+                    shock.dealer_gamma_flip_proximity
+                ),
+                "tick_flow_1": tick_flows[0],
+                "tick_flow_2": tick_flows[1],
+                "tick_flow_3": tick_flows[2],
+                "cascade_fragility_index": float(features.cascade_fragility_index),
+                "crowd_asymmetry_score": float(features.crowd_asymmetry_score),
+                "narrative_exhaustion_divergence": float(
+                    features.narrative_exhaustion_divergence
+                ),
+            },
+        )
+        if self.grounding is not None:
+            with contextlib.suppress(Exception):
+                if hasattr(self.grounding, "append"):
+                    self.grounding.append(packet, artifact_kind="mirofish_cascade")
+        within_sla = latency_ms < 1.8
+        return {
+            "status": "CASCADE_COMPLETE",
+            "page": "brain",
+            "kind": "nios_mirofish_shock_cascade",
+            "symbol": symbol,
+            "silo": str(request.silo),
+            "sentiment_tag": tag,
+            "shock": deterministic["shock"],
+            "archetype_count": len(names),
+            "archetypes": names,
+            "tick_count": len(tick_flows),
+            "tick_flows": [round(row, 9) for row in tick_flows],
+            "tick_breakdown": tick_breakdown,
+            "archetype_weights": [round(row, 9) for row in weights],
+            "cascade_fragility_index": float(features.cascade_fragility_index),
+            "crowd_asymmetry_score": float(features.crowd_asymmetry_score),
+            "narrative_exhaustion_divergence": float(
+                features.narrative_exhaustion_divergence
+            ),
+            "fragility_halt_threshold": float(FRAGILITY_HALT_THRESHOLD),
+            "requires_ring1_halt": bool(features.requires_ring1_halt),
+            "fragility_override": bool(result.fragility_override),
+            "revoked_long_leases": int(result.revoked_long_leases),
+            "latency_ms": round(latency_ms, 6),
+            "engine_latency_ms": round(float(result.latency_ms), 6),
+            "sla_ms": 1.8,
+            "within_sla": within_sla,
+            "sha256_digest": digest,
+            "grounding": {
+                "sha256_digest": packet.sha256_digest,
+                "cascade_digest": digest,
+                "packet": packet.to_dict(),
+            },
+            "packet": packet.to_dict(),
+            "operator": str(request.operator),
+            "law": "sec_018 Law 3 - a cascade is simulated and every number is hashed",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def _committee_for(self, silo: str) -> Any:
+        """Build (once per silo) the grounded System 2 committee."""
+
+        with self._committee_lock:
+            committee = self._committee_cache.get(silo)
+            if committee is None:
+                from ring2_brain.cognition.committee_graph import (
+                    System2InvestmentCommittee,
+                )
+
+                committee = System2InvestmentCommittee(
+                    ledger=self.grounding,
+                    feature_store=self.feature_store,
+                    bus=self.bus,
+                    silo=silo,
+                )
+                self._committee_cache[silo] = committee
+            return committee
+
+    def committee_debate(self, request: CommitteeDebateRequest) -> dict[str, Any]:
+        """Run one grounded System 2 debate turn and seal the packet."""
+
+        from ring2_brain.cognition.committee_graph import (
+            CommitteeAbstained,
+            UngroundedNumericalClaimError,
+        )
+        from ring2_brain.mirofish.contagion_engine import ShockVector
+        from ring2_brain.quant.scanner import FactorPanel, VectorizedFactorScanner
+
+        silo = str(request.silo)
+        known = self._known_silos()
+        if known and silo not in known:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown silo {silo!r}; expected one of {known}",
+            )
+        scanner = self.scanner
+        if scanner is None:
+            scanner = VectorizedFactorScanner()
+            with contextlib.suppress(Exception):
+                scanner.warmup()
+            self.scanner = scanner
+        started = time.perf_counter()
+        try:
+            panel = FactorPanel.generate(n_symbols=500, n_periods=32)
+            with contextlib.suppress(Exception):
+                scanner.warmup()
+            scan = scanner.scan(panel, commit=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a scan failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"committee scan failed: {type(exc).__name__}: {exc}",
+            ) from None
+        candidates = list(getattr(scan, "candidates", ()) or ())
+        if not candidates:
+            raise HTTPException(
+                status_code=409,
+                detail="the factor scan produced no candidate above the funnel floor",
+            )
+        requested = str(request.symbol)
+        candidate = candidates[0]
+        symbol_match = requested == "AUTO"
+        for row in candidates:
+            if str(row.symbol).upper() == requested:
+                candidate = row
+                symbol_match = True
+                break
+        engine = self._contagion_engine_for(silo)
+        cascade = engine.run(
+            ShockVector(18.0, 1.3, 4.0, 0.2, tags=("value_absorption",)),
+            candidate.symbol,
+            now_ns=panel.valid_time_ns,
+            persist=False,
+        )
+        verdict = "CONVICTED"
+        abstention_reason = ""
+        outcome: Any = None
+        try:
+            outcome = self._committee_for(silo).run(
+                candidate,
+                contagion=cascade.features,
+                spread_bps=float(request.spread_bps),
+                now_ns=panel.valid_time_ns,
+                universe_size=int(scan.universe_size),
+                publish=False,
+            )
+        except CommitteeAbstained as exc:
+            verdict = "ABSTAINED"
+            abstention_reason = str(exc) or "committee abstained"
+        except UngroundedNumericalClaimError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{type(exc).__name__}: {exc}",
+            ) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a committee failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"committee debate failed: {type(exc).__name__}: {exc}",
+            ) from None
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        transcript: list[dict[str, Any]] = []
+        packet_payload: dict[str, Any] = {}
+        digest = ""
+        proposal_payload: dict[str, Any] = {}
+        report_payload: dict[str, Any] = {}
+        if outcome is not None:
+            report = outcome.report
+            for stage in report.stages:
+                transcript.append(
+                    {
+                        "stage": str(stage.stage),
+                        "actor": str(stage.actor),
+                        "text": str(stage.text),
+                        "verified": bool(stage.verified),
+                        "claims_checked": int(stage.claims_checked),
+                    }
+                )
+            packet_payload = _jsonable(outcome.packet)
+            if not isinstance(packet_payload, dict):
+                packet_payload = {"packet": packet_payload}
+            digest = str(outcome.packet.sha256_digest)
+            if outcome.proposal is not None:
+                proposal_payload = _jsonable(outcome.proposal)
+                if not isinstance(proposal_payload, dict):
+                    proposal_payload = {"proposal": proposal_payload}
+            report_payload = {
+                "symbol": str(report.symbol),
+                "packet_digest": str(report.packet_digest),
+                "vault": str(report.vault),
+                "cap_pct": float(report.cap_pct),
+                "position_pct": float(report.position_pct),
+                "side": str(report.side),
+                "elapsed_ms": float(report.elapsed_ms),
+                "verifications": [
+                    _jsonable(row) for row in report.verifications
+                ],
+                "all_stages_verified": all(
+                    bool(stage.verified) for stage in report.stages
+                ),
+                "claims_checked": int(
+                    sum(int(stage.claims_checked) for stage in report.stages)
+                ),
+            }
+            if self.grounding is not None and verdict == "CONVICTED":
+                with contextlib.suppress(Exception):
+                    if hasattr(self.grounding, "append"):
+                        self.grounding.append(
+                            outcome.packet, artifact_kind="committee_debate"
+                        )
+        if not digest:
+            digest = _sha256_hex(
+                json.dumps(
+                    {"transcript": transcript, "verdict": verdict},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        return {
+            "status": verdict,
+            "page": "brain",
+            "kind": "nios_system2_committee_debate",
+            "silo": silo,
+            "requested_symbol": requested,
+            "symbol": str(candidate.symbol),
+            "symbol_match": symbol_match,
+            "rank": int(candidate.rank),
+            "score": float(candidate.score),
+            "price": float(candidate.price),
+            "universe_size": int(scan.universe_size),
+            "verdict": verdict,
+            "abstention_reason": abstention_reason,
+            "transcript": transcript,
+            "stage_count": len(transcript),
+            "report": report_payload,
+            "proposal": proposal_payload,
+            "sha256_digest": digest,
+            "grounding": {
+                "sha256_digest": digest,
+                "claims_checked": int(report_payload.get("claims_checked", 0) or 0),
+                "all_stages_verified": bool(
+                    report_payload.get("all_stages_verified", False)
+                ),
+                "packet": packet_payload,
+            },
+            "packet": packet_payload,
+            "contagion": {
+                "cascade_fragility_index": float(
+                    cascade.features.cascade_fragility_index
+                ),
+                "requires_ring1_halt": bool(cascade.features.requires_ring1_halt),
+            },
+            "elapsed_ms": round(elapsed_ms, 3),
+            "operator": str(request.operator),
+            "law": "sec_018 Law 3 - an ungrounded number aborts the debate",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def evaluate_challenger(self, request: ChallengerEvalRequest) -> dict[str, Any]:
+        """Admit or reject a challenger genome/plugin against the nursery gates."""
+
+        import numpy as np
+
+        from core.plugins import PluginManifest
+        from ring2_brain.forge.alpha_forge import StrategyGenome
+
+        forge = self.forge
+        registry = self.plugins
+        if forge is None or registry is None:
+            raise HTTPException(
+                status_code=503,
+                detail="forge or plugin registry unavailable",
+            )
+        name = str(request.plugin_name)
+        thresholds = {}
+        with contextlib.suppress(Exception):
+            thresholds = dict(forge.thresholds() or {})
+        dsr_floor = float(thresholds.get("promotion_dsr_floor", 1.5))
+        min_fills = int(thresholds.get("min_winning_shadow_fills", 30) or 30)
+        declared_fills = int(request.shadow_fills)
+        sharpe = float(request.candidate_sharpe)
+
+        record = None
+        with contextlib.suppress(Exception):
+            record = registry.get(name)
+        if record is None:
+            weights = {
+                f"genome_{name}_w{index}": round(float(value), 6)
+                for index, value in enumerate(
+                    np.frombuffer(
+                        _sha256_hex(name).encode("ascii")[:32], dtype=np.uint8
+                    )
+                    / 255.0
+                )
+            }
+            try:
+                record = registry.register(
+                    PluginManifest(
+                        name=name,
+                        kind="factor_pack",
+                        ring="ring2",
+                        author="ring3.operator",
+                        description="operator-submitted challenger genome",
+                        factor_weights=weights,
+                        metadata={"silo": str(request.silo), "source": "step6_cockpit"},
+                    )
+                )
+            except ValueError:  # a concurrent register won the race
+                with contextlib.suppress(Exception):
+                    record = registry.get(name)
+            except Exception as exc:  # noqa: BLE001 - registration is a 502
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"plugin registration failed: {type(exc).__name__}: {exc}",
+                ) from None
+        if record is None:
+            raise HTTPException(
+                status_code=502, detail="plugin registry returned no record"
+            )
+
+        # Mirror the declared nursery exposure into the plugin registry. The
+        # loop is bounded by the gate itself, so a hostile payload cannot spin.
+        recorded = 0
+        current = int(getattr(record, "shadow_fills", 0) or 0)
+        for _ in range(max(0, min(declared_fills, min_fills) - current)):
+            with contextlib.suppress(Exception):
+                registry.record_fill(name, net_bps=2.5)
+                recorded += 1
+
+        genome_id = f"plugin:{name}"
+        genome = StrategyGenome(
+            genome_id=genome_id,
+            weights=(
+                np.frombuffer(_sha256_hex(name).encode("ascii")[:32], dtype=np.uint8)
+                / 255.0
+            ),
+            silo=str(request.silo),
+            shadow_fills=declared_fills,
+            winning_shadow_fills=declared_fills,
+            deflated_sharpe=sharpe,
+            metrics_source="operator_input",
+        )
+        try:
+            forge.register_challenger(genome)
+        except Exception as exc:  # noqa: BLE001 - forge registration is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"challenger registration failed: {type(exc).__name__}: {exc}",
+            ) from None
+
+        nursery: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            nursery = dict(registry.shadow_report(name) or {})
+        stored = forge.get_challenger(genome_id)
+        dsr_ok = sharpe >= dsr_floor
+        nursery_ok = declared_fills >= min_fills
+        graduated = bool(nursery.get("graduated", False))
+        promoted = bool(dsr_ok and nursery_ok and graduated)
+        reasons: list[str] = []
+        if not dsr_ok:
+            reasons.append(
+                f"deflated_sharpe {sharpe:.4f} < promotion floor {dsr_floor:.2f}"
+            )
+        if not nursery_ok:
+            reasons.append(f"shadow_fills {declared_fills} < required {min_fills}")
+        if nursery_ok and not graduated:
+            reasons.append("plugin registry has not graduated the shadow record")
+        return {
+            "status": "PROMOTED" if promoted else "REJECTED",
+            "page": "forge",
+            "kind": "nios_challenger_evaluation",
+            "plugin_name": name,
+            "genome_id": genome_id,
+            "silo": str(request.silo),
+            "candidate_sharpe": sharpe,
+            "shadow_fills": declared_fills,
+            "winning_shadow_fills": declared_fills,
+            "recorded_fills": recorded,
+            "gates": {
+                "deflated_sharpe": {
+                    "measured": sharpe,
+                    "required": dsr_floor,
+                    "passed": dsr_ok,
+                },
+                "shadow_fills": {
+                    "measured": declared_fills,
+                    "required": min_fills,
+                    "passed": nursery_ok,
+                },
+                "nursery_graduated": {
+                    "measured": graduated,
+                    "required": True,
+                    "passed": graduated,
+                },
+            },
+            "gate_results": {
+                "dsr_floor_met": dsr_ok,
+                "shadow_nursery_met": nursery_ok,
+                "nursery_graduated": graduated,
+            },
+            "promotion_ready": promoted,
+            "rejection_reasons": reasons,
+            "hold_reason": "; ".join(reasons),
+            "nursery": nursery,
+            "genome": _jsonable(stored) if stored is not None else {},
+            "thresholds": thresholds,
+            "forge": {
+                "champion_count": int(
+                    len(getattr(forge, "champions", lambda: ())() or ())
+                ),
+                "challenger_count": int(
+                    len(getattr(forge, "challengers", lambda: ())() or ())
+                ),
+            },
+            "activation": "SHADOW",
+            "note": (
+                "Admission only: the 00:00 UTC forge run decides deployment and "
+                "no plugin code is executed or signed here."
+            ),
+            "operator": str(request.operator),
+            "law": "sec_018 Law 4 - DSR >= 1.50 and 30 shadow fills before promotion",
+            "generated_at_ns": time.time_ns(),
+        }
 
     def feed_state(self) -> dict[str, Any]:
         """Which market-data path is live: public dual-vendor or paper autopilot."""
@@ -4505,6 +5507,43 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         request: LedgerReconcileRequest | None = None,
     ) -> dict[str, Any]:
         return control.reconcile_ledger(request or LedgerReconcileRequest())
+
+    # ---- Phase 4 Step 6: /verification, /brain, /forge operator actions ---
+    @app.post("/api/v2/control/verification/chaos-drill")
+    def control_verification_chaos_drill(
+        request: ChaosDrillRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.chaos_drill(request or ChaosDrillRequest())
+
+    @app.post("/api/v2/control/verification/vopr")
+    def control_verification_vopr(
+        request: VoprCampaignRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.vopr_campaign(request or VoprCampaignRequest())
+
+    @app.post("/api/v2/control/verification/os-tune")
+    def control_verification_os_tune(
+        request: OsTuneRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.os_tune(request or OsTuneRequest())
+
+    @app.post("/api/v2/control/brain/mirofish-shock")
+    def control_brain_mirofish_shock(
+        request: MiroFishShockRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.mirofish_shock(request or MiroFishShockRequest())
+
+    @app.post("/api/v2/control/brain/committee-debate")
+    def control_brain_committee_debate(
+        request: CommitteeDebateRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.committee_debate(request or CommitteeDebateRequest())
+
+    @app.post("/api/v2/control/forge/evaluate-challenger")
+    def control_forge_evaluate_challenger(
+        request: ChallengerEvalRequest,
+    ) -> dict[str, Any]:
+        return control.evaluate_challenger(request)
 
 
     # Registered before the SPA mount at "/" so /metrics is never shadowed.

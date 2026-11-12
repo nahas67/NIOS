@@ -1,19 +1,31 @@
-import { FileCode2, Flame, Plug, Rocket, Timer } from 'lucide-react'
+import { FileCode2, Flame, Plug, Rocket, ShieldCheck, Timer } from 'lucide-react'
 import { useState } from 'react'
 
-import { ActionFeedback, ProofRow } from '@/components/operator-action'
+import { ActionFeedback, ActionPanel, ProofRow } from '@/components/operator-action'
 import { PageShell, StatTile, DataState } from '@/components/page-shell'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { useAction } from '@/hooks/use-action'
 import { usePageData } from '@/hooks/use-page-data'
-import { fetchForgePage, fetchSkillMarkdown } from '@/lib/api'
+import { fetchForgePage, fetchSkillMarkdown, postEvaluateChallenger } from '@/lib/api'
 import { formatBps } from '@/lib/format'
 import { cell, num } from '@/lib/rows'
-import type { SkillMarkdownReceipt } from '@/types'
+import type { ChallengerEvalReceipt, SkillMarkdownReceipt } from '@/types'
+
+const SILO_IDS = ['CRYPTO_BINANCE', 'INDIA_ZERODHA_DHAN', 'US_IBKR', 'FX_MT5'] as const
 
 export function ForgePage() {
-  const { data, error, loading } = usePageData(fetchForgePage)
+  const { data, error, loading, reload } = usePageData(fetchForgePage)
   const leaderboard = data?.leaderboard ?? []
   const thresholds = data?.thresholds ?? {}
   const plugins = data?.plugins ?? {}
@@ -25,9 +37,27 @@ export function ForgePage() {
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
   const detail = useAction<SkillMarkdownReceipt>()
 
+  const [pluginName, setPluginName] = useState('genome_alpha_7')
+  const [sharpe, setSharpe] = useState('1.85')
+  const [fills, setFills] = useState('30')
+  const [silo, setSilo] = useState<string>('CRYPTO_BINANCE')
+  const evaluation = useAction<ChallengerEvalReceipt>()
+
   async function inspectSkill(name: string) {
     setSelectedSkill(name)
     await detail.run(() => fetchSkillMarkdown(name))
+  }
+
+  async function evaluateChallenger() {
+    const receipt = await evaluation.run(() =>
+      postEvaluateChallenger({
+        plugin_name: pluginName.trim(),
+        candidate_sharpe: Number.parseFloat(sharpe) || 0,
+        shadow_fills: Number.parseInt(fills, 10) || 0,
+        silo,
+      })
+    )
+    if (receipt) reload()
   }
 
   return (
@@ -70,6 +100,168 @@ export function ForgePage() {
       </div>
 
       <DataState loading={loading} error={error}>
+        <ActionPanel
+          title="Evaluate Challenger Genome / Plugin"
+          description="Registers the candidate in the Shadow nursery and enforces both gates from the forge itself: Deflated Sharpe ≥ 1.50 and ≥ 30 shadow fills. Admission only — no plugin code is executed, deployed or signed."
+        >
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="space-y-1">
+              <Label
+                htmlFor="challenger-name"
+                className="text-[10px] uppercase tracking-wider text-muted-foreground"
+              >
+                Genome / plugin
+              </Label>
+              <Input
+                id="challenger-name"
+                value={pluginName}
+                onChange={(event) => setPluginName(event.target.value)}
+                className="h-8 w-52 font-mono text-xs"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label
+                htmlFor="challenger-sharpe"
+                className="text-[10px] uppercase tracking-wider text-muted-foreground"
+              >
+                Deflated Sharpe
+              </Label>
+              <Input
+                id="challenger-sharpe"
+                type="number"
+                step="0.01"
+                value={sharpe}
+                onChange={(event) => setSharpe(event.target.value)}
+                className="h-8 w-28 font-mono text-xs"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label
+                htmlFor="challenger-fills"
+                className="text-[10px] uppercase tracking-wider text-muted-foreground"
+              >
+                Shadow fills
+              </Label>
+              <Input
+                id="challenger-fills"
+                type="number"
+                min={0}
+                value={fills}
+                onChange={(event) => setFills(event.target.value)}
+                className="h-8 w-24 font-mono text-xs"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                Silo
+              </Label>
+              <Select value={silo} onValueChange={setSilo}>
+                <SelectTrigger className="h-8 w-52 font-mono text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {SILO_IDS.map((value) => (
+                    <SelectItem key={value} value={value} className="font-mono text-xs">
+                      {value}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              disabled={evaluation.pending || pluginName.trim().length === 0}
+              onClick={evaluateChallenger}
+            >
+              <ShieldCheck className="mr-1 size-3.5" />
+              Evaluate Challenger
+            </Button>
+          </div>
+
+          <div className="mt-3">
+            <ActionFeedback pending={evaluation.pending} error={evaluation.error}>
+              {evaluation.receipt ? (
+                <div className="rounded-lg border border-border/70 bg-background/40 p-3">
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    <Badge
+                      variant={evaluation.receipt.promotion_ready ? 'default' : 'destructive'}
+                      className="font-mono text-[10px]"
+                    >
+                      {evaluation.receipt.status}
+                    </Badge>
+                    <span className="font-mono text-[10px] text-muted-foreground">
+                      {evaluation.receipt.plugin_name} · {evaluation.receipt.genome_id} ·{' '}
+                      {evaluation.receipt.silo}
+                    </span>
+                    <Badge variant="outline" className="font-mono text-[9px]">
+                      {evaluation.receipt.activation}
+                    </Badge>
+                  </div>
+                  <div className="grid gap-x-6 sm:grid-cols-2">
+                    <ProofRow
+                      label="Deflated Sharpe ≥ 1.50"
+                      value={gateLabel(
+                        evaluation.receipt.gate_results.dsr_floor_met,
+                        evaluation.receipt.candidate_sharpe.toFixed(4)
+                      )}
+                    />
+                    <ProofRow
+                      label="Shadow fills ≥ 30"
+                      value={gateLabel(
+                        evaluation.receipt.gate_results.shadow_nursery_met,
+                        String(evaluation.receipt.shadow_fills)
+                      )}
+                    />
+                    <ProofRow
+                      label="Nursery graduated"
+                      value={gateLabel(
+                        evaluation.receipt.gate_results.nursery_graduated,
+                        String(evaluation.receipt.nursery.graduated ?? false)
+                      )}
+                    />
+                    <ProofRow
+                      label="Recorded fills"
+                      value={String(evaluation.receipt.recorded_fills)}
+                    />
+                    <ProofRow
+                      label="Champions"
+                      value={String(evaluation.receipt.forge.champion_count ?? 0)}
+                    />
+                    <ProofRow
+                      label="Challengers"
+                      value={String(evaluation.receipt.forge.challenger_count ?? 0)}
+                    />
+                  </div>
+                  {evaluation.receipt.rejection_reasons.length > 0 ? (
+                    <ul className="mt-2 space-y-1">
+                      {evaluation.receipt.rejection_reasons.map((reason) => (
+                        <li
+                          key={reason}
+                          role="alert"
+                          className="rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1 font-mono text-[10px] text-amber-300"
+                        >
+                          {reason}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-2 text-[11px] text-muted-foreground">
+                      Both nursery gates hold. The genome waits in shadow until the 00:00 UTC forge
+                      run decides deployment.
+                    </p>
+                  )}
+                </div>
+              ) : !evaluation.pending ? (
+                <p className="text-[11px] text-muted-foreground">
+                  No evaluation yet. A candidate never reaches the roster on a promise — both gates
+                  are read from the forge.
+                </p>
+              ) : null}
+            </ActionFeedback>
+          </div>
+        </ActionPanel>
+
         <Card className="border-border/70 bg-card/60 shadow-none">
           <CardHeader className="px-4">
             <CardTitle className="text-sm">Champion / challenger leaderboard</CardTitle>
@@ -239,6 +431,10 @@ function formatCountdown(seconds: number): string {
   const hours = Math.floor(total / 3600)
   const minutes = Math.floor((total % 3600) / 60)
   return `${hours}h ${String(minutes).padStart(2, '0')}m`
+}
+
+function gateLabel(passed: boolean, measured: string): string {
+  return `${passed ? 'PASS' : 'FAIL'} · ${measured}`
 }
 
 function pluginNames(plugins: Record<string, unknown>): string[] {

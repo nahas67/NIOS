@@ -1550,3 +1550,239 @@ export interface LedgerReconcileReceipt {
   generated_at_ns: number
   [key: string]: unknown
 }
+
+export interface ChaosDrillReceipt {
+  status: 'PASSED' | 'FAILED'
+  page: string
+  kind: string
+  target: string
+  silo: string
+  pid: number
+  killed: boolean
+  returncode: number | null
+  sigkill_delivered: boolean
+  inflight_reservation_observed: boolean
+  reservation_key: string
+  iterations: number
+  hold_ms: number
+  seed: number
+  recovery: Record<string, unknown>
+  lease_reboot: {
+    symbol: string
+    segment: string
+    stale_lease_armed: boolean
+    swept: number
+    active_after_reboot: number
+    mode_after_reboot: number
+    disarmed: boolean
+    passed: boolean
+  }
+  invariants: {
+    no_orphaned_orders: boolean
+    at_most_once_execution: boolean
+    stale_lease_swept_to_disarmed: boolean
+    double_entry_conservation: boolean
+  }
+  all_invariants_hold: boolean
+  proof: {
+    pending_after: number
+    duplicate_transfer_ids: number
+    orphaned_orders: number
+    sum_debits_micros: number
+    sum_credits_micros: number
+    lease_mode_after_reboot: number
+  }
+  elapsed_ms: number
+  notes: string[]
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface VoprCampaignReceipt {
+  status: 'PASSED' | 'FAILED'
+  page: string
+  kind: string
+  seed: number
+  steps: number
+  fault_counts: Record<string, number>
+  injected_faults: number
+  power_cycles: number
+  reservations: number
+  commits: number
+  voids: number
+  overdrafts: number
+  conservation_violations: number
+  ledger_violations: number
+  duplicate_executions: number
+  double_entry_ok: boolean
+  at_most_once_ok: boolean
+  conservation_proof: {
+    overdrafts: number
+    double_entry_ok: boolean
+    at_most_once_ok: boolean
+  }
+  all_invariants_hold: boolean
+  duration_ms: number
+  errors: string[]
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface OsTuneCheck {
+  id: string
+  label: string
+  status: string
+  detail: string
+  [key: string]: unknown
+}
+
+export interface OsTuneReceipt {
+  status: 'PASSED' | 'FAILED'
+  page: string
+  kind: string
+  platform: string
+  platform_release: string
+  profile: string
+  ring: string
+  apply_requested: boolean
+  tuned: boolean
+  checks: OsTuneCheck[]
+  groups: Record<string, OsTuneCheck[]>
+  applied: string[]
+  recommended: string[]
+  applied_count: number
+  recommended_count: number
+  unavailable: string[]
+  error_count: number
+  sockets: Record<string, unknown>
+  socket_telemetry: {
+    transport: string
+    tcp_nodelay: number
+    so_keepalive: number
+    recv_buffer_bytes: number
+    send_buffer_bytes: number
+    errors: string[]
+  }
+  transports: Record<string, unknown>
+  all_invariants_hold: boolean
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface MiroFishTickBreakdown {
+  tick: number
+  net_flow: number
+  archetypes: Array<{ name: string; weight: number; flow: number }>
+}
+
+export interface MiroFishShockReceipt {
+  status: string
+  page: string
+  kind: string
+  symbol: string
+  silo: string
+  sentiment_tag: string
+  shock: Record<string, unknown>
+  archetype_count: number
+  archetypes: string[]
+  tick_count: number
+  tick_flows: number[]
+  tick_breakdown: MiroFishTickBreakdown[]
+  archetype_weights: number[]
+  cascade_fragility_index: number
+  crowd_asymmetry_score: number
+  narrative_exhaustion_divergence: number
+  fragility_halt_threshold: number
+  requires_ring1_halt: boolean
+  fragility_override: boolean
+  revoked_long_leases: number
+  latency_ms: number
+  engine_latency_ms: number
+  sla_ms: number
+  within_sla: boolean
+  sha256_digest: string
+  grounding: Record<string, unknown>
+  packet: Record<string, unknown>
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface CommitteeTranscriptStage {
+  stage: string
+  actor: string
+  text: string
+  verified: boolean
+  claims_checked: number
+}
+
+export interface CommitteeDebateReceipt {
+  status: string
+  page: string
+  kind: string
+  silo: string
+  requested_symbol: string
+  symbol: string
+  symbol_match: boolean
+  rank: number
+  score: number
+  price: number
+  universe_size: number
+  verdict: 'CONVICTED' | 'ABSTAINED'
+  abstention_reason: string
+  transcript: CommitteeTranscriptStage[]
+  stage_count: number
+  report: Record<string, unknown>
+  proposal: Record<string, unknown>
+  sha256_digest: string
+  grounding: Record<string, unknown>
+  packet: Record<string, unknown>
+  contagion: Record<string, unknown>
+  elapsed_ms: number
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface ChallengerEvalReceipt {
+  status: 'PROMOTED' | 'REJECTED'
+  page: string
+  kind: string
+  plugin_name: string
+  genome_id: string
+  silo: string
+  candidate_sharpe: number
+  shadow_fills: number
+  winning_shadow_fills: number
+  recorded_fills: number
+  gates: Record<
+    string,
+    { measured: number | boolean; required: number | boolean; passed: boolean }
+  >
+  gate_results: {
+    dsr_floor_met: boolean
+    shadow_nursery_met: boolean
+    nursery_graduated: boolean
+  }
+  promotion_ready: boolean
+  rejection_reasons: string[]
+  hold_reason: string
+  nursery: Record<string, unknown>
+  genome: Record<string, unknown>
+  thresholds: Record<string, unknown>
+  forge: Record<string, unknown>
+  activation: string
+  note: string
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}

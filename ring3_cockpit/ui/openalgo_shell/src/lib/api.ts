@@ -5,7 +5,10 @@ import type {
   BrokerCredentialReport,
   CancelOrdersPayload,
   CancelOrdersReceipt,
+  ChallengerEvalReceipt,
+  ChaosDrillReceipt,
   CockpitState,
+  CommitteeDebateReceipt,
   ExtensionsActionResponse,
   ExtensionsControlPayload,
   ExtensionsState,
@@ -22,9 +25,11 @@ import type {
   LLMProbeReport,
   McpPageData,
   MetricsSnapshot,
+  MiroFishShockReceipt,
   OptionPricePayload,
   OptionPriceReceipt,
   OrdersPageData,
+  OsTuneReceipt,
   PagesIndex,
   PaperOrderPayload,
   PaperOrderReceipt,
@@ -38,6 +43,7 @@ import type {
   SupervisorControlResponse,
   VaultRotationReport,
   VaultStatus,
+  VoprCampaignReceipt,
 } from '@/types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? ''
@@ -461,5 +467,117 @@ export function postLedgerReconcile(
   return request<LedgerReconcileReceipt>('/api/v2/control/ledger/reconcile', {
     method: 'POST',
     body: JSON.stringify({ silos: silos ?? null, operator: 'ring3.cockpit' }),
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 Step 6 — /verification, /brain and /forge operator actions
+ * ------------------------------------------------------------------ */
+
+/**
+ * SIGKILL a worker mid-outbox and prove every ``sec_009`` reboot invariant.
+ *
+ * The drill replays the journal and returns `pending_after == 0`,
+ * `duplicate_transfer_ids == 0`, a stale lease swept to `DISARMED` and
+ * `sum(debits) == sum(credits)` — never a promise that they should hold.
+ */
+export function postChaosDrill(payload: {
+  iterations?: number
+  hold_ms?: number
+  seed?: number
+  silo?: string
+  symbol?: string
+}): Promise<ChaosDrillReceipt> {
+  return request<ChaosDrillReceipt>('/api/v2/control/verification/chaos-drill', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Run the seeded deterministic VOPR fault campaign.
+ *
+ * Same seed + same step count always reproduce the same fault histogram, so a
+ * red row is a reproducible defect rather than a flake.
+ */
+export function postVoprCampaign(payload: {
+  seed?: number
+  steps?: number
+}): Promise<VoprCampaignReceipt> {
+  return request<VoprCampaignReceipt>('/api/v2/control/verification/vopr', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Apply and audit OS / socket low-latency tuning.
+ *
+ * Rows the serving process may not change stay `RECOMMENDED` with their exact
+ * command; they are reported, never silently skipped.
+ */
+export function postOsTune(payload: {
+  apply?: boolean
+  ring?: string
+}): Promise<OsTuneReceipt> {
+  return request<OsTuneReceipt>('/api/v2/control/verification/os-tune', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Simulate one five-archetype, three-tick MiroFish contagion cascade.
+ *
+ * Deterministic for a given shock vector: the returned SHA-256 digest commits
+ * to the inputs and outputs, never to wall-clock jitter.
+ */
+export function postMiroFishShock(payload: {
+  symbol?: string
+  shock_bps?: number
+  sentiment_tag?: string
+  volatility_ratio?: number
+  spread_bps?: number
+  gamma_flip_proximity?: number
+  silo?: string
+}): Promise<MiroFishShockReceipt> {
+  return request<MiroFishShockReceipt>('/api/v2/control/brain/mirofish-shock', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Run one grounded System 2 committee debate and seal the transcript.
+ *
+ * Every numerical claim is re-computed by `NumericalGroundingVerifier`; a
+ * fabricated figure aborts the debate with `UNGROUNDED-NUMERICAL-CLAIM`.
+ */
+export function postCommitteeDebate(payload: {
+  silo?: string
+  symbol?: string
+  spread_bps?: number
+}): Promise<CommitteeDebateReceipt> {
+  return request<CommitteeDebateReceipt>('/api/v2/control/brain/committee-debate', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Evaluate a challenger genome/plugin against the forge nursery gates.
+ *
+ * Promotion requires `Deflated Sharpe >= 1.50` **and** `>= 30` shadow fills,
+ * both read from the forge — never from the request.
+ */
+export function postEvaluateChallenger(payload: {
+  plugin_name: string
+  candidate_sharpe?: number
+  shadow_fills?: number
+  silo?: string
+}): Promise<ChallengerEvalReceipt> {
+  return request<ChallengerEvalReceipt>('/api/v2/control/forge/evaluate-challenger', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
   })
 }
