@@ -922,3 +922,105 @@ export interface MetricsSnapshot {
   scrape_duration_seconds: number
 }
 
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 5 — Ring 0 zero-downtime key rotation + OS tuning
+ * ------------------------------------------------------------------ */
+
+export interface VaultOsTuningSummary {
+  ok: boolean
+  tuned: boolean
+  platform: string
+  profile: string
+  applied: number
+  recommended: number
+  error_count: number
+  socket_tcp_nodelay: number
+  transports_ok: boolean
+}
+
+export interface ArchivedVaultKey {
+  key_version: number
+  algorithm: string
+  public_key_hex: string
+  fingerprint_sha256: string
+  archived_at_ns: number
+  read_only: boolean
+  path?: string
+}
+
+export interface VaultRotationRecord {
+  key_version: number
+  previous_key_version: number
+  rotated_at_ns: number
+  operator: string
+  reencrypted_llm_keys_count: number
+  reencrypted_broker_venues_count: number
+  reencrypted_broker_credentials_count: number
+  ed25519_public_fingerprint: string
+  previous_ed25519_public_fingerprint: string
+}
+
+export interface VaultStatus {
+  schema: string
+  status: string
+  ring: string
+  vault: string
+  write_only: boolean
+  raw_secrets_exposed: boolean
+  key_version: number
+  ed25519_algorithm: string
+  ed25519_public_key_hex: string
+  ed25519_public_fingerprint: string
+  signing_key_version: number
+  archived_public_keys: ArchivedVaultKey[]
+  verifier_ring_read_only: boolean
+  llm_keys_stored: number
+  broker_credentials_stored: number
+  broker_venues_stored: number
+  broker_venues: string[]
+  reencrypted_llm_keys_count: number
+  reencrypted_broker_venues_count: number
+  last_rotation: VaultRotationRecord | null
+  rotation_pending_recovery: boolean
+  checked_at_ns: number
+  os_tuning: VaultOsTuningSummary | null
+  reason?: string
+}
+
+export interface VaultRotationReport {
+  schema: string
+  status: string
+  ring: string
+  vault: string
+  operator: string
+  key_version: number
+  previous_key_version: number
+  key_version_incremented: boolean
+  ed25519_algorithm: string
+  ed25519_public_key_hex: string
+  ed25519_public_fingerprint: string
+  previous_ed25519_public_fingerprint: string
+  fingerprint_changed: boolean
+  reencrypted_llm_keys_count: number
+  reencrypted_broker_venues_count: number
+  reencrypted_broker_credentials_count: number
+  broker_venues: string[]
+  credentials_zero_loss: boolean
+  masks_unchanged: boolean
+  dry_run_verified: boolean
+  fernet_roundtrip_ok: boolean
+  historical_signature_verified: boolean
+  historical_probe_sha256: string
+  previous_public_key_archived: boolean
+  archived_public_keys: ArchivedVaultKey[]
+  verifier_ring: string
+  zero_downtime: boolean
+  zero_loss: boolean
+  write_only: boolean
+  raw_secrets_exposed: boolean
+  rotated_at_ns: number
+  elapsed_ms: number
+  os_tuning: VaultOsTuningSummary | null
+  zero_restart?: boolean
+}
+

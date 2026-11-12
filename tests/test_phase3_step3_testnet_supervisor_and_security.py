@@ -1049,7 +1049,7 @@ def test_gate4_control_endpoint_dispatches_a_sandbox_order(
 
 def test_gate5_test_inventory_and_rebuilt_cockpit_bundle() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 16, [path.name for path in test_files]
+    assert len(test_files) == 17, [path.name for path in test_files]
     assert (
         ROOT / "tests" / "test_phase3_step3_testnet_supervisor_and_security.py"
         in test_files

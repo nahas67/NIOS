@@ -10,6 +10,9 @@ The binding specification is `NIOS_Core_architecture.json` (`sec_001`–`sec_018
 operating constitution is `AGENTS.md`. If code, a prompt, or a convenience shortcut conflicts
 with the JSON, the JSON wins.
 
+On-call procedures — boot, kill switch, crash recovery, key rotation, monitoring and OS
+tuning — live in [`RUNBOOK.md`](RUNBOOK.md).
+
 ---
 
 ## Quick start
@@ -150,7 +153,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**202 tests · 0 failures · 0 warnings.** A warning is treated as a defect: `pyproject.toml`
+**263 tests · 0 failures · 0 warnings.** A warning is treated as a defect: `pyproject.toml`
 sets `filterwarnings = ["error"]` and exempts only four named third-party donor modules.
 
 ```bash
@@ -172,7 +175,9 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | `test_step7_cockpit_and_e2e.py` | Cockpit REST/SSE, kill switch, full-ring E2E |
 | `test_step8_forge_mcp_and_deploy.py` | Alpha Forge, MCP air-gap, deployment |
 | `test_phase2_step1…step4` | Donor activation, silo adapters, feeds/LLM pool, TLA+/VOPR/hedger |
-| `test_phase2_step4_formal_vopr_and_hedger.py` | Also holds the **final release certification** gate (compiled `dist/` served at `/`) |
+| `test_phase2_step4_formal_vopr_and_hedger.py` | Also holds the **final Phase 2 certification** gate (compiled `dist/` served at `/`) |
+| `test_phase3_step1…step4` | 4-ring OS supervisor, live cutover/cockpit, testnet + security, soak/metrics/chaos |
+| `test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS/socket low-latency auditor, zero-downtime Fernet + Ed25519 rotation, runbook completeness, final `v3.0.0-PROD` certification |
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
 independent of whatever happens to be installed in the interpreter.
@@ -194,6 +199,16 @@ The cockpit is read-only for market state. These are the complete write surfaces
 | `POST` | `/api/v2/control/llms` | LLM provider/model/budget; API keys are write-only |
 | `POST` | `/api/v2/control/killswitch` | Global halt; disarms leases and flattens within 1.0 ms |
 | `GET`/`POST` | `/api/v2/control/extensions` | Skills, plugins, MCP tools, Alpha Forge audit |
+| `GET`/`POST` | `/api/v2/control/feeds` | Market-data mode hot-swap (`PAPER_AUTOPILOT` / `LIVE_PUBLIC_DUAL_VENDOR`) |
+| `GET`/`POST` | `/api/v2/control/brokers/credentials` | Masked inventory / write-only venue credential handshake |
+| `GET`/`POST` | `/api/v2/control/supervisor` | 4-ring OS process start / stop / restart / status |
+| `GET`/`POST` | `/api/v2/control/brokers/testnet` · `/testnet-order` | Ring 0 sandbox bridge state / dispatch |
+| `POST` | `/api/v2/control/llms/probe` | Local LLM probe under the 250 ms hard cap |
+| `POST` | `/api/v2/control/rearm` | Explicit human reset from `HALTED` back to `ARMED` |
+| `POST` | `/api/v2/control/vault/rotate-keys` | Zero-downtime Fernet master-key + Ed25519 rotation |
+| `GET` | `/api/v2/control/vault/status` | Key version, public fingerprint, archived keys, OS tuning |
+| `GET` | `/api/v2/metrics` · `/metrics` | Prometheus / OpenMetrics exposition |
+| `GET` | `/api/v2/metrics/json` | JSON telemetry for the cockpit chip |
 | `GET` | `/api/v2/mcp/tools` | Read-only MCP tool catalogue + air-gap audit |
 | `POST` | `/api/v2/mcp/call` · `/api/v2/mcp` · `/api/v2/mcp/rpc` | MCP invocation (JSON-RPC + SSE) |
 
@@ -203,7 +218,8 @@ The cockpit is read-only for market state. These are the complete write surfaces
 2. **Contagion & Lease X-Ray** — formal verification / VOPR badge, 60 s lease table, MiroFish
    archetypes, SHA-256 grounding ledger, TacticalVault tail-hedger card.
 3. **Control Room** — token budget, 12/12 venue adapter matrix, broker hot-swap, LLM
-   switchboard, extensions.
+   switchboard, broker credential vault, **Ring 0 key rotation with live OS low-latency
+   status**, extensions.
 
 ---
 
@@ -216,8 +232,11 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     11 suites, 202 tests
+tests/                     17 suites
 scripts/run_nios.py        smoke test + unified server
+scripts/tune_os_performance.py  OS/socket low-latency audit (--check/--apply/--json)
+scripts/soak_test_harness.py    accelerated soak + memory-leak audit
+RUNBOOK.md                 production SOPs 1-5
 start_nios.bat / .sh       1-click launch
 ```
 

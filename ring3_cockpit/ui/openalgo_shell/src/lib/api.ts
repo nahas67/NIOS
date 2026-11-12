@@ -15,6 +15,8 @@ import type {
   MetricsSnapshot,
   RearmReport,
   SupervisorControlResponse,
+  VaultRotationReport,
+  VaultStatus,
 } from '@/types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? ''
@@ -212,4 +214,29 @@ export function metricsJsonUrl(): string {
 
 export function fetchMetrics(): Promise<MetricsSnapshot> {
   return request<MetricsSnapshot>('/api/v2/metrics/json')
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 5 — Ring 0 zero-downtime key rotation + OS tuning
+ * ------------------------------------------------------------------ */
+
+/** Current key version, archived Ed25519 keys and the OS tuning summary. */
+export function fetchVaultStatus(): Promise<VaultStatus> {
+  return request<VaultStatus>('/api/v2/control/vault/status')
+}
+
+/**
+ * Rotate the Ring 0 Fernet master keys and Ed25519 order-signing keypair.
+ *
+ * Zero downtime and zero credential loss: stored LLM and broker secrets are
+ * re-encrypted in place and the previous public key is archived so historical
+ * signed orders still verify. The reply is proof-only — never secret material.
+ */
+export function postVaultRotate(
+  operator = 'ring3.cockpit'
+): Promise<VaultRotationReport> {
+  return request<VaultRotationReport>('/api/v2/control/vault/rotate-keys', {
+    method: 'POST',
+    body: JSON.stringify({ operator, reason: 'operator-initiated rotation' }),
+  })
 }

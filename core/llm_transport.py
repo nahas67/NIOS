@@ -43,6 +43,8 @@ from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 import httpx
 
+from core.os_tuning import LOW_LATENCY_SOCKET_OPTIONS
+
 __all__ = [
     "BASELINE_USD_PER_DAY",
     "DEFAULT_DAILY_USD_CAP",
@@ -679,8 +681,17 @@ class LLMHttp2TransportPool:
     def _build_sync_client(
         self, transport: httpx.BaseTransport | None
     ) -> httpx.Client:
+        # ``sec_010``: the HTTP/2 control-plane and LLM paths must not inherit
+        # Nagle.  When no test transport is injected, build the pool ourselves
+        # so the Ring 1 low-latency socket contract is applied to every
+        # connection (TCP_NODELAY, SO_KEEPALIVE, bounded buffers).
         if self.http2_requested:
             try:
+                if transport is None:
+                    transport = httpx.HTTPTransport(
+                        http2=True,
+                        socket_options=LOW_LATENCY_SOCKET_OPTIONS,
+                    )
                 client = httpx.Client(
                     http2=True,
                     limits=self.limits,
@@ -691,6 +702,11 @@ class LLMHttp2TransportPool:
                 return client
             except Exception:
                 self.http2_enabled = False
+        if transport is None:
+            transport = httpx.HTTPTransport(
+                http2=False,
+                socket_options=LOW_LATENCY_SOCKET_OPTIONS,
+            )
         return httpx.Client(
             http2=False,
             limits=self.limits,
@@ -700,11 +716,17 @@ class LLMHttp2TransportPool:
 
     def _async_client_or_create(self) -> httpx.AsyncClient:
         if self._async_client is None:
+            transport = self._async_transport
+            if transport is None:
+                transport = httpx.AsyncHTTPTransport(
+                    http2=self.http2_enabled,
+                    socket_options=LOW_LATENCY_SOCKET_OPTIONS,
+                )
             self._async_client = httpx.AsyncClient(
                 http2=self.http2_enabled,
                 limits=self.limits,
                 timeout=self.timeout,
-                transport=self._async_transport,
+                transport=transport,
             )
         return self._async_client
 

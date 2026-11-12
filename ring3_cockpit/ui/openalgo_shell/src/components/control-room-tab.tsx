@@ -33,7 +33,7 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { postBroker, postBrokerCredentials, postExtensions, postLLM, postLLMProbe, fetchMetrics, metricsAliasUrl, metricsJsonUrl, metricsUrl } from '@/lib/api'
+import { postBroker, postBrokerCredentials, postExtensions, postLLM, postLLMProbe, fetchMetrics, fetchVaultStatus, metricsAliasUrl, metricsJsonUrl, metricsUrl, postVaultRotate } from '@/lib/api'
 import { formatPct, formatUsd } from '@/lib/format'
 import type {
   BrokerCredentialReport,
@@ -45,6 +45,8 @@ import type {
   MetricsSnapshot,
   SiloState,
   VaultKey,
+  VaultRotationReport,
+  VaultStatus,
 } from '@/types'
 
 interface ControlRoomTabProps {
@@ -145,6 +147,8 @@ export function ControlRoomTab({ state, onSaved }: ControlRoomTabProps) {
       </div>
 
       <BrokerCredentialVault state={state} onSaved={onSaved} />
+
+      <VaultRotationPanel />
 
       <ExtensionsPanel
         extensions={state?.extensions ?? null}
@@ -1472,6 +1476,232 @@ function TelemetryMetricsPanel() {
         </div>
 
         {error ? <p className="text-[10px] text-red-300">{error}</p> : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3 Step 5 · Ring 0 zero-downtime key rotation + OS tuning
+ * ------------------------------------------------------------------ */
+
+function VaultRotationPanel() {
+  const [status, setStatus] = useState<VaultStatus | null>(null)
+  const [report, setReport] = useState<VaultRotationReport | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  const load = async () => {
+    try {
+      setStatus(await fetchVaultStatus())
+    } catch (cause) {
+      setFailed(true)
+      setMessage(
+        cause instanceof Error ? cause.message : 'vault status unavailable'
+      )
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  const rotate = async () => {
+    setBusy(true)
+    setMessage(null)
+    setFailed(false)
+    try {
+      const next = await postVaultRotate()
+      setReport(next)
+      setMessage(
+        `Key v${next.key_version} live · ${next.reencrypted_llm_keys_count} LLM key(s) and ${next.reencrypted_broker_venues_count} venue(s) re-encrypted · zero restart`
+      )
+      await load()
+    } catch (cause) {
+      setFailed(true)
+      setMessage(cause instanceof Error ? cause.message : 'key rotation failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const tuning = report?.os_tuning ?? status?.os_tuning ?? null
+  const archived = report?.archived_public_keys ?? status?.archived_public_keys ?? []
+  const tuningTone =
+    tuning && tuning.error_count > 0
+      ? 'red'
+      : tuning && tuning.recommended > 0
+        ? 'amber'
+        : 'emerald'
+
+  return (
+    <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
+      <CardHeader className="px-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <KeyRound className="size-4 text-primary" />
+            Ring 0 vault key rotation
+          </CardTitle>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="outline" className="font-mono text-[9px]">
+              KEY v{report?.key_version ?? status?.key_version ?? 1}
+            </Badge>
+            <Badge
+              variant="outline"
+              className="font-mono text-[9px]"
+              title={
+                tuning
+                  ? `${tuning.platform} · ${tuning.profile} · ${tuning.applied} applied / ${tuning.recommended} recommended`
+                  : 'OS tuning audit not loaded'
+              }
+            >
+              <Cpu className="mr-1 size-3" />
+              OS LOW-LATENCY{' '}
+              {tuning
+                ? `${tuning.applied} APPLIED / ${tuning.recommended} RECOMMENDED`
+                : 'AUDIT PENDING'}
+            </Badge>
+            <Badge
+              variant={tuningTone === 'emerald' ? 'secondary' : 'outline'}
+              className={`font-mono text-[9px] ${
+                tuningTone === 'red'
+                  ? 'border-red-500/40 text-red-300'
+                  : tuningTone === 'amber'
+                    ? 'border-amber-500/40 text-amber-300'
+                    : 'border-emerald-500/40 text-emerald-300'
+              }`}
+            >
+              {tuning ? (tuning.ok ? 'PROBE OK' : 'PROBE ERROR') : 'NO PROBE'}
+            </Badge>
+          </div>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Rotates the Fernet master keys and the Ed25519 order-signing keypair in
+          place. Stored LLM and broker credentials are re-encrypted atomically, the
+          previous public key is archived read-only so historical signed orders still
+          verify, and no worker restarts. Responses carry counts and fingerprints
+          only — never a key or a secret.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3 px-4">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              Ed25519 key
+            </div>
+            <div className="font-mono text-xs text-foreground">
+              {report?.ed25519_public_fingerprint ??
+                status?.ed25519_public_fingerprint ??
+                '—'}
+            </div>
+          </div>
+          <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              LLM keys
+            </div>
+            <div className="font-mono text-xs tabular-nums">
+              {report?.reencrypted_llm_keys_count ??
+                status?.llm_keys_stored ??
+                0}
+            </div>
+          </div>
+          <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              Broker venues
+            </div>
+            <div className="font-mono text-xs tabular-nums">
+              {report?.reencrypted_broker_venues_count ??
+                status?.broker_venues_stored ??
+                0}
+            </div>
+          </div>
+          <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              Archived keys
+            </div>
+            <div className="font-mono text-xs tabular-nums">
+              {archived.length} · read-only
+            </div>
+          </div>
+        </div>
+
+        {tuning ? (
+          <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
+            <span className="font-mono">
+              {tuning.platform} · {tuning.profile}
+            </span>
+            <span className="font-mono">
+              TCP_NODELAY={tuning.socket_tcp_nodelay}
+            </span>
+            <span className="font-mono">
+              transports {tuning.transports_ok ? 'OK' : 'GAP'}
+            </span>
+            <span className="font-mono">
+              errors {tuning.error_count}
+            </span>
+            <span className="font-mono">run: python scripts/tune_os_performance.py --check</span>
+          </div>
+        ) : null}
+
+        {report ? (
+          <div className="flex flex-wrap gap-2 text-[9px]">
+            {[
+              ['ZERO LOSS', report.credentials_zero_loss],
+              ['DRY-RUN VERIFIED', report.dry_run_verified],
+              ['MASKS STABLE', report.masks_unchanged],
+              ['HISTORY VERIFIES', report.historical_signature_verified],
+              ['ZERO DOWNTIME', report.zero_downtime],
+            ].map(([label, ok]) => (
+              <span
+                key={String(label)}
+                className={`rounded border px-1.5 py-0.5 font-mono ${
+                  ok
+                    ? 'border-emerald-500/40 text-emerald-300'
+                    : 'border-red-500/40 text-red-300'
+                }`}
+              >
+                {String(label)}
+              </span>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[10px] text-muted-foreground">
+            {status?.last_rotation
+              ? `last rotation v${status.last_rotation.key_version} by ${status.last_rotation.operator}`
+              : 'no rotation recorded · initial key generation v1'}
+            {status?.rotation_pending_recovery ? ' · RECOVERY PENDING' : ''}
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => void rotate()}
+            disabled={busy}
+            className="gap-1.5"
+          >
+            <RefreshCw className={`size-3.5 ${busy ? 'animate-spin' : ''}`} />
+            {busy ? 'Rotating…' : 'Rotate Ring 0 Vault Keys'}
+          </Button>
+        </div>
+
+        {message ? (
+          <div
+            className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-[10px] ${
+              failed
+                ? 'border border-red-500/30 bg-red-500/10 text-red-200'
+                : 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+            }`}
+          >
+            {failed ? (
+              <AlertTriangle className="size-3" />
+            ) : (
+              <CheckCircle2 className="size-3" />
+            )}
+            {message}
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   )

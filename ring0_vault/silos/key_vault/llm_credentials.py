@@ -15,21 +15,57 @@ created with owner-only permissions.  It lives under
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Mapping
 
 from cryptography.fernet import Fernet, InvalidToken
 
-__all__ = ["LLMKeyVault", "mask_secret", "MASK_PREFIX"]
+__all__ = ["LLMKeyVault", "mask_secret", "atomic_write_private", "MASK_PREFIX"]
 
 #: Prefix used for every masked token returned to Ring 3.
 MASK_PREFIX = "***"
 #: Number of trailing characters preserved for operator identification.
 MASK_VISIBLE_CHARS = 4
+
+
+def atomic_write_private(
+    path: str | Path, payload: bytes, mode: int = 0o600
+) -> Path:
+    """Write ``payload`` to ``path`` atomically with owner-only permissions.
+
+    The temporary file lives in the same directory (same filesystem), is
+    fsynced, then ``os.replace`` swaps it in.  A reader therefore sees either
+    the complete old file or the complete new one, never a half-written key or
+    credential store.  ``0o600`` is applied both at creation and after the
+    rename so a pre-existing file with looser permissions is tightened too.
+    """
+
+    target = Path(path)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, int(mode))
+    try:
+        os.write(fd, bytes(payload))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if target.exists():
+        # Windows refuses to replace a file carrying the read-only attribute
+        # (0o400 archives).  Clear it first; the final chmod restores the mode.
+        try:
+            os.chmod(target, 0o600)
+        except OSError:  # pragma: no cover - platform specific
+            pass
+    os.replace(tmp, target)
+    try:
+        os.chmod(target, int(mode))
+    except OSError:  # pragma: no cover - Windows read-only semantics
+        pass
+    return target
 
 
 def mask_secret(secret: str) -> str:
@@ -64,7 +100,8 @@ class LLMKeyVault:
         self._key_path = self.root / "fernet.key"
         self._store_path = self.root / "llm_keys.json"
         self._lock = threading.RLock()
-        self._fernet = Fernet(self._load_or_create_key())
+        self._key = self._load_or_create_key()
+        self._fernet = Fernet(self._key)
         if not self._store_path.exists():
             self._store_path.write_text("{}", encoding="utf-8")
 
@@ -132,6 +169,86 @@ class LLMKeyVault:
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._read()))
+
+    # -- zero-downtime key rotation (Ring 0 only) -------------------------
+    @property
+    def key_material(self) -> bytes:
+        """The current Fernet key bytes.  Ring 0 rotation only."""
+
+        return bytes(self._key)
+
+    @property
+    def store_path(self) -> Path:
+        return self._store_path
+
+    @contextlib.contextmanager
+    def rotation_guard(self) -> Iterator[None]:
+        """Hold the vault write lock for the whole rotation window.
+
+        A credential written by the cockpit while keys rotate would otherwise
+        be encrypted under the old Fernet and lost.  The lock makes snapshot +
+        re-encrypt + adopt one atomic critical section inside Ring 0.
+        """
+
+        with self._lock:
+            yield
+
+    def rotation_snapshot(self) -> dict[str, str]:
+        """Decrypt every stored secret for a rotation.  Ring 0 only.
+
+        Raises ``ValueError`` rather than silently dropping an entry: a rotation
+        must never lose a credential.
+        """
+
+        with self._lock:
+            data = self._read()
+            secrets: dict[str, str] = {}
+            for name, blob in data.items():
+                try:
+                    secrets[name] = self._fernet.decrypt(blob.encode("ascii")).decode(
+                        "utf-8"
+                    )
+                except (InvalidToken, ValueError) as exc:
+                    raise ValueError(
+                        f"credential {name!r} cannot be decrypted; "
+                        "refusing to rotate and lose it"
+                    ) from exc
+            return secrets
+
+    def install_rotated_key(
+        self, new_key: bytes, plaintext: Mapping[str, str]
+    ) -> dict[str, Any]:
+        """Write the new key and re-encrypted store atomically, then adopt it."""
+
+        with self._lock:
+            fernet = Fernet(bytes(new_key))
+            payload = {
+                str(name): fernet.encrypt(str(value).encode("utf-8")).decode("ascii")
+                for name, value in plaintext.items()
+            }
+            atomic_write_private(self._key_path, bytes(new_key), 0o600)
+            atomic_write_private(
+                self._store_path,
+                json.dumps(payload, sort_keys=True).encode("utf-8"),
+                0o600,
+            )
+            self._key = bytes(new_key)
+            self._fernet = fernet
+            return {"store": str(self._store_path), "entries": len(payload)}
+
+    def adopt_fernet_key(self, new_key: bytes) -> None:
+        """Adopt key material already written to disk (crash recovery path)."""
+
+        with self._lock:
+            self._key = bytes(new_key)
+            self._fernet = Fernet(self._key)
+
+    def fernet_roundtrip(self, message: bytes) -> bool:
+        """Prove the adopted Fernet envelope still decrypts to the same bytes."""
+
+        with self._lock:
+            blob = self._fernet.encrypt(bytes(message))
+            return self._fernet.decrypt(blob) == bytes(message)
 
     # -- internal ---------------------------------------------------------
     def _decrypt(self, name: str) -> str | None:

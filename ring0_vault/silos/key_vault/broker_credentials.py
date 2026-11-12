@@ -19,13 +19,14 @@ leave the process.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Mapping
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -33,7 +34,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-from ring0_vault.silos.key_vault.llm_credentials import mask_secret
+from ring0_vault.silos.key_vault.llm_credentials import (
+    atomic_write_private,
+    mask_secret,
+)
 
 __all__ = [
     "BrokerCredentialVault",
@@ -71,7 +75,8 @@ class BrokerCredentialVault:
         self._signer_key_path = self.root / "broker_signer.key"
         self._store_path = self.root / "broker_credentials.json"
         self._lock = threading.RLock()
-        self._fernet = Fernet(self._load_or_create_fernet_key())
+        self._fernet_key = self._load_or_create_fernet_key()
+        self._fernet = Fernet(self._fernet_key)
         self._signer = self._load_or_create_signer()
         if not self._store_path.exists():
             self._store_path.write_text("{}", encoding="utf-8")
@@ -152,6 +157,109 @@ class BrokerCredentialVault:
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._read()))
+
+    # -- zero-downtime key rotation (Ring 0 only) -------------------------
+    @property
+    def fernet_key_material(self) -> bytes:
+        return bytes(self._fernet_key)
+
+    @property
+    def signer_seed(self) -> bytes:
+        """Raw Ed25519 seed.  Ring 0 rotation only; never serialised to Ring 3."""
+
+        return self._signer.private_bytes_raw()
+
+    @property
+    def signing_public_key_bytes(self) -> bytes:
+        return self._signer.public_key().public_bytes_raw()
+
+    @property
+    def ed25519_public_fingerprint(self) -> str:
+        """SHA-256 hex prefix of the Ed25519 public key (stable identifier)."""
+
+        return hashlib.sha256(self.signing_public_key_bytes).hexdigest()[:16]
+
+    @property
+    def store_path(self) -> Path:
+        return self._store_path
+
+    @contextlib.contextmanager
+    def rotation_guard(self) -> Iterator[None]:
+        """Hold the vault write lock for the whole rotation window."""
+
+        with self._lock:
+            yield
+
+    def rotation_snapshot(self) -> dict[str, str]:
+        """Decrypt every stored credential for a rotation.  Ring 0 only."""
+
+        with self._lock:
+            data = self._read()
+            secrets: dict[str, str] = {}
+            for name, blob in data.items():
+                try:
+                    secrets[name] = self._fernet.decrypt(blob.encode("ascii")).decode(
+                        "utf-8"
+                    )
+                except (InvalidToken, ValueError) as exc:
+                    raise ValueError(
+                        f"credential {name!r} cannot be decrypted; "
+                        "refusing to rotate and lose it"
+                    ) from exc
+            return secrets
+
+    def install_rotated_material(
+        self,
+        new_key: bytes,
+        plaintext: Mapping[str, str],
+        signer_seed: bytes,
+    ) -> dict[str, Any]:
+        """Atomically install a new Fernet key, store and Ed25519 signer."""
+
+        with self._lock:
+            fernet = Fernet(bytes(new_key))
+            signer = Ed25519PrivateKey.from_private_bytes(bytes(signer_seed))
+            payload = {
+                str(name): fernet.encrypt(str(value).encode("utf-8")).decode("ascii")
+                for name, value in plaintext.items()
+            }
+            atomic_write_private(self._fernet_key_path, bytes(new_key), 0o600)
+            atomic_write_private(self._signer_key_path, bytes(signer_seed), 0o600)
+            atomic_write_private(
+                self._store_path,
+                json.dumps(payload, sort_keys=True).encode("utf-8"),
+                0o600,
+            )
+            self._fernet_key = bytes(new_key)
+            self._fernet = fernet
+            self._signer = signer
+            return {
+                "store": str(self._store_path),
+                "entries": len(payload),
+                "public_key_hex": signer.public_key().public_bytes_raw().hex(),
+            }
+
+    def adopt_rotated_material(self, new_key: bytes, signer_seed: bytes) -> None:
+        """Adopt material already on disk (crash-recovery path)."""
+
+        with self._lock:
+            self._fernet_key = bytes(new_key)
+            self._fernet = Fernet(self._fernet_key)
+            self._signer = Ed25519PrivateKey.from_private_bytes(bytes(signer_seed))
+
+    @staticmethod
+    def verify_with_public_key(
+        message: bytes, signature: bytes, public_key_hex: str
+    ) -> bool:
+        """Verify a historical order signature against an archived public key."""
+
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(str(public_key_hex))).verify(
+                bytes(signature), bytes(message)
+            )
+        except Exception:  # noqa: BLE001 - any failure is simply "not verified"
+            return False
+        return True
 
     # -- signing -----------------------------------------------------------
     @property

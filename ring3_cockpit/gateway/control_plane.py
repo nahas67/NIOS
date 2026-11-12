@@ -18,6 +18,8 @@ surfaces (extensions + read-only MCP) without granting order authority:
 ``POST /api/v2/control/feeds``   hot-swap PAPER_AUTOPILOT / LIVE dual-vendor
 ``POST /api/v2/control/brokers/credentials`` write-only testnet handshake
 ``POST /api/v2/control/llms/probe``          live Ollama probe under 250 ms
+``POST /api/v2/control/vault/rotate-keys``   zero-downtime Ring 0 key rotation
+``GET  /api/v2/control/vault/status``        key version + OS tuning status
 ======================  =====================================================
 
 Design notes
@@ -68,6 +70,10 @@ from ring0_vault.ibor.ledger_outbox import (
     SiloGuard,
 )
 from ring0_vault.silos.key_vault.llm_credentials import LLMKeyVault
+from ring0_vault.silos.key_vault.key_rotation import (
+    rotate_ring0_vault_keys,
+    vault_key_status,
+)
 from ring0_vault.silos.silo_registry import (
     MarketSiloRegistry,
     SiloMode,
@@ -91,6 +97,7 @@ __all__ = [
     "ExtensionsControlRequest",
     "SupervisorControlRequest",
     "TestnetOrderRequest",
+    "VaultRotationRequest",
     "autopilot_paper_loop",
     "create_app",
     "DEFAULT_DAILY_LLM_BUDGET_USD",
@@ -226,6 +233,17 @@ class RearmRequest(BaseModel):
 
     reason: str = "operator re-arm"
     operator: str = "ring3.operator"
+
+
+class VaultRotationRequest(BaseModel):
+    """``POST /api/v2/control/vault/rotate-keys`` payload (Phase 3 Step 5).
+
+    Rotation is non-destructive and zero-downtime, so it needs no ``confirm``
+    flag; the operator and reason are recorded in Ring 0's rotation journal.
+    """
+
+    operator: str = "ring3.operator"
+    reason: str = "scheduled zero-downtime rotation"
 
 
 class ExtensionsControlRequest(BaseModel):
@@ -1632,6 +1650,68 @@ class ControlPlane:
         self._credential_reports[f"{report['silo']}:{report['venue']}"] = dict(report)
         return report
 
+    # -- Phase 3 Step 5: zero-downtime Ring 0 key rotation --------------
+    def _broker_vault_or_default(self) -> Any:
+        if self.broker_vault is not None:
+            return self.broker_vault
+        from ring0_vault.silos.key_vault.broker_credentials import default_broker_vault
+
+        return default_broker_vault()
+
+    def rotate_vault_keys(
+        self, request: VaultRotationRequest | None = None
+    ) -> dict[str, Any]:
+        """Rotate the Ring 0 Fernet + Ed25519 keys while the platform runs.
+
+        The reply is a proof receipt: version, fingerprint, re-encrypted counts
+        and the OS tuning summary.  It never contains a raw Fernet key, a
+        private Ed25519 seed, an API key or a broker secret.
+        """
+
+        operator = str(request.operator) if request is not None else "ring3.operator"
+        try:
+            report = rotate_ring0_vault_keys(
+                llm_vault=self.key_vault,
+                broker_vault=self._broker_vault_or_default(),
+                operator=operator,
+            )
+        except ValueError as exc:
+            # The message names the store/entry only; it never contains a secret.
+            raise HTTPException(
+                status_code=500, detail=f"vault rotation aborted: {exc}"
+            ) from None
+
+        # Masks cannot change (plaintext is preserved) but the live slots are
+        # refreshed from the new key so the cockpit never shows a stale token.
+        for slot in ("1", "2"):
+            token = self.key_vault.masked(f"llm.system{slot}")
+            if token is not None:
+                self._llm[slot].api_key_masked = token
+                self._llm[slot].api_key_set = True
+                self._llm[slot].updated_at_ns = int(report["rotated_at_ns"])
+        report["zero_restart"] = True
+        report["operator_label"] = operator
+        return report
+
+    def vault_status(self) -> dict[str, Any]:
+        """Secret-free Ring 0 key custody status + OS low-latency summary."""
+
+        try:
+            return vault_key_status(
+                llm_vault=self.key_vault,
+                broker_vault=self._broker_vault_or_default(),
+            )
+        except Exception as exc:  # noqa: BLE001 - status must render, never crash
+            return {
+                "schema": "nios.ring0.key_rotation_status.v1",
+                "status": "UNAVAILABLE",
+                "ring": "ring0_vault",
+                "vault": "ring0_vault/silos/key_vault",
+                "write_only": True,
+                "raw_secrets_exposed": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+
     # -- Phase 3 Step 2: live local LLM probe ------------------------
     def probe_llms(self, request: LLMProbeRequest | None = None) -> dict[str, Any]:
         """Ping System 1 / System 2 under the strict 250 ms hard cap."""
@@ -2436,6 +2516,17 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.post("/api/v2/control/rearm")
     def control_rearm(request: RearmRequest | None = None) -> dict[str, Any]:
         return control.rearm(request)
+
+    # ---- Phase 3 Step 5: zero-downtime Ring 0 vault key rotation --------
+    @app.post("/api/v2/control/vault/rotate-keys")
+    def control_vault_rotate(
+        request: VaultRotationRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.rotate_vault_keys(request)
+
+    @app.get("/api/v2/control/vault/status")
+    def control_vault_status() -> dict[str, Any]:
+        return control.vault_status()
 
     @app.get("/api/v2/control/extensions")
     def control_extensions() -> dict[str, Any]:

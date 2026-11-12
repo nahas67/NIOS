@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import math
+import socket
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -300,6 +301,20 @@ class _TradeWindow:
 
 class SiloWebSocketMultiplexer:
     """One isolated WebSocket normalizer for one pinned silo worker."""
+
+    @staticmethod
+    def configure_transport_socket(sock: socket.socket) -> dict[str, Any]:
+        """Apply the Ring 1 low-latency contract to a venue WebSocket socket.
+
+        A venue WebSocket carries the ticks that start the ``<0.14 ms``
+        tick-to-intent budget, so Nagle is never allowed on it.  The helper is
+        owned by :mod:`core.os_tuning` and reads every option back from the
+        kernel; the returned report is the audit evidence.
+        """
+
+        from core.os_tuning import configure_low_latency_socket
+
+        return configure_low_latency_socket(sock)
 
     __slots__ = (
         "silo",
