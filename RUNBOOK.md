@@ -178,6 +178,7 @@ Verification commands:
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
 python -m pytest tests -q                        # 18 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate
+python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive)
 ```
 
 ### 3.3 Chaos / crash injection
@@ -240,17 +241,57 @@ dry-run receipt. Repeat per venue (`binance`, `dhan`, `ibkr`, `oanda`, `mt5`).
 ### 4.3 Transition a silo from `PAPER` to `LIVE`
 
 Preconditions: the venue credential is configured (`dry_run_verified=true`), every adapter
-in the silo is `ready`, and the kill latch is clear.
+in the silo is `ready`, the kill latch is clear, **and the 22-gate pre-flight certificate
+reports `failed_gates == 0`**.
 
 ```bash
+curl.exe -s http://127.0.0.1:8000/api/v2/control/preflight
+
 curl.exe -s -X POST http://127.0.0.1:8000/api/v2/control/brokers \
   -H "Content-Type: application/json" \
   -d "{\"silo\":\"CRYPTO_BINANCE\",\"mode\":\"LIVE\",\"confirm_live\":true,\"operator\":\"oncall.name\"}"
 ```
 
-`confirm_live=true` is mandatory; without it the request is rejected. The change applies in
-memory with zero worker restart. Reverse with `"mode":"PAPER"` (always allowed). Paper is
-the default after every restart — live is never sticky.
+`confirm_live=true` is mandatory; without it the request is rejected with `403`. With it,
+the gateway re-checks the certificate and refuses the transition with `409`
+`PRE_FLIGHT_GATE_BLOCKED` — naming every failed gate id — if any constitutional invariant
+is broken. The change applies in memory with zero worker restart. Reverse with
+`"mode":"PAPER"` (always allowed). Paper is the default after every restart — live is never
+sticky.
+
+### 4.4 22-gate go-live certificate
+
+```bash
+curl.exe -s http://127.0.0.1:8000/api/v2/control/preflight            # fast path
+curl.exe -s -X POST http://127.0.0.1:8000/api/v2/control/preflight \
+  -H "Content-Type: application/json" -d "{\"full_smoke\":true}"      # full re-run
+python scripts/preflight_golive.py --strict                           # CLI, release gate
+```
+
+The fast path replays a short-lived in-process certificate and the persisted receipt of the
+last certified 22-row smoke suite for the current commit, so the cockpit stays responsive.
+`full_smoke=true` (or `--fast` omitted on the CLI) re-runs every gate from scratch. The reply
+carries `ready_for_live_cutover`, `passed_gates` / `total_gates`, `failed_gates`,
+`failed_gate_ids`, the per-gate checklist and a deterministic 64-character
+`certificate_sha256`. Treat a `FAIL` row as a release blocker: never re-tag, never widen a
+gate, and never hand-edit a silo to `LIVE` around it.
+
+### 4.5 Forge + tail-hedge drill (Ring 2 proposes, Ring 0 signs)
+
+```bash
+curl.exe -s -X POST http://127.0.0.1:8000/api/v2/control/supervisor/forge-hedge \
+  -H "Content-Type: application/json" -d "{\"operator\":\"oncall.name\"}"
+```
+
+One closed-loop cycle: the Nightly Alpha Forge audits champions, demotes anything under
+`+0.50 bps` and disarms its Ring 1 lease, breeds challengers, runs the three-tick MiroFish
+cascade, and the TacticalVault tail-hedger prices a grounded protective put. Ring 0 verifies
+the proposal and returns an Ed25519 `TACTICAL_SWING` insurance receipt. In
+`--multiprocess` mode the command travels to the Ring 2 worker and the signature comes back
+from the Ring 0 worker (`mode=cross_process`); single-process mode runs the same ordering
+in-process (`mode=single_process`). The reply reports `retired_champions`,
+`disarmed_leases`, `genomes_evaluated` and `ring0_signature.verified` — a rejection is data,
+not an error: fix the cause, do not bypass the vault cap.
 
 ---
 
@@ -318,6 +359,8 @@ until every latency-critical row is `APPLIED`. Never disable the audit to silenc
 | `POST` | `/api/v2/control/killswitch` | Global halt + ADR-009 flatten |
 | `POST` | `/api/v2/control/rearm` | Human reset back to `ARMED` |
 | `GET`/`POST` | `/api/v2/control/supervisor` | 4-ring process supervision |
+| `POST` | `/api/v2/control/supervisor/forge-hedge` | Closed-loop forge + Ring 0 signed tail hedge |
+| `GET`/`POST` | `/api/v2/control/preflight` | 22-gate go-live readiness certificate |
 | `GET`/`POST` | `/api/v2/control/extensions` | Skills / plugins / MCP / Forge |
 | `POST` | `/api/v2/control/vault/rotate-keys` | Zero-downtime Fernet + Ed25519 rotation |
 | `GET` | `/api/v2/control/vault/status` | Key version, fingerprint, OS tuning |

@@ -31,9 +31,10 @@ from __future__ import annotations
 import math
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from core.feature_store import FeatureStore
 from core.llm_transport import LLMHttp2TransportPool, TokenBudgetLedger
@@ -503,6 +504,7 @@ class NIOSCoreOrchestrator:
             tb_pg_provisioner=self.tb_pg_provisioner,
             autopilot_runner=self.autopilot_tick,
             autopilot_provider=self.autopilot_snapshot,
+            forge_hedge_runner=self.run_forge_and_hedge_cycle,
         )
 
     # -- properties -------------------------------------------------------
@@ -590,6 +592,109 @@ class NIOSCoreOrchestrator:
             now_ns=now_ns,
             lease_now_ns=time.monotonic_ns(),
         )
+
+    def _hedge_silo_for(self, symbols: Sequence[str]) -> str:
+        """Pick the silo whose Ring 0 whitelist actually admits this symbol."""
+        probes = {str(item).upper() for item in symbols if str(item)}
+        for candidate in self.silos:
+            allowed = self.firewall.whitelists.get(str(candidate))
+            if allowed and probes & {str(item).upper() for item in allowed}:
+                return str(candidate)
+        return str(self.silos[0])
+
+    def run_forge_and_hedge_cycle(
+        self,
+        *,        strategy_id: str | None = None,
+        champion_fills_bps: Iterable[float] = (),
+        champion_symbols: Iterable[str] = (),
+        challengers: int = 4,
+        price_shock_bps: float = 120.0,
+        tail_correlation: float = 0.68,
+        spot: float = 50_000.0,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """Single-process closed-loop Nightly Alpha Forge + tail-hedge cycle.
+
+        Byte-for-byte the same ordering the Ring 2 worker executes in
+        ``--multiprocess`` mode, but wired in-process: the forge audits and
+        demotes decayed champions (disarming their SHM leases), the MiroFish
+        cascade prices a grounded put, and Ring 0 -- here ``self.signer`` --
+        verifies and Ed25519-signs it.  Ring 2 never touches the key: the
+        proposal crosses a shim that only Ring 0 code can service.
+        """
+        import os as _os
+
+        from core.process_supervisor import _forge_and_hedge_cycle, _sign_tail_hedge
+        from ring1_spinal.silo_worker import SILO_ORDER
+        from ring2_brain.mirofish.contagion_engine import ShockVector
+
+        champion_symbols_t = tuple(str(item) for item in champion_symbols)
+        command = {
+            "cmd": "forge_and_hedge",
+            "request_id": str(request_id or uuid.uuid4().hex[:8]),
+            "strategy_id": str(strategy_id or self.strategy_id),
+            "champion_fills_bps": [float(value) for value in champion_fills_bps],
+            "champion_symbols": list(champion_symbols_t),
+            "challengers": int(challengers),
+            "price_shock_bps": float(price_shock_bps),
+            "tail_correlation": float(tail_correlation),
+            "spot": float(spot),
+        }
+
+        signed: list[dict[str, Any]] = []
+        firewall = self.firewall
+        signer = self.signer
+        ledger = self.ledger
+
+        class _Ring0SigningShim:
+            """Ring 2's outbound queue, serviced by Ring 0 in this process."""
+
+            def put(self, payload: Mapping[str, Any]) -> None:
+                signed.append(
+                    _sign_tail_hedge(
+                        payload,
+                        firewall=firewall,
+                        signer=signer,
+                        ledger=ledger,
+                        silo_order=tuple(SILO_ORDER),
+                        pid=_os.getpid(),
+                    )
+                )
+
+        silo = self._hedge_silo_for(command["champion_symbols"])
+        # The insurance is bought *inside* the silo that owns the vault
+        # (Law 5).  Sizing against the whole book would price a premium the
+        # single TacticalSwing vault can never pay, so the hedge basis is the
+        # silo's own NAV and its own tactical vault balance.
+        hedge_basis = {
+            "portfolio_notional_micros": max(
+                1, int(self.ledger.silo_nav_micros(silo) or 0)
+            ),
+            "tactical_vault_micros": max(
+                1,
+                int(self.ledger.balance(silo, VaultName.TACTICAL_SWING) or 0),
+            ),
+        }
+
+        event = _forge_and_hedge_cycle(
+            {"ring0_queue": _Ring0SigningShim()},
+            command=command,
+            leases=self.lease_table,
+            silo=silo,
+            symbol=command["champion_symbols"][0] if command["champion_symbols"] else self.symbol,
+            strategy_id=self.strategy_id,
+            toolkit={
+                "forge": self.forge,
+                "hedger": self.tail_hedger,
+                "contagion": self.contagion,
+                "shock": ShockVector,
+            },
+            hedge_basis=hedge_basis,
+        )
+        event["mode"] = "single_process"
+        event["ring0_signature"] = signed[0] if signed else None
+        event["signed"] = bool(signed and signed[0].get("verified"))
+        return event
 
     def refresh_system1(
         self,

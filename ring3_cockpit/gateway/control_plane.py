@@ -40,7 +40,9 @@ import contextlib
 import gc
 import json
 import os
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -147,6 +149,19 @@ _DEFAULT_ALLOCATION: dict[str, float] = {
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phase 4 Step 2 -- pre-flight cache and closed-loop forge drill defaults
+# ---------------------------------------------------------------------------
+
+#: How long an interactive (fast-path) certificate may be replayed.
+PREFLIGHT_CACHE_TTL_S = 300.0
+
+#: Deterministic decayed-champion sample used by the cockpit drill: the rolling
+#: net edge is below the +0.50 bps demotion threshold (sec_018 Law 4), so the
+#: cycle retires a champion and disarms its Ring 1 lease instead of pretending
+#: a live edge exists.
+FORGE_HEDGE_DRILL_FILLS_BPS: tuple[float, ...] = (-1.4, -1.1, -1.9, -0.8, -1.2, -1.5)
+
 # Request models
 # ---------------------------------------------------------------------------
 
@@ -395,6 +410,47 @@ class SupervisorControlRequest(BaseModel):
         return aliases[token]
 
 
+class PreflightRequest(BaseModel):
+    """``POST /api/v2/control/preflight`` payload (Phase 4 Step 2).
+
+    ``full_smoke=False`` is the interactive fast path: gate 5 replays the
+    persisted 22-row smoke receipt for this commit instead of re-spawning the
+    suite.  ``full_smoke=True`` re-runs every gate from scratch and is the
+    release-gate form.
+    """
+
+    full_smoke: bool = False
+    silo: str = "ALL"
+    refresh: bool = True
+
+    @field_validator("silo")
+    @classmethod
+    def _silo_ok(cls, value: str) -> str:
+        token = str(value or "ALL").strip().upper()
+        return token or "ALL"
+
+
+class ForgeHedgeRequest(BaseModel):
+    """``POST /api/v2/control/supervisor/forge-hedge`` payload (Step 2).
+
+    The endpoint runs one *closed-loop* cycle: Ring 2 audits/demotes the
+    champion, disarms its shared-memory lease, breeds challengers, runs the
+    three-tick contagion cascade and prices a grounded protective put; Ring 0
+    verifies and Ed25519-signs it.  Nothing here can reach a broker socket.
+    """
+
+    strategy_id: str | None = None
+    champion_fills_bps: list[float] | None = None
+    champion_symbols: list[str] | None = None
+    challengers: int = Field(default=4, ge=0, le=64)
+    price_shock_bps: float = Field(default=180.0, gt=0.0, le=5_000.0)
+    tail_correlation: float = Field(default=0.68, ge=-1.0, le=1.0)
+    spot: float = Field(default=50_000.0, gt=0.0)
+    request_id: str | None = None
+    timeout_s: float = Field(default=30.0, gt=0.0, le=120.0)
+    operator: str = "ring3.operator"
+
+
 class TestnetOrderRequest(BaseModel):
     """``POST /api/v2/control/brokers/testnet-order`` payload (``sec_011``).
 
@@ -553,6 +609,7 @@ class ControlPlane:
         broker_vault: Any = None,
         llm_probe_fetcher: Any = None,
         testnet_bridge: Any = None,
+        forge_hedge_runner: Any = None,
     ) -> None:
         self.ledger = ledger
         self.firewall = firewall
@@ -584,6 +641,13 @@ class ControlPlane:
         # schedules it inside the FastAPI lifespan and never trades directly.
         self.autopilot_runner = autopilot_runner
         self.autopilot_provider = autopilot_provider
+        # Phase 4 Step 2: the single-process forge + tail-hedge closed loop is a
+        # composition-root callback (the orchestrator owns the Ring 0 signer), so
+        # Ring 3 triggers the cycle without ever holding a signing key.
+        self.forge_hedge_runner = forge_hedge_runner
+        self._preflight_cache: dict[tuple[bool, str], tuple[float, dict[str, Any]]] = {}
+        self._preflight_lock = threading.Lock()
+        self._last_preflight: dict[str, Any] | None = None
         # ``sec_004``: the 4-ring topology is only real if the cockpit can prove
         # four distinct OS processes are alive.  The supervisor is injected so
         # single-process mode still renders (with an explicit "not attached").
@@ -1324,6 +1388,303 @@ class ControlPlane:
             time.sleep(0.05)
         return False
 
+    # -- Phase 4 Step 2: 22-gate pre-flight go-live certificate -----------
+    @staticmethod
+    def _preflight_body(report: Mapping[str, Any]) -> dict[str, Any]:
+        """Normalise the CLI report into the cockpit/contract payload."""
+        gates = [dict(gate) for gate in (report.get("gates") or [])]
+        checklist = [
+            f"{gate.get('status')} {gate.get('gate')}" for gate in gates
+        ]
+        return {
+            "kind": "nios_golive_readiness_certificate",
+            "release": str(report.get("release", "")),
+            "schema": str(report.get("schema", "")),
+            "signer": str(report.get("signer", "")),
+            "silo_scope": str(report.get("silo_scope", "ALL")),
+            "strict": bool(report.get("strict", False)),
+            "full_smoke": bool(report.get("full_smoke", False)),
+            "ready_for_live_cutover": bool(report.get("ready_for_live_cutover", False)),
+            "passed_gates": int(report.get("gates_passed", 0) or 0),
+            "failed_gates": int(report.get("failed_gates", 0) or 0),
+            "warned_gates": int(report.get("warned_gates", 0) or 0),
+            "total_gates": int(
+                report.get("gates_expected", len(gates)) or len(gates)
+            ),
+            "failed_gate_ids": list(report.get("failed_gate_ids") or []),
+            "warned_gate_ids": list(report.get("warned_gate_ids") or []),
+            "certificate_sha256": str(report.get("certificate_sha256", "")),
+            "certificate_digest_algorithm": str(
+                report.get("certificate_digest_algorithm", "sha256")
+            ),
+            "duration_ms": report.get("duration_ms"),
+            "generated_at_ns": report.get("generated_at_ns"),
+            "gates": gates,
+            "gate_checklist": checklist,
+            "law": "sec_016 - nothing reaches LIVE until every invariant is certified",
+        }
+
+    def preflight_certificate(
+        self,
+        *,
+        full_smoke: bool = False,
+        silo: str = "ALL",
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Run (or replay) the 22-gate pre-flight go-live certificate.
+
+        The certificate is deterministic over gate outcomes, so a short-lived
+        in-process cache is both safe and necessary: the cockpit polls it and
+        the ``LIVE`` cutover gate consults it on every request.  ``refresh``
+        forces a fresh run; a failure to execute is a ``503``, never a silently
+        optimistic certificate.
+        """
+        key = (bool(full_smoke), str(silo or "ALL").strip().upper() or "ALL")
+        with self._preflight_lock:
+            cached = self._preflight_cache.get(key)
+            if (
+                not refresh
+                and cached is not None
+                and (time.monotonic() - cached[0]) < PREFLIGHT_CACHE_TTL_S
+            ):
+                body = dict(cached[1])
+                body["served_from"] = "in_process_cache"
+                body["cache_age_s"] = round(time.monotonic() - cached[0], 3)
+                return body
+
+            from scripts.preflight_golive import run_preflight
+
+            try:
+                report = run_preflight(silo=silo, full_smoke=bool(full_smoke))
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "pre-flight certification could not run: "
+                        f"{type(exc).__name__}"
+                    ),
+                ) from None
+            body = self._preflight_body(report)
+            self._preflight_cache[key] = (time.monotonic(), dict(body))
+            self._last_preflight = body
+            payload = dict(body)
+            payload["served_from"] = "fresh_run"
+            payload["cache_age_s"] = 0.0
+            return payload
+
+    def preflight_state(self, *, refresh: bool = False) -> dict[str, Any]:
+        """``GET /api/v2/control/preflight`` -- interactive fast path."""
+        certificate = self.preflight_certificate(
+            full_smoke=False, silo="ALL", refresh=refresh
+        )
+        return {
+            **certificate,
+            "endpoint": "/api/v2/control/preflight",
+            "full_smoke_available": True,
+            "next_action": (
+                "confirm_live=true may be authorised"
+                if certificate["ready_for_live_cutover"]
+                else "resolve every FAIL row before enabling confirm_live"
+            ),
+        }
+
+    # -- Phase 4 Step 2: closed-loop forge + tail-hedge trigger -----------
+    @staticmethod
+    def _await_forge_hedge_events(
+        supervisor: Any, request_id: str, *, timeout_s: float
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        """Drain the supervisor bus until the cycle and its Ring 0 receipt land."""
+        deadline = time.monotonic() + max(1.0, float(timeout_s))
+        cycle: dict[str, Any] | None = None
+        signed: dict[str, Any] | None = None
+        rejected: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            try:
+                drained = supervisor.drain_events(limit=8192)
+            except Exception:  # pragma: no cover - bus teardown
+                drained = []
+            for event in drained:
+                kind = str(event.get("type"))
+                if str(event.get("request_id") or "") != request_id:
+                    continue
+                if kind == "ring2_forge_hedge":
+                    cycle = dict(event)
+                elif kind == "ring0_hedge_signed":
+                    signed = dict(event)
+                elif kind in ("ring0_hedge_rejected", "ring2_forge_error"):
+                    rejected = dict(event)
+            if cycle is not None and (signed is not None or rejected is not None):
+                return cycle, signed, rejected
+            if rejected is not None:
+                return cycle, signed, rejected
+            time.sleep(0.05)
+        return cycle, signed, rejected
+
+    def run_forge_and_hedge(self, request: ForgeHedgeRequest) -> dict[str, Any]:
+        """Execute one Nightly Alpha Forge + Tactical Tail-Hedger cycle.
+
+        Cross-process mode drives the Ring 2 worker over its control channel and
+        waits for the Ring 0 worker to verify and sign; single-process mode calls
+        the orchestrator's composition-root runner.  Both return the same
+        receipt shape, so the cockpit renders one contract.
+        """
+        started = time.monotonic()
+        request_id = (
+            str(request.request_id or "").strip()
+            or f"forge-hedge-{uuid.uuid4().hex[:8]}"
+        )
+        state = self.supervisor_state()
+        silo = str(state.get("silo") or "CRYPTO_BINANCE")
+        from core.process_supervisor import RING_SYMBOLS
+
+        symbols = [str(item) for item in (request.champion_symbols or []) if str(item)]
+        if symbols:
+            symbol = symbols[0]
+        else:
+            # Ring 0's whitelist is the authority: a symbol the firewall would
+            # reject must never be priced into a hedge proposal (sec_004).
+            allowed = sorted(
+                str(item) for item in (self.firewall.whitelists.get(silo) or [])
+            )
+            symbol = (
+                allowed[0]
+                if allowed
+                else str(state.get("symbol") or RING_SYMBOLS.get(silo, "BTCUSDT"))
+            )
+        fills = (
+            [float(value) for value in request.champion_fills_bps]
+            if request.champion_fills_bps
+            else list(FORGE_HEDGE_DRILL_FILLS_BPS)
+        )
+        strategy_id = str(request.strategy_id or self.strategy_id)
+
+        supervisor = self.process_supervisor
+        running = bool(self.ring_processes().get("running", False))
+        cycle: dict[str, Any] | None = None
+        signature: dict[str, Any] | None = None
+        rejected: dict[str, Any] | None = None
+
+        if supervisor is not None and running:
+            mode = "cross_process"
+            command = supervisor.run_forge_and_hedge_cycle(
+                strategy_id=strategy_id,
+                champion_fills_bps=fills,
+                champion_symbols=[symbol],
+                challengers=int(request.challengers),
+                price_shock_bps=float(request.price_shock_bps),
+                tail_correlation=float(request.tail_correlation),
+                spot=float(request.spot),
+                request_id=request_id,
+            )
+            request_id = str(command.get("request_id") or request_id)
+            cycle, signature, rejected = self._await_forge_hedge_events(
+                supervisor, request_id, timeout_s=float(request.timeout_s)
+            )
+            if cycle is None:
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        "Ring 2 did not answer the forge cycle within "
+                        f"{float(request.timeout_s):.0f} s"
+                    ),
+                )
+        else:
+            mode = "single_process"
+            runner = self.forge_hedge_runner
+            if runner is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "forge+hedge runner is not attached: start the four OS "
+                        "workers or run inside the single-process orchestrator"
+                    ),
+                )
+            try:
+                cycle = dict(
+                    runner(
+                        strategy_id=strategy_id,
+                        champion_fills_bps=fills,
+                        champion_symbols=[symbol],
+                        challengers=int(request.challengers),
+                        price_shock_bps=float(request.price_shock_bps),
+                        tail_correlation=float(request.tail_correlation),
+                        spot=float(request.spot),
+                        request_id=request_id,
+                    )
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"forge+hedge cycle failed: {type(exc).__name__}",
+                ) from None
+            signature = cycle.get("ring0_signature")
+            if isinstance(signature, dict) and str(signature.get("type", "")) == "ring0_hedge_rejected":
+                rejected = signature
+                signature = None
+
+        retirements = [dict(item) for item in (cycle.get("retirements") or [])]
+        disarmed = sum(int(item.get("disarmed_leases", 0) or 0) for item in retirements)
+        receipt: dict[str, Any] | None = None
+        if signature:
+            receipt = {
+                "proposal_id": str(signature.get("proposal_id", "")),
+                "plan_id": str(signature.get("plan_id", "")),
+                "silo": str(signature.get("silo", silo)),
+                "symbol": str(signature.get("symbol", symbol)),
+                "vault": str(signature.get("vault", "TacticalSwing")),
+                "hedge_role": str(signature.get("hedge_role", "INSURANCE")),
+                "digest_hex": str(signature.get("digest_hex", "")),
+                "signature_hex": str(signature.get("signature_hex", "")),
+                "public_key_hex": str(signature.get("public_key_hex", "")),
+                "signature_algorithm": "ed25519",
+                "verified": bool(signature.get("verified", False)),
+                "premium_bps": signature.get("premium_bps"),
+                "strike": signature.get("strike"),
+                "contracts": signature.get("contracts"),
+                "grounding_hash": str(signature.get("grounding_hash", "")),
+            }
+
+        return {
+            "kind": "nios_forge_hedge_receipt",
+            "mode": mode,
+            "request_id": request_id,
+            "operator": str(request.operator),
+            "silo": silo,
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "champion_id": str(cycle.get("champion_id") or strategy_id),
+            "champion_status": cycle.get("champion_status"),
+            "champion_rolling_net_bps": cycle.get("champion_rolling_net_bps"),
+            "retired_champions": int(cycle.get("retired", 0) or 0),
+            "disarmed_leases": disarmed,
+            "retirements": retirements,
+            "promoted_champions": int(cycle.get("promoted", 0) or 0),
+            "genomes_evaluated": int(cycle.get("genomes_evaluated", 0) or 0),
+            "cascade_fragility_index": cycle.get("cascade_fragility_index"),
+            "tail_correlation": cycle.get("tail_correlation"),
+            "tail_hedge_triggered": bool(cycle.get("tail_hedge_triggered", False)),
+            "hedge_routed": bool(receipt is not None),
+            "signed": bool(receipt is not None and receipt["verified"]),
+            "ring0_signature": receipt,
+            "rejection": (
+                {"reason": str(rejected.get("reason", "")), **{
+                    key: rejected[key]
+                    for key in ("proposal_id", "premium_micros", "cap_micros")
+                    if key in rejected
+                }}
+                if rejected
+                else None
+            ),
+            "elapsed_ms": round((time.monotonic() - started) * 1e3, 3),
+            "timestamp_ns": time.time_ns(),
+            "law": (
+                "sec_018 Laws 4+5 - shadow graduation, nightly forge, ADR-009 "
+                "insurance route; Ring 2 proposes, Ring 0 signs"
+            ),
+        }
+
     # -- Phase 3 Step 3: Ring 0 sandbox execution bridge -----------------
     def _ensure_testnet_bridge(self) -> Any:
         if self.testnet_bridge is not None:
@@ -1868,6 +2229,38 @@ class ControlPlane:
                         "operator action (sec_011 rule 11)"
                     ),
                 )
+            if request.mode == SiloMode.LIVE.value and request.confirm_live:
+                # Phase 4 Step 2 -- Pre-Flight Go-Live Gate.  A silo may only
+                # leave PAPER when the 22-gate certificate is green: an
+                # uncertified invariant (dirty tree, broken proof, stale vault)
+                # must fail closed *before* capital is exposed.
+                certificate = self.preflight_certificate(full_smoke=False)
+                failed = int(certificate.get("failed_gates", 0) or 0)
+                if failed or not certificate.get("ready_for_live_cutover", False):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "PRE_FLIGHT_GATE_BLOCKED",
+                            "message": (
+                                "LIVE cutover refused: the 22-gate pre-flight "
+                                "certificate does not certify this release"
+                            ),
+                            "failed_gates": failed,
+                            "failed_gate_ids": list(
+                                certificate.get("failed_gate_ids") or []
+                            ),
+                            "warned_gates": int(
+                                certificate.get("warned_gates", 0) or 0
+                            ),
+                            "certificate_sha256": str(
+                                certificate.get("certificate_sha256", "")
+                            ),
+                            "remediation": (
+                                "POST /api/v2/control/preflight, resolve every FAIL "
+                                "row, then retry the LIVE transition"
+                            ),
+                        },
+                    )
             self.registry.set_mode(
                 silo.silo_id,
                 request.mode,
@@ -2503,6 +2896,29 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.post("/api/v2/control/supervisor")
     def control_supervisor(request: SupervisorControlRequest) -> dict[str, Any]:
         return control.control_supervisor(request)
+
+    # ---- Phase 4 Step 2: closed-loop forge + tail-hedge trigger --------
+    @app.post("/api/v2/control/supervisor/forge-hedge")
+    def control_supervisor_forge_hedge(
+        request: ForgeHedgeRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.run_forge_and_hedge(request or ForgeHedgeRequest())
+
+    # ---- Phase 4 Step 2: 22-gate pre-flight go-live certificate --------
+    @app.get("/api/v2/control/preflight")
+    def control_preflight_state(refresh: bool = Query(False)) -> dict[str, Any]:
+        return control.preflight_state(refresh=refresh)
+
+    @app.post("/api/v2/control/preflight")
+    def control_preflight(
+        request: PreflightRequest | None = None,
+    ) -> dict[str, Any]:
+        payload = request or PreflightRequest()
+        return control.preflight_certificate(
+            full_smoke=payload.full_smoke,
+            silo=payload.silo,
+            refresh=payload.refresh,
+        )
 
     # ---- Phase 3 Step 3: Ring 0 sandbox order dispatch -----------------
     @app.get("/api/v2/control/brokers/testnet")

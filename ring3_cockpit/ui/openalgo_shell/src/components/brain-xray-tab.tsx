@@ -7,6 +7,7 @@ import {
   Clock3,
   Cpu,
   Fingerprint,
+  Flame,
   GitBranch,
   HeartPulse,
   RefreshCw,
@@ -28,12 +29,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { fetchFormalProofs, postSupervisor } from '@/lib/api'
+import { fetchFormalProofs, postSupervisor, postSupervisorForgeHedge } from '@/lib/api'
 import { formatBps, formatPct, truncateDigest } from '@/lib/format'
 import type {
   CockpitState,
   ContagionState,
   FeedState,
+  ForgeHedgeReceipt,
   FormalProofState,
   LeaseRow,
   RingProcessesState,
@@ -244,6 +246,9 @@ function RingProcessMatrix({
   const [busy, setBusy] = useState<'start' | 'restart' | null>(null)
   const [note, setNote] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Phase 4 Step 2: closed-loop Ring 2 forge + Ring 0 signed tail-hedge.
+  const [forgeBusy, setForgeBusy] = useState(false)
+  const [forge, setForge] = useState<ForgeHedgeReceipt | null>(null)
 
   const startSupervisor = async () => {
     setBusy('start')
@@ -261,6 +266,29 @@ function RingProcessMatrix({
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
       setBusy(null)
+    }
+  }
+
+  const runForgeHedge = async () => {
+    setForgeBusy(true)
+    setError(null)
+    setNote(null)
+    try {
+      const receipt = await postSupervisorForgeHedge()
+      setForge(receipt)
+      const signature = receipt.ring0_signature
+      setNote(
+        `${receipt.mode === 'cross_process' ? 'Ring 2 worker' : 'Single-process'} cycle · ` +
+          `${receipt.retired_champions} champion(s) retired · ` +
+          `${receipt.disarmed_leases} lease(s) disarmed · ` +
+          (receipt.signed
+            ? `Ring 0 Ed25519 ${String(signature?.signature_hex ?? '').slice(0, 16)}… verified`
+            : `no signature (${receipt.rejection?.reason ?? 'hedge not routed'})`)
+      )
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setForgeBusy(false)
     }
   }
 
@@ -327,13 +355,24 @@ function RingProcessMatrix({
               size="sm"
               variant="outline"
               className="h-6 px-2 font-mono text-[9px]"
-              disabled={busy !== null || !available}
+              disabled={busy !== null || !available || forgeBusy}
               onClick={restartRing1}
             >
               <RefreshCw
                 className={`mr-1 size-3 ${busy === 'restart' ? 'animate-spin' : ''}`}
               />
               RESTART RING 1
+            </Button>
+            {/* Phase 4 Step 2: closed-loop ring forge + Ring 0 signed hedge. */}
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 font-mono text-[9px]"
+              disabled={forgeBusy}
+              onClick={runForgeHedge}
+            >
+              <Flame className={`mr-1 size-3 ${forgeBusy ? 'animate-pulse' : ''}`} />
+              {forgeBusy ? 'FORGING…' : 'RUN CROSS-PROCESS FORGE & TAIL-HEDGE'}
             </Button>
           </div>
         </div>
@@ -455,6 +494,74 @@ function RingProcessMatrix({
             last cycle · {lastCycle.frames ?? 0} frames ·{' '}
             <span className="text-emerald-300">{lastCycle.accepted ?? 0} accepted</span> ·{' '}
             {lastCycle.rejected ?? 0} rejected · round {lastCycle.round ?? 0}
+          </div>
+        ) : null}
+
+        {/* Phase 4 Step 2: Ring 0 Ed25519 tail-hedge receipt from the cycle. */}
+        {forge ? (
+          <div className="space-y-2 rounded-md border border-border/60 bg-muted/20 px-3 py-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                <Flame className="size-3" />
+                Forge + tail-hedge cycle
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Badge variant="outline" className="font-mono text-[8px]">
+                  {forge.mode === 'cross_process' ? 'CROSS-PROCESS' : 'SINGLE-PROCESS'}
+                </Badge>
+                <Badge
+                  variant={forge.signed ? 'secondary' : 'outline'}
+                  className={`font-mono text-[8px] ${
+                    forge.signed
+                      ? 'border-emerald-500/40 text-emerald-300'
+                      : 'border-amber-500/40 text-amber-300'
+                  }`}
+                >
+                  <ShieldCheck className="mr-1 size-3" />
+                  {forge.signed ? 'RING 0 ED25519 VERIFIED' : 'UNSIGNED'}
+                </Badge>
+              </div>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-4">
+              <Metric label="Retired champions" value={String(forge.retired_champions)} />
+              <Metric label="Disarmed leases" value={String(forge.disarmed_leases)} />
+              <Metric label="Genomes evaluated" value={String(forge.genomes_evaluated)} />
+              <Metric
+                label="Fragility"
+                value={
+                  forge.cascade_fragility_index === null ||
+                  forge.cascade_fragility_index === undefined
+                    ? '—'
+                    : forge.cascade_fragility_index.toFixed(3)
+                }
+              />
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <Fingerprint className="size-3" />
+                Ed25519 signature
+              </span>
+              <span className="font-mono text-foreground">
+                {forge.ring0_signature
+                  ? `${forge.ring0_signature.signature_hex.slice(0, 24)}…`
+                  : (forge.rejection?.reason ?? 'hedge not routed')}
+              </span>
+            </div>
+            {forge.ring0_signature ? (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[9px] text-muted-foreground">
+                <span>vault {forge.ring0_signature.vault}</span>
+                <span>silo {forge.ring0_signature.silo}</span>
+                <span>symbol {forge.ring0_signature.symbol}</span>
+                <span>
+                  premium{' '}
+                  {forge.ring0_signature.premium_bps === null
+                    ? '—'
+                    : `${forge.ring0_signature.premium_bps.toFixed(1)} bps`}
+                </span>
+                <span>request {forge.request_id}</span>
+                <span>{forge.elapsed_ms.toFixed(0)} ms</span>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </CardContent>

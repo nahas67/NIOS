@@ -8,11 +8,13 @@ import type {
   ExtensionsState,
   FeedControlResponse,
   FeedMode,
+  ForgeHedgeReceipt,
   FormalProofState,
   KillReport,
   LLMControlPayload,
   LLMProbeReport,
   MetricsSnapshot,
+  PreflightCertificate,
   RearmReport,
   SupervisorControlResponse,
   VaultRotationReport,
@@ -238,5 +240,55 @@ export function postVaultRotate(
   return request<VaultRotationReport>('/api/v2/control/vault/rotate-keys', {
     method: 'POST',
     body: JSON.stringify({ operator, reason: 'operator-initiated rotation' }),
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 Step 2 — 22-gate pre-flight go-live certificate
+ * ------------------------------------------------------------------ */
+
+/**
+ * Interactive readiness certificate (`GET /api/v2/control/preflight`).
+ *
+ * The server replays a short-lived in-process certificate and, by default, the
+ * persisted 22-row smoke receipt for this commit, so the cockpit stays
+ * responsive. `refresh` forces a fresh certification run.
+ */
+export function fetchPreflight(refresh = false): Promise<PreflightCertificate> {
+  const query = refresh ? '?refresh=true' : ''
+  return request<PreflightCertificate>(`/api/v2/control/preflight${query}`)
+}
+
+/**
+ * Full 22-gate certification (`POST /api/v2/control/preflight`).
+ *
+ * `fullSmoke=true` re-spawns the 22-row suite instead of replaying the receipt —
+ * the release-gate form an operator runs before `confirm_live=true`.
+ */
+export function postPreflight(
+  fullSmoke = false,
+  silo = 'ALL'
+): Promise<PreflightCertificate> {
+  return request<PreflightCertificate>('/api/v2/control/preflight', {
+    method: 'POST',
+    body: JSON.stringify({ full_smoke: fullSmoke, silo, refresh: true }),
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 Step 2 — cross-process forge + tail-hedge cycle
+ * ------------------------------------------------------------------ */
+
+/**
+ * Run one closed-loop Nightly Alpha Forge + Tactical Tail-Hedger cycle.
+ *
+ * Ring 2 demotes decayed champions (disarming their leases), breeds challengers,
+ * runs the contagion cascade and prices a grounded put; Ring 0 verifies and
+ * Ed25519-signs it. The receipt is proof-only.
+ */
+export function postSupervisorForgeHedge(): Promise<ForgeHedgeReceipt> {
+  return request<ForgeHedgeReceipt>('/api/v2/control/supervisor/forge-hedge', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit' }),
   })
 }

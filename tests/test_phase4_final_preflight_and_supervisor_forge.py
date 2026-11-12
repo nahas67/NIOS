@@ -13,6 +13,17 @@ Four gates close the Main Core (Phases 1-3):
 * Gate 4 -- the regression inventory grew from 17 to 18 suites while every
   pre-existing Phase 1-3 suite stayed intact.
 
+Phase 4 Step 2 wires those organs into the Ring 3 control plane and cockpit:
+
+* ``GET``/``POST /api/v2/control/preflight`` return the certificate with
+  ``ready_for_live_cutover``, ``passed_gates``/``failed_gates`` and a
+  64-character SHA-256 digest.
+* ``POST /api/v2/control/supervisor/forge-hedge`` executes the closed-loop forge
+  + tail-hedge cycle and returns a verified Ring 0 Ed25519 receipt.
+* ``POST /api/v2/control/brokers`` refuses ``mode="LIVE"`` unless the
+  certificate reports ``failed_gates == 0``.
+* The compiled ``dist/`` bundle served at ``GET /`` carries both controls.
+
 Nothing in this module places a live order, unlocks a silo, or reads a secret.
 The Ring 0 leg only ever produces an *unsigned* proposal signature over a
 sandbox-safe payload.
@@ -26,6 +37,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, Iterator
 
 import pytest
 
@@ -34,6 +46,7 @@ PYTHON = sys.executable or "python"
 
 SILO = "CRYPTO_BINANCE"
 SYMBOL = "BTCUSDT"
+RELEASE_EXPECTED = "3.0.0-PROD"
 
 #: The 17 suites that already existed when Phase 4 began.
 BASELINE_SUITES: tuple[str, ...] = (
@@ -315,3 +328,185 @@ def test_gate4_regression_inventory_is_eighteen_suites() -> None:
     assert EXPECTED_SANDBOX_VENUES == 12
     assert len(SILOS) == 4
     assert len(set(SILOS)) == 4
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Step 2 -- Ring 3 control-plane wiring of the certificate + forge
+# ---------------------------------------------------------------------------
+
+LIVE_SILO = "FX_MT5"
+
+
+@pytest.fixture(scope="module")
+def cockpit() -> Iterator[Any]:
+    """One certified single-process cockpit shared by the Step 2 assertions."""
+    from fastapi.testclient import TestClient
+
+    from scripts.run_nios import build_runtime
+
+    runtime = build_runtime()
+    try:
+        yield TestClient(runtime.control_app())
+    finally:
+        runtime.close()
+
+
+def test_step2_get_preflight_certifies_22_gates(cockpit: Any) -> None:
+    """``GET /api/v2/control/preflight`` is the interactive readiness contract."""
+    response = cockpit.get("/api/v2/control/preflight")
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["kind"] == "nios_golive_readiness_certificate"
+    assert body["release"] == RELEASE_EXPECTED
+    assert body["ready_for_live_cutover"] is True
+    assert body["failed_gates"] == 0
+    assert body["warned_gates"] == 0
+    assert body["passed_gates"] == 22
+    assert body["total_gates"] == 22
+    assert body["failed_gate_ids"] == []
+
+    digest = body["certificate_sha256"]
+    assert isinstance(digest, str) and len(digest) == 64
+    int(digest, 16)
+
+    gates = body["gates"]
+    assert len(gates) == 22
+    assert [gate["status"] for gate in gates] == ["PASS"] * 22
+    assert len(body["gate_checklist"]) == 22
+    assert body["endpoint"] == "/api/v2/control/preflight"
+    assert body["served_from"] in {"in_process_cache", "fresh_run"}
+
+
+def test_step2_post_preflight_fast_path_is_deterministic(cockpit: Any) -> None:
+    """``POST`` with ``full_smoke=False`` replays the same certificate digest."""
+    first = cockpit.get("/api/v2/control/preflight").json()
+    response = cockpit.post(
+        "/api/v2/control/preflight",
+        json={"full_smoke": False, "silo": "ALL", "refresh": False},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["full_smoke"] is False
+    assert body["ready_for_live_cutover"] is True
+    assert body["failed_gates"] == 0
+    # Deterministic over gate outcomes: same tree, same digest, cached or not.
+    assert body["certificate_sha256"] == first["certificate_sha256"]
+    assert body["served_from"] in {"in_process_cache", "fresh_run"}
+
+
+def test_step2_forge_hedge_cycle_returns_verified_ring0_signature(
+    cockpit: Any,
+) -> None:
+    """The closed loop retires a champion, disarms leases and signs in Ring 0."""
+    response = cockpit.post(
+        "/api/v2/control/supervisor/forge-hedge",
+        json={"operator": "ops@nios", "request_id": "phase4-step2"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["kind"] == "nios_forge_hedge_receipt"
+    assert body["mode"] in {"single_process", "cross_process"}
+    assert body["request_id"] == "phase4-step2"
+    assert body["retired_champions"] >= 1
+    assert body["disarmed_leases"] >= 1
+    assert body["genomes_evaluated"] >= 4
+    assert body["tail_hedge_triggered"] is True
+    assert body["hedge_routed"] is True
+    assert body["signed"] is True
+    assert body["rejection"] is None
+
+    signature = body["ring0_signature"]
+    assert signature is not None
+    assert signature["vault"] == "TacticalSwing"
+    assert signature["hedge_role"] == "INSURANCE"
+    assert signature["signature_algorithm"] == "ed25519"
+    assert signature["verified"] is True
+    assert len(signature["digest_hex"]) == 64
+    assert len(signature["signature_hex"]) == 128
+    assert len(signature["public_key_hex"]) == 64
+    assert len(signature["grounding_hash"]) == 64
+    assert signature["premium_bps"] and signature["premium_bps"] > 0.0
+    assert signature["strike"] < 50_000.0 * 1.01
+    assert signature["proposal_id"].startswith("tail-hedge-")
+
+
+def test_step2_live_cutover_requires_a_green_certificate(
+    cockpit: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mode="LIVE"`` fails closed when a critical invariant is broken."""
+    control = cockpit.app.state.control
+    monkeypatch.setattr(
+        control,
+        "preflight_certificate",
+        lambda **_kwargs: {
+            "ready_for_live_cutover": False,
+            "failed_gates": 1,
+            "failed_gate_ids": ["formal.tla_four_proofs"],
+            "warned_gates": 0,
+            "certificate_sha256": "f" * 64,
+        },
+    )
+    blocked = cockpit.post(
+        "/api/v2/control/brokers",
+        json={
+            "silo": LIVE_SILO,
+            "mode": "LIVE",
+            "confirm_live": True,
+            "operator": "ops@nios",
+        },
+    )
+    assert blocked.status_code == 409, blocked.text
+    detail = blocked.json()["detail"]
+    assert detail["error"] == "PRE_FLIGHT_GATE_BLOCKED"
+    assert detail["failed_gates"] == 1
+    assert detail["failed_gate_ids"] == ["formal.tla_four_proofs"]
+
+    monkeypatch.undo()
+
+    # With the real, green certificate the same request is authorised ...
+    allowed = cockpit.post(
+        "/api/v2/control/brokers",
+        json={
+            "silo": LIVE_SILO,
+            "mode": "LIVE",
+            "confirm_live": True,
+            "operator": "ops@nios",
+        },
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["broker"]["mode"] == "LIVE"
+
+    # ... and PAPER is always allowed back.
+    paper = cockpit.post(
+        "/api/v2/control/brokers", json={"silo": LIVE_SILO, "mode": "PAPER"}
+    )
+    assert paper.status_code == 200, paper.text
+    assert paper.json()["broker"]["mode"] == "PAPER"
+
+
+def test_step2_compiled_bundle_serves_both_new_controls(cockpit: Any) -> None:
+    """The production bundle served at ``/`` carries the Step 2 cockpit controls."""
+    root = cockpit.get("/")
+    assert root.status_code == 200
+    assert "text/html" in root.headers.get("content-type", "")
+
+    bundle = ROOT / "ring3_cockpit" / "ui" / "openalgo_shell" / "dist"
+    assert (bundle / "index.html").is_file(), "production bundle was not rebuilt"
+    assets = sorted((bundle / "assets").glob("*.js"))
+    assert assets, "no compiled JS chunk"
+    script = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace") for path in assets
+    )
+
+    for needle in (
+        "22-Gate Go-Live Readiness Certificate",
+        "RUN CROSS-PROCESS FORGE",
+        "/api/v2/control/preflight",
+        "/api/v2/control/supervisor/forge-hedge",
+        "ready_for_live_cutover",
+        "certificate_sha256",
+    ):
+        assert needle in script, f"missing cockpit control: {needle}"

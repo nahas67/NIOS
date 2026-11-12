@@ -33,7 +33,7 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { postBroker, postBrokerCredentials, postExtensions, postLLM, postLLMProbe, fetchMetrics, fetchVaultStatus, metricsAliasUrl, metricsJsonUrl, metricsUrl, postVaultRotate } from '@/lib/api'
+import { postBroker, postBrokerCredentials, postExtensions, postLLM, postLLMProbe, fetchMetrics, fetchPreflight, fetchVaultStatus, metricsAliasUrl, metricsJsonUrl, metricsUrl, postPreflight, postVaultRotate } from '@/lib/api'
 import { formatPct, formatUsd } from '@/lib/format'
 import type {
   BrokerCredentialReport,
@@ -43,6 +43,7 @@ import type {
   LLMProbeReport,
   LLMSlot,
   MetricsSnapshot,
+  PreflightCertificate,
   SiloState,
   VaultKey,
   VaultRotationReport,
@@ -149,6 +150,8 @@ export function ControlRoomTab({ state, onSaved }: ControlRoomTabProps) {
       <BrokerCredentialVault state={state} onSaved={onSaved} />
 
       <VaultRotationPanel />
+
+      <GoLivePreflightPanel />
 
       <ExtensionsPanel
         extensions={state?.extensions ?? null}
@@ -1484,6 +1487,239 @@ function TelemetryMetricsPanel() {
 /* ------------------------------------------------------------------ *
  * Phase 3 Step 5 · Ring 0 zero-downtime key rotation + OS tuning
  * ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 Step 2 — 22-gate go-live readiness certificate
+ * ------------------------------------------------------------------ */
+
+function GoLivePreflightPanel() {
+  const [certificate, setCertificate] = useState<PreflightCertificate | null>(null)
+  const [busy, setBusy] = useState<'fast' | 'full' | null>(null)
+  const [message, setMessage] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let live = true
+    const load = async () => {
+      try {
+        const next = await fetchPreflight(false)
+        if (live) setCertificate(next)
+      } catch (cause) {
+        if (live) {
+          setFailed(true)
+          setMessage(
+            cause instanceof Error ? cause.message : 'pre-flight certificate unavailable'
+          )
+        }
+      }
+    }
+    void load()
+    return () => {
+      live = false
+    }
+  }, [])
+
+  const run = async (fullSmoke: boolean) => {
+    setBusy(fullSmoke ? 'full' : 'fast')
+    setMessage(null)
+    setFailed(false)
+    try {
+      const next = await postPreflight(fullSmoke, 'ALL')
+      setCertificate(next)
+      setMessage(
+        `${next.passed_gates}/${next.total_gates} gates passed · ` +
+          `${next.failed_gates} failed · ` +
+          `${next.ready_for_live_cutover ? 'LIVE CUTOVER AUTHORISED' : 'LIVE CUTOVER BLOCKED'}`
+      )
+    } catch (cause) {
+      setFailed(true)
+      setMessage(cause instanceof Error ? cause.message : 'pre-flight certification failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const ready = Boolean(certificate?.ready_for_live_cutover)
+  const gates = certificate?.gates ?? []
+  const digest = certificate?.certificate_sha256 ?? ''
+
+  return (
+    <Card className="gap-3 border-border/70 bg-card/60 py-4 shadow-none">
+      <CardHeader className="px-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <ShieldCheck className="size-4 text-primary" />
+            22-Gate Go-Live Readiness Certificate
+          </CardTitle>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge
+              variant={ready ? 'secondary' : 'outline'}
+              className={`font-mono text-[9px] ${
+                ready
+                  ? 'border-emerald-500/40 text-emerald-300'
+                  : 'border-amber-500/40 text-amber-300'
+              }`}
+            >
+              {certificate
+                ? ready
+                  ? 'READY FOR LIVE CUTOVER'
+                  : 'LIVE CUTOVER BLOCKED'
+                : 'NOT CERTIFIED'}
+            </Badge>
+            <Badge variant="outline" className="font-mono text-[9px]">
+              {certificate
+                ? `${certificate.passed_gates} / ${certificate.total_gates} GATES`
+                : 'PRE-FLIGHT PENDING'}
+            </Badge>
+            {certificate?.served_from ? (
+              <Badge variant="outline" className="font-mono text-[9px]">
+                {certificate.served_from === 'in_process_cache' ? 'CACHED' : 'FRESH RUN'}
+              </Badge>
+            ) : null}
+          </div>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Every constitutional invariant — clean tree, TLA+ 35,771-state proofs, 1,000-step
+          VOPR, vault custody, conformal rejects, cost floors, supervisor signing contract,
+          OS socket readiness, kill switch — certified before a silo may leave{' '}
+          <span className="font-mono">PAPER</span>. A single FAIL refuses{' '}
+          <span className="font-mono">confirm_live=true</span>.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3 px-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 px-3 font-mono text-[10px]"
+            disabled={busy !== null}
+            onClick={() => void run(false)}
+          >
+            <ShieldCheck className="mr-1 size-3" />
+            {busy === 'fast' ? 'CERTIFYING…' : 'RUN 22-GATE PRE-FLIGHT'}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 px-3 font-mono text-[10px]"
+            disabled={busy !== null}
+            onClick={() => void run(true)}
+          >
+            <RefreshCw className={`mr-1 size-3 ${busy === 'full' ? 'animate-spin' : ''}`} />
+            {busy === 'full' ? 'RE-RUNNING SMOKE…' : 'FULL SMOKE RE-RUN'}
+          </Button>
+          <span className="font-mono text-[10px] text-muted-foreground">
+            release {certificate?.release ?? '3.0.0-PROD'} · scope{' '}
+            {certificate?.silo_scope ?? 'ALL'}
+          </span>
+        </div>
+
+        {message ? (
+          <div
+            className={`rounded-md border px-2 py-1 font-mono text-[10px] ${
+              failed
+                ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+            }`}
+          >
+            {message}
+          </div>
+        ) : null}
+
+        <div className="grid gap-2 sm:grid-cols-3">
+          <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              Ready for live cutover
+            </div>
+            <div
+              className={`font-mono text-xs ${
+                ready ? 'text-emerald-300' : 'text-amber-300'
+              }`}
+            >
+              {certificate ? (ready ? 'TRUE' : 'FALSE') : '—'}
+            </div>
+          </div>
+          <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              Gates passed
+            </div>
+            <div className="font-mono text-xs tabular-nums">
+              {certificate
+                ? `${certificate.passed_gates} / ${certificate.total_gates}`
+                : '—'}
+            </div>
+          </div>
+          <div className="rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              Failed gates
+            </div>
+            <div
+              className={`font-mono text-xs tabular-nums ${
+                certificate && certificate.failed_gates > 0
+                  ? 'text-red-300'
+                  : 'text-emerald-300'
+              }`}
+            >
+              {certificate ? certificate.failed_gates : '—'}
+            </div>
+          </div>
+        </div>
+
+        <div className="rounded-md border border-border/60 bg-muted/20 px-2 py-1.5">
+          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+            Certificate SHA-256 ({digest.length} chars)
+          </div>
+          <div className="break-all font-mono text-[10px] text-foreground">
+            {digest || '—'}
+          </div>
+        </div>
+
+        {certificate && certificate.failed_gate_ids.length > 0 ? (
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1.5 font-mono text-[10px] text-red-200">
+            FAIL · {certificate.failed_gate_ids.join(' · ')}
+          </div>
+        ) : null}
+
+        {gates.length > 0 ? (
+          <div className="max-h-64 overflow-auto rounded-md border border-border/60">
+            <table className="w-full border-collapse text-[10px]">
+              <thead className="sticky top-0 bg-card/95">
+                <tr className="text-left uppercase tracking-wide text-muted-foreground">
+                  <th className="w-8 px-2 py-1 font-normal">#</th>
+                  <th className="px-2 py-1 font-normal">Gate</th>
+                  <th className="w-16 px-2 py-1 font-normal">Status</th>
+                  <th className="px-2 py-1 font-normal">Evidence</th>
+                </tr>
+              </thead>
+              <tbody>
+                {gates.map((gate, index) => (
+                  <tr key={gate.gate} className="border-t border-border/40">
+                    <td className="px-2 py-1 font-mono text-muted-foreground">
+                      {index + 1}
+                    </td>
+                    <td className="px-2 py-1 font-mono text-foreground">{gate.gate}</td>
+                    <td
+                      className={`px-2 py-1 font-mono ${
+                        gate.status === 'PASS'
+                          ? 'text-emerald-300'
+                          : gate.status === 'WARN'
+                            ? 'text-amber-300'
+                            : 'text-red-300'
+                      }`}
+                    >
+                      {gate.status}
+                    </td>
+                    <td className="px-2 py-1 text-muted-foreground">{gate.detail}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  )
+}
 
 function VaultRotationPanel() {
   const [status, setStatus] = useState<VaultStatus | null>(null)

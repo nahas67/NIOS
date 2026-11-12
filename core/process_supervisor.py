@@ -1028,6 +1028,7 @@ def _forge_and_hedge_cycle(
     symbol: str,
     strategy_id: str,
     toolkit: Mapping[str, Any],
+    hedge_basis: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One closed-loop Nightly Alpha Forge + Tactical Tail-Hedger cycle.
 
@@ -1089,6 +1090,7 @@ def _forge_and_hedge_cycle(
         spot=spot,
         symbol=symbol,
         silo=silo,
+        **dict(hedge_basis or {}),
     )
 
     event: dict[str, Any] = {

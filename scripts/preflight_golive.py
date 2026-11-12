@@ -205,6 +205,7 @@ class PreflightContext:
     silo_scope: str
     strict: bool
     tempdir: str
+    full_smoke: bool = True
     runtime: Any = None
     _client: Any = None
 
@@ -388,8 +389,80 @@ def gate_artifacts_present(_ctx: PreflightContext) -> Gate:
 # ---------------------------------------------------------------------------
 
 
-def gate_smoke_suite(_ctx: PreflightContext) -> Gate:
-    """Run ``scripts/run_nios.py --smoke-test`` and require 22 PASS rows."""
+def _smoke_receipt_path() -> Path:
+    """Where a completed 22-row smoke certification is cached.
+
+    The receipt is a *record of a real run*, never a substitute for one: it is
+    keyed on the git commit, invalidated when that commit moves, and only ever
+    written after ``run_nios.py --smoke-test`` printed 22 PASS rows and exited
+    zero.  ``full_smoke=False`` (the interactive cockpit fast path) replays it
+    so an operator is not forced to wait ~30 s for a suite that has not changed.
+    """
+    return ROOT / ".nios" / "preflight" / "smoke_receipt.json"
+
+
+def _read_smoke_receipt() -> dict[str, Any] | None:
+    """Return the cached receipt when it still describes *this* commit."""
+    path = _smoke_receipt_path()
+    if not path.is_file():
+        return None
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # pragma: no cover - corrupt cache is a miss
+        return None
+    code, out, _err = _git("rev-parse", "HEAD")
+    head = out.strip() if code == 0 else ""
+    if not head or str(receipt.get("commit", "")) != head:
+        return None
+    if int(receipt.get("rows_observed", 0) or 0) != 22:
+        return None
+    if int(receipt.get("returncode", -1)) != 0 or not receipt.get("certified"):
+        return None
+    return receipt
+
+
+def _write_smoke_receipt(evidence: Mapping[str, Any]) -> None:
+    """Persist a *successful* smoke certification for the fast path."""
+    code, out, _err = _git("rev-parse", "HEAD")
+    head = out.strip() if code == 0 else ""
+    path = _smoke_receipt_path()
+    payload = {
+        "schema": "nios_smoke_receipt_v1",
+        "commit": head,
+        "generated_at_ns": time.time_ns(),
+        **{key: evidence[key] for key in evidence},
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    except OSError:  # pragma: no cover - a cache write must never fail the gate
+        pass
+
+
+def gate_smoke_suite(ctx: PreflightContext) -> Gate:
+    """Run ``scripts/run_nios.py --smoke-test`` and require 22 PASS rows.
+
+    With ``ctx.full_smoke`` false the gate replays the persisted receipt for the
+    current commit instead of re-spawning a 30 s suite; the evidence it reports
+    is byte-identical to the executed run so the certificate digest is stable
+    across both paths.
+    """
+    if not ctx.full_smoke:
+        receipt = _read_smoke_receipt()
+        if receipt is not None:
+            return Gate(
+                "smoke.22_row_suite",
+                "22-row run_nios.py --smoke-test suite",
+                PASS,
+                str(receipt.get("detail") or "ROWS=22"),
+                {
+                    "rows_expected": 22,
+                    "rows_observed": int(receipt.get("rows_observed", 22)),
+                    "certified": bool(receipt.get("certified", True)),
+                    "returncode": int(receipt.get("returncode", 0)),
+                    "budget_passed": bool(receipt.get("budget_passed", True)),
+                },
+            )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ROOT)
     env.setdefault("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
@@ -442,18 +515,22 @@ def gate_smoke_suite(_ctx: PreflightContext) -> Gate:
         detail += f", rc={completed.returncode}, pass_rows={pass_rows}"
         if first_fail:
             detail += f", first_failure={first_fail}"
+    evidence = {
+        "rows_expected": 22,
+        "rows_observed": pass_rows,
+        "certified": certified,
+        "returncode": completed.returncode,
+        "budget_passed": "RUNTIME BUDGET  PASS" in output,
+    }
+    if ok:
+        # Only a real 22-row PASS is ever cached for the fast path.
+        _write_smoke_receipt({**evidence, "detail": detail})
     return Gate(
         "smoke.22_row_suite",
         "22-row run_nios.py --smoke-test suite",
         PASS if ok else FAIL,
         detail,
-        {
-            "rows_expected": 22,
-            "rows_observed": pass_rows,
-            "certified": certified,
-            "returncode": completed.returncode,
-            "budget_passed": "RUNTIME BUDGET  PASS" in output,
-        },
+        evidence,
     )
 
 
@@ -1368,14 +1445,24 @@ def _run_gate(gate_id: str, check: Callable[[PreflightContext], Gate], ctx: Pref
 
 
 def run_preflight(
-    *, silo: str = SILO_SCOPE_ALL, strict: bool = False
+    *, silo: str = SILO_SCOPE_ALL, strict: bool = False, full_smoke: bool = True
 ) -> dict[str, Any]:
-    """Execute every gate and return the signed readiness certificate."""
+    """Execute every gate and return the signed readiness certificate.
+
+    ``full_smoke=False`` is the interactive fast path used by the Ring 3 cockpit:
+    gate 5 replays the persisted receipt of the last certified 22-row suite for
+    this commit instead of re-spawning it.  Every other gate still runs live.
+    """
     scope = SILO_SCOPE_ALL if str(silo).upper() in {"ALL", ""} else str(silo).upper()
     if scope != SILO_SCOPE_ALL and scope not in SILOS:
         raise ValueError(f"unknown silo scope: {silo!r}")
     tempdir = tempfile.mkdtemp(prefix="nios-preflight-")
-    ctx = PreflightContext(silo_scope=scope, strict=bool(strict), tempdir=tempdir)
+    ctx = PreflightContext(
+        silo_scope=scope,
+        strict=bool(strict),
+        tempdir=tempdir,
+        full_smoke=bool(full_smoke),
+    )
     gates: list[Gate] = []
     started = time.perf_counter()
     try:
@@ -1402,6 +1489,7 @@ def run_preflight(
         "signer": SIGNER,
         "silo_scope": scope,
         "strict": bool(strict),
+        "full_smoke": bool(full_smoke),
         "gates_expected": len(GATE_REGISTRY),
         "gates_passed": sum(1 for gate in gates if gate.status == PASS),
         "failed_gates": len(failed),
@@ -1471,10 +1559,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="treat warnings as failures (recommended before a live cutover)",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "replay the persisted 22-row smoke receipt for this commit instead of "
+            "re-spawning the suite (interactive cockpit path)"
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
-        report = run_preflight(silo=args.silo, strict=args.strict)
+        report = run_preflight(
+            silo=args.silo, strict=args.strict, full_smoke=not args.fast
+        )
     except ValueError as exc:
         print(f"PREFLIGHT ERROR: {exc}", file=sys.stderr)
         return 2

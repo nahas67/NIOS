@@ -1024,3 +1024,89 @@ export interface VaultRotationReport {
   zero_restart?: boolean
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 Step 2 - 22-gate go-live pre-flight certificate
+ * ------------------------------------------------------------------ */
+
+export interface PreflightGate {
+  gate: string
+  label: string
+  status: string
+  detail: string
+  evidence?: Record<string, unknown>
+  duration_ms?: number
+}
+
+export interface PreflightCertificate {
+  kind: string
+  release: string
+  schema: string
+  signer: string
+  silo_scope: string
+  strict: boolean
+  full_smoke: boolean
+  ready_for_live_cutover: boolean
+  passed_gates: number
+  failed_gates: number
+  warned_gates: number
+  total_gates: number
+  failed_gate_ids: string[]
+  warned_gate_ids: string[]
+  certificate_sha256: string
+  certificate_digest_algorithm: string
+  duration_ms?: number | null
+  generated_at_ns?: number | null
+  gates: PreflightGate[]
+  gate_checklist: string[]
+  served_from?: string
+  cache_age_s?: number
+  endpoint?: string
+  next_action?: string
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 Step 2 - closed-loop forge + Ring 0 tail-hedge receipt
+ * ------------------------------------------------------------------ */
+
+export interface ForgeHedgeSignature {
+  proposal_id: string
+  plan_id: string
+  silo: string
+  symbol: string
+  vault: string
+  hedge_role: string
+  digest_hex: string
+  signature_hex: string
+  public_key_hex: string
+  signature_algorithm: string
+  verified: boolean
+  premium_bps: number | null
+  strike: number | null
+  contracts: number | null
+  grounding_hash: string
+}
+
+export interface ForgeHedgeReceipt {
+  kind: string
+  mode: string
+  request_id: string
+  silo: string
+  symbol: string
+  strategy_id: string
+  champion_id: string
+  champion_status?: string | null
+  champion_rolling_net_bps?: number | null
+  retired_champions: number
+  disarmed_leases: number
+  retirements: Array<Record<string, unknown>>
+  promoted_champions: number
+  genomes_evaluated: number
+  cascade_fragility_index?: number | null
+  tail_hedge_triggered: boolean
+  hedge_routed: boolean
+  signed: boolean
+  ring0_signature: ForgeHedgeSignature | null
+  rejection: { reason: string } | null
+  elapsed_ms: number
+}
