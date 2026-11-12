@@ -1110,3 +1110,191 @@ export interface ForgeHedgeReceipt {
   rejection: { reason: string } | null
   elapsed_ms: number
 }
+
+/* ------------------------------------------------------------------ *
+ * Step 4 — multi-page read-only cockpit telemetry
+ * ------------------------------------------------------------------ */
+
+export interface PageSpec {
+  key: string
+  title: string
+  route: string
+  aliases: string[]
+  ring: string
+  read_only: boolean
+  summary: string
+  live?: boolean
+  status?: string
+  api?: string
+}
+
+export interface PagesIndex {
+  version: string
+  document_id: string
+  page_count: number
+  pages: PageSpec[]
+  routes: Record<string, string>
+  counts: Record<string, number | boolean>
+  air_gap: Record<string, unknown>
+  generated_at_ns: number
+}
+
+export interface OrdersPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  oms: Record<string, unknown>
+  working_orders: Array<Record<string, unknown>>
+  twap_icebergs: Array<Record<string, unknown>>
+  events: Array<Record<string, unknown>>
+  outbox: Record<string, unknown>
+  reservations: Array<Record<string, unknown>>
+  pending_reservations: number
+  positions: Record<string, unknown>
+  reconciliation: Record<string, unknown>
+  counts: Record<string, number>
+  generated_at_ns: number
+}
+
+export interface AnalyzerStrategyRow {
+  strategy_id: string
+  graduated: boolean
+  required_fills: number
+  completed_fills: number
+  remaining_fills: number
+  progress_pct: number
+  q98_bps: number
+  adverse_selection_bps: number
+  report: Record<string, unknown>
+}
+
+export interface AnalyzerNursery {
+  required_fills: number
+  calibrated: boolean
+  graduated_count: number
+  graduated_strategies: string[]
+  strategies: AnalyzerStrategyRow[]
+}
+
+export interface AnalyzerPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  nursery: AnalyzerNursery
+  paper: Record<string, number>
+  live: Record<string, number>
+  source: { package: string; components: string[] }
+  generated_at_ns: number
+}
+
+export interface QuantScanCandidate {
+  rank: number
+  symbol: string
+  score: number
+  price: number
+  feature_count?: number
+  sha256_digest?: string
+}
+
+export interface QuantScan {
+  available?: boolean
+  error?: string
+  candidates?: QuantScanCandidate[]
+  elapsed_ms?: number
+  universe_size?: number
+  factor_count?: number
+  as_of_ns?: number
+  scan_id?: string
+  kernel_count?: number
+  donor_factor_count?: number
+}
+
+export interface ActivationEntryInfo {
+  module: string
+  ok: boolean
+  error: string
+  exports: string[]
+}
+
+export interface ActivationMatrix {
+  ok: boolean
+  import_errors: number
+  loader_file_count: number
+  engine_file_count: number
+  loader_module_count: number
+  engine_module_count: number
+  total_modules: number
+  registry_sources: string[]
+  engine_classes: string[]
+  loaders: ActivationEntryInfo[]
+  engines: ActivationEntryInfo[]
+  failures: string[]
+}
+
+export interface QuantPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  universe_scan: QuantScan
+  factors: { count: number; kernels: number; warm: boolean }
+  valuation: Record<string, unknown>
+  tail_hedger: Record<string, unknown>
+  datasets: ActivationMatrix
+  generated_at_ns: number
+}
+
+export interface ForgeLeaderRow {
+  strategy_id: string
+  role: string
+  deflated_sharpe: number
+  net_edge_bps: number
+  promotion_ready: boolean
+  above_floor: boolean
+  [key: string]: unknown
+}
+
+export interface ForgePageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  forge: Record<string, unknown>
+  thresholds: Record<string, number>
+  leaderboard: ForgeLeaderRow[]
+  next_run: { seconds_until_next_run: number; next_run_ns: number; schedule_utc: string }
+  plugins: Record<string, unknown>
+  skills: Record<string, unknown>
+  generated_at_ns: number
+}
+
+export interface LedgerPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  silos: Record<string, Record<string, unknown>>
+  transfers: Array<Record<string, unknown>>
+  double_entry: { debits_micros: number; credits_micros: number; balanced: boolean }
+  ratchet: { long_term_pct: number; reserve_pct: number; cross_border_wire_bps: number }
+  invariant: Record<string, unknown>
+  backends: Record<string, unknown>
+  counts: Record<string, number>
+  generated_at_ns: number
+}
+
+export interface McpPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  tools: Array<Record<string, unknown>>
+  count: number
+  air_gap: Record<string, unknown>
+  invariants: Record<string, number>
+  transport: string
+  console_ready: boolean
+  generated_at_ns: number
+}

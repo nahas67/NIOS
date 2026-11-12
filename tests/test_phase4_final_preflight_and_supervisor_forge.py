@@ -902,3 +902,99 @@ def test_step2_mirofish_sub_1_8ms_ring1_sub_140us_and_deterministic_cert_hash(
             assert hashed["within_budget"] is True
     finally:
         runtime.close()
+
+
+def test_all_9_cockpit_pages_and_spa_routes_are_served_and_hydrated(
+    cockpit: Any,
+) -> None:
+    """Every production cockpit page is served, hydrated and grounded by Ring 3."""
+    spa_routes = (
+        "/",
+        "/dashboard",
+        "/orders",
+        "/analyzer",
+        "/quant",
+        "/brain",
+        "/forge",
+        "/ledger",
+        "/verification",
+        "/control",
+    )
+    index_bytes = (FRONTEND / "dist" / "index.html").read_bytes()
+    assert index_bytes, "compiled cockpit bundle is missing dist/index.html"
+
+    for route in spa_routes:
+        response = cockpit.get(route)
+        assert response.status_code == 200, (route, response.status_code)
+        assert response.headers["content-type"].startswith("text/html"), route
+        # Deep links and hard refreshes must return the very same shell.
+        assert response.content == index_bytes, route
+
+    index = cockpit.get("/api/v2/cockpit/pages")
+    assert index.status_code == 200
+    payload = index.json()
+    assert payload["page_count"] == 9
+    assert {page["key"] for page in payload["pages"]} == {
+        "dashboard",
+        "orders",
+        "analyzer",
+        "quant",
+        "brain",
+        "forge",
+        "ledger",
+        "verification",
+        "control",
+    }
+    assert payload["air_gap"]["ring3_read_only"] is True
+    assert payload["air_gap"]["order_signing_tools"] == 0
+    assert payload["counts"]["silos"] >= 4
+    assert payload["counts"]["vaults"] >= 4
+
+    for endpoint in ("orders", "analyzer", "quant", "forge", "ledger", "mcp"):
+        response = cockpit.get(f"/api/v2/cockpit/{endpoint}")
+        assert response.status_code == 200, endpoint
+        body = response.json()
+        assert isinstance(body, dict) and body, endpoint
+        assert body["read_only"] is True, endpoint
+        assert body["page"], endpoint
+        assert body["generated_at_ns"] > 0, endpoint
+
+    # The catch-all must never shadow the read-only surfaces behind it.
+    for guarded in ("/api/v2/cockpit/state", "/metrics", "/api/v2/mcp/tools"):
+        assert cockpit.get(guarded).status_code == 200, guarded
+
+    bundle_js = sorted((FRONTEND / "dist" / "assets").glob("*.js"))
+    assert bundle_js, "compiled cockpit bundle has no JavaScript chunk"
+    source = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
+    )
+    for title in (
+        "Sovereign Dashboard",
+        "Orders & Positions",
+        "Shadow Analyzer",
+        "Quant Scanner, Valuation Lab & Feeds",
+        "Brain & Contagion X-Ray",
+        "Nocturnal Alpha Forge & Plugins",
+        "IBOR Double-Entry Ledger & Tax Lots",
+        "Formal Proofs, Chaos & Telemetry",
+        "Control Room & MCP Console",
+    ):
+        assert title in source, f"page view {title!r} missing from the bundle"
+    for legacy in (
+        "22-Gate Go-Live Readiness Certificate",
+        "RUN CROSS-PROCESS FORGE",
+        "ready_for_live_cutover",
+        "certificate_sha256",
+    ):
+        assert legacy in source, f"legacy selector {legacy!r} missing from the bundle"
+
+    lint = _run_frontend(
+        ["biome", "lint", "src/", "--reporter=json", "--max-diagnostics=200"],
+        timeout_s=300.0,
+    )
+    assert lint.returncode == 0, (lint.stdout or "")[-3000:]
+    report = json.loads(lint.stdout)
+    assert report["diagnostics"] == []
+    assert report["summary"]["errors"] == 0
+    assert report["summary"]["warnings"] == 0
+    assert report["summary"]["diagnosticsNotPrinted"] == 0

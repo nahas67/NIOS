@@ -23,5 +23,7 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
+    // The 9-page cockpit ships as one pre-cached bundle; 500 kB is too tight.
+    chunkSizeWarningLimit: 1024,
   },
 })

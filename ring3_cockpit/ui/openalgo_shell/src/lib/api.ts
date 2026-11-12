@@ -1,4 +1,5 @@
 import type {
+  AnalyzerPageData,
   BrokerControlPayload,
   BrokerCredentialPayload,
   BrokerCredentialReport,
@@ -9,12 +10,18 @@ import type {
   FeedControlResponse,
   FeedMode,
   ForgeHedgeReceipt,
+  ForgePageData,
   FormalProofState,
   KillReport,
+  LedgerPageData,
   LLMControlPayload,
   LLMProbeReport,
+  McpPageData,
   MetricsSnapshot,
+  OrdersPageData,
+  PagesIndex,
   PreflightCertificate,
+  QuantPageData,
   RearmReport,
   SupervisorControlResponse,
   VaultRotationReport,
@@ -291,4 +298,68 @@ export function postSupervisorForgeHedge(): Promise<ForgeHedgeReceipt> {
     method: 'POST',
     body: JSON.stringify({ operator: 'ring3.cockpit' }),
   })
+}
+
+/* ------------------------------------------------------------------ *
+ * Step 4 — read-only multi-page cockpit telemetry
+ * ------------------------------------------------------------------ */
+
+/** Page catalog: nine production pages, their routes and live counts. */
+export function fetchPages(): Promise<PagesIndex> {
+  return request<PagesIndex>('/api/v2/cockpit/pages')
+}
+
+/** SmartOMS blotter, Maker-Peg / TWAP slicers, atomic outbox and positions. */
+export function fetchOrdersPage(): Promise<OrdersPageData> {
+  return request<OrdersPageData>('/api/v2/cockpit/orders')
+}
+
+/** 30-fill L2 shadow graduation nursery plus adverse-selection telemetry. */
+export function fetchAnalyzerPage(): Promise<AnalyzerPageData> {
+  return request<AnalyzerPageData>('/api/v2/cockpit/analyzer')
+}
+
+/** 490-factor scanner, valuation lab, tail-hedger and loader readiness. */
+export function fetchQuantPage(refresh = false): Promise<QuantPageData> {
+  const query = refresh ? '?refresh=true' : ''
+  return request<QuantPageData>(`/api/v2/cockpit/quant${query}`)
+}
+
+/** Nocturnal Alpha Forge leaderboard, challenger plugins and skill catalog. */
+export function fetchForgePage(): Promise<ForgePageData> {
+  return request<ForgePageData>('/api/v2/cockpit/forge')
+}
+
+/** Double-entry IBOR journal, 35/15 ratchet preview and backend schema status. */
+export function fetchLedgerPage(): Promise<LedgerPageData> {
+  return request<LedgerPageData>('/api/v2/cockpit/ledger')
+}
+
+/** Air-gapped MCP tool inventory and its read-only invariants. */
+export interface McpCallResult {
+  name: string
+  ok: boolean
+  result?: unknown
+  error?: string
+  elapsed_ms: number
+}
+
+/**
+ * Invoke one read-only MCP tool through the air-gapped Ring 3 bridge.
+ *
+ * The bridge rejects any tool that could read broker keys or sign an order, so a
+ * successful receipt is proof-only telemetry.
+ */
+export function callMcpTool(
+  name: string,
+  args: Record<string, unknown> = {}
+): Promise<McpCallResult> {
+  return request<McpCallResult>('/api/v2/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({ name, arguments: args }),
+  })
+}
+
+export function fetchMcpPage(): Promise<McpPageData> {
+  return request<McpPageData>('/api/v2/cockpit/mcp')
 }

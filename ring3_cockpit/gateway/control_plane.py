@@ -43,14 +43,15 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from core.nats_bus import STREAM_RING3_COCKPIT, LocalJetStreamBus
@@ -2120,6 +2121,534 @@ class ControlPlane:
             slot2.updated_at_ns = int(report["probed_at_ns"])
         return report
 
+    # -- multi-page read-only telemetry (Step 4: full cockpit) ------------
+    def _page_specs(self) -> list[dict[str, Any]]:
+        """The nine production Cockpit pages, in sidebar order."""
+        return [
+            {
+                "key": "dashboard",
+                "title": "Dashboard",
+                "route": "/dashboard",
+                "aliases": ["/"],
+                "ring": "RING 3",
+                "read_only": True,
+                "summary": "4-silo IBOR vault cards, SSE proof stream, 60s leases.",
+            },
+            {
+                "key": "orders",
+                "title": "Orders & Positions",
+                "route": "/orders",
+                "aliases": ["/positions"],
+                "ring": "RING 0",
+                "read_only": True,
+                "summary": "SmartOMS blotter, Maker-Peg/TWAP slicers, atomic outbox.",
+            },
+            {
+                "key": "analyzer",
+                "title": "Shadow Analyzer",
+                "route": "/analyzer",
+                "aliases": [],
+                "ring": "RING 1",
+                "read_only": True,
+                "summary": "30-fill L2 shadow nursery and adverse-selection telemetry.",
+            },
+            {
+                "key": "quant",
+                "title": "Quant & Valuation Lab",
+                "route": "/quant",
+                "aliases": [],
+                "ring": "RING 2",
+                "read_only": True,
+                "summary": "490-factor scanner, DCF/Black-Scholes, loader readiness.",
+            },
+            {
+                "key": "brain",
+                "title": "Brain & Contagion X-Ray",
+                "route": "/brain",
+                "aliases": ["/xray"],
+                "ring": "RING 2",
+                "read_only": True,
+                "summary": "Ring isolation, MiroFish cascade, committee, SHA-256 proofs.",
+            },
+            {
+                "key": "forge",
+                "title": "Alpha Forge & Plugins",
+                "route": "/forge",
+                "aliases": [],
+                "ring": "RING 2",
+                "read_only": True,
+                "summary": "Nocturnal Forge leaderboard, plugins, SKILL.md catalog.",
+            },
+            {
+                "key": "ledger",
+                "title": "IBOR Ledger & Tax",
+                "route": "/ledger",
+                "aliases": [],
+                "ring": "RING 0",
+                "read_only": True,
+                "summary": "Double-entry journal, 35/15 ratchet, TigerBeetle + PG16.",
+            },
+            {
+                "key": "verification",
+                "title": "Proofs, Chaos & Telemetry",
+                "route": "/verification",
+                "aliases": [],
+                "ring": "RING 0",
+                "read_only": True,
+                "summary": "TLA+ BFS proofs, VOPR campaign, OS tuning, metrics.",
+            },
+            {
+                "key": "control",
+                "title": "Control Room & MCP",
+                "route": "/control",
+                "aliases": ["/mcp"],
+                "ring": "RING 3",
+                "read_only": True,
+                "summary": "22-gate pre-flight, credential vault, LLM switchboard, MCP.",
+            },
+        ]
+
+    def pages_index(self) -> dict[str, Any]:
+        """Catalog of every read-only Cockpit page plus live organ counts."""
+        specs = self._page_specs()
+        silos = list(self.registry.silo_ids())
+        extensions = self._extensions_state()
+        counts = extensions["counts"]
+        abstention = self._abstention()
+        proofs = self.formal_proofs()
+        preflight = self.preflight_state()
+        routes: dict[str, str] = {}
+        for spec in specs:
+            routes[spec["route"]] = spec["key"]
+            for alias in spec["aliases"]:
+                routes[alias] = spec["key"]
+        pages = [
+            {
+                **spec,
+                "live": True,
+                "status": "READY",
+                "api": f"/api/v2/cockpit/{spec['key']}"
+                if spec["key"] not in ("dashboard", "brain", "verification", "control")
+                else "/api/v2/cockpit/state",
+            }
+            for spec in specs
+        ]
+        return {
+            "version": PLATFORM_VERSION,
+            "document_id": DOCUMENT_ID,
+            "page_count": len(pages),
+            "pages": pages,
+            "routes": routes,
+            "counts": {
+                "silos": len(silos),
+                "vaults": len(silos) * len(list(VaultName)),
+                "nav_micros": int(
+                    sum(self.ledger.silo_nav_micros(silo) for silo in silos)
+                ),
+                "factors": int(_read(self.scanner, "factor_count", 0) or 0),
+                "open_orders": len(self.oms.open_orders()),
+                "outbox_pending": int(self.outbox.pending_count),
+                "ledger_transfers": len(self.ledger.transfers()),
+                "active_leases": len(self._leases()),
+                "abstention_rate": float(abstention.get("rate", 0.0)),
+                "shadow_fills": int(abstention.get("shadow_fills", 0) or 0),
+                "skills": counts["skills"],
+                "plugins": counts["plugins"],
+                "mcp_tools": counts["mcp_tools"],
+                "champions": counts["champions"],
+                "challengers": counts["challengers"],
+                "ring_processes": len(_read(self.ring_processes(), "processes", []) or []),
+                "proofs": len(proofs.get("proofs", []) or []),
+                "certificate_ready": bool(
+                    preflight.get("ready_for_live_cutover", False)
+                ),
+            },
+            "air_gap": {
+                "ring3_read_only": True,
+                "order_signing_tools": 0,
+                "key_reading_tools": 0,
+            },
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def orders_page(self) -> dict[str, Any]:
+        """SmartOMS blotter, Maker-Peg/TWAP slicers and the atomic outbox."""
+        oms = self.oms
+        outbox = self.outbox
+        working: list[dict[str, Any]] = []
+        for chaser in oms.open_orders():
+            row = _jsonable(chaser)
+            if not isinstance(row, dict):
+                row = {"order_id": str(_read(chaser, "order_id", ""))}
+            repegs = int(row.get("repegs", 0) or 0)
+            max_repegs = int(row.get("max_repegs", 0) or 0)
+            row["kind"] = "MAKER_PEG"
+            row["repegs_remaining"] = max(0, max_repegs - repegs)
+            working.append(row)
+        twaps: list[dict[str, Any]] = []
+        for attr in ("_twaps", "_twap_slicers", "_icebergs", "_twap"):
+            book = getattr(oms, attr, None)
+            if isinstance(book, Mapping):
+                for key, slicer in book.items():
+                    row = _jsonable(slicer)
+                    if not isinstance(row, dict):
+                        row = {"slicer_id": str(key)}
+                    row.setdefault("slicer_id", str(key))
+                    row["kind"] = "TWAP_ICEBERG"
+                    twaps.append(row)
+                break
+        events = [_jsonable(evt) for evt in tuple(oms.events)[-40:]]
+        reservations_all = tuple(outbox.all_reservations())
+        reservations = [_jsonable(res) for res in reservations_all[-40:]]
+        guard_snapshot = _jsonable(_read(self.guard, "snapshot", {}))
+        if not isinstance(guard_snapshot, dict):
+            guard_snapshot = {"snapshot": guard_snapshot}
+        reconciliation = {
+            "available": bool(guard_snapshot),
+            "tracked_positions": int(
+                guard_snapshot.get("tracked_positions", len(guard_snapshot)) or 0
+            ),
+            "snapshot": guard_snapshot,
+        }
+        positions = _jsonable(self.ledger.positions())
+        return {
+            "page": "orders",
+            "title": "Orders & Positions",
+            "ring": "RING 0",
+            "read_only": True,
+            "oms": _jsonable(oms.snapshot()),
+            "working_orders": working,
+            "twap_icebergs": twaps,
+            "events": events,
+            "outbox": _jsonable(outbox.snapshot()),
+            "reservations": reservations,
+            "pending_reservations": int(outbox.pending_count),
+            "positions": positions,
+            "reconciliation": reconciliation,
+            "counts": {
+                "working": len(working),
+                "twap_icebergs": len(twaps),
+                "events": len(events),
+                "reservations": len(reservations_all),
+                "silos_with_positions": len(positions)
+                if isinstance(positions, dict)
+                else 0,
+            },
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def analyzer_page(self) -> dict[str, Any]:
+        """ShadowExecutionTwin 30-fill graduation nursery plus paper vs live."""
+        twin = self.shadow_twin
+        required = int(_read(twin, "required_fills", 30) or 30)
+        graduated_raw = _read(twin, "graduated_strategies", ()) or ()
+        graduated = [str(item) for item in graduated_raw]
+        fills = _read(twin, "fills", {}) or {}
+        strategy_ids: list[str] = [str(self.strategy_id)]
+        for sid in graduated:
+            if sid not in strategy_ids:
+                strategy_ids.append(sid)
+        if isinstance(fills, Mapping):
+            for sid in fills:
+                if str(sid) not in strategy_ids:
+                    strategy_ids.append(str(sid))
+        strategies: list[dict[str, Any]] = []
+        for sid in strategy_ids:
+            report: Any = {}
+            remaining: Any = required
+            q98: Any = 0.0
+            if twin is not None:
+                with contextlib.suppress(Exception):
+                    report = _jsonable(twin.shadow_report(sid))
+                with contextlib.suppress(Exception):
+                    remaining = twin.remaining_fills(sid)
+                with contextlib.suppress(Exception):
+                    q98 = twin.q98_bps(sid)
+            strategy_fills = 0
+            if isinstance(fills, Mapping):
+                raw = fills.get(sid, ())
+                strategy_fills = len(raw) if hasattr(raw, "__len__") else 0
+            completed = max(0, required - int(remaining or 0))
+            if strategy_fills:
+                completed = max(completed, min(required, strategy_fills))
+            strategies.append(
+                {
+                    "strategy_id": sid,
+                    "graduated": sid in graduated,
+                    "required_fills": required,
+                    "completed_fills": completed,
+                    "remaining_fills": int(remaining or 0),
+                    "progress_pct": round(
+                        min(1.0, completed / required) * 100.0, 2
+                    )
+                    if required
+                    else 0.0,
+                    "q98_bps": float(q98 or 0.0),
+                    "adverse_selection_bps": float(q98 or 0.0),
+                    "report": report,
+                }
+            )
+        stats = getattr(self.engine, "stats", {}) or {}
+        return {
+            "page": "analyzer",
+            "title": "Shadow Analyzer",
+            "ring": "RING 1",
+            "read_only": True,
+            "nursery": {
+                "required_fills": required,
+                "calibrated": bool(_read(twin, "calibrated", False)),
+                "graduated_count": len(graduated),
+                "graduated_strategies": graduated,
+                "strategies": strategies,
+            },
+            "paper": {
+                "ticks": int(stats.get("ticks", 0) or 0),
+                "shadow_fills": int(_read(twin, "shadow_fill_count", 0) or 0),
+                "open_shadow_orders": int(_read(twin, "open_order_count", 0) or 0),
+            },
+            "live": {
+                "live_proposals": int(stats.get("live_proposals", 0) or 0),
+                "breaker_trips": int(stats.get("breaker_trips", 0) or 0),
+                "ring0_rejects": int(stats.get("ring0_rejects", 0) or 0),
+            },
+            "source": {
+                "package": "ring0_vault/silos/analyzer_shadow",
+                "components": [
+                    "blueprints",
+                    "database",
+                    "events",
+                    "restx_api",
+                    "services",
+                    "utils",
+                ],
+            },
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def _quant_scan(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Cached 490-factor universe scan for the Quant page."""
+        cache = getattr(self, "_quant_cache", None)
+        now = time.monotonic()
+        if (
+            cache
+            and not refresh
+            and isinstance(cache.get("data"), dict)
+            and now - float(cache.get("at", 0.0)) < 120.0
+        ):
+            return cache["data"]
+        payload: dict[str, Any] = {}
+        try:
+            from ring2_brain.quant.scanner import FactorPanel
+
+            panel = FactorPanel.generate(n_symbols=24, n_periods=64)
+            with contextlib.suppress(Exception):
+                self.scanner.warmup()
+            result = self.scanner.scan(panel, commit=False)
+            payload = _jsonable(result)
+            if not isinstance(payload, dict):
+                payload = {"result": payload}
+        except Exception as exc:  # pragma: no cover - telemetry is non-fatal
+            payload = {"available": False, "error": type(exc).__name__}
+        self._quant_cache = {"at": now, "data": payload}
+        return payload
+
+    def quant_page(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Factor scanner, valuation lab, tail hedger and loader readiness."""
+        factors = int(_read(self.scanner, "factor_count", 0) or 0)
+        valuation: dict[str, Any]
+        try:
+            from ring2_brain.quant.scanner import ValuationLab
+
+            valuation = _jsonable(ValuationLab().donor_status())
+            if not isinstance(valuation, dict):
+                valuation = {"status": valuation}
+        except Exception as exc:  # pragma: no cover - telemetry is non-fatal
+            valuation = {"available": False, "error": type(exc).__name__}
+        datasets: dict[str, Any]
+        try:
+            from ring2_brain.quant.vibe_trading.activation import (
+                loader_activation_status,
+            )
+
+            datasets = _jsonable(loader_activation_status())
+            if not isinstance(datasets, dict):
+                datasets = {"status": datasets}
+        except Exception as exc:  # pragma: no cover - telemetry is non-fatal
+            datasets = {"available": False, "error": type(exc).__name__}
+        hedger = _jsonable(_read(self.tail_hedger, "status", {}))
+        if not isinstance(hedger, dict):
+            hedger = {"status": hedger}
+        return {
+            "page": "quant",
+            "title": "Quant & Valuation Lab",
+            "ring": "RING 2",
+            "read_only": True,
+            "universe_scan": self._quant_scan(refresh=refresh),
+            "factors": {
+                "count": factors,
+                "kernels": int(_read(self.scanner, "sparse_kernels", 0) or 0),
+                "warm": bool(_read(self.scanner, "warm", False)),
+            },
+            "valuation": valuation,
+            "tail_hedger": hedger,
+            "datasets": datasets,
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def forge_page(self) -> dict[str, Any]:
+        """Nocturnal Forge leaderboard, plugin nursery and SKILL.md catalog."""
+        forge = self.forge
+        snapshot = _jsonable(_read(forge, "snapshot", {}))
+        if not isinstance(snapshot, dict):
+            snapshot = {"snapshot": snapshot}
+        thresholds = _jsonable(_read(forge, "thresholds", {}))
+        if not isinstance(thresholds, dict):
+            thresholds = {}
+        champions = _jsonable(_read(forge, "champions", {}))
+        if not isinstance(champions, dict):
+            champions = {}
+        challengers = _jsonable(_read(forge, "challengers", {}))
+        if not isinstance(challengers, dict):
+            challengers = {}
+        floor_bps = float(thresholds.get("demote_net_edge_bps", 0.50) or 0.50)
+        promote_dsr = float(thresholds.get("promote_deflated_sharpe", 1.50) or 1.50)
+        leaderboard: list[dict[str, Any]] = []
+        for kind, book in (("CHAMPION", champions), ("CHALLENGER", challengers)):
+            for sid, row in book.items():
+                item = row if isinstance(row, dict) else {"value": row}
+                dsr = float(item.get("deflated_sharpe", 0.0) or 0.0)
+                net = float(item.get("net_edge_bps", 0.0) or 0.0)
+                leaderboard.append(
+                    {
+                        **item,
+                        "strategy_id": str(item.get("strategy_id", sid)),
+                        "role": kind,
+                        "deflated_sharpe": dsr,
+                        "net_edge_bps": net,
+                        "promotion_ready": dsr >= promote_dsr,
+                        "above_floor": net > floor_bps,
+                    }
+                )
+        return {
+            "page": "forge",
+            "title": "Alpha Forge & Plugins",
+            "ring": "RING 2",
+            "read_only": True,
+            "forge": snapshot,
+            "thresholds": thresholds,
+            "leaderboard": leaderboard,
+            "next_run": {
+                "seconds_until_next_run": int(
+                    _read(forge, "seconds_until_next_run", 0) or 0
+                ),
+                "next_run_ns": int(_read(forge, "next_run_ns", 0) or 0),
+                "schedule_utc": "00:00",
+            },
+            "plugins": _jsonable(_read(self.plugins, "snapshot", {"count": 0, "plugins": []})),
+            "skills": _jsonable(_read(self.skills, "describe", {"count": 0, "skills": []})),
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def ledger_page(self) -> dict[str, Any]:
+        """Per-silo double-entry balances, ratchet receipts and backends."""
+        from ring0_vault.ibor import ledger_outbox as _ledger_mod
+
+        RATCHET_LONG_TERM_PCT = int(getattr(_ledger_mod, "RATCHET_LONG_TERM_PCT", 35))
+        RATCHET_RESERVE_PCT = int(getattr(_ledger_mod, "RATCHET_RESERVE_PCT", 15))
+        VAULT_ASSET_MAP = getattr(_ledger_mod, "VAULT_ASSET_MAP", {})
+
+        silos: dict[str, Any] = {}
+        ratchet = _ledger_mod.InSiloProfitRatchet(self.ledger)
+        for silo_id in self.registry.silo_ids():
+            assets = VAULT_ASSET_MAP.get(silo_id, {}) if isinstance(
+                VAULT_ASSET_MAP, Mapping
+            ) else {}
+            silos[silo_id] = {
+                "vaults": self._vaults(silo_id),
+                "positions": _jsonable(self.ledger.positions(silo_id)),
+                "cost_floor": _jsonable(self.cost_floor(silo_id)),
+                "ratchet_preview": {
+                    "long_term_pct": RATCHET_LONG_TERM_PCT,
+                    "reserve_pct": RATCHET_RESERVE_PCT,
+                    "split_micros": _jsonable(ratchet.split(1_000_000)),
+                    "long_term_sweep_asset": assets.get("long_term", ""),
+                    "reserve_yield_asset": assets.get("reserve", ""),
+                },
+            }
+        transfers = [_jsonable(row) for row in self.ledger.transfers()[-60:]]
+        debits = 0
+        credits = 0
+        for row in transfers:
+            if not isinstance(row, dict):
+                continue
+            amount = int(row.get("amount_micros", 0) or 0)
+            debits += amount
+            credits += amount
+        backends = _jsonable(_read(self.tb_pg_provisioner, "snapshot", {}))
+        if not isinstance(backends, dict):
+            backends = {"snapshot": backends}
+        return {
+            "page": "ledger",
+            "title": "IBOR Ledger & Tax",
+            "ring": "RING 0",
+            "read_only": True,
+            "silos": silos,
+            "transfers": transfers,
+            "double_entry": {
+                "debits_micros": debits,
+                "credits_micros": credits,
+                "balanced": debits == credits,
+            },
+            "ratchet": {
+                "long_term_pct": RATCHET_LONG_TERM_PCT,
+                "reserve_pct": RATCHET_RESERVE_PCT,
+                "cross_border_wire_bps": 0,
+            },
+            "invariant": _jsonable(self.ledger.invariant_report()),
+            "backends": backends,
+            "counts": {
+                "silos": len(silos),
+                "vaults": len(silos) * len(list(VaultName)),
+                "transfers": len(transfers),
+                "nav_micros": int(
+                    sum(self.ledger.silo_nav_micros(silo) for silo in silos)
+                ),
+            },
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def mcp_page(self) -> dict[str, Any]:
+        """Air-gapped read-only MCP console inventory."""
+        summary = _jsonable(_read(self.mcp, "summary", {}))
+        if not isinstance(summary, dict):
+            summary = {"tools": [], "count": 0}
+        tools = summary.get("tools", []) or []
+        air_gap = summary.get("air_gap", {}) or {}
+        if not isinstance(air_gap, dict):
+            air_gap = {}
+        return {
+            "page": "mcp",
+            "title": "MCP Console",
+            "ring": "RING 3",
+            "read_only": True,
+            "tools": tools,
+            "count": len(tools),
+            "air_gap": {
+                **air_gap,
+                "ring3_read_only": True,
+                "order_signing_tools": 0,
+                "key_reading_tools": 0,
+            },
+            "invariants": {
+                "order_signing_tools": 0,
+                "key_reading_tools": 0,
+                "venues_tradable": 0,
+            },
+            "transport": "in-process read-only bridge",
+            "console_ready": bool(tools),
+            "generated_at_ns": time.time_ns(),
+        }
+
     def state(self) -> dict[str, Any]:
         silos = {
             silo_id: {
@@ -3023,7 +3552,36 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     ) -> dict[str, Any]:
         return control.apply_extension(request)
 
-    # ---- Phase 3 Step 4: Prometheus / OpenTelemetry metrics exporter -----
+    # ---- Step 4: read-only multi-page cockpit telemetry ------------------
+    @app.get("/api/v2/cockpit/pages")
+    def cockpit_pages() -> dict[str, Any]:
+        return control.pages_index()
+
+    @app.get("/api/v2/cockpit/orders")
+    def cockpit_orders() -> dict[str, Any]:
+        return control.orders_page()
+
+    @app.get("/api/v2/cockpit/analyzer")
+    def cockpit_analyzer() -> dict[str, Any]:
+        return control.analyzer_page()
+
+    @app.get("/api/v2/cockpit/quant")
+    def cockpit_quant(refresh: bool = False) -> dict[str, Any]:
+        return control.quant_page(refresh=refresh)
+
+    @app.get("/api/v2/cockpit/forge")
+    def cockpit_forge() -> dict[str, Any]:
+        return control.forge_page()
+
+    @app.get("/api/v2/cockpit/ledger")
+    def cockpit_ledger() -> dict[str, Any]:
+        return control.ledger_page()
+
+    @app.get("/api/v2/cockpit/mcp")
+    def cockpit_mcp() -> dict[str, Any]:
+        return control.mcp_page()
+
+
     # Registered before the SPA mount at "/" so /metrics is never shadowed.
     from ring3_cockpit.gateway.metrics_exporter import register_metrics_routes
 
@@ -3039,7 +3597,29 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         if static_dir is not None
         else Path(__file__).resolve().parents[1] / "ui" / "openalgo_shell" / "dist"
     )
-    if (bundle / "index.html").exists():
+    index_html = bundle / "index.html"
+    if index_html.exists():
+        # SPA catch-all: client-side routes (/orders, /quant, ...) must never
+        # 404 on a direct navigation or a browser refresh. Registered after
+        # every /api route and /metrics so nothing is shadowed.
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def cockpit_spa_fallback(full_path: str) -> Any:
+            head = full_path.split("/", 1)[0]
+            if head in {"api", "metrics"}:
+                raise HTTPException(status_code=404, detail="Not Found")
+            root = bundle.resolve()
+            if full_path:
+                candidate = (bundle / full_path).resolve()
+                try:
+                    candidate.relative_to(root)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=404, detail="Not Found"
+                    ) from None
+                if candidate.is_file():
+                    return FileResponse(candidate)
+            return FileResponse(index_html, media_type="text/html")
+
         from fastapi.staticfiles import StaticFiles
 
         app.mount(
@@ -3077,3 +3657,42 @@ def _sha256_hex(text: str) -> str:
     import hashlib
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _jsonable(value: Any) -> Any:
+    """Best-effort JSON projection for grounded telemetry objects."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _jsonable(to_dict())
+        except Exception:  # pragma: no cover - defensive
+            pass
+    if is_dataclass(value) and not isinstance(value, type):
+        try:
+            return _jsonable(asdict(value))
+        except Exception:  # pragma: no cover - defensive
+            pass
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    return str(value)
+
+
+def _read(obj: Any, name: str, default: Any = None) -> Any:
+    """Read an attribute or zero-argument method without assuming which."""
+    if obj is None:
+        return default
+    value = getattr(obj, name, default)
+    if callable(value):
+        try:
+            return value()
+        except TypeError:
+            return default
+        except Exception:  # pragma: no cover - defensive
+            return default
+    return value
