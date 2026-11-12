@@ -376,51 +376,51 @@
 /* Analyzer mode overrides for permission status items (Profile page) */
 .analyzer .bg-green-50,
 .analyzer .dark\:bg-green-950\/20 {
-  background-color: oklch(0.22 0.04 145) !important;
+  background-color: oklch(0.22 0.04 145);
 }
 .analyzer .bg-red-50,
 .analyzer .dark\:bg-red-950\/20 {
-  background-color: oklch(0.22 0.04 25) !important;
+  background-color: oklch(0.22 0.04 25);
 }
 .analyzer .border-green-200,
 .analyzer .dark\:border-green-800 {
-  border-color: oklch(0.4 0.1 145) !important;
+  border-color: oklch(0.4 0.1 145);
 }
 .analyzer .border-red-200,
 .analyzer .dark\:border-red-800 {
-  border-color: oklch(0.4 0.1 25) !important;
+  border-color: oklch(0.4 0.1 25);
 }
 .analyzer .bg-green-100,
 .analyzer .dark\:bg-green-900 {
-  background-color: oklch(0.3 0.06 145) !important;
+  background-color: oklch(0.3 0.06 145);
 }
 .analyzer .bg-red-100,
 .analyzer .dark\:bg-red-900 {
-  background-color: oklch(0.3 0.06 25) !important;
+  background-color: oklch(0.3 0.06 25);
 }
 .analyzer .bg-red-100.dark\:bg-red-900\/30,
 .analyzer .dark\:bg-red-900\/30 {
-  background-color: oklch(0.25 0.05 25) !important;
+  background-color: oklch(0.25 0.05 25);
 }
 .analyzer .bg-yellow-100,
 .analyzer .dark\:bg-yellow-900\/30 {
-  background-color: oklch(0.25 0.05 70) !important;
+  background-color: oklch(0.25 0.05 70);
 }
 .analyzer .text-red-700,
 .analyzer .dark\:text-red-300 {
-  color: oklch(0.75 0.15 25) !important;
+  color: oklch(0.75 0.15 25);
 }
 .analyzer .text-red-600,
 .analyzer .dark\:text-red-400 {
-  color: oklch(0.7 0.15 25) !important;
+  color: oklch(0.7 0.15 25);
 }
 .analyzer .text-yellow-700,
 .analyzer .dark\:text-yellow-300 {
-  color: oklch(0.8 0.12 70) !important;
+  color: oklch(0.8 0.12 70);
 }
 .analyzer .bg-red-200,
 .analyzer .dark\:bg-red-800 {
-  background-color: oklch(0.35 0.08 25) !important;
+  background-color: oklch(0.35 0.08 25);
 }
 
 /* Safe area utilities for mobile devices with notches/home indicators */

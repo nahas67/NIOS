@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -965,10 +965,17 @@ function VenueCredentialCard({
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <label className="flex items-center gap-2 text-[10px] text-muted-foreground">
-          <Switch checked={sandbox} onCheckedChange={setSandbox} aria-label="sandbox credential" />
-          Sandbox / testnet host
-        </label>
+        <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+          <Switch
+            id="venue-credential-sandbox"
+            checked={sandbox}
+            onCheckedChange={setSandbox}
+            aria-label="Sandbox / testnet host"
+          />
+          <label htmlFor="venue-credential-sandbox" className="cursor-pointer select-none">
+            Sandbox / testnet host
+          </label>
+        </div>
         <Button
           type="button"
           size="sm"
@@ -1728,7 +1735,7 @@ function VaultRotationPanel() {
   const [message, setMessage] = useState<string | null>(null)
   const [failed, setFailed] = useState(false)
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       setStatus(await fetchVaultStatus())
     } catch (cause) {
@@ -1737,11 +1744,11 @@ function VaultRotationPanel() {
         cause instanceof Error ? cause.message : 'vault status unavailable'
       )
     }
-  }
+  }, [])
 
   useEffect(() => {
     void load()
-  }, [])
+  }, [load])
 
   const rotate = async () => {
     setBusy(true)

@@ -23,6 +23,8 @@ Phase 4 Step 2 wires those organs into the Ring 3 control plane and cockpit:
 * ``POST /api/v2/control/brokers`` refuses ``mode="LIVE"`` unless the
   certificate reports ``failed_gates == 0``.
 * The compiled ``dist/`` bundle served at ``GET /`` carries both controls.
+* ``npx biome lint src/`` in the cockpit workspace exits ``0`` with zero
+  diagnostics, and ``GET /`` serves that rebuilt bundle asset-for-asset.
 
 Nothing in this module places a live order, unlocks a silo, or reads a secret.
 The Ring 0 leg only ever produces an *unsigned* proposal signature over a
@@ -33,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -335,6 +338,28 @@ def test_gate4_regression_inventory_is_eighteen_suites() -> None:
 # ---------------------------------------------------------------------------
 
 LIVE_SILO = "FX_MT5"
+FRONTEND = ROOT / "ring3_cockpit" / "ui" / "openalgo_shell"
+
+
+def _run_frontend(
+    args: list[str], *, timeout_s: float
+) -> subprocess.CompletedProcess:
+    """Run a Node toolchain command in the cockpit workspace.
+
+    ``npx`` is a ``.cmd`` shim on Windows, so route it through ``cmd.exe``;
+    POSIX shells resolve the binary directly.
+    """
+    command = ["cmd.exe", "/c", "npx", *args] if os.name == "nt" else ["npx", *args]
+    return subprocess.run(
+        command,
+        cwd=str(FRONTEND),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_s,
+        check=False,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -510,3 +535,43 @@ def test_step2_compiled_bundle_serves_both_new_controls(cockpit: Any) -> None:
         "certificate_sha256",
     ):
         assert needle in script, f"missing cockpit control: {needle}"
+
+
+def test_step2_frontend_lint_is_zero_and_bundle_is_served(cockpit: Any) -> None:
+    """Biome must exit ``0`` with zero diagnostics and ``GET /`` serves it cleanly.
+
+    The React 19 cockpit is the operator's only window into Ring 3, so the
+    production bundle is a release artefact: it may not ship with a single
+    lint error, warning or unprinted diagnostic, and the served ``index.html``
+    must reference the on-disk rebuilt assets byte-for-byte.
+    """
+    completed = _run_frontend(
+        ["biome", "lint", "src/", "--reporter=json", "--max-diagnostics=200"],
+        timeout_s=300.0,
+    )
+    output = (completed.stdout or "") + (completed.stderr or "")
+    assert completed.returncode == 0, output[-4000:]
+
+    report = json.loads(completed.stdout)
+    summary = report["summary"]
+    assert summary["errors"] == 0, report["diagnostics"][:5]
+    assert summary["warnings"] == 0, report["diagnostics"][:5]
+    assert summary["diagnosticsNotPrinted"] == 0, summary
+    assert report["diagnostics"] == [], report["diagnostics"][:5]
+    assert summary["changed"] + summary["unchanged"] >= 40, summary
+
+    bundle = FRONTEND / "dist"
+    index_bytes = (bundle / "index.html").read_bytes()
+    index_html = index_bytes.decode("utf-8")
+    served = cockpit.get("/")
+    assert served.status_code == 200
+    assert "text/html" in served.headers.get("content-type", "")
+    assert served.content == index_bytes
+
+    assets = re.findall(r'(?:src|href)="(/assets/[^"]+)"', index_html)
+    assert assets, "index.html references no compiled asset"
+    for asset in assets:
+        assert (bundle / asset.lstrip("/")).is_file(), f"missing rebuilt asset: {asset}"
+        response = cockpit.get(asset)
+        assert response.status_code == 200, asset
+        assert response.content, f"empty served asset: {asset}"
