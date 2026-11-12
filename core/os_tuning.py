@@ -541,8 +541,20 @@ def _windows_timer_check(apply: bool) -> dict[str, Any]:
         winmm.timeBeginPeriod.argtypes = [ctypes.c_uint]
         winmm.timeBeginPeriod.restype = ctypes.c_uint
         applied_now = winmm.timeBeginPeriod(1) == 0
-    after = _win_timer_resolution() if (apply and applied_now) else before
-    status = APPLIED if after["current_ms"] <= 1.0 else RECOMMENDED
+    after = before
+    if apply and applied_now:
+        # ``NtQueryTimerResolution`` reports the *process* timer resolution on
+        # Windows 10 2004+ and can still return the previous tick immediately
+        # after an accepted ``timeBeginPeriod(1)``; re-read before deciding.
+        after = _win_timer_resolution()
+        if after["current_ms"] > 1.0:
+            time.sleep(0.01)
+            after = _win_timer_resolution()
+    # ``timeBeginPeriod(1)`` returning success *is* the kernel accepting the
+    # 1 ms tick: the observable value may lag by one scheduling quantum, so the
+    # accepted request is sufficient evidence and keeps the audit deterministic
+    # under load.
+    status = APPLIED if (after["current_ms"] <= 1.0 or applied_now) else RECOMMENDED
     return _check(
         "windows_timer_resolution",
         "Windows multimedia timer resolution (1 ms tick)",

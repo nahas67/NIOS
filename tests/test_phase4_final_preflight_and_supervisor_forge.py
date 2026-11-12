@@ -635,3 +635,270 @@ def test_step2_preflight_under_active_autopilot_passes_22_of_22() -> None:
             assert int(runtime.autopilot_snapshot().get("rounds", 0)) > rounds_before
     finally:
         runtime.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Step 2 patch -- MiroFish < 1.8 ms, Ring 1 < 140 us, stable cert hash
+# ---------------------------------------------------------------------------
+
+
+def _flow_tick(valid_ns: int, symbol: str) -> Any:
+    """One clean executed-flow tick (Law 1 OFI passes on the long side)."""
+    from core.schemas import ExecutedFlowTick
+
+    return ExecutedFlowTick(
+        symbol=symbol,
+        valid_time_ns=valid_ns,
+        knowledge_ts_ns=valid_ns,
+        last_price=100.0,
+        spread_bps=2.0,
+        realized_vol_5s=1.0,
+        normal_vol_5s=1.0,
+        taker_buy_volume_5s=710.0,
+        taker_sell_volume_5s=290.0,
+        bid_cancel_to_fill_ratio=1.4,
+        ask_cancel_to_fill_ratio=1.4,
+    )
+
+
+def test_step2_mirofish_sub_1_8ms_ring1_sub_140us_and_deterministic_cert_hash(
+    cockpit: Any,
+) -> None:
+    """Vectorized contagion, pinned Ring 1 tail latency and a timing-proof digest.
+
+    * fifty consecutive five-archetype three-tick cascades: median and p95
+      both under the ``sec_010`` 1.8 ms SLA (target 0.50 ms);
+    * the MCP ``nios_simulate_mirofish_cascade`` backend (which persists to the
+      bitemporal store) stays under the same SLA because contagion rows are
+      write-behind;
+    * one thousand ticks through ``ZeroGCSpinalEngine`` on a pinned core:
+      p50 < 0.088 ms and p99 < 0.140 ms;
+    * two live ``POST /api/v2/control/preflight`` calls under the active paper
+      autopilot return byte-identical ``certificate_sha256`` digests because
+      Gate 22 contributes ``within_budget``, never raw nanosecond jitter.
+    """
+    from ring2_brain.mirofish.contagion_engine import (
+        MiroFishContagionEngine,
+        ShockVector,
+    )
+
+    # ---- 1. MiroFish 3-tick cascade ---------------------------------------
+    engine = MiroFishContagionEngine(silo="US", warmup=True)
+    shock = ShockVector(
+        price_shock_bps=40.0,
+        realized_vol_ratio=2.0,
+        spread_bps=6.0,
+        dealer_gamma_flip_proximity=0.2,
+    )
+    samples_ms: list[float] = []
+    results = []
+    for _ in range(50):
+        started = time.perf_counter_ns()
+        result = engine.run(shock, "BTCUSDT", persist=False)
+        samples_ms.append((time.perf_counter_ns() - started) / 1_000_000.0)
+        results.append(result)
+    ordered = sorted(samples_ms)
+    median_ms = ordered[len(ordered) // 2]
+    p95_ms = ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
+    assert median_ms < 1.8, f"cascade median {median_ms:.4f} ms >= 1.8 ms"
+    assert p95_ms < 1.8, f"cascade p95 {p95_ms:.4f} ms >= 1.8 ms"
+    assert median_ms < 0.50, f"cascade median {median_ms:.4f} ms missed the 0.50 ms target"
+
+    # Deterministic outputs: repeats are bit-identical, bounds hold.
+    reference = results[0]
+    for repeat in results[1:]:
+        assert repeat.tick_flows == reference.tick_flows
+        assert (
+            repeat.features.cascade_fragility_index
+            == reference.features.cascade_fragility_index
+        )
+        assert (
+            repeat.features.crowd_asymmetry_score
+            == reference.features.crowd_asymmetry_score
+        )
+    assert 0.0 <= reference.features.cascade_fragility_index <= 1.0
+    assert -1.0 <= reference.features.crowd_asymmetry_score <= 1.0
+
+    # ---- 1b. MCP tool backend (persists through the write-behind store) ----
+    runner = getattr(cockpit.app.state.control, "cascade_runner", None)
+    assert callable(runner), "MCP cascade_runner is not wired"
+    runner_ms: list[float] = []
+    for _ in range(20):
+        started = time.perf_counter_ns()
+        payload = runner(
+            price_shock_bps=40.0,
+            realized_vol_ratio=2.0,
+            spread_bps=6.0,
+            dealer_gamma_flip_proximity=0.2,
+            tags=(),
+            symbol="BTCUSDT",
+        )
+        runner_ms.append((time.perf_counter_ns() - started) / 1_000_000.0)
+        assert payload.features.cascade_fragility_index == reference.features.cascade_fragility_index
+    runner_median = sorted(runner_ms)[len(runner_ms) // 2]
+    assert runner_median < 1.8, f"MCP cascade median {runner_median:.4f} ms >= 1.8 ms"
+
+    # ---- 2. Ring 1 tick-to-intent on a pinned core ------------------------
+    from core.schemas import LEASE_TTL_NS, LeaseMode, System1Lease
+    from core.shm_ipc import (
+        GlobalKillLatch,
+        LeaseTableSHM,
+        ShadowBookSHM,
+        unlink_all,
+    )
+    from ring1_spinal.shadow_twin import REQUIRED_SHADOW_FILLS, ShadowExecutionTwin
+    from ring1_spinal.silo_worker import (
+        current_cpu_affinity,
+        pin_cpu_core,
+        set_cpu_affinity,
+    )
+    from ring1_spinal.spinal_loop import ZeroGCSpinalEngine
+
+    symbol = "BTCUSDT"
+    strategy_id = "phase4-latency-probe"
+    unlink_all()
+    kill = GlobalKillLatch(reset=True)
+    leases = LeaseTableSHM(reset=True, kill_latch=kill)
+    book = ShadowBookSHM(reset=True)
+    available = current_cpu_affinity() or (0,)
+    pin = pin_cpu_core(available[-1])
+    try:
+        base = time.monotonic_ns()
+        lease = System1Lease(
+            symbol=symbol,
+            mode=LeaseMode.LONG_ONLY,
+            target_bps=18.0,
+            stop_bps=12.0,
+            expires_at_ns=base + LEASE_TTL_NS,
+            strategy_id_hash=7,
+        )
+        leases.write_lease(lease, now_ns=base)
+        book.write_snapshot(symbol, 100.0, 100.02, 500.0, 500.0, updated_at_ns=base)
+        twin = ShadowExecutionTwin(book)
+        warmup = ZeroGCSpinalEngine(
+            leases,
+            kill_latch=kill,
+            shadow_twin=twin,
+            bus=None,
+            strategy_id=strategy_id,
+            proposal_sink=[],
+            card_sink=[],
+        )
+        for index in range(REQUIRED_SHADOW_FILLS + 1):
+            stamp = base + index
+            warmup.on_tick(_flow_tick(stamp, symbol), now_ns=stamp)
+        assert twin.is_graduated(strategy_id), "shadow warmup did not graduate"
+
+        probe = ZeroGCSpinalEngine(
+            leases,
+            kill_latch=kill,
+            shadow_twin=twin,
+            bus=None,
+            strategy_id=strategy_id,
+            proposal_sink=[],
+            card_sink=[],
+        )
+        tick_latency_ns: list[int] = []
+        # Build the 1,000-tick window before the stopwatch: the SLA measures
+        # ``on_tick``, never ``ExecutedFlowTick`` construction.
+        window = [
+            _flow_tick(base + 1_000 + index, symbol) for index in range(1_000)
+        ]
+        with probe.gc_guard():
+            for index, flow_tick in enumerate(window):
+                begin = time.perf_counter_ns()
+                probe.on_tick(flow_tick, now_ns=base + 1_000 + index)
+                tick_latency_ns.append(time.perf_counter_ns() - begin)
+        tick_latency_ns.sort()
+        p50_ms = tick_latency_ns[len(tick_latency_ns) // 2] / 1_000_000.0
+        p99_ms = tick_latency_ns[
+            min(len(tick_latency_ns) - 1, int(len(tick_latency_ns) * 0.99))
+        ] / 1_000_000.0
+        assert pin.pinned, f"core pin failed: {pin.reason}"
+        assert p50_ms < 0.088, f"Ring 1 p50 {p50_ms:.4f} ms >= 0.088 ms"
+        assert p99_ms < 0.140, f"Ring 1 p99 {p99_ms:.4f} ms >= 0.140 ms"
+    finally:
+        if pin.pinned and pin.previous:
+            try:
+                set_cpu_affinity(pin.previous)
+            except Exception:  # pragma: no cover - restore is best effort
+                pass
+        for handle in (book, leases, kill):
+            try:
+                handle.close()
+            except Exception:
+                pass
+            try:
+                handle.unlink()
+            except Exception:
+                pass
+        unlink_all()
+
+    # ---- 3. Timing-invariant certificate under a live autopilot -----------
+    from fastapi.testclient import TestClient
+
+    from scripts.run_nios import build_runtime
+
+    runtime = build_runtime()
+    try:
+        app = runtime.control_app()
+        with TestClient(app) as client:
+            assert app.state.autopilot_task is not None
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                if int(runtime.autopilot_snapshot().get("rounds", 0)) >= 2:
+                    break
+                time.sleep(0.05)
+            assert int(runtime.autopilot_snapshot().get("rounds", 0)) >= 2
+
+            certs: list[dict[str, Any]] = []
+            for _ in range(2):
+                response = client.post(
+                    "/api/v2/control/preflight",
+                    json={"full_smoke": False, "silo": "ALL", "refresh": True},
+                )
+                assert response.status_code == 200, response.text
+                body = response.json()
+                assert body["ready_for_live_cutover"] is True
+                assert body["passed_gates"] == 22
+                assert body["failed_gates"] == 0
+                assert body["autopilot_tape_active"] is True
+                assert body["autopilot_quiesced"] is True
+                gate = next(
+                    row
+                    for row in body["gates"]
+                    if row["gate"] == "cockpit.killswitch_and_rearm"
+                )
+                assert gate["status"] == "PASS", gate
+                assert gate["evidence"]["within_budget"] is True
+                assert 0 < int(gate["evidence"]["latency_ns"]) < 1_000_000
+                certs.append(body)
+
+            first, second = certs
+            assert first["certificate_sha256"] == second["certificate_sha256"]
+            assert len(first["certificate_sha256"]) == 64
+            int(first["certificate_sha256"], 16)
+
+            # ``GET`` replays the in-process cache and ``POST`` runs fresh; the
+            # ``--fast --json`` CLI is a *different OS process*.  All three must
+            # agree on the same commit, which is only possible because the
+            # certificate hashes invariant verdicts, never measurements.
+            get_body = client.get("/api/v2/control/preflight").json()
+            assert get_body["passed_gates"] == 22
+            assert get_body["certificate_sha256"] == first["certificate_sha256"]
+
+            cli = _run(
+                ["scripts/preflight_golive.py", "--fast", "--json"], timeout_s=900.0
+            )
+            assert cli.returncode == 0, (cli.stdout or "")[-3000:]
+            cli_report = json.loads(cli.stdout)
+            assert cli_report["gates_passed"] == 22
+            assert cli_report["certificate_sha256"] == first["certificate_sha256"]
+            # The volatile measurement stays visible to the operator in the
+            # runtime telemetry but never enters the hashed projection.
+            assert "latency_ns" in first["gates"][-1]["evidence"]
+            hashed = cli_report["certificate"]["gates"][-1]["evidence"]
+            assert "latency_ns" not in hashed
+            assert hashed["within_budget"] is True
+    finally:
+        runtime.close()

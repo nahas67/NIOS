@@ -99,6 +99,15 @@ ARCHETYPE_WEIGHTS: tuple[float, ...] = tuple(weight for _, weight in ARCHETYPES)
 if abs(sum(ARCHETYPE_WEIGHTS) - 1.0) > 1e-12:  # pragma: no cover - constant guard
     raise RuntimeError("sec_008 archetype weights must sum to 1.0")
 
+#: Contiguous, read-only weight/state vectors hoisted to module scope so the
+#: per-cascade call performs **no** allocation, no ``np.asarray`` rebuild and no
+#: dictionary walk over the five archetypes (``sec_010`` 1.8 ms SLA).
+_WEIGHTS_NP: np.ndarray = np.asarray(ARCHETYPE_WEIGHTS, dtype=np.float64)
+_WEIGHTS_NP.setflags(write=False)
+
+#: Untagged shocks share one immutable five-float vector.
+_ZERO_TAGS: tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0)
+
 #: Optional causal ontology tags -> per-archetype trigger boost.
 SHOCK_TAG_BOOSTS: Mapping[str, tuple[float, float, float, float, float]] = {
     "retail_euphoria": (1.0, 0.0, 0.0, 0.0, 0.0),
@@ -111,6 +120,18 @@ SHOCK_TAG_BOOSTS: Mapping[str, tuple[float, float, float, float, float]] = {
     "pod_shop_stop_out": (0.0, 0.0, 0.0, 1.0, 0.0),
     "value_absorption": (0.0, 0.0, 0.0, 0.0, 1.0),
     "institutional_absorption": (0.0, 0.0, 0.0, 0.0, 1.0),
+}
+
+#: Flat one-hot ontology boosts, resolved once at import.
+_TAG_BOOSTS: dict[str, tuple[float, float, float, float, float]] = {
+    str(tag).strip().lower(): (
+        float(values[0]),
+        float(values[1]),
+        float(values[2]),
+        float(values[3]),
+        float(values[4]),
+    )
+    for tag, values in SHOCK_TAG_BOOSTS.items()
 }
 
 
@@ -201,17 +222,35 @@ class ShockVector:
             tuple(str(tag).strip().lower() for tag in tuple(self.tags) if str(tag).strip()),
         )
 
-    def tag_weights(self) -> np.ndarray:
-        """Map ontology tags onto the five-archetype trigger vector."""
-        boosts = np.zeros(5, dtype=np.float64)
+    def tag_boost_tuple(self) -> tuple[float, float, float, float, float]:
+        """Map ontology tags onto the five-archetype trigger vector.
+
+        Returns a flat five-float tuple (allocation-free for untagged shocks)
+        so the hot cascade never rebuilds a NumPy array per call.
+        """
+        if not self.tags:
+            return _ZERO_TAGS
+        b0 = b1 = b2 = b3 = b4 = 0.0
         for tag in self.tags:
-            values = SHOCK_TAG_BOOSTS.get(tag)
+            values = _TAG_BOOSTS.get(tag)
             if values is None:
                 continue
-            for index, value in enumerate(values):
-                if value > boosts[index]:
-                    boosts[index] = float(value)
-        return boosts
+            v0, v1, v2, v3, v4 = values
+            if v0 > b0:
+                b0 = v0
+            if v1 > b1:
+                b1 = v1
+            if v2 > b2:
+                b2 = v2
+            if v3 > b3:
+                b3 = v3
+            if v4 > b4:
+                b4 = v4
+        return (b0, b1, b2, b3, b4)
+
+    def tag_weights(self) -> np.ndarray:
+        """NumPy view of :meth:`tag_boost_tuple` (backwards-compatible API)."""
+        return np.asarray(self.tag_boost_tuple(), dtype=np.float64)
 
 
 @dataclass(slots=True)
@@ -266,11 +305,14 @@ def _cascade_kernel(
     vol_ratio: float,
     spread_bps: float,
     gamma_proximity: float,
-    tags: np.ndarray,
+    tags,
     weights: np.ndarray,
+    out: np.ndarray,
 ) -> np.ndarray:
     """Three deterministic contagion ticks -> structural feature vector.
 
+    Writes into the caller-supplied ``out`` buffer (9 contiguous float64
+    slots) so the hot path allocates nothing per cascade.
     Returns ``[crowd_asymmetry, fragility, divergence, retail_tick1,
     value_tick3, total_tick3, pod_activation, dealer_stress, cta_stress]``.
     """
@@ -354,7 +396,6 @@ def _cascade_kernel(
         1.0,
     )
 
-    out = np.empty(9, dtype=np.float64)
     out[0] = crowd
     out[1] = fragility
     out[2] = divergence
@@ -372,8 +413,9 @@ def _cascade_numpy(
     vol_ratio: float,
     spread_bps: float,
     gamma_proximity: float,
-    tags: np.ndarray,
+    tags,
     weights: np.ndarray,
+    out: np.ndarray,
 ) -> np.ndarray:
     """Pure-NumPy fallback with the identical contract as the Numba kernel."""
     shock = min(max(float(shock_bps) / 100.0, -1.5), 1.5)
@@ -453,20 +495,20 @@ def _cascade_numpy(
         ),
         1.0,
     )
-    return np.array(
-        [
-            crowd,
-            fragility,
-            divergence,
-            retail_t1,
-            value_t3,
-            total_t3,
-            pod_activation,
-            dealer_stress,
-            cta_stress,
-        ],
-        dtype=np.float64,
-    )
+    out[0] = crowd
+    out[1] = fragility
+    out[2] = divergence
+    out[3] = retail_t1
+    out[4] = value_t3
+    out[5] = total_t3
+    out[6] = pod_activation
+    out[7] = dealer_stress
+    out[8] = cta_stress
+    return out
+
+
+#: Kernel selected once at import: no per-cascade global/attribute dispatch.
+_KERNEL = _cascade_kernel if NUMBA_AVAILABLE else _cascade_numpy
 
 
 def cascade_features(
@@ -476,14 +518,14 @@ def cascade_features(
     as_of_ns: int | None = None,
 ) -> ContagionFeatures:
     """Run the deterministic cascade without any I/O (pure function)."""
-    kernel = _cascade_kernel if NUMBA_AVAILABLE else _cascade_numpy
-    raw = kernel(
+    raw = _KERNEL(
         float(shock.price_shock_bps),
         float(shock.realized_vol_ratio),
         float(shock.spread_bps),
         float(shock.dealer_gamma_flip_proximity),
-        shock.tag_weights(),
-        np.asarray(ARCHETYPE_WEIGHTS, dtype=np.float64),
+        shock.tag_boost_tuple(),
+        _WEIGHTS_NP,
+        np.empty(9, dtype=np.float64),
     )
     stamp = int(as_of_ns) if as_of_ns is not None else time.time_ns()
     return ContagionFeatures(
@@ -516,14 +558,27 @@ class MiroFishContagionEngine:
         self.lease_table = lease_table
         self.silo = str(silo)
         self.graph_path = graph_path
-        self.donor = donor_mirofish_status()
+        # The donor probe imports harvested MiroFish service modules.  It is
+        # resolved lazily so constructing an engine (Gate 15, the MCP tool,
+        # every cold CLI start) never pays a multi-second import inside the
+        # measured cascade path.
+        self._donor: dict[str, Any] | None = None
         self._registered_symbols: set[str] = set()
         self._full_swept_in_episode = False
         self._last_result: CascadeResult | None = None
+        # Contiguous scratch buffer reused by every cascade on this engine.
+        self._out = np.empty(9, dtype=np.float64)
         if warmup:
             self.warmup()
 
     # -- bridge -----------------------------------------------------------
+    @property
+    def donor(self) -> dict[str, Any]:
+        """Harvested MiroFish service availability (imported on first read)."""
+        if self._donor is None:
+            self._donor = donor_mirofish_status()
+        return self._donor
+
     @property
     def donor_bridge(self) -> dict[str, Any]:
         return self.donor
@@ -569,14 +624,14 @@ class MiroFishContagionEngine:
         """Execute the three ticks, persist features, enforce the override."""
         started = time.perf_counter()
         stamp = int(now_ns) if now_ns is not None else time.time_ns()
-        kernel = _cascade_kernel if NUMBA_AVAILABLE else _cascade_numpy
-        raw = kernel(
+        raw = _KERNEL(
             float(shock.price_shock_bps),
             float(shock.realized_vol_ratio),
             float(shock.spread_bps),
             float(shock.dealer_gamma_flip_proximity),
-            shock.tag_weights(),
-            np.asarray(ARCHETYPE_WEIGHTS, dtype=np.float64),
+            shock.tag_boost_tuple(),
+            _WEIGHTS_NP,
+            self._out,
         )
         features = ContagionFeatures(
             symbol=str(symbol),

@@ -7,10 +7,13 @@ to uphold and emits a deterministic, SHA-256 signed Go-Live Readiness
 Certificate.
 
 The certificate digest is computed over the *gate outcomes only* (gate id,
-status and stable scalar evidence).  Wall-clock timestamps, pids, durations and
-host names are deliberately excluded, so two runs with the same system state
+status and stable scalar evidence).  Wall-clock timestamps, pids, durations,
+nanosecond stopwatch readings and live scrape sizes are deliberately excluded
+(see :data:`VOLATILE_EVIDENCE_KEYS`), so two runs with the same system state
 produce the same 64-character digest on any machine -- which is what makes the
-certificate meaningful as evidence rather than as a log line.
+certificate meaningful as evidence rather than as a log line.  Gate 22 keeps
+its measured ``latency_ns`` in the runtime telemetry and hashes only the
+invariant ``within_budget`` verdict.
 
 Gate inventory (22):
 
@@ -137,10 +140,51 @@ EXPECTED_SANDBOX_VENUES = 12
 SMOKE_TIMEOUT_S = 600.0
 GIT_TIMEOUT_S = 60.0
 KILLSWITCH_LATENCY_BUDGET_NS = 1_000_000
+#: ``sec_010`` MiroFish SLA for a full three-tick five-archetype cascade.
+CONTAGION_SLA_MS = 1.8
+#: Fixed certification epoch (2026-01-01T00:00:00Z).  Gate 17's grounded fact
+#: packet commits to ``as_of_ns`` inside its SHA-256 digest, so a wall-clock
+#: stamp would perturb ``certificate_sha256`` between two green runs on the
+#: same commit.  The gate is a deterministic certification probe, so it pins
+#: the instant it probes.
+PREFLIGHT_AS_OF_NS = 1_767_225_600_000_000_000
 
 PASS = "PASS"
 FAIL = "FAIL"
 WARN = "WARN"
+
+#: Evidence keys that carry per-run hardware jitter (nanosecond stopwatch
+#: readings, live scrape sizes).  They stay in the gate's runtime telemetry but
+#: are stripped from the certificate projection, so two green runs on the same
+#: commit produce the exact same 64-character ``certificate_sha256``.
+VOLATILE_EVIDENCE_KEYS: frozenset[str] = frozenset(
+    {
+        "latency_ns",
+        "latency_ms",
+        "cascade_latency_ms",
+        "duration_ms",
+        "prometheus_bytes",
+        "generated_at_ns",
+        # Gate 20 audits live host state: ``shm_capacity`` flips between
+        # APPLIED and RECOMMENDED as free physical RAM crosses its threshold,
+        # so the tallies move while the readiness verdict does not.
+        "applied_count",
+        "recommended_count",
+    }
+)
+
+
+def canonical_evidence(value: Any) -> Any:
+    """Recursively drop volatile keys from a gate evidence structure."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): canonical_evidence(item)
+            for key, item in value.items()
+            if str(key) not in VOLATILE_EVIDENCE_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [canonical_evidence(item) for item in value]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +223,17 @@ class Gate:
         return self.status == FAIL
 
     def certificate_payload(self) -> dict[str, Any]:
-        """Deterministic projection: no timings, no pids, no wall clock."""
+        """Deterministic projection: no timings, no pids, no wall clock.
+
+        Volatile evidence keys (nanosecond stopwatches, live scrape sizes) are
+        stripped recursively; the invariant booleans they support -- e.g.
+        ``within_budget`` -- remain part of the digest.
+        """
         return {
             "gate": self.gate_id,
             "label": self.label,
             "status": self.status,
-            "evidence": self.evidence,
+            "evidence": canonical_evidence(self.evidence),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -1008,17 +1057,26 @@ def gate_contagion_cascade(_ctx: PreflightContext) -> Gate:
 
     engine = MiroFishContagionEngine(silo="US", warmup=True)
     result = engine.run(
-        ShockVector(price_shock_bps=40.0, realized_vol_ratio=2.0), "PREFLIGHT"
+        ShockVector(price_shock_bps=40.0, realized_vol_ratio=2.0),
+        "PREFLIGHT",
+        persist=False,
     )
     features = result.features
     fragility = float(features.cascade_fragility_index)
     crowd = float(features.crowd_asymmetry_score)
-    ok = 0.0 <= fragility <= 1.0 and -1.0 <= crowd <= 1.0
+    latency_ms = float(result.latency_ms)
+    within_sla = latency_ms < CONTAGION_SLA_MS
+    ok = (
+        0.0 <= fragility <= 1.0
+        and -1.0 <= crowd <= 1.0
+        and within_sla
+    )
     return Gate(
         "ring2.contagion_three_tick_cascade",
         "MiroFish three-tick contagion cascade",
         PASS if ok else FAIL,
-        f"fragility={fragility:.3f}, crowd={crowd:+.3f}",
+        f"fragility={fragility:.3f}, crowd={crowd:+.3f}, "
+        f"cascade={latency_ms:.3f} ms (SLA {CONTAGION_SLA_MS:.1f} ms)",
         {
             "cascade_fragility_index": round(fragility, 6),
             "crowd_asymmetry_score": round(crowd, 6),
@@ -1026,6 +1084,8 @@ def gate_contagion_cascade(_ctx: PreflightContext) -> Gate:
                 float(features.narrative_exhaustion_divergence), 6
             ),
             "ticks": 3,
+            "sla_ms": CONTAGION_SLA_MS,
+            "within_sla": within_sla,
         },
     )
 
@@ -1082,6 +1142,9 @@ def gate_tail_hedger(_ctx: PreflightContext) -> Gate:
         spot=50_000.0,
         symbol="PREFLIGHT",
         silo="US_IBKR",
+        # Pinned so the grounded-fact digest -- and therefore the certificate
+        # digest -- is reproducible on an identical commit.
+        as_of_ns=PREFLIGHT_AS_OF_NS,
     )
     if plan is None:
         return Gate(
@@ -1359,9 +1422,10 @@ def gate_killswitch(ctx: PreflightContext) -> Gate:
     # the hardware latch and never one-time framework setup.
     report = ctx.orchestrator().trigger_global_kill_switch(client=ctx.client())
     latency_ns = int(report.get("latency_ns", 0) or 0)
+    within_budget = 0 < latency_ns < KILLSWITCH_LATENCY_BUDGET_NS
     ok = (
         int(report.get("halt_status", 0) or 0) == 200
-        and 0 < latency_ns < KILLSWITCH_LATENCY_BUDGET_NS
+        and within_budget
         and str(report.get("halted_state")) == "HALTED"
         and int(report.get("rearm_status", 0) or 0) == 200
         and str(report.get("final_state")) == "ARMED"
@@ -1370,12 +1434,16 @@ def gate_killswitch(ctx: PreflightContext) -> Gate:
         "cockpit.killswitch_and_rearm",
         "Global kill switch < 1 ms + re-arm",
         PASS if ok else FAIL,
-        f"halt latency={latency_ns} ns, HALTED->{report.get('halted_state')}, "
+        f"halt latency={latency_ns} ns (budget {KILLSWITCH_LATENCY_BUDGET_NS} ns), "
+        f"HALTED->{report.get('halted_state')}, "
         f"rearm->{report.get('final_state')}",
         {
             "halt_status": int(report.get("halt_status", 0) or 0),
+            # Runtime telemetry only: stripped from the certificate digest so a
+            # 0.7 ms and a 0.9 ms halt certify identically on the same commit.
             "latency_ns": latency_ns,
             "latency_budget_ns": KILLSWITCH_LATENCY_BUDGET_NS,
+            "within_budget": within_budget,
             "halted_state": str(report.get("halted_state", "")),
             "rearm_status": int(report.get("rearm_status", 0) or 0),
             "rearm_state": str(report.get("rearm_state", "")),

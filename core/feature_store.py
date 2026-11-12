@@ -188,6 +188,30 @@ _SCHEMA_SQL: tuple[str, ...] = (
 )
 
 
+#: Contagion rows are write-behind: the cascade SLA (``sec_010`` 1.8 ms) must
+#: never absorb a DuckDB commit, and on this class of hardware one 32-row
+#: ``INSERT OR REPLACE`` commit costs ~0.25 s (ART index + WAL fsync).
+#: ``append_contagion`` therefore only appends to an in-process list (~17 us).
+#: Rows are committed on the next filtered read (read-after-write), on an
+#: explicit :meth:`FeatureStore.flush`, on :meth:`FeatureStore.close`, or when
+#: the buffer reaches ``CONTAGION_FLUSH_BATCH`` (the double-writer guard).
+#:
+#: There is deliberately **no** timer thread: a background commit inside the
+#: Ring 1 interpreter measurably pollutes the ``sec_010`` tick-to-intent tail
+#: (p99 0.015 ms -> 0.09 ms), so the flush is always driven by a caller that
+#: already owns the latency budget.
+CONTAGION_FLUSH_BATCH = 32
+
+_CONTAGION_INSERT_SQL = """
+                INSERT OR REPLACE INTO contagion_features
+                    (silo, sym, as_of_date, as_of_ns, knowledge_ts_ns, tick_index,
+                     crowd_asymmetry_score, cascade_fragility_index,
+                     narrative_exhaustion_divergence, requires_ring1_halt,
+                     sha256_digest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+
+
 class FeatureStore:
     """Bitemporal DuckDB feature lake with Parquet partition export."""
 
@@ -199,6 +223,11 @@ class FeatureStore:
         self.partition_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._con = duckdb.connect(str(self.db_path))
+        self._contagion_pending: list[tuple[Any, ...]] = []
+        #: Guards the buffer only, so a producer is never blocked by the
+        #: ~0.25 s DuckDB commit another thread holds ``_lock`` for.  Lock
+        #: order is always ``_pending_lock`` -> ``_lock``.
+        self._pending_lock = threading.Lock()
         self._init_schema()
 
     # -- infrastructure ---------------------------------------------------
@@ -212,11 +241,30 @@ class FeatureStore:
         return self._con
 
     def close(self) -> None:
+        try:
+            self._flush_contagion()
+        except Exception:  # pragma: no cover - best-effort durability
+            pass
         with self._lock:
             try:
                 self._con.close()
             except Exception:  # pragma: no cover
                 pass
+
+    def flush(self) -> int:
+        """Persist buffered contagion rows; returns the number flushed."""
+        return self._flush_contagion()
+
+    def _flush_contagion(self) -> int:
+        """Commit the buffered contagion batch in one transaction."""
+        with self._pending_lock:
+            if not self._contagion_pending:
+                return 0
+            rows = self._contagion_pending
+            self._contagion_pending = []
+        with self._lock:
+            self._con.executemany(_CONTAGION_INSERT_SQL, rows)
+        return len(rows)
 
     def __enter__(self) -> "FeatureStore":
         return self
@@ -609,17 +657,9 @@ class FeatureStore:
                 ("narrative_exhaustion_divergence", features.narrative_exhaustion_divergence),
             ]
         )
-        with self._lock:
-            self._con.execute(
-                """
-                INSERT OR REPLACE INTO contagion_features
-                    (silo, sym, as_of_date, as_of_ns, knowledge_ts_ns, tick_index,
-                     crowd_asymmetry_score, cascade_fragility_index,
-                     narrative_exhaustion_divergence, requires_ring1_halt,
-                     sha256_digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
+        with self._pending_lock:
+            self._contagion_pending.append(
+                (
                     silo,
                     features.symbol,
                     date_key,
@@ -631,8 +671,14 @@ class FeatureStore:
                     features.narrative_exhaustion_divergence,
                     features.requires_ring1_halt,
                     digest,
-                ],
+                )
             )
+            overflow = len(self._contagion_pending) >= CONTAGION_FLUSH_BATCH
+        if overflow:
+            # Double-writer guard only: a reader would normally have drained
+            # this long before.  Bounded so a store nobody reads cannot grow
+            # without limit.
+            self._flush_contagion()
         return digest
 
     def query_contagion(
@@ -646,6 +692,10 @@ class FeatureStore:
     ) -> list[dict[str, Any]]:
         as_of = int(as_of_ns)
         cutoff = as_of if knowledge_ts_ns is None else int(knowledge_ts_ns)
+        # Read-after-write: a filtered read observes every buffered row.  The
+        # flush is issued before ``_lock`` is taken to keep the lock order
+        # ``_pending_lock`` -> ``_lock``.
+        self._flush_contagion()
         with self._lock:
             cursor = self._con.execute(
                 """
