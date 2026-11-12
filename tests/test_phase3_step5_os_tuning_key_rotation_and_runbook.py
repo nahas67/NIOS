@@ -7,7 +7,7 @@ Gate 2  Zero-downtime Ring 0 key rotation: Fernet master keys + Ed25519 keypair,
         signatures still verifying, no raw secret in any response or tracked file.
 Gate 3  ``RUNBOOK.md`` completeness: SOPs 1-5 and every canonical ``/api/v2/*``
         endpoint documented.
-Gate 4  Final full-platform inventory (17 suites), rebuilt cockpit bundle with
+Gate 4  Final full-platform inventory (18 suites), rebuilt cockpit bundle with
         the rotation control, and the annotated ``v3.0.0-PROD`` release tag.
 
 Governing sections: ``sec_004`` (ring isolation + air-gap), ``sec_010`` /
@@ -449,9 +449,9 @@ def test_gate3_runbook_documents_all_sops_and_endpoints() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate4_test_inventory_is_seventeen_files() -> None:
+def test_gate4_test_inventory_is_eighteen_files() -> None:
     test_files = sorted(TESTS_DIR.glob("test_*.py"))
-    assert len(test_files) == 17, [path.name for path in test_files]
+    assert len(test_files) == 18, [path.name for path in test_files]
     assert "test_phase3_step5_os_tuning_key_rotation_and_runbook.py" in {
         path.name for path in test_files
     }

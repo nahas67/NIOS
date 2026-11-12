@@ -4,7 +4,7 @@ Gate 1  Prometheus / OpenMetrics format, scrape, and JSON telemetry parity.
 Gate 2  Accelerated soak + memory-leak audit (2,000 cycles, 4 silos).
 Gate 3  Chaos SIGKILL hard-crash recovery (outbox voiding, double-entry
         conservation, stale-lease fail-closed).
-Gate 4  Full regression inventory (17 suites), rebuilt cockpit bundle, and the
+Gate 4  Full regression inventory (18 suites), rebuilt cockpit bundle, and the
         annotated ``v3.0.0-PROD`` release tag.
 
 Governing sections: ``sec_004`` (ring isolation + heartbeat SHM), ``sec_009``
@@ -302,9 +302,9 @@ def test_gate3_chaos_sigkill_lease_and_tick_recovery(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate4_test_inventory_is_seventeen_files() -> None:
+def test_gate4_test_inventory_is_eighteen_files() -> None:
     test_files = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 17, test_files
+    assert len(test_files) == 18, test_files
     for expected in (
         "test_phase3_step1_multiprocess_and_live_daemons.py",
         "test_phase3_step2_live_cutover_and_cockpit.py",
