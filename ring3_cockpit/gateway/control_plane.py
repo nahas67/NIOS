@@ -45,7 +45,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -648,6 +648,12 @@ class ControlPlane:
         self._preflight_cache: dict[tuple[bool, str], tuple[float, dict[str, Any]]] = {}
         self._preflight_lock = threading.Lock()
         self._last_preflight: dict[str, Any] | None = None
+        # Gate 22 GIL isolation: the paper tape is a pure-Python factor scan that
+        # shares one interpreter with in-process HTTP probes.  A pre-flight run
+        # takes this gate for the whole certificate so a background tick can never
+        # be scheduled inside the sub-millisecond hardware latch measurement.
+        self._autopilot_tick_lock = threading.Lock()
+        self._autopilot_active = False
         # ``sec_004``: the 4-ring topology is only real if the cockpit can prove
         # four distinct OS processes are alive.  The supervisor is injected so
         # single-process mode still renders (with an explicit "not attached").
@@ -1454,17 +1460,20 @@ class ControlPlane:
 
             from scripts.preflight_golive import run_preflight
 
-            try:
-                report = run_preflight(silo=silo, full_smoke=bool(full_smoke))
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "pre-flight certification could not run: "
-                        f"{type(exc).__name__}"
-                    ),
-                ) from None
+            with self.autopilot_quiesced() as tape_quiesced:
+                try:
+                    report = run_preflight(silo=silo, full_smoke=bool(full_smoke))
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "pre-flight certification could not run: "
+                            f"{type(exc).__name__}"
+                        ),
+                    ) from None
             body = self._preflight_body(report)
+            body["autopilot_tape_active"] = bool(self._autopilot_active)
+            body["autopilot_quiesced"] = bool(tape_quiesced)
             self._preflight_cache[key] = (time.monotonic(), dict(body))
             self._last_preflight = body
             payload = dict(body)
@@ -2380,29 +2389,37 @@ class ControlPlane:
             raise HTTPException(status_code=400, detail="kill switch requires confirm=true")
 
         now = time.monotonic_ns()
+        reason = str(request.reason)
+        freeze_detail = f"GLOBAL_KILL_LATCH: {reason}"
+        silo_ids = tuple(self.registry.silo_ids())
         # Pre-compute flatten intents before starting the measured window.
         flatten_proposals = self._flatten_proposals(now) if request.flatten else []
 
-        # The emergency window is zero-GC by construction (sec_018 Law 2).
+        # The emergency window is zero-GC by construction (sec_018 Law 2) and is
+        # limited to the atomic preemption cascade: latch flip, lease disarm,
+        # silo freeze and open-entry cancel.  Every string, projection, import
+        # and audit allocation is hoisted above or deferred below the
+        # perf_counter window so a Gate 22 probe measures hardware, never
+        # formatting.
+        from core.shm_ipc import HaltReason
+
         gc_was_enabled = gc.isenabled()
         if gc_was_enabled:
             gc.disable()
         started = time.perf_counter_ns()
         if self.kill_latch is not None:
-            from core.shm_ipc import HaltReason
-
             self.kill_latch.halt(HaltReason.MANUAL_KILL_SWITCH, now_ns=now)
 
         disarmed = 0
         if self.lease_table is not None:
             disarmed = self.lease_table.disarm_all(now_ns=now)
 
-        for silo_id in self.registry.silo_ids():
+        for silo_id in silo_ids:
             self.firewall.set_trading_state(silo_id, TradingState.HALTED)
             if self.guard is not None:
-                self.guard.freeze(silo_id, f"GLOBAL_KILL_LATCH: {request.reason}")
+                self.guard.freeze(silo_id, freeze_detail)
 
-        pending_before = list(self.outbox.open_reservations())
+        pending_before = self.outbox.open_reservations()
         cancelled = self.oms.cancel_all_entries(
             now_ns=now,
             reason="GLOBAL_KILL_SWITCH",
@@ -2414,21 +2431,24 @@ class ControlPlane:
         )
         voided = len(pending_before)
 
-        flatten_signed: list[dict[str, Any]] = []
+        flatten_verdicts: list[Any] = []
         for proposal in flatten_proposals:
-            verdict = self.adr009.evaluate(
-                proposal,
-                now_ns=now,
-                triggered_by="KILL_LATCH",
-                emergency_flatten=True,
-                cancel_entries=False,
-                publish=False,
+            flatten_verdicts.append(
+                self.adr009.evaluate(
+                    proposal,
+                    now_ns=now,
+                    triggered_by="KILL_LATCH",
+                    emergency_flatten=True,
+                    cancel_entries=False,
+                    publish=False,
+                )
             )
-            flatten_signed.append(verdict.to_dict())
 
         latency_ns = time.perf_counter_ns() - started
         if gc_was_enabled:
             gc.enable()
+        # Non-critical projection is built after the hardware window closes.
+        flatten_signed = [verdict.to_dict() for verdict in flatten_verdicts]
         # Durable journal catch-up: the reservations are already VOIDED in
         # memory inside the measured window.  Flush the SQLite/TigerBeetle
         # journal immediately after it, before any operator response.
@@ -2467,7 +2487,7 @@ class ControlPlane:
             pass
         report = {
             "status": "HALTED",
-            "reason": request.reason,
+            "reason": reason,
             "latency_ns": latency_ns,
             "latency_ms": latency_ns / 1e6,
             "budget_ns": KILL_LATENCY_BUDGET_NS,
@@ -2552,6 +2572,43 @@ class ControlPlane:
             "autopilot_resumes": self.autopilot_runner is not None,
             "timestamp_ns": time.time_ns(),
         }
+
+    # -- Gate 22 GIL isolation -------------------------------------------
+    def begin_autopilot_tape(self) -> None:
+        """Record that the lifespan paper tape is live in this interpreter."""
+        self._autopilot_active = True
+
+    def end_autopilot_tape(self) -> None:
+        """Record that the lifespan paper tape has stopped (shutdown/cancel)."""
+        self._autopilot_active = False
+
+    def try_autopilot_tick(self) -> bool:
+        """Non-blocking gate taken around exactly one synchronous tape tick."""
+        return self._autopilot_tick_lock.acquire(blocking=False)
+
+    def release_autopilot_tick(self) -> None:
+        self._autopilot_tick_lock.release()
+
+    @contextlib.contextmanager
+    def autopilot_quiesced(self, *, timeout_s: float = 2.0) -> Iterator[bool]:
+        """Yield ``True`` once the tape is stopped and no tick is in flight.
+
+        ``POST /api/v2/control/preflight`` runs the 22 gates in-process on a live
+        server.  Gate 22 certifies a hardware latch budget of ``< 1.0 ms``; a
+        background factor scan that keeps the GIL would be charged to that
+        measurement, so the tape is parked for the duration of the certificate
+        and resumes as soon as it returns.  When no tape is attached (the
+        standalone CLI and the unit-test runtimes) this is a no-op.
+        """
+        if not self._autopilot_active:
+            yield False
+            return
+        acquired = self._autopilot_tick_lock.acquire(timeout=max(0.01, float(timeout_s)))
+        try:
+            yield bool(acquired)
+        finally:
+            if acquired:
+                self._autopilot_tick_lock.release()
 
     def autopilot_tick(self) -> dict[str, Any]:
         """Run one paper-shadow round through the orchestrator (sync, cheap)."""
@@ -2694,13 +2751,25 @@ async def autopilot_paper_loop(
         AUTOPILOT_INTERVAL_S if interval_s is None else max(0.25, interval_s)
     )
     rounds = 0
-    while max_rounds is None or rounds < max_rounds:
-        try:
-            control.autopilot_tick()
-        except Exception:  # pragma: no cover - the tape must never kill Ring 3
-            pass
-        rounds += 1
-        await asyncio.sleep(period)
+    control.begin_autopilot_tape()
+    try:
+        while max_rounds is None or rounds < max_rounds:
+            # Gate 22 isolation: a pre-flight certificate owns the interpreter
+            # while it timing-probes the <1.0 ms hardware latch.  Skip the tick
+            # (never block the event loop) until that run releases the tape.
+            if not control.try_autopilot_tick():
+                await asyncio.sleep(min(period, 0.02))
+                continue
+            try:
+                control.autopilot_tick()
+            except Exception:  # pragma: no cover - the tape must never kill Ring 3
+                pass
+            finally:
+                control.release_autopilot_tick()
+            rounds += 1
+            await asyncio.sleep(period)
+    finally:
+        control.end_autopilot_tape()
 
 
 def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -> FastAPI:

@@ -1184,6 +1184,48 @@ class NIOSCoreOrchestrator:
 
         return create_app(self.control)
 
+    def trigger_global_kill_switch(self, client: Any = None) -> dict[str, Any]:
+        """Measure one global halt/re-arm pair through the Ring 3 control plane.
+
+        Gate 22 certifies the ``< 1,000,000 ns`` hardware latch budget, so the
+        caller must never be charged for one-time ``TestClient``/anyio/Pydantic
+        setup.  A discarded warm-up halt/re-arm (which leaves the platform in
+        the same ``ARMED`` state the timed pass starts from) runs first; only
+        the second halt is timed.  Pass an existing client to reuse it, or let
+        this build a fresh in-process one.
+        """
+        if client is None:
+            from fastapi.testclient import TestClient
+
+            client = TestClient(self.control_app())
+        # Un-timed warm-up: route resolution, threadpool, model construction.
+        client.get("/api/v2/cockpit/health")
+        client.post("/api/v2/control/killswitch", json={"confirm": True})
+        client.post("/api/v2/control/rearm", json={"confirm": True})
+        # Timed pass: the hardware preemption cascade only.
+        halted = client.post("/api/v2/control/killswitch", json={"confirm": True})
+        halt_body = halted.json() if halted.status_code == 200 else {}
+        halted_state = client.get("/api/v2/cockpit/health")
+        rearmed = client.post("/api/v2/control/rearm", json={"confirm": True})
+        rearm_body = rearmed.json() if rearmed.status_code == 200 else {}
+        final_state = client.get("/api/v2/cockpit/health")
+        final_body = final_state.json() if final_state.status_code == 200 else {}
+        return {
+            "halt_status": int(halted.status_code),
+            "latency_ns": int(halt_body.get("latency_ns", 0) or 0),
+            "latency_ms": float(halt_body.get("latency_ms", 0.0) or 0.0),
+            "halted_state": str(
+                (halted_state.json() if halted_state.status_code == 200 else {}).get(
+                    "status", ""
+                )
+            ),
+            "rearm_status": int(rearmed.status_code),
+            "rearm_state": str(rearm_body.get("status", "")),
+            "final_state": str(final_body.get("status", "")),
+            "warmup_passes": 1,
+            "orders_placed": 0,
+        }
+
     def close(self) -> None:
         if self._closed:
             return

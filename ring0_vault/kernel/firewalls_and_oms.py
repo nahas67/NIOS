@@ -1417,6 +1417,7 @@ class SmartOMS:
         if not keys:
             return 0
         self.outbox.void_many(keys, reason=reason, now_ns=stamp, persist=persist)
+        event_reason = f"{reason}; pending outbox reservation voided"
         for chaser in targets:
             chaser.mark_canceled(reason)
             event = ExecutionEvent(
@@ -1428,7 +1429,7 @@ class SmartOMS:
                 qty=chaser.qty,
                 price=chaser.price,
                 state="CANCELED",
-                reason=f"{reason}; pending outbox reservation voided",
+                reason=event_reason,
                 timestamp_ns=stamp,
             )
             self._events.append(event)

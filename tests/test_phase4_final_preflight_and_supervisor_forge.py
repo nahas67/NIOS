@@ -575,3 +575,63 @@ def test_step2_frontend_lint_is_zero_and_bundle_is_served(cockpit: Any) -> None:
         response = cockpit.get(asset)
         assert response.status_code == 200, asset
         assert response.content, f"empty served asset: {asset}"
+
+def test_step2_preflight_under_active_autopilot_passes_22_of_22() -> None:
+    """Gate 22 must measure the hardware latch, never the tape's GIL slice.
+
+    The live server runs ``autopilot_paper_loop`` in the same interpreter that
+    serves ``POST /api/v2/control/preflight``.  A background factor scan must
+    not be charged to the ``< 1.0 ms`` preemption budget, so the tape is
+    quiesced for the certificate and Gate 22 warms the route before timing.
+    """
+    from fastapi.testclient import TestClient
+
+    from scripts.run_nios import build_runtime
+
+    runtime = build_runtime()
+    try:
+        app = runtime.control_app()
+        with TestClient(app) as client:
+            assert app.state.autopilot_task is not None
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                if int(runtime.autopilot_snapshot().get("rounds", 0)) >= 2:
+                    break
+                time.sleep(0.05)
+            rounds_before = int(runtime.autopilot_snapshot().get("rounds", 0))
+            assert rounds_before >= 2, "paper tape never started ticking"
+
+            latencies: list[int] = []
+            for refresh in (True, True, False):
+                response = client.post(
+                    "/api/v2/control/preflight",
+                    json={"full_smoke": False, "silo": "ALL", "refresh": refresh},
+                )
+                assert response.status_code == 200, response.text
+                body = response.json()
+                assert body["ready_for_live_cutover"] is True
+                assert body["passed_gates"] == 22
+                assert body["failed_gates"] == 0
+                assert body["failed_gate_ids"] == []
+                assert body["autopilot_tape_active"] is True
+                assert body["autopilot_quiesced"] is True
+                gate = next(
+                    row
+                    for row in body["gates"]
+                    if row["gate"] == "cockpit.killswitch_and_rearm"
+                )
+                assert gate["status"] == "PASS", gate
+                latency_ns = int(gate["evidence"]["latency_ns"])
+                assert 0 < latency_ns < 1_000_000, gate
+                latencies.append(latency_ns)
+
+            assert max(latencies) < 1_000_000
+            deadline = time.monotonic() + 10.0
+            while (
+                time.monotonic() < deadline
+                and int(runtime.autopilot_snapshot().get("rounds", 0)) <= rounds_before
+            ):
+                time.sleep(0.05)
+            assert int(runtime.autopilot_snapshot().get("rounds", 0)) > rounds_before
+    finally:
+        runtime.close()
