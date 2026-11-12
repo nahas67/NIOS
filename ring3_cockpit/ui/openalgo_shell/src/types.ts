@@ -1298,3 +1298,255 @@ export interface McpPageData {
   console_ready: boolean
   generated_at_ns: number
 }
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 Step 5 — interactive operator actions (paper-only)
+ * ------------------------------------------------------------------ */
+
+export type PaperOrderStyle = 'MAKER_PEG' | 'TWAP_ICEBERG'
+export type OrderSide = 'BUY' | 'SELL'
+
+export interface PaperOrderPayload {
+  silo: string
+  symbol: string
+  side: OrderSide
+  quantity: number
+  order_style: PaperOrderStyle
+  limit_price?: number | null
+  expected_gross_bps?: number
+  spread_bps?: number
+  fill_immediately?: boolean
+}
+
+export interface RatchetSplit {
+  realized_net_micros: number
+  long_term_micros: number
+  reserve_micros: number
+  scalper_micros: number
+}
+
+export interface RatchetReceipt {
+  applied: boolean
+  long_term_pct: number
+  reserve_pct: number
+  scalper_pct: number
+  split_micros: RatchetSplit
+  [key: string]: unknown
+}
+
+export interface PaperOrderReceipt {
+  status: 'FILLED' | 'WORKING'
+  mode: string
+  page: string
+  silo: string
+  symbol: string
+  side: string
+  quantity: number
+  order_style: string
+  order_id: string
+  filled: boolean
+  fill_price: number | null
+  notional_micros: number
+  realized_net_micros: number
+  ratchet: RatchetReceipt
+  proposal: Record<string, unknown>
+  order: Record<string, unknown> | null
+  receipt: Record<string, unknown> | null
+  outbox: Record<string, unknown>
+  blotter: OrdersPageData
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface CancelOrdersPayload {
+  order_id?: string
+  silo?: string | null
+  reason?: string
+}
+
+export interface CancelOrdersReceipt {
+  status: string
+  mode: string
+  page: string
+  order_id: string
+  silo: string | null
+  cancelled_count: number
+  cancelled_order_ids: string[]
+  voided_outbox_keys: string[]
+  receipt: Record<string, unknown> | null
+  outbox: Record<string, unknown>
+  blotter: OrdersPageData
+  operator: string
+  reason: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface ShadowBurstPayload {
+  silo: string
+  rounds: number
+}
+
+export interface ShadowBurstTick {
+  status: string
+  ticks: number
+  total_ticks: number
+  shadow_fills: number
+  live_fills: number
+  graduated: string[]
+}
+
+export interface ShadowBurstReceipt {
+  status: string
+  mode: string
+  page: string
+  silo: string
+  strategy_id: string
+  rounds_requested: number
+  rounds_completed: number
+  ticks_executed: number
+  fills_gained: number
+  shadow_fills: number
+  required_fills: number
+  remaining_fills: number
+  graduated: boolean
+  graduation_threshold_met: boolean
+  adverse_selection_bps: number
+  q98_bps: number
+  total_shadow_fills: number
+  last_tick: ShadowBurstTick | null
+  nursery: AnalyzerNursery
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface OptionPricePayload {
+  symbol: string
+  spot: number
+  strike: number
+  volatility: number
+  days_to_expiry: number
+  risk_free_rate: number
+  option_type: 'PUT' | 'CALL'
+}
+
+export interface OptionGreeks {
+  price: number
+  delta: number
+  gamma: number
+  vega: number
+  theta: number
+  rho: number
+  d1: number
+  d2: number
+}
+
+export interface OptionGroundingReceipt {
+  sha256_digest: string
+  verified: boolean
+  claims_checked: number
+  derived_expressions: number
+  tolerance: number
+  packet: Record<string, unknown>
+  report: Record<string, unknown>
+}
+
+export interface OptionPriceReceipt {
+  status: string
+  page: string
+  symbol: string
+  option_type: string
+  inputs: Record<string, number>
+  greeks: OptionGreeks
+  grounding: OptionGroundingReceipt
+  packet: Record<string, unknown>
+  grounding_ledger: { packets: number }
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface QuantScanPayload {
+  top_k: number
+}
+
+export interface InteractiveQuantScan {
+  status: string
+  page: string
+  scan_id: string
+  factor_count: number
+  universe_size: number
+  candidate_count: number
+  top_k: number
+  candidates: QuantScanCandidate[]
+  scan_latency_ms: number
+  reported_elapsed_ms: number
+  kernel_count: number
+  compression_ratio: number
+  as_of_ns: number
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface SkillMarkdownReceipt {
+  status: string
+  page: string
+  skill: string
+  name: string
+  description: string
+  enabled: boolean
+  path: string
+  frontmatter: Record<string, unknown>
+  body: string
+  markdown: string
+  bytes: number
+  progressive_disclosure: boolean
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface ReconcileSiloReceipt {
+  silo: string
+  drift_ppm: number
+  drift_pct: number
+  threshold_ppm: number
+  within_threshold: boolean
+  breached: boolean
+  frozen: boolean
+  symbols_checked: number
+  repair_action: string
+  vaults: Record<string, unknown>
+  report: Record<string, unknown>
+  [key: string]: unknown
+}
+
+export interface LedgerReconcileReceipt {
+  status: string
+  page: string
+  silos_checked: string[]
+  silo_count: number
+  silos: Record<string, ReconcileSiloReceipt>
+  breached_silos: string[]
+  all_within_threshold: boolean
+  threshold_ppm: number
+  double_entry: {
+    debits_micros: number
+    credits_micros: number
+    balanced: boolean
+    proof: string
+  }
+  invariant: Record<string, unknown>
+  frozen_silos: string[]
+  operator: string
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}

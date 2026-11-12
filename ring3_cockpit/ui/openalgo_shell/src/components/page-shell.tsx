@@ -9,11 +9,23 @@ interface PageShellProps {
   ring: string
   subtitle: string
   actions?: ReactNode
+  /**
+   * Capability badge. Interactive paper-only pages declare `PAPER CONTROL`;
+   * they still cannot sign a live order from Ring 3.
+   */
+  capability?: 'READ-ONLY' | 'PAPER CONTROL'
   children: ReactNode
 }
 
-/** Consistent read-only page header used by every cockpit page. */
-export function PageShell({ title, ring, subtitle, actions, children }: PageShellProps) {
+/** Consistent page header used by every cockpit page. */
+export function PageShell({
+  title,
+  ring,
+  subtitle,
+  actions,
+  capability = 'READ-ONLY',
+  children,
+}: PageShellProps) {
   return (
     <div className="space-y-4">
       <header className="flex flex-wrap items-end justify-between gap-3">
@@ -25,9 +37,13 @@ export function PageShell({ title, ring, subtitle, actions, children }: PageShel
             </Badge>
             <Badge
               variant="outline"
-              className="border-emerald-500/40 font-mono text-[9px] text-emerald-300"
+              className={
+                capability === 'READ-ONLY'
+                  ? 'border-emerald-500/40 font-mono text-[9px] text-emerald-300'
+                  : 'border-amber-500/40 font-mono text-[9px] text-amber-300'
+              }
             >
-              READ-ONLY
+              {capability}
             </Badge>
           </div>
           <p className="mt-1 max-w-3xl text-[11px] text-muted-foreground">{subtitle}</p>

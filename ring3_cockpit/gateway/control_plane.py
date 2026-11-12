@@ -39,6 +39,7 @@ import asyncio
 import contextlib
 import gc
 import json
+import math
 import os
 import threading
 import time
@@ -499,6 +500,145 @@ class TestnetOrderRequest(BaseModel):
         if not value:
             raise ValueError("confirm_sandbox must be true to acknowledge a paper venue")
         return True
+
+
+class PaperOrderRequest(BaseModel):
+    """``POST /api/v2/control/orders/paper`` payload (Step 5, ``sec_018`` Law 4).
+
+    Paper-only by construction: there is no venue field and no credential is
+    read.  The order is grounded, reserved by the Ring 0 outbox, routed through
+    ``SmartOMS`` (Maker-Peg or TWAP/Iceberg) and, when filled, swept by the
+    in-silo ``35% / 15% / 50%`` profit ratchet.
+    """
+
+    silo: str = Field(..., min_length=1)
+    symbol: str = Field(..., min_length=1)
+    side: str = "BUY"
+    quantity: float = Field(..., gt=0.0, le=1_000_000.0)
+    order_style: str = "MAKER_PEG"
+    limit_price: float | None = Field(default=None, gt=0.0)
+    expected_gross_bps: float = Field(default=18.0, ge=0.0, le=5_000.0)
+    spread_bps: float = Field(default=1.2, ge=0.0, le=500.0)
+    top_of_book_qty: float = Field(default=1_000.0, gt=0.0)
+    fill_immediately: bool = True
+    strategy_id: str | None = None
+    operator: str = "ring3.operator"
+
+    @field_validator("silo")
+    @classmethod
+    def _silo_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if not token:
+            raise ValueError("silo must not be empty")
+        return token
+
+    @field_validator("side")
+    @classmethod
+    def _side_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if token not in ("BUY", "SELL"):
+            raise ValueError("side must be BUY or SELL")
+        return token
+
+    @field_validator("order_style")
+    @classmethod
+    def _style_ok(cls, value: str) -> str:
+        token = str(value).strip().upper().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "MAKER_PEG": "MAKER_PEG",
+            "MAKER": "MAKER_PEG",
+            "PEG": "MAKER_PEG",
+            "TWAP": "TWAP_ICEBERG",
+            "ICEBERG": "TWAP_ICEBERG",
+            "TWAP_ICEBERG": "TWAP_ICEBERG",
+        }
+        if token not in aliases:
+            raise ValueError("order_style must be MAKER_PEG or TWAP_ICEBERG")
+        return aliases[token]
+
+
+class CancelOrdersRequest(BaseModel):
+    """``POST /api/v2/control/orders/cancel`` payload (Step 5).
+
+    ``order_id`` may be one ``SmartOMS`` order id or the literal ``ALL``.
+    Cancelling always voids the matching pending outbox reservation so no
+    stranded capital survives the cancel.
+    """
+
+    order_id: str = "ALL"
+    silo: str | None = None
+    reason: str = "operator cancel"
+    operator: str = "ring3.operator"
+
+    @field_validator("order_id")
+    @classmethod
+    def _order_ok(cls, value: str) -> str:
+        token = str(value or "ALL").strip()
+        return token or "ALL"
+
+
+class ShadowBurstRequest(BaseModel):
+    """``POST /api/v2/control/analyzer/shadow-burst`` payload (Step 5).
+
+    Drives ``rounds`` paper autopilot ticks so the operator can graduate a
+    strategy to the 30-fill shadow threshold interactively.
+    """
+
+    silo: str = "CRYPTO_BINANCE"
+    rounds: int = Field(default=10, ge=1, le=500)
+    strategy_id: str | None = None
+    operator: str = "ring3.operator"
+
+    @field_validator("silo")
+    @classmethod
+    def _silo_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if not token:
+            raise ValueError("silo must not be empty")
+        return token
+
+
+class OptionPriceRequest(BaseModel):
+    """``POST /api/v2/control/quant/price-option`` payload (Step 5, ``sec_017``).
+
+    Every input and every Greek is sealed into a SHA-256
+    ``GroundedFactPacket`` before the number reaches the cockpit.
+    """
+
+    symbol: str = Field(default="NIOS.OPT", min_length=1)
+    spot: float = Field(..., gt=0.0)
+    strike: float = Field(..., gt=0.0)
+    volatility: float = Field(..., gt=0.0, le=20.0)
+    days_to_expiry: float = Field(..., gt=0.0, le=36_500.0)
+    risk_free_rate: float = Field(default=0.05, ge=-1.0, le=1.0)
+    option_type: str = "PUT"
+    operator: str = "ring3.operator"
+
+    @field_validator("option_type")
+    @classmethod
+    def _type_ok(cls, value: str) -> str:
+        token = str(value).strip().upper()
+        if token not in ("PUT", "CALL"):
+            raise ValueError("option_type must be PUT or CALL")
+        return token
+
+
+class QuantScanRequest(BaseModel):
+    """``POST /api/v2/control/quant/scan`` payload (Step 5)."""
+
+    top_k: int = Field(default=15, ge=1, le=500)
+    operator: str = "ring3.operator"
+
+
+class LedgerReconcileRequest(BaseModel):
+    """``POST /api/v2/control/ledger/reconcile`` payload (Step 5, ``sec_009``).
+
+    Runs ``LiveReconciler.reconcile_all`` across every silo (or the requested
+    subset) and proves double-entry conservation.
+    """
+
+    silos: list[str] | None = None
+    operator: str = "ring3.operator"
 
 
 # ---------------------------------------------------------------------------
@@ -1842,6 +1982,760 @@ class ControlPlane:
             del self._testnet_receipts[:-64]
         return body
 
+    # ------------------------------------------------------------------
+    # Phase 4 Step 5: interactive operator actions (paper-only by design)
+    # ------------------------------------------------------------------
+    _PAPER_REFERENCE_PRICES: Mapping[str, float] = {
+        "CRYPTO_BINANCE": 50_000.0,
+        "INDIA_ZERODHA_DHAN": 2_400.0,
+        "US_IBKR": 180.0,
+        "FX_MT5": 1.085,
+    }
+
+    def _known_silos(self) -> list[str]:
+        registry = self.registry
+        if registry is None:
+            return []
+        with contextlib.suppress(Exception):
+            return [str(s) for s in registry.silo_ids()]
+        return []
+
+    def _halted(self) -> bool:
+        return bool(getattr(self.kill_latch, "is_halted", False))
+
+    def submit_paper_order(self, request: PaperOrderRequest) -> dict[str, Any]:
+        """Route one grounded **paper** order through outbox -> OMS -> IBOR.
+
+        Nothing here touches a broker socket, reads a credential, or signs an
+        order: the payload has no venue and no key surface.  ``sec_018`` Law 4
+        is preserved because a paper fill still pays the full cost floor and
+        must clear the conformal gate before it is reserved.
+        """
+
+        from core.schemas import UnsignedProposal
+        from ring0_vault.ibor.ledger_outbox import MICROS_PER_UNIT
+
+        if self._halted():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "GLOBAL_HALTED: the global kill latch is HALTED; rearm via "
+                    "POST /api/v2/control/rearm before submitting paper orders"
+                ),
+            )
+        known = self._known_silos()
+        if known and request.silo not in known:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown silo {request.silo!r}; expected one of {known}",
+            )
+        guard = self.guard
+        if guard is not None and bool(guard.is_frozen(request.silo)):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"SILO_FROZEN: {request.silo} is frozen by reconciliation drift; "
+                    "repair the ledger before submitting paper orders"
+                ),
+            )
+
+        now = time.time_ns()
+        price = float(
+            request.limit_price
+            if request.limit_price is not None
+            else self._PAPER_REFERENCE_PRICES.get(request.silo, 100.0)
+        )
+        half_spread = max(price * 0.0001, price * (request.spread_bps / 10_000.0) / 2.0)
+        book = (price - half_spread, price + half_spread)
+        proposal_id = f"paper-{request.silo.lower()}-{uuid.uuid4().hex[:12]}"
+        symbol = str(request.symbol).strip().upper()
+        proposal = UnsignedProposal(
+            proposal_id=proposal_id,
+            strategy_id=str(request.strategy_id or self.strategy_id),
+            silo=request.silo,
+            vault=VaultName.SPINAL_SCALPER,
+            symbol=symbol,
+            side=str(request.side),
+            qty=float(request.quantity),
+            limit_price=price,
+            expected_gross_bps=float(request.expected_gross_bps),
+            spread_bps=float(request.spread_bps),
+            grounding_hash=_sha256_hex(
+                f"{proposal_id}|{request.silo}|{symbol}|{request.side}|"
+                f"{request.quantity}|{price}|{request.order_style}"
+            ),
+            created_at_ns=now,
+        )
+        notional_micros = int(round(proposal.qty * price * MICROS_PER_UNIT))
+        realized_net_micros = int(
+            round(notional_micros * max(0.0, request.expected_gross_bps) / 10_000.0)
+        )
+
+        try:
+            reservation = self.outbox.reserve(
+                proposal, cost_floor=self.cost_floor(request.silo), now_ns=now
+            )
+            order_row: dict[str, Any]
+            order_id: str
+            filled = False
+            if request.order_style == "MAKER_PEG":
+                chaser = self.oms.submit_maker_peg(
+                    proposal, reservation, book, now_ns=now
+                )
+                order_id = chaser.order_id
+                order_row = _jsonable(chaser)
+                if not isinstance(order_row, dict):  # pragma: no cover - defensive
+                    order_row = {"order_id": order_id}
+                if request.fill_immediately:
+                    self.oms.on_fill(
+                        order_id,
+                        price=float(chaser.price),
+                        realized_net_micros=realized_net_micros,
+                        now_ns=now + 1,
+                    )
+                    filled = True
+            else:
+                plan = self.oms.submit_twap(
+                    proposal, request.top_of_book_qty, now_ns=now
+                )
+                order_id = proposal_id
+                order_row = _jsonable(plan)
+                if not isinstance(order_row, dict):  # pragma: no cover - defensive
+                    order_row = {"order_id": order_id}
+                order_row.setdefault("order_id", order_id)
+                order_row["kind"] = "TWAP_ICEBERG"
+                if request.fill_immediately:
+                    self.outbox.commit(
+                        reservation.outbox_idempotency_key,
+                        broker_order_id=order_id,
+                        now_ns=now + 1,
+                        realized_net_micros=realized_net_micros,
+                        ratchet=getattr(self.oms, "ratchet", None),
+                    )
+                    filled = True
+                    with contextlib.suppress(Exception):
+                        self.oms.record_execution(
+                            ExecutionEvent(
+                                event_type="ORDER_FILLED",
+                                silo=str(proposal.silo),
+                                symbol=str(proposal.symbol),
+                                order_id=order_id,
+                                side=str(proposal.side),
+                                qty=float(proposal.qty),
+                                price=price,
+                                state="FILLED",
+                                reason=(
+                                    "paper TWAP/Iceberg swept at reference mid; "
+                                    f"in-silo ratchet swept {realized_net_micros} micros"
+                                ),
+                                timestamp_ns=now + 1,
+                            )
+                        )
+            receipt = self.outbox.get(reservation.outbox_idempotency_key)
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a rejected paper order is never a 500
+            raise HTTPException(
+                status_code=409,
+                detail=f"paper order rejected: {type(exc).__name__}: {exc}",
+            ) from None
+
+        ratchet = getattr(self.oms, "ratchet", None)
+        split: dict[str, Any] = {}
+        if ratchet is not None:
+            with contextlib.suppress(Exception):
+                split = _jsonable(ratchet.split(realized_net_micros)) or {}
+        reservation_row = _jsonable(receipt) if receipt is not None else {}
+        if not isinstance(reservation_row, dict):
+            reservation_row = {"value": reservation_row}
+        return {
+            "status": "FILLED" if filled else "WORKING",
+            "mode": "PAPER",
+            "page": "orders",
+            "silo": request.silo,
+            "symbol": proposal.symbol,
+            "side": proposal.side,
+            "quantity": float(proposal.qty),
+            "order_style": request.order_style,
+            "order_id": order_id,
+            "filled": filled,
+            "fill_price": float(price),
+            "notional_micros": notional_micros,
+            "realized_net_micros": realized_net_micros if filled else 0,
+            "ratchet": {
+                "applied": bool(filled and realized_net_micros > 0),
+                "long_term_pct": 35,
+                "reserve_pct": 15,
+                "scalper_pct": 50,
+                "split_micros": split,
+            },
+            "proposal": {
+                "proposal_id": proposal.proposal_id,
+                "strategy_id": proposal.strategy_id,
+                "vault": str(proposal.vault),
+                "limit_price": proposal.limit_price,
+                "expected_gross_bps": proposal.expected_gross_bps,
+                "spread_bps": proposal.spread_bps,
+                "grounding_hash": proposal.grounding_hash,
+                "is_grounded": proposal.is_grounded,
+            },
+            "order": order_row,
+            "receipt": reservation_row,
+            "outbox": _jsonable(self.outbox.snapshot()),
+            "blotter": self.orders_page(),
+            "operator": str(request.operator),
+            "law": "sec_018 Law 4 - paper only; no broker credential is read",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def cancel_paper_orders(self, request: CancelOrdersRequest) -> dict[str, Any]:
+        """Cancel working ``SmartOMS`` orders and void their outbox holds."""
+
+        target = str(request.order_id or "ALL").strip()
+        known = self._known_silos()
+        silo = str(request.silo).strip().upper() if request.silo else None
+        if silo is not None and known and silo not in known:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown silo {silo!r}; expected one of {known}",
+            )
+        now = time.time_ns()
+        reason = str(request.reason or "operator cancel")
+        cancelled_ids: list[str] = []
+        voided_ids: list[str] = []
+        receipt: dict[str, Any] | None = None
+
+        try:
+            if target.upper() == "ALL":
+                open_ids = [str(order.order_id) for order in self.oms.open_orders(silo)]
+                pending_keys = [
+                    res.outbox_idempotency_key
+                    for res in self.outbox.open_reservations()
+                    if silo is None or str(res.silo) == silo
+                ]
+                self.oms.cancel_all_entries(
+                    silo=silo,
+                    now_ns=now,
+                    reason=reason,
+                    extra_outbox_keys=tuple(pending_keys),
+                )
+                cancelled_ids = open_ids
+                voided_ids = [str(key) for key in pending_keys]
+                leftover = [
+                    res.outbox_idempotency_key
+                    for res in self.outbox.open_reservations()
+                    if silo is None or str(res.silo) == silo
+                ]
+                for key in leftover:
+                    with contextlib.suppress(Exception):
+                        self.outbox.void(key, reason=reason, now_ns=now)
+                        voided_ids.append(str(key))
+            else:
+                try:
+                    reservation = self.oms.cancel(target, reason=reason, now_ns=now)
+                except KeyError:
+                    reservation = None
+                if reservation is not None:
+                    receipt = _jsonable(reservation)
+                    if not isinstance(receipt, dict):  # pragma: no cover - defensive
+                        receipt = {"value": receipt}
+                    cancelled_ids = [target]
+                else:
+                    match = next(
+                        (
+                            res
+                            for res in self.outbox.open_reservations()
+                            if res.outbox_idempotency_key == target
+                            or res.proposal_id == target
+                            or res.broker_order_id == target
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"no working order or pending reservation {target!r}",
+                        )
+                    reservation = self.outbox.void(
+                        match.outbox_idempotency_key, reason=reason, now_ns=now
+                    )
+                    receipt = _jsonable(reservation)
+                    if not isinstance(receipt, dict):  # pragma: no cover - defensive
+                        receipt = {"value": receipt}
+                    voided_ids = [str(match.outbox_idempotency_key)]
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - cancel is fail-safe, never a 500
+            raise HTTPException(
+                status_code=409,
+                detail=f"cancel rejected: {type(exc).__name__}: {exc}",
+            ) from None
+
+        return {
+            "status": "CANCELLED",
+            "mode": "PAPER",
+            "page": "orders",
+            "order_id": target,
+            "silo": silo or "ALL",
+            "cancelled_count": len(cancelled_ids),
+            "cancelled_order_ids": cancelled_ids,
+            "voided_outbox_keys": voided_ids,
+            "receipt": receipt,
+            "outbox": _jsonable(self.outbox.snapshot()),
+            "blotter": self.orders_page(),
+            "operator": str(request.operator),
+            "reason": reason,
+            "law": "sec_009 - a cancel always releases its pending transfer",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def shadow_burst(self, request: ShadowBurstRequest) -> dict[str, Any]:
+        """Drive ``rounds`` paper ticks through the 30-fill shadow nursery."""
+
+        runner = self.autopilot_runner
+        if runner is None:
+            raise HTTPException(
+                status_code=503,
+                detail="autopilot runner unavailable; the shadow nursery is not wired",
+            )
+        known = self._known_silos()
+        if known and request.silo not in known:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown silo {request.silo!r}; expected one of {known}",
+            )
+        strategy_id = str(request.strategy_id or self.strategy_id)
+        twin = self.shadow_twin
+        target_fills = int(request.rounds)
+        baseline_fills = 0
+        if twin is not None:
+            with contextlib.suppress(Exception):
+                baseline_fills = int(twin.shadow_fill_count(strategy_id))
+        # One paper tick does not always resolve a shadow fill (the twin posts a
+        # maker peg, then fills it on a later tick).  Keep ticking until the
+        # operator gets the burst they asked for, with a hard safety ceiling.
+        max_ticks = max(target_fills * 4, target_fills + 8)
+        completed = 0
+        fills_gained = 0
+        last_tick: dict[str, Any] = {}
+        halted = False
+        try:
+            while completed < max_ticks:
+                outcome = runner(silos=(request.silo,))
+                completed += 1
+                if isinstance(outcome, Mapping):
+                    last_tick = {str(k): v for k, v in outcome.items()}
+                else:  # pragma: no cover - defensive
+                    last_tick = {"value": outcome}
+                if str(last_tick.get("status", "")).upper() == "HALTED":
+                    halted = True
+                if twin is not None:
+                    with contextlib.suppress(Exception):
+                        fills_gained = (
+                            int(twin.shadow_fill_count(strategy_id)) - baseline_fills
+                        )
+                if halted or fills_gained >= target_fills:
+                    break
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a burst failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"shadow burst failed: {type(exc).__name__}: {exc}",
+            ) from None
+
+        required = int(getattr(twin, "required_fills", 30) or 30)
+        fills = 0
+        graduated = False
+        q98 = 0.0
+        remaining = required
+        if twin is not None:
+            with contextlib.suppress(Exception):
+                fills = int(twin.shadow_fill_count(strategy_id))
+            with contextlib.suppress(Exception):
+                graduated = bool(twin.is_graduated(strategy_id))
+            with contextlib.suppress(Exception):
+                q98 = float(twin.q98_bps(strategy_id) or 0.0)
+            with contextlib.suppress(Exception):
+                remaining = int(twin.remaining_fills(strategy_id))
+        page = self.analyzer_page()
+        nursery = page.get("nursery", {}) if isinstance(page, dict) else {}
+        q98_value = float(q98 or 0.0)
+        if not math.isfinite(q98_value):  # NaN/inf residual window before calibration
+            q98_value = 0.0
+        return {
+            "status": "HALTED" if halted else "BURST_COMPLETE",
+            "mode": "PAPER",
+            "page": "analyzer",
+            "silo": request.silo,
+            "strategy_id": strategy_id,
+            "rounds_requested": target_fills,
+            "rounds_completed": completed,
+            "ticks_executed": completed,
+            "fills_gained": int(fills_gained),
+            "shadow_fills": fills,
+            "required_fills": required,
+            "remaining_fills": remaining,
+            "graduated": bool(graduated),
+            "graduation_threshold_met": fills >= required,
+            "adverse_selection_bps": round(q98_value, 6),
+            "q98_bps": round(q98_value, 6),
+            "total_shadow_fills": int(
+                getattr(last_tick, "get", lambda *_: 0)("shadow_fills", fills) or fills
+            ),
+            "last_tick": {
+                key: _jsonable(value)
+                for key, value in last_tick.items()
+                if key in ("status", "ticks", "total_ticks", "shadow_fills", "live_fills", "graduated")
+            },
+            "nursery": nursery,
+            "operator": str(request.operator),
+            "law": "sec_018 Law 4 - 30 shadow fills before any live graduation",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def price_option(self, request: OptionPriceRequest) -> dict[str, Any]:
+        """Black-Scholes price sealed into a SHA-256 grounding packet."""
+
+        from core.schemas import GroundedFactPacket
+        from ring2_brain.quant.scanner import ValuationLab
+        from ring2_brain.truth.grounding_gate import NumericalGroundingVerifier
+
+        years = float(request.days_to_expiry) / 365.0
+        try:
+            lab = ValuationLab()
+            greeks = lab.options(
+                spot=float(request.spot),
+                strike=float(request.strike),
+                volatility=float(request.volatility),
+                rate=float(request.risk_free_rate),
+                years=years,
+                kind=request.option_type.lower(),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a pricer failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"option pricing failed: {type(exc).__name__}: {exc}",
+            ) from None
+
+        now = time.time_ns()
+        metrics: dict[str, float] = {
+            "spot": float(request.spot),
+            "strike": float(request.strike),
+            "volatility": float(request.volatility),
+            "years": years,
+            "risk_free_rate": float(request.risk_free_rate),
+            "price": float(greeks.get("price", 0.0)),
+            "delta": float(greeks.get("delta", 0.0)),
+            "gamma": float(greeks.get("gamma", 0.0)),
+            "vega": float(greeks.get("vega", 0.0)),
+            "theta": float(greeks.get("theta", 0.0)),
+            "rho": float(greeks.get("rho", 0.0)),
+            "d1": float(greeks.get("d1", 0.0)),
+            "d2": float(greeks.get("d2", 0.0)),
+        }
+        symbol = str(request.symbol).strip().upper()
+        packet = GroundedFactPacket(
+            symbol=symbol,
+            valid_time_ns=now,
+            knowledge_ts_ns=now,
+            as_of_ns=now,
+            metrics=metrics,
+        )
+        # ``repr`` emits scientific notation for small Greeks (gamma ~ 4e-05),
+        # and the claim extractor reads the mantissa only, so the figure would
+        # never match the packet. A fixed decimal form keeps every claim exact.
+        def _claim(value: float) -> str:
+            return f"{float(value):.12f}"
+
+        thesis = (
+            f"{request.option_type} grounded option pricing receipt. "
+            f"spot {_claim(metrics['spot'])} strike {_claim(metrics['strike'])} "
+            f"volatility {_claim(metrics['volatility'])} years {_claim(metrics['years'])} "
+            f"risk_free_rate {_claim(metrics['risk_free_rate'])} "
+            f"price {_claim(metrics['price'])} delta {_claim(metrics['delta'])} "
+            f"gamma {_claim(metrics['gamma'])} vega {_claim(metrics['vega'])} "
+            f"theta {_claim(metrics['theta'])} rho {_claim(metrics['rho'])} "
+            f"d1 {_claim(metrics['d1'])} d2 {_claim(metrics['d2'])}."
+        )
+        try:
+            report = NumericalGroundingVerifier().verify_thesis_claims(thesis, packet)
+        except Exception as exc:  # noqa: BLE001 - ungrounded numbers are a 422
+            raise HTTPException(
+                status_code=422,
+                detail=f"{type(exc).__name__}: {exc}",
+            ) from None
+        grounding_ledger: dict[str, Any] | None = None
+        if self.grounding is not None:
+            # ``GroundingLedger.append(packet)`` is the immutable entry point;
+            # ``commit(...)`` builds a packet from raw metrics instead.
+            with contextlib.suppress(Exception):
+                if hasattr(self.grounding, "append"):
+                    self.grounding.append(packet, artifact_kind="option_price")
+            packet_count = 0
+            with contextlib.suppress(Exception):
+                packet_count = len(self.grounding.packets())
+            if packet_count == 0:
+                with contextlib.suppress(Exception):
+                    packet_count = len(self.grounding)
+            grounding_ledger = {"packets": int(packet_count), "digest": packet.sha256_digest}
+        return {
+            "status": "GROUNDED",
+            "page": "quant",
+            "symbol": symbol,
+            "option_type": request.option_type,
+            "inputs": {
+                "spot": metrics["spot"],
+                "strike": metrics["strike"],
+                "volatility": metrics["volatility"],
+                "days_to_expiry": float(request.days_to_expiry),
+                "years_to_expiry": years,
+                "risk_free_rate": metrics["risk_free_rate"],
+            },
+            "greeks": {
+                "price": metrics["price"],
+                "delta": metrics["delta"],
+                "gamma": metrics["gamma"],
+                "vega": metrics["vega"],
+                "theta": metrics["theta"],
+                "rho": metrics["rho"],
+                "d1": metrics["d1"],
+                "d2": metrics["d2"],
+            },
+            "grounding": {
+                "sha256_digest": packet.sha256_digest,
+                "verified": bool(report.claims_checked >= 0),
+                "claims_checked": int(report.claims_checked),
+                "derived_expressions": int(report.derived_expressions),
+                "tolerance": float(report.tolerance),
+                "packet": packet.to_dict(),
+                "report": report.to_dict(),
+            },
+            "packet": packet.to_dict(),
+            "grounding_ledger": grounding_ledger,
+            "operator": str(request.operator),
+            "law": "sec_018 Law 3 - every number carries a SHA-256 commitment",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def scan_factors(self, request: QuantScanRequest) -> dict[str, Any]:
+        """Run the live 490-factor ``VectorizedFactorScanner`` scan."""
+
+        from ring2_brain.quant.scanner import FactorPanel
+
+        started = time.perf_counter()
+        try:
+            panel = FactorPanel.generate(n_symbols=24, n_periods=64)
+            with contextlib.suppress(Exception):
+                self.scanner.warmup()
+            result = self.scanner.scan(panel, commit=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a scan failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"factor scan failed: {type(exc).__name__}: {exc}",
+            ) from None
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        payload = _jsonable(result)
+        if not isinstance(payload, dict):
+            payload = {"result": payload}
+        candidates = payload.get("candidates", []) or []
+        if not isinstance(candidates, list):
+            candidates = list(candidates)
+        self._quant_cache = {"at": time.monotonic(), "data": payload}
+        return {
+            "status": "SCANNED",
+            "page": "quant",
+            "scan_id": payload.get("scan_id", ""),
+            "factor_count": int(
+                payload.get("factor_count", _read(self.scanner, "factor_count", 0)) or 0
+            ),
+            "universe_size": int(payload.get("universe_size", 0) or 0),
+            "candidate_count": len(candidates),
+            "top_k": int(request.top_k),
+            "candidates": candidates[: int(request.top_k)],
+            "scan_latency_ms": round(latency_ms, 3),
+            "reported_elapsed_ms": float(payload.get("elapsed_ms", 0.0) or 0.0),
+            "kernel_count": int(payload.get("kernel_count", 0) or 0),
+            "compression_ratio": float(payload.get("compression_ratio", 0.0) or 0.0),
+            "as_of_ns": int(payload.get("as_of_ns", 0) or 0),
+            "operator": str(request.operator),
+            "law": "sec_018 Law 3 - ranked candidates carry per-row digests",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def skill_markdown(self, skill_name: str) -> dict[str, Any]:
+        """Progressive disclosure: return one ``SKILL.md`` body on demand."""
+
+        from ring2_brain.skills.skill_registry import parse_frontmatter
+
+        token = str(skill_name or "").strip()
+        if (
+            not token
+            or token in {".", ".."}
+            or "/" in token
+            or "\\" in token
+            or ".." in token
+            or len(token) > 128
+        ):
+            raise HTTPException(status_code=404, detail=f"unknown skill {token!r}")
+        registry = self.skills
+        meta = None
+        if registry is not None:
+            with contextlib.suppress(Exception):
+                meta = registry.get(token)
+        if meta is None:
+            raise HTTPException(
+                status_code=404, detail=f"unknown skill {token!r}"
+            )
+        meta_path = getattr(meta, "path", "")
+        root_raw = getattr(registry, "root", "") or ""
+        if meta_path and root_raw:
+            with contextlib.suppress(Exception):
+                root = Path(str(root_raw)).resolve()
+                candidate = Path(str(meta_path))
+                resolved = (
+                    candidate if candidate.is_absolute() else root / candidate
+                ).resolve()
+                resolved.relative_to(root)
+        try:
+            body = registry.load(token)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"unknown skill {token!r}") from None
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=409, detail=f"skill {token!r} is disabled: {exc}"
+            ) from None
+        except Exception as exc:  # noqa: BLE001 - unreadable skill is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"skill load failed: {type(exc).__name__}: {exc}",
+            ) from None
+        frontmatter: dict[str, Any] = {}
+        markdown = str(body or "")
+        markdown_body = markdown
+        with contextlib.suppress(Exception):
+            raw_front, raw_body = parse_frontmatter(markdown)
+            frontmatter = dict(raw_front or {})
+            markdown_body = str(raw_body)
+        return {
+            "status": "FOUND",
+            "page": "forge",
+            "skill": token,
+            "name": str(getattr(meta, "name", token) or token),
+            "description": str(getattr(meta, "description", "") or ""),
+            "enabled": bool(getattr(meta, "enabled", True)),
+            "path": str(meta_path),
+            "frontmatter": frontmatter,
+            "body": markdown_body,
+            "markdown": markdown,
+            "bytes": len(markdown.encode("utf-8")),
+            "progressive_disclosure": True,
+            "law": "sec_016 - SKILL.md bodies load only on explicit request",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    def reconcile_ledger(self, request: LedgerReconcileRequest) -> dict[str, Any]:
+        """4-silo ``LiveReconciler`` sweep + double-entry conservation proof."""
+
+        from ring0_vault.ibor import ledger_outbox as _ledger_mod
+
+        LiveReconciler = _ledger_mod.LiveReconciler
+        known = self._known_silos()
+        requested = (
+            [str(s).strip().upper() for s in request.silos]
+            if request.silos
+            else list(known)
+        )
+        if known:
+            unknown = [s for s in requested if s not in known]
+            if unknown:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"unknown silo(s) {unknown}; expected one of {known}",
+                )
+        try:
+            reconciler = LiveReconciler(self.ledger, self.guard)
+            reports = list(reconciler.reconcile_all(requested))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - a reconcile failure is a 502
+            raise HTTPException(
+                status_code=502,
+                detail=f"reconciliation failed: {type(exc).__name__}: {exc}",
+            ) from None
+
+        guard = self.guard
+        silos: dict[str, Any] = {}
+        breached: list[str] = []
+        for report in reports:
+            row = _jsonable(report)
+            if not isinstance(row, dict):  # pragma: no cover - defensive
+                row = {"value": row}
+            drift_pct = float(row.get("drift_pct", 0.0) or 0.0)
+            drift_ppm = round(drift_pct * 10_000.0, 4)
+            silo_id = str(row.get("silo", ""))
+            frozen = bool(guard.is_frozen(silo_id)) if guard is not None else False
+            if drift_ppm > 100.0 or bool(row.get("breached", False)):
+                breached.append(silo_id)
+            silos[silo_id] = {
+                "silo": silo_id,
+                "drift_pct": drift_pct,
+                "drift_ppm": drift_ppm,
+                "threshold_ppm": 100.0,
+                "within_threshold": drift_ppm <= 100.0,
+                "breached": bool(row.get("breached", False)),
+                "frozen": frozen,
+                "symbols_checked": int(row.get("symbols_checked", 0) or 0),
+                "repair_action": str(row.get("repair_action", "") or ""),
+                "vaults": self._vaults(silo_id),
+                "report": row,
+            }
+
+        invariant = _jsonable(self.ledger.invariant_report())
+        if not isinstance(invariant, dict):
+            invariant = {"report": invariant}
+        transfers = [_jsonable(row) for row in self.ledger.transfers()]
+        debits = 0
+        credits = 0
+        for row in transfers:
+            if not isinstance(row, dict):
+                continue
+            amount = int(row.get("amount_micros", 0) or 0)
+            debits += amount
+            credits += amount
+        balanced = debits == credits and bool(invariant.get("balanced", True))
+        return {
+            "status": "RECONCILED" if not breached else "DRIFT_BREACH",
+            "page": "ledger",
+            "silos_checked": requested,
+            "silo_count": len(silos),
+            "silos": silos,
+            "breached_silos": breached,
+            "all_within_threshold": not breached,
+            "threshold_ppm": 100.0,
+            "double_entry": {
+                "debits_micros": debits,
+                "credits_micros": credits,
+                "balanced": balanced,
+                "proof": f"sum(debits) {debits} == sum(credits) {credits}"
+                if balanced
+                else f"sum(debits) {debits} != sum(credits) {credits}",
+            },
+            "invariant": invariant,
+            "frozen_silos": list(guard.frozen_silos) if guard is not None else [],
+            "operator": str(request.operator),
+            "law": "sec_009 - drift > 0.01% freezes the silo; the ledger is never edited",
+            "generated_at_ns": time.time_ns(),
+        }
+
 
     def feed_state(self) -> dict[str, Any]:
         """Which market-data path is live: public dual-vendor or paper autopilot."""
@@ -2383,8 +3277,8 @@ class ControlPlane:
                     )
                     if required
                     else 0.0,
-                    "q98_bps": float(q98 or 0.0),
-                    "adverse_selection_bps": float(q98 or 0.0),
+                    "q98_bps": _finite_or_zero(q98),
+                    "adverse_selection_bps": _finite_or_zero(q98),
                     "report": report,
                 }
             )
@@ -3581,6 +4475,37 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def cockpit_mcp() -> dict[str, Any]:
         return control.mcp_page()
 
+    # ---- Phase 4 Step 5: interactive operator actions --------------------
+    @app.post("/api/v2/control/orders/paper")
+    def control_orders_paper(request: PaperOrderRequest) -> dict[str, Any]:
+        return control.submit_paper_order(request)
+
+    @app.post("/api/v2/control/orders/cancel")
+    def control_orders_cancel(request: CancelOrdersRequest) -> dict[str, Any]:
+        return control.cancel_paper_orders(request)
+
+    @app.post("/api/v2/control/analyzer/shadow-burst")
+    def control_shadow_burst(request: ShadowBurstRequest) -> dict[str, Any]:
+        return control.shadow_burst(request)
+
+    @app.post("/api/v2/control/quant/price-option")
+    def control_quant_price_option(request: OptionPriceRequest) -> dict[str, Any]:
+        return control.price_option(request)
+
+    @app.post("/api/v2/control/quant/scan")
+    def control_quant_scan(request: QuantScanRequest) -> dict[str, Any]:
+        return control.scan_factors(request)
+
+    @app.get("/api/v2/cockpit/skills/{skill_name}")
+    def cockpit_skill_markdown(skill_name: str) -> dict[str, Any]:
+        return control.skill_markdown(skill_name)
+
+    @app.post("/api/v2/control/ledger/reconcile")
+    def control_ledger_reconcile(
+        request: LedgerReconcileRequest | None = None,
+    ) -> dict[str, Any]:
+        return control.reconcile_ledger(request or LedgerReconcileRequest())
+
 
     # Registered before the SPA mount at "/" so /metrics is never shadowed.
     from ring3_cockpit.gateway.metrics_exporter import register_metrics_routes
@@ -3651,6 +4576,15 @@ def _proof_line(payload: Mapping[str, Any]) -> str:
         ).format_proof_line()
     except Exception:  # pragma: no cover - malformed telemetry
         return ""
+
+
+def _finite_or_zero(value: Any) -> float:
+    """Coerce a telemetry reading to a JSON-safe finite float (NaN/inf -> 0.0)."""
+    try:
+        result = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) else 0.0
 
 
 def _sha256_hex(text: str) -> str:

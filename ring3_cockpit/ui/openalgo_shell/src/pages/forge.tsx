@@ -1,12 +1,16 @@
-import { Flame, Plug, Rocket, Timer } from 'lucide-react'
+import { FileCode2, Flame, Plug, Rocket, Timer } from 'lucide-react'
+import { useState } from 'react'
 
+import { ActionFeedback, ProofRow } from '@/components/operator-action'
 import { PageShell, StatTile, DataState } from '@/components/page-shell'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { useAction } from '@/hooks/use-action'
 import { usePageData } from '@/hooks/use-page-data'
-import { fetchForgePage } from '@/lib/api'
+import { fetchForgePage, fetchSkillMarkdown } from '@/lib/api'
 import { formatBps } from '@/lib/format'
 import { cell, num } from '@/lib/rows'
+import type { SkillMarkdownReceipt } from '@/types'
 
 export function ForgePage() {
   const { data, error, loading } = usePageData(fetchForgePage)
@@ -18,10 +22,19 @@ export function ForgePage() {
   const demoteBps = Number(thresholds.demote_net_edge_bps ?? 0.5)
   const seconds = data?.next_run?.seconds_until_next_run ?? 0
 
+  const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
+  const detail = useAction<SkillMarkdownReceipt>()
+
+  async function inspectSkill(name: string) {
+    setSelectedSkill(name)
+    await detail.run(() => fetchSkillMarkdown(name))
+  }
+
   return (
     <PageShell
       title="Nocturnal Alpha Forge & Plugins"
       ring="RING 2"
+      capability="PAPER CONTROL"
       subtitle="00:00 UTC walk-forward forge. A challenger only replaces a champion with Deflated Sharpe ≥ 1.50 and a positive rolling net edge."
       actions={
         <Badge variant="outline" className="font-mono text-[10px]">
@@ -127,23 +140,94 @@ export function ForgePage() {
             <CardHeader className="px-4">
               <CardTitle className="text-sm">Registered challenger plugins & skills</CardTitle>
             </CardHeader>
-            <CardContent className="flex flex-wrap gap-1.5 px-4">
+            <CardContent className="flex flex-wrap items-center gap-1.5 px-4">
               {pluginNames(plugins).map((name) => (
                 <Badge key={`plugin-${name}`} variant="outline" className="font-mono text-[10px]">
                   {name}
                 </Badge>
               ))}
               {skillNames(skills).map((name) => (
-                <Badge key={`skill-${name}`} variant="secondary" className="font-mono text-[10px]">
-                  {name}
-                </Badge>
+                <button
+                  key={`skill-${name}`}
+                  type="button"
+                  onClick={() => inspectSkill(name)}
+                  title="Inspect Full SKILL.md"
+                  className="rounded-full transition-opacity hover:opacity-75 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <Badge
+                    variant={selectedSkill === name ? 'default' : 'secondary'}
+                    className="cursor-pointer font-mono text-[10px]"
+                  >
+                    {name}
+                  </Badge>
+                </button>
               ))}
               {pluginNames(plugins).length === 0 && skillNames(skills).length === 0 ? (
                 <p className="text-[11px] text-muted-foreground">No plugins or skills registered.</p>
               ) : null}
+              {skillNames(skills).length > 0 ? (
+                <p className="w-full text-[10px] text-muted-foreground">
+                  Select a skill badge to Inspect Full SKILL.md (progressive disclosure, sec_016).
+                </p>
+              ) : null}
             </CardContent>
           </Card>
         </div>
+
+        <Card className="border-border/70 bg-card/60 shadow-none">
+          <CardHeader className="px-4">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <FileCode2 className="size-4" />
+              Skill inspector — full SKILL.md on demand
+            </CardTitle>
+            <p className="text-[11px] text-muted-foreground">
+              The gateway reads only inside the skill registry root; unknown and path-traversing
+              names answer 404.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-3 px-4">
+            <ActionFeedback pending={detail.pending} error={detail.error}>
+              {detail.receipt ? (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline" className="font-mono text-[10px]">
+                      {detail.receipt.status}
+                    </Badge>
+                    <span className="font-mono text-[11px]">{detail.receipt.name}</span>
+                    <Badge
+                      variant={detail.receipt.enabled ? 'default' : 'secondary'}
+                      className="font-mono text-[9px]"
+                    >
+                      {detail.receipt.enabled ? 'ENABLED' : 'DISABLED'}
+                    </Badge>
+                  </div>
+                  <div className="grid gap-x-6 sm:grid-cols-2">
+                    <ProofRow label="Path" value={detail.receipt.path} />
+                    <ProofRow label="Bytes" value={String(detail.receipt.bytes)} />
+                    <ProofRow
+                      label="Progressive disclosure"
+                      value={detail.receipt.progressive_disclosure ? 'YES' : 'NO'}
+                    />
+                    <ProofRow
+                      label="Frontmatter keys"
+                      value={Object.keys(detail.receipt.frontmatter).join(', ') || 'none'}
+                    />
+                  </div>
+                  {detail.receipt.description ? (
+                    <p className="text-[11px] text-muted-foreground">{detail.receipt.description}</p>
+                  ) : null}
+                  <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-lg border border-border/70 bg-background/60 p-3 font-mono text-[11px] leading-relaxed">
+                    {detail.receipt.markdown}
+                  </pre>
+                </div>
+              ) : !detail.pending ? (
+                <p className="rounded-lg border border-dashed border-border/70 px-3 py-6 text-center text-xs text-muted-foreground">
+                  No skill inspected yet. Choose a skill badge above to load its full Markdown body.
+                </p>
+              ) : null}
+            </ActionFeedback>
+          </CardContent>
+        </Card>
       </DataState>
     </PageShell>
   )

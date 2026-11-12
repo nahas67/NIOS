@@ -1,13 +1,17 @@
-import { BookOpen, Coins, Scale, Vault } from 'lucide-react'
+import { BookOpen, Coins, RefreshCw, Scale, Vault } from 'lucide-react'
 
+import { ActionFeedback, ActionPanel, ProofRow } from '@/components/operator-action'
 import { PageShell, StatTile, DataState } from '@/components/page-shell'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
+import { useAction } from '@/hooks/use-action'
 import { usePageData } from '@/hooks/use-page-data'
-import { fetchLedgerPage } from '@/lib/api'
+import { fetchLedgerPage, postLedgerReconcile } from '@/lib/api'
 import { formatCompactUsd, microsToUsd } from '@/lib/format'
 import { cell, num, rowKey } from '@/lib/rows'
+import type { LedgerReconcileReceipt } from '@/types'
 
 const VAULT_ORDER = [
   'ReserveYield',
@@ -33,10 +37,17 @@ export function LedgerPage() {
   const ratchet = data?.ratchet
   const backends = Object.entries(data?.backends ?? {})
 
+  const reconcile = useAction<LedgerReconcileReceipt>()
+
+  async function runSweep() {
+    await reconcile.run(() => postLedgerReconcile())
+  }
+
   return (
     <PageShell
       title="IBOR Double-Entry Ledger & Tax Lots"
       ring="RING 0"
+      capability="PAPER CONTROL"
       subtitle="Four silos × four vaults in 128-bit micro-units. Debits always equal credits; profits compound inside the silo."
       actions={
         <Badge
@@ -73,6 +84,27 @@ export function LedgerPage() {
           hint="Append-only double-entry rows"
         />
       </div>
+
+      <ActionPanel
+        title="Run 4-silo IBOR reconciliation sweep"
+        description="LiveReconciler compares every internal position against the broker book, freezes any silo above the 100 ppm drift bound, and proves sum(debits) == sum(credits)."
+      >
+        <div className="flex flex-wrap items-center gap-3">
+          <Button type="button" size="sm" disabled={reconcile.pending} onClick={runSweep}>
+            <RefreshCw className="mr-1 size-3.5" />
+            Run 4-Silo IBOR Reconciliation Sweep
+          </Button>
+          <span className="font-mono text-[10px] text-muted-foreground">
+            threshold {reconcile.receipt?.threshold_ppm ?? 100} ppm · 60 s background reconciler
+          </span>
+        </div>
+
+        <div className="mt-3">
+          <ActionFeedback pending={reconcile.pending} error={reconcile.error}>
+            {reconcile.receipt ? <ReconcileProof receipt={reconcile.receipt} /> : null}
+          </ActionFeedback>
+        </div>
+      </ActionPanel>
 
       <DataState loading={loading} error={error}>
         <div className="grid gap-3 lg:grid-cols-2">
@@ -212,5 +244,66 @@ export function LedgerPage() {
         </div>
       </DataState>
     </PageShell>
+  )
+}
+
+function ReconcileProof({ receipt }: { receipt: LedgerReconcileReceipt }) {
+  return (
+    <div className="rounded-lg border border-border/70 bg-background/40 p-3">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <Badge variant={receipt.status === 'RECONCILED' ? 'default' : 'destructive'} className="font-mono text-[10px]">
+          {receipt.status}
+        </Badge>
+        <Badge
+          variant={receipt.double_entry.balanced ? 'default' : 'destructive'}
+          className="font-mono text-[10px]"
+        >
+          {receipt.double_entry.balanced ? 'sum(debits) == sum(credits)' : 'DOUBLE-ENTRY DRIFT'}
+        </Badge>
+        <span className="font-mono text-[10px] text-muted-foreground">
+          {receipt.silo_count} silos · {receipt.all_within_threshold ? 'all within threshold' : 'breach'}
+        </span>
+      </div>
+
+      <div className="space-y-1">
+        {Object.entries(receipt.silos).map(([siloId, silo]) => (
+          <div
+            key={siloId}
+            className="flex flex-wrap items-center justify-between gap-2 border-b border-border/30 py-1 last:border-0"
+          >
+            <span className="font-mono text-[11px]">{siloId}</span>
+            <span className="flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
+              <span>{silo.drift_ppm.toFixed(2)} ppm</span>
+              <Badge
+                variant={silo.frozen ? 'destructive' : 'outline'}
+                className="font-mono text-[9px]"
+              >
+                {silo.frozen ? 'FROZEN' : 'ACTIVE'}
+              </Badge>
+              <Badge
+                variant={silo.within_threshold ? 'secondary' : 'destructive'}
+                className="font-mono text-[9px]"
+              >
+                {silo.within_threshold ? 'WITHIN' : 'BREACH'}
+              </Badge>
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-2 grid gap-x-6 sm:grid-cols-2">
+        <ProofRow
+          label="Debits"
+          value={formatCompactUsd(microsToUsd(receipt.double_entry.debits_micros))}
+        />
+        <ProofRow
+          label="Credits"
+          value={formatCompactUsd(microsToUsd(receipt.double_entry.credits_micros))}
+        />
+      </div>
+      <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
+        {receipt.double_entry.proof}
+      </p>
+    </div>
   )
 }

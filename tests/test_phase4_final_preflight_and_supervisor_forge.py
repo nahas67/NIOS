@@ -998,3 +998,294 @@ def test_all_9_cockpit_pages_and_spa_routes_are_served_and_hydrated(
     assert report["summary"]["errors"] == 0
     assert report["summary"]["warnings"] == 0
     assert report["summary"]["diagnosticsNotPrinted"] == 0
+
+
+def test_interactive_workstation_actions_across_pages_on_v1(cockpit: Any) -> None:
+    """Phase 4 Step 5: every operator control works end to end, paper-only.
+
+    The cockpit is no longer telemetry-only. An operator can submit a grounded
+    PAPER order, cancel it, drive shadow fills to the 30-fill graduation line,
+    price a grounded option, re-scan the 490-factor zoo, read a full SKILL.md on
+    demand and reconcile all four IBOR silos — without any of those actions able
+    to sign a live order from Ring 3.
+    """
+    silo = "CRYPTO_BINANCE"
+    operator = "pytest.step5"
+    paper_path = "/api/v2/control/orders/paper"
+
+    def submit_paper(**overrides: Any) -> Any:
+        payload: dict[str, Any] = {
+            "silo": silo,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "quantity": 0.25,
+            "order_style": "MAKER_PEG",
+            "fill_immediately": False,
+            "operator": operator,
+        }
+        payload.update(overrides)
+        return cockpit.post(paper_path, json=payload)
+
+    # ---------------------------------------------------------------- orders
+    # A previous gate may have tripped the global kill latch; an operator
+    # re-arms explicitly, and then the exact same order must be accepted.
+    order = submit_paper()
+    if order.status_code == 409 and "GLOBAL_HALTED" in order.text:
+        rearm = cockpit.post(
+            "/api/v2/control/rearm",
+            json={"reason": "step5 operator test", "operator": operator},
+        )
+        assert rearm.status_code == 200, rearm.text
+        order = submit_paper()
+    assert order.status_code == 200, order.text
+
+    working = order.json()
+    assert working["status"] == "WORKING"
+    assert working["mode"] == "PAPER"
+    assert working["filled"] is False
+    assert working["fill_price"] > 0
+    assert working["page"] == "orders"
+    assert working["silo"] == silo and working["symbol"] == "BTCUSDT"
+    assert working["order_style"] == "MAKER_PEG"
+    assert working["proposal"]["grounding_hash"]
+    assert len(working["proposal"]["grounding_hash"]) == 64
+    assert working["proposal"]["is_grounded"] is True
+    assert working["outbox"]["pending"] >= 1
+    assert working["blotter"]["page"] == "orders"
+    blocked_id = working["order_id"]
+
+    # Cancel the single working order: the outbox reservation is voided too.
+    cancel = cockpit.post(
+        "/api/v2/control/orders/cancel",
+        json={"order_id": blocked_id, "silo": silo, "operator": operator},
+    )
+    assert cancel.status_code == 200, cancel.text
+    cancelled = cancel.json()
+    assert cancelled["status"] == "CANCELLED"
+    assert cancelled["mode"] == "PAPER"
+    assert cancelled["cancelled_count"] >= 1
+    assert blocked_id in cancelled["cancelled_order_ids"]
+    assert cancelled["outbox"]["pending"] == 0
+
+    # A TWAP/Iceberg order fills immediately and applies the in-silo ratchet.
+    twap = submit_paper(order_style="TWAP_ICEBERG", fill_immediately=True)
+    assert twap.status_code == 200, twap.text
+    filled = twap.json()
+    assert filled["status"] == "FILLED"
+    assert filled["filled"] is True
+    assert filled["fill_price"] > 0
+    assert filled["notional_micros"] > 0
+    assert filled["realized_net_micros"] > 0
+    ratchet = filled["ratchet"]
+    assert ratchet["applied"] is True
+    assert (ratchet["long_term_pct"], ratchet["reserve_pct"], ratchet["scalper_pct"]) == (
+        35,
+        15,
+        50,
+    )
+    split = ratchet["split_micros"]
+    assert (
+        split["long_term_micros"] + split["reserve_micros"] + split["scalper_micros"]
+        == split["realized_net_micros"]
+    )
+    assert split["realized_net_micros"] == filled["realized_net_micros"]
+
+    # ``ALL`` cancels whatever is still open and leaves the outbox clean.
+    cancel_all = cockpit.post(
+        "/api/v2/control/orders/cancel",
+        json={"order_id": "ALL", "silo": silo, "operator": operator},
+    )
+    assert cancel_all.status_code == 200, cancel_all.text
+    assert cancel_all.json()["outbox"]["pending"] == 0
+
+    # Validation and safety envelope.
+    assert submit_paper(silo="MARS_EXCHANGE").status_code == 422
+    assert submit_paper(order_style="MARKET").status_code == 422
+    assert submit_paper(side="HOLD").status_code == 422
+    assert submit_paper(quantity=0).status_code == 422
+
+    # -------------------------------------------------------------- analyzer
+    analyzer = cockpit.get("/api/v2/cockpit/analyzer")
+    assert analyzer.status_code == 200
+    nursery = analyzer.json()["nursery"]
+    baseline = 0
+    if nursery["strategies"]:
+        baseline = nursery["strategies"][0]["completed_fills"]
+
+    burst = cockpit.post(
+        "/api/v2/control/analyzer/shadow-burst",
+        json={"silo": silo, "rounds": 10, "operator": operator},
+    )
+    assert burst.status_code == 200, burst.text
+    burst_body = burst.json()
+    assert burst_body["status"] in {"BURST_COMPLETE", "HALTED"}
+    assert burst_body["mode"] == "PAPER"
+    assert burst_body["page"] == "analyzer"
+    assert burst_body["rounds_requested"] == 10
+    assert burst_body["required_fills"] >= 30
+    assert burst_body["shadow_fills"] == burst_body["total_shadow_fills"]
+    assert burst_body["shadow_fills"] >= baseline
+    if baseline < burst_body["required_fills"]:
+        assert burst_body["fills_gained"] >= 1
+        assert burst_body["ticks_executed"] >= 1
+    assert isinstance(burst_body["adverse_selection_bps"], (int, float))
+    assert burst_body["graduated"] is (
+        burst_body["shadow_fills"] >= burst_body["required_fills"]
+    )
+    assert burst_body["nursery"]["required_fills"] >= 30
+
+    # Top the nursery up to the 30/30 graduation line in the same session.
+    if burst_body["shadow_fills"] < burst_body["required_fills"]:
+        top_up = cockpit.post(
+            "/api/v2/control/analyzer/shadow-burst",
+            json={
+                "silo": silo,
+                "rounds": burst_body["required_fills"] - burst_body["shadow_fills"],
+                "operator": operator,
+            },
+        )
+        assert top_up.status_code == 200, top_up.text
+        topped = top_up.json()
+        assert topped["graduated"] is True
+        assert topped["shadow_fills"] >= topped["required_fills"]
+        assert topped["remaining_fills"] == 0
+
+    # ----------------------------------------------------------------- quant
+    priced = cockpit.post(
+        "/api/v2/control/quant/price-option",
+        json={
+            "symbol": "BTC-OPT",
+            "spot": 50_000.0,
+            "strike": 48_000.0,
+            "volatility": 0.65,
+            "days_to_expiry": 30,
+            "risk_free_rate": 0.05,
+            "option_type": "PUT",
+            "operator": operator,
+        },
+    )
+    assert priced.status_code == 200, priced.text
+    pricing = priced.json()
+    assert pricing["status"] == "GROUNDED"
+    assert pricing["page"] == "quant"
+    greeks = pricing["greeks"]
+    assert greeks["price"] > 0
+    assert -1.0 <= greeks["delta"] <= 0.0
+    assert greeks["gamma"] > 0
+    assert greeks["vega"] > 0
+    assert greeks["theta"] < 0
+    digest = pricing["grounding"]["sha256_digest"]
+    assert len(digest) == 64 and int(digest, 16) >= 0
+    assert pricing["grounding"]["verified"] is True
+    assert pricing["grounding"]["claims_checked"] > 0
+    assert pricing["packet"]["sha256_digest"] == digest
+    assert pricing["packet"]["metrics"]["price"] == greeks["price"]
+    assert pricing["grounding_ledger"]["packets"] >= 1
+
+    call = cockpit.post(
+        "/api/v2/control/quant/price-option",
+        json={
+            "symbol": "BTC-OPT",
+            "spot": 50_000.0,
+            "strike": 48_000.0,
+            "volatility": 0.65,
+            "days_to_expiry": 30,
+            "risk_free_rate": 0.05,
+            "option_type": "CALL",
+            "operator": operator,
+        },
+    )
+    assert call.status_code == 200, call.text
+    assert call.json()["greeks"]["delta"] > 0
+
+    assert (
+        cockpit.post(
+            "/api/v2/control/quant/price-option",
+            json={"spot": 50_000.0, "strike": 48_000.0, "volatility": 0.0},
+        ).status_code
+        == 422
+    )
+
+    scan = cockpit.post(
+        "/api/v2/control/quant/scan", json={"top_k": 15, "operator": operator}
+    )
+    assert scan.status_code == 200, scan.text
+    scanned = scan.json()
+    assert scanned["status"] == "SCANNED"
+    assert scanned["factor_count"] == 490
+    assert scanned["universe_size"] >= 24
+    assert 1 <= len(scanned["candidates"]) <= 15
+    assert scanned["scan_latency_ms"] > 0
+    assert scanned["candidates"][0]["sha256_digest"]
+
+    # ----------------------------------------------------------------- forge
+    forge = cockpit.get("/api/v2/cockpit/forge")
+    assert forge.status_code == 200
+    skill_rows = forge.json()["skills"].get("skills") or []
+    assert skill_rows, "no SKILL.md catalog seed found"
+    skill_name = skill_rows[0]["name"]
+
+    skill = cockpit.get(f"/api/v2/cockpit/skills/{skill_name}")
+    assert skill.status_code == 200, skill.text
+    skill_body = skill.json()
+    assert skill_body["status"] == "FOUND"
+    assert skill_body["page"] == "forge"
+    assert skill_body["name"] == skill_name
+    assert skill_body["progressive_disclosure"] is True
+    assert skill_body["bytes"] > 0
+    assert skill_body["markdown"].strip()
+    assert skill_body["body"].strip()
+    assert skill_body["path"].endswith("SKILL.md")
+
+    assert cockpit.get("/api/v2/cockpit/skills/does-not-exist-step5").status_code == 404
+    traversal = cockpit.get("/api/v2/cockpit/skills/..%2f..%2fetc%2fpasswd")
+    assert traversal.status_code == 404
+
+    # ---------------------------------------------------------------- ledger
+    reconcile = cockpit.post(
+        "/api/v2/control/ledger/reconcile", json={"operator": operator}
+    )
+    assert reconcile.status_code == 200, reconcile.text
+    receipt = reconcile.json()
+    assert receipt["page"] == "ledger"
+    assert receipt["silo_count"] >= 4
+    assert receipt["threshold_ppm"] == 100.0
+    assert len(receipt["silos"]) == receipt["silo_count"]
+    assert receipt["double_entry"]["balanced"] is True
+    assert receipt["double_entry"]["debits_micros"] == receipt["double_entry"]["credits_micros"]
+    assert receipt["double_entry"]["proof"]
+    if receipt["status"] == "RECONCILED":
+        assert receipt["all_within_threshold"] is True
+        assert receipt["breached_silos"] == []
+        for silo_row in receipt["silos"].values():
+            assert silo_row["drift_ppm"] <= 100.0
+            assert silo_row["frozen"] is False
+    for silo_row in receipt["silos"].values():
+        assert isinstance(silo_row["vaults"], dict)
+        assert silo_row["vaults"]
+
+    # ------------------------------------------------- rebuilt SPA bundle
+    bundle_js = sorted((FRONTEND / "dist" / "assets").glob("*.js"))
+    assert bundle_js, "compiled cockpit bundle has no JavaScript chunk"
+    bundle = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
+    )
+    for label in (
+        "Submit Paper Order",
+        "Cancel Open Orders",
+        "Run +10 Shadow Fills Burst",
+        "Re-Scan 490 Factors",
+        "Inspect Full SKILL.md",
+        "Run 4-Silo IBOR Reconciliation Sweep",
+        "PAPER CONTROL",
+        "SHA-256 grounding hash",
+        "/api/v2/control/orders/paper",
+        "/api/v2/control/orders/cancel",
+        "/api/v2/control/analyzer/shadow-burst",
+        "/api/v2/control/quant/price-option",
+        "/api/v2/control/quant/scan",
+        "/api/v2/control/ledger/reconcile",
+        "/api/v2/cockpit/skills/",
+    ):
+        assert label in bundle, f"rebuilt bundle is missing {label!r}"
+

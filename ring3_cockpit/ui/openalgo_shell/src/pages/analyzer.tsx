@@ -1,24 +1,48 @@
-import { Activity, FlaskConical, GraduationCap, Timer } from 'lucide-react'
+import { Activity, FlaskConical, GraduationCap, Timer, Zap } from 'lucide-react'
+import { useState } from 'react'
 
+import { ActionFeedback, ActionPanel, ProofRow } from '@/components/operator-action'
 import { PageShell, StatTile, DataState } from '@/components/page-shell'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { useAction } from '@/hooks/use-action'
 import { usePageData } from '@/hooks/use-page-data'
-import { fetchAnalyzerPage } from '@/lib/api'
+import { fetchAnalyzerPage, postShadowBurst } from '@/lib/api'
 import { formatBps, formatPct } from '@/lib/format'
 import { cell } from '@/lib/rows'
+import type { ShadowBurstReceipt } from '@/types'
+
+const SILO_IDS = ['CRYPTO_BINANCE', 'INDIA_ZERODHA_DHAN', 'US_IBKR', 'FX_MT5'] as const
 
 export function AnalyzerPage() {
-  const { data, error, loading } = usePageData(fetchAnalyzerPage)
+  const { data, error, loading, reload } = usePageData(fetchAnalyzerPage)
   const nursery = data?.nursery
   const strategies = nursery?.strategies ?? []
   const required = nursery?.required_fills ?? 30
+
+  const [silo, setSilo] = useState<string>('CRYPTO_BINANCE')
+  const burst = useAction<ShadowBurstReceipt>()
+
+  async function runBurst() {
+    const receipt = await burst.run(() => postShadowBurst({ silo, rounds: 10 }))
+    if (receipt) reload()
+  }
 
   return (
     <PageShell
       title="Shadow Analyzer & Graduation Nursery"
       ring="RING 1"
+      capability="PAPER CONTROL"
       subtitle="OpenAlgo analyzer shadow hooks plus the 30-fill L2 shadow twin. No strategy graduates without adversarial paper evidence."
       actions={
         <Badge variant="outline" className="font-mono text-[10px]">
@@ -52,6 +76,78 @@ export function AnalyzerPage() {
           hint={nursery?.calibrated ? 'Conformal window calibrated' : 'Cold start — abstaining'}
         />
       </div>
+
+      <ActionPanel
+        title="Run shadow-fill burst"
+        description="Drives +10 L2 shadow execution ticks through the twin so the operator can graduate a strategy to 30/30 fills without waiting for the nightly tape."
+      >
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Silo
+            </Label>
+            <Select value={silo} onValueChange={setSilo}>
+              <SelectTrigger className="h-8 w-56 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SILO_IDS.map((value) => (
+                  <SelectItem key={value} value={value} className="font-mono text-xs">
+                    {value}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <Button type="button" size="sm" disabled={burst.pending} onClick={runBurst}>
+            <Zap className="mr-1 size-3.5" />
+            Run +10 Shadow Fills Burst
+          </Button>
+        </div>
+
+        <div className="mt-3">
+          <ActionFeedback pending={burst.pending} error={burst.error}>
+            {burst.receipt ? (
+              <div className="rounded-lg border border-border/70 bg-background/40 p-3">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <Badge
+                    variant={burst.receipt.graduated ? 'default' : 'outline'}
+                    className="font-mono text-[10px]"
+                  >
+                    {burst.receipt.graduated ? 'GRADUATED' : burst.receipt.status}
+                  </Badge>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {burst.receipt.silo} · {burst.receipt.strategy_id}
+                  </span>
+                </div>
+                <div className="grid gap-x-6 sm:grid-cols-2">
+                  <ProofRow
+                    label="Fills"
+                    value={`${burst.receipt.shadow_fills}/${burst.receipt.required_fills}`}
+                  />
+                  <ProofRow
+                    label="Gained this burst"
+                    value={`+${burst.receipt.fills_gained} in ${burst.receipt.ticks_executed} ticks`}
+                  />
+                  <ProofRow
+                    label="Remaining"
+                    value={`${burst.receipt.remaining_fills} fills`}
+                  />
+                  <ProofRow
+                    label="Adverse selection"
+                    value={formatBps(burst.receipt.adverse_selection_bps)}
+                  />
+                  <ProofRow label="Q98 residual" value={formatBps(burst.receipt.q98_bps)} />
+                  <ProofRow
+                    label="Threshold met"
+                    value={burst.receipt.graduation_threshold_met ? 'YES' : 'NO'}
+                  />
+                </div>
+              </div>
+            ) : null}
+          </ActionFeedback>
+        </div>
+      </ActionPanel>
 
       <DataState loading={loading} error={error}>
         <Card className="border-border/70 bg-card/60 shadow-none">

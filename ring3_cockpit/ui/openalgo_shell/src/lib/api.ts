@@ -3,6 +3,8 @@ import type {
   BrokerControlPayload,
   BrokerCredentialPayload,
   BrokerCredentialReport,
+  CancelOrdersPayload,
+  CancelOrdersReceipt,
   CockpitState,
   ExtensionsActionResponse,
   ExtensionsControlPayload,
@@ -12,17 +14,27 @@ import type {
   ForgeHedgeReceipt,
   ForgePageData,
   FormalProofState,
+  InteractiveQuantScan,
   KillReport,
   LedgerPageData,
+  LedgerReconcileReceipt,
   LLMControlPayload,
   LLMProbeReport,
   McpPageData,
   MetricsSnapshot,
+  OptionPricePayload,
+  OptionPriceReceipt,
   OrdersPageData,
   PagesIndex,
+  PaperOrderPayload,
+  PaperOrderReceipt,
   PreflightCertificate,
   QuantPageData,
+  QuantScanPayload,
   RearmReport,
+  ShadowBurstPayload,
+  ShadowBurstReceipt,
+  SkillMarkdownReceipt,
   SupervisorControlResponse,
   VaultRotationReport,
   VaultStatus,
@@ -362,4 +374,92 @@ export function callMcpTool(
 
 export function fetchMcpPage(): Promise<McpPageData> {
   return request<McpPageData>('/api/v2/cockpit/mcp')
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 Step 5 — interactive operator actions (paper-only)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Submit a grounded PAPER order through the atomic outbox, Smart OMS and IBOR.
+ *
+ * The endpoint refuses with 409 when the global kill latch is HALTED or the
+ * silo is frozen, so a click can never bypass the four-ring safety envelope.
+ * A filled order applies the 35% / 15% / 50% in-silo ratchet on the receipt.
+ */
+export function postPaperOrder(payload: PaperOrderPayload): Promise<PaperOrderReceipt> {
+  return request<PaperOrderReceipt>('/api/v2/control/orders/paper', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Cancel one working order, or every open order when `order_id` is `ALL`.
+ *
+ * Pending outbox reservations are voided with the same atomic call so the
+ * blotter and the outbox ledger never disagree after a cancel.
+ */
+export function postCancelOrders(
+  payload: CancelOrdersPayload = {}
+): Promise<CancelOrdersReceipt> {
+  return request<CancelOrdersReceipt>('/api/v2/control/orders/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ order_id: 'ALL', operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Drive N shadow execution ticks through the L2 twin for one silo.
+ *
+ * One tick does not always resolve a fill (the twin posts a maker peg, then
+ * fills on a later tick), so the gateway keeps ticking until the requested
+ * fills land or the ceiling is reached.
+ */
+export function postShadowBurst(payload: ShadowBurstPayload): Promise<ShadowBurstReceipt> {
+  return request<ShadowBurstReceipt>('/api/v2/control/analyzer/shadow-burst', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Price a European option and seal every input and Greek into a SHA-256
+ * `GroundedFactPacket` verified by the numerical grounding verifier.
+ */
+export function postPriceOption(payload: OptionPricePayload): Promise<OptionPriceReceipt> {
+  return request<OptionPriceReceipt>('/api/v2/control/quant/price-option', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/** Re-run the 490-factor vectorized scan and return the fresh ranking. */
+export function postQuantScan(payload: QuantScanPayload = { top_k: 15 }): Promise<InteractiveQuantScan> {
+  return request<InteractiveQuantScan>('/api/v2/control/quant/scan', {
+    method: 'POST',
+    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
+  })
+}
+
+/**
+ * Load one full `SKILL.md` on demand (progressive disclosure, sec_016).
+ *
+ * The gateway only reads inside the skill registry root and answers 404 for an
+ * unknown or path-traversing name.
+ */
+export function fetchSkillMarkdown(name: string): Promise<SkillMarkdownReceipt> {
+  return request<SkillMarkdownReceipt>(
+    `/api/v2/cockpit/skills/${encodeURIComponent(name)}`
+  )
+}
+
+/** Reconcile all four silos and prove `sum(debits) == sum(credits)`. */
+export function postLedgerReconcile(
+  silos?: string[]
+): Promise<LedgerReconcileReceipt> {
+  return request<LedgerReconcileReceipt>('/api/v2/control/ledger/reconcile', {
+    method: 'POST',
+    body: JSON.stringify({ silos: silos ?? null, operator: 'ring3.cockpit' }),
+  })
 }
