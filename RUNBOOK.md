@@ -175,8 +175,9 @@ The recovery contract is `CrashAtomicOutbox` + `IBORLedger`:
 Verification commands:
 
 ```bash
-python scripts/run_nios.py --smoke-test          # EXIT=0 required
-python -m pytest tests -q                        # 17 suites, 0 failures, 0 warnings
+python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
+python -m pytest tests -q                        # 18 suites, 0 failures, 0 warnings
+python scripts/preflight_golive.py --strict      # go-live readiness certificate
 ```
 
 ### 3.3 Chaos / crash injection

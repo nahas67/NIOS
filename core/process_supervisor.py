@@ -68,7 +68,7 @@ from dataclasses import dataclass, field
 from multiprocessing import Process, Queue, RawValue
 from multiprocessing.shared_memory import SharedMemory
 from queue import Empty
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from core.schemas import (
     DualVendorBar,
@@ -447,6 +447,7 @@ def _ctx(
     event_queue: Any,
     ring0_queue: Any,
     control_queue: Any,
+    brain_queue: Any,
     tick_interval_s: float,
     lease_interval_s: float,
 ) -> dict[str, Any]:
@@ -463,6 +464,7 @@ def _ctx(
         "event_queue": event_queue,
         "ring0_queue": ring0_queue,
         "control_queue": control_queue,
+        "brain_queue": brain_queue,
         "tick_interval_s": float(tick_interval_s),
         "lease_interval_s": float(lease_interval_s),
     }
@@ -501,6 +503,149 @@ def _emit(ctx: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # Ring 0 -- sovereign vault worker
 # ---------------------------------------------------------------------------
+
+
+_HEDGE_PROPOSAL_FIELDS = (
+    "proposal_id",
+    "strategy_id",
+    "silo",
+    "symbol",
+    "side",
+    "qty",
+    "limit_price",
+    "expected_gross_bps",
+    "spread_bps",
+    "grounding_hash",
+    "is_reduce_only",
+    "created_at_ns",
+)
+
+#: Fraction of the tactical vault a single protective put may commit.
+HEDGE_PREMIUM_CAP_PCT = 0.12
+
+#: Contract multiplier used to convert option premium into cash notional.
+HEDGE_CONTRACT_MULTIPLIER = 100
+
+
+def _sign_tail_hedge(
+    payload: Mapping[str, Any],
+    *,
+    firewall: Any,
+    signer: Any,
+    ledger: Any,
+    silo_order: Sequence[str],
+    pid: int,
+) -> dict[str, Any]:
+    """Verify and Ed25519-sign one Ring 2 tail-hedge proposal (insurance route).
+
+    A protective put is bought for convexity, so its ``expected_gross_bps`` is
+    negative by construction: it can never clear the 98% split-conformal alpha
+    gate, and forcing it through would turn the sovereign firewall into a deny
+    all.  Insurance is therefore routed deliberately around the alpha gate while
+    every *capital* control still applies -- instrument whitelist, silo
+    membership, grounding digest, vault identity, and the 12% tactical-vault
+    notional cap.  The order is signed here, in Ring 0, and nowhere else
+    (sec_004 air gap; Laws 2 and 4).
+
+    Business rejections are returned as ``ring0_hedge_rejected`` events instead
+    of exceptions so a single bad proposal can never take the worker down.
+    """
+
+    def rejected(reason: str, **extra: Any) -> dict[str, Any]:
+        event = {
+            "type": "ring0_hedge_rejected",
+            "worker": RING0_WORKER,
+            "pid": int(pid),
+            "hedge_role": "INSURANCE",
+            "reason": str(reason),
+        }
+        event.update({key: value for key, value in extra.items() if value is not None})
+        return event
+
+    body = payload.get("proposal")
+    if not isinstance(body, Mapping):
+        return rejected("PROPOSAL_MISSING")
+    plan = payload.get("plan") if isinstance(payload.get("plan"), Mapping) else {}
+
+    try:
+        vault = VaultName(str(body.get("vault")))
+    except Exception:
+        return rejected("VAULT_UNKNOWN", proposal_id=str(body.get("proposal_id") or ""))
+    proposal_id = str(body.get("proposal_id") or "")
+    if vault is not VaultName.TACTICAL_SWING:
+        return rejected("VAULT_NOT_TACTICAL_SWING", proposal_id=proposal_id)
+    side = str(body.get("side") or "").upper()
+    if side != "BUY":
+        return rejected("SIDE_NOT_BUY", proposal_id=proposal_id)
+    if not firewall.is_valid_digest(str(body.get("grounding_hash") or "")):
+        return rejected("GROUNDING_DIGEST_INVALID", proposal_id=proposal_id)
+
+    fields = {key: body[key] for key in _HEDGE_PROPOSAL_FIELDS if key in body}
+    fields["vault"] = vault
+    try:
+        proposal = UnsignedProposal(**fields)
+    except Exception as exc:
+        return rejected(f"PROPOSAL_INVALID:{type(exc).__name__}", proposal_id=proposal_id)
+
+    if str(proposal.silo) not in silo_order:
+        return rejected("SILO_UNKNOWN", proposal_id=proposal.proposal_id)
+    allowed = firewall.whitelists.get(str(proposal.silo))
+    if allowed is not None and str(proposal.symbol).upper() not in allowed:
+        return rejected("SYMBOL_NOT_WHITELISTED", proposal_id=proposal.proposal_id)
+
+    premium_micros = int(
+        round(
+            float(proposal.qty)
+            * float(proposal.limit_price)
+            * HEDGE_CONTRACT_MULTIPLIER
+            * 1_000_000
+        )
+    )
+    try:
+        vault_micros = int(ledger.balance(proposal.silo, VaultName.TACTICAL_SWING) or 0)
+        cap_basis = vault_micros or int(ledger.total_nav_micros(list(silo_order)) or 0)
+    except Exception:  # pragma: no cover - ledger read is best-effort
+        cap_basis = 0
+    cap_micros = int(cap_basis * HEDGE_PREMIUM_CAP_PCT)
+    if premium_micros <= 0 or premium_micros > cap_micros:
+        return rejected(
+            "HEDGE_PREMIUM_CAP_BREACH",
+            proposal_id=proposal.proposal_id,
+            premium_micros=premium_micros,
+            cap_micros=cap_micros,
+        )
+
+    order_payload = proposal.to_dict()
+    try:
+        digest_hex, signature_hex, _sealed = signer.sign_payload(order_payload)
+        verified = bool(signer.verify(order_payload, signature_hex))
+    except Exception as exc:
+        return rejected(
+            f"SIGNING_FAILED:{type(exc).__name__}", proposal_id=proposal.proposal_id
+        )
+
+    _public = getattr(signer, "public_key_hex", "")
+    return {
+        "type": "ring0_hedge_signed",
+        "worker": RING0_WORKER,
+        "pid": int(pid),
+        "request_id": str(payload.get("request_id") or ""),
+        "proposal_id": proposal.proposal_id,
+        "plan_id": str(plan.get("plan_id") or ""),
+        "silo": str(proposal.silo),
+        "symbol": str(proposal.symbol),
+        "vault": str(vault),
+        "hedge_role": "INSURANCE",
+        "digest_hex": digest_hex,
+        "signature_hex": signature_hex,
+        "public_key_hex": str(_public() if callable(_public) else _public),
+        "verified": verified,
+        "premium_micros": premium_micros,
+        "premium_bps": plan.get("premium_bps"),
+        "strike": plan.get("strike"),
+        "contracts": float(proposal.qty),
+        "grounding_hash": str(proposal.grounding_hash),
+    }
 
 
 def ring0_vault_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - process
@@ -600,6 +745,20 @@ def ring0_vault_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - pr
         except (EOFError, OSError):  # pragma: no cover - queue torn down
             break
         try:
+            if isinstance(payload, Mapping) and payload.get("kind") == "tail_hedge":
+                # Insurance route: verify + sign only, never the alpha gate.
+                _emit(
+                    ctx,
+                    _sign_tail_hedge(
+                        payload,
+                        firewall=firewall,
+                        signer=signer,
+                        ledger=ledger,
+                        silo_order=SILO_ORDER,
+                        pid=pid,
+                    ),
+                )
+                continue
             proposal = UnsignedProposal(**payload)
             floor = floors.get(proposal.silo)
             verdict = firewall.evaluate(
@@ -819,6 +978,184 @@ def ring1_spinal_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - p
 # Ring 2 -- bicameral brain worker
 # ---------------------------------------------------------------------------
 
+# Market label used by the copula shield / contagion graph.  Derived, never a
+# hand-written literal at the call site, so the mapping cannot drift per silo.
+RING_MARKET_SILO: dict[str, str] = {
+    "CRYPTO_BINANCE": "CRYPTO",
+    "INDIA_ZERODHA_DHAN": "INDIA",
+    "US_IBKR": "US",
+    "FX_MT5": "FX",
+}
+
+#: The only Ring 2 command that can move capital -- and it can only *propose*.
+FORGE_HEDGE_COMMAND = "forge_and_hedge"
+
+
+def _forge_toolkit(leases: Any, *, silo: str) -> dict[str, Any]:
+    """Build the Ring 2 forge + contagion + tail-hedger stack, lazily.
+
+    Every dependency here is a Ring 2 organ: no broker key, no exchange socket,
+    no signer.  The toolkit is created on first use so a smoke-test boot does not
+    pay for the contagion kernel warm-up (sec_010 budget).
+    """
+    from ring1_spinal.silo_worker import SILO_ORDER
+    from ring2_brain.forge.alpha_forge import NocturnalAlphaForge
+    from ring2_brain.mirofish.contagion_engine import ShockVector  # noqa: F401
+    from ring2_brain.mirofish.contagion_engine import MiroFishContagionEngine
+    from ring2_brain.quant.tail_hedger import TacticalTailHedger
+
+    forge = NocturnalAlphaForge(lease_table=leases, silos=SILO_ORDER)
+    contagion = MiroFishContagionEngine(
+        lease_table=leases,
+        silo=RING_MARKET_SILO.get(silo, "US"),
+        warmup=True,
+    )
+    hedger = TacticalTailHedger(contagion_engine=contagion)
+    return {
+        "forge": forge,
+        "contagion": contagion,
+        "hedger": hedger,
+        "shock": ShockVector,
+    }
+
+
+def _forge_and_hedge_cycle(
+    ctx: Mapping[str, Any],
+    *,
+    command: Mapping[str, Any],
+    leases: Any,
+    silo: str,
+    symbol: str,
+    strategy_id: str,
+    toolkit: Mapping[str, Any],
+) -> dict[str, Any]:
+    """One closed-loop Nightly Alpha Forge + Tactical Tail-Hedger cycle.
+
+    Ordering is deliberate (sec_018 Law 4 + Law 5):
+
+    1. **Audit** -- demote every champion whose rolling net edge fell below
+       ``+0.50 bps`` and disarm its Ring 1 lease in ``LeaseTableSHM``.  The
+       disarm happens here, in Ring 2, through the shared lease table; Ring 2
+       still cannot sign or route an order.
+    2. **Walk-forward challengers** -- breed/evaluate genomes and promote only
+       those clearing Deflated Sharpe ``>= 1.50`` across ``>= 30`` shadow fills.
+    3. **Tail contagion** -- run the three-tick cascade and, at or above the
+       fragility trigger, price a *grounded* Black-Scholes put and hand the
+       unsigned ``UnsignedProposal`` to Ring 0 across the process boundary.
+       Ring 2 never signs it; ``ring0-vault-worker`` verifies and signs.
+
+    Returns the cockpit event dict (never raises for a business rejection).
+    """
+    forge = toolkit["forge"]
+    hedger = toolkit["hedger"]
+    contagion = toolkit["contagion"]
+    shock_cls = toolkit["shock"]
+
+    champion_id = str(command.get("strategy_id") or strategy_id)
+    symbols = tuple(str(item) for item in (command.get("champion_symbols") or (symbol,)))
+    fills = [float(value) for value in (command.get("champion_fills_bps") or ())]
+
+    forge.register_champion(champion_id, silo=silo, symbols=symbols)
+    for net_bps in fills:
+        forge.record_champion_fill(champion_id, net_bps, silo=silo, symbols=symbols)
+
+    challengers = int(command.get("challengers") or 0)
+    if challengers > 0:
+        forge.breed_random_genomes(challengers, silo=silo)
+
+    report = forge.audit()
+
+    # --- 3. contagion -> grounded tail hedge -------------------------------
+    price_shock_bps = float(command.get("price_shock_bps") or 120.0)
+    try:
+        contagion.register_symbol(symbol)
+    except Exception:  # pragma: no cover - idempotent registration
+        pass
+    cascade = contagion.run(
+        shock_cls(price_shock_bps=price_shock_bps, realized_vol_ratio=2.5),
+        symbol,
+    )
+    features = cascade.features
+    override = command.get("cascade_fragility_index")
+    fragility = (
+        float(override) if override is not None else float(features.cascade_fragility_index)
+    )
+    tail_correlation = float(command.get("tail_correlation") or 0.68)
+    spot = float(command.get("spot") or 50_000.0)
+
+    status, plan = hedger.monitor_and_hedge(
+        cascade_fragility_index=fragility,
+        tail_correlation=tail_correlation,
+        spot=spot,
+        symbol=symbol,
+        silo=silo,
+    )
+
+    event: dict[str, Any] = {
+        "type": "ring2_forge_hedge",
+        "worker": RING2_WORKER,
+        "pid": os.getpid(),
+        "request_id": str(command.get("request_id") or ""),
+        "silo": silo,
+        "symbol": symbol,
+        "champion_id": champion_id,
+        "champions_audited": len(forge.champions()),
+        "retired": int(report.retired_count),
+        "promoted": int(report.promoted_count),
+        "held": int(report.held_count),
+        "genomes_evaluated": int(report.genomes_evaluated),
+        "fdr_rejections": int(report.fdr_rejections),
+        "retirements": list(report.retirements),
+        "promotions": [
+            {
+                "strategy_id": str(item.get("strategy_id", "")),
+                "deflated_sharpe": float(item.get("deflated_sharpe", 0.0) or 0.0),
+                "shadow_fills": int(item.get("shadow_fills", 0) or 0),
+            }
+            for item in report.promotions
+        ],
+        "cascade_fragility_index": float(fragility),
+        "tail_correlation": float(tail_correlation),
+        "tail_hedge_triggered": bool(status.triggered),
+        "hedge_routed": False,
+        "signed": False,
+    }
+
+    record = forge.get_champion(champion_id)
+    if record is not None:
+        event["champion_status"] = str(record.status)
+        event["champion_rolling_net_bps"] = float(record.rolling_net_bps)
+
+    if plan is not None:
+        proposal_payload = plan.proposal.to_dict()
+        ctx["ring0_queue"].put(
+            {
+                "kind": "tail_hedge",
+                "request_id": str(command.get("request_id") or ""),
+                "proposal": proposal_payload,
+                "plan": {
+                    "plan_id": str(plan.plan_id),
+                    "premium_bps": float(plan.premium_bps),
+                    "strike": float(plan.strike),
+                    "spot": float(plan.spot),
+                    "contracts": float(plan.contracts),
+                    "delta": float(plan.delta),
+                    "grounding_hash": str(plan.packet.sha256_digest),
+                    "grounding_verified": bool(plan.grounding_verified),
+                },
+            }
+        )
+        event["hedge_routed"] = True
+        event["hedge_plan_id"] = str(plan.plan_id)
+        event["hedge_proposal_id"] = str(plan.proposal.proposal_id)
+        event["hedge_premium_bps"] = float(plan.premium_bps)
+        event["hedge_strike"] = float(plan.strike)
+        event["hedge_contracts"] = float(plan.contracts)
+        event["hedge_grounding_hash"] = str(plan.packet.sha256_digest)
+        event["hedge_grounding_verified"] = bool(plan.grounding_verified)
+
+    return event
+
 
 def ring2_brain_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - process
     """Ring 2: System 1 lease writer + contagion observer.  No broker keys."""
@@ -837,6 +1174,9 @@ def ring2_brain_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - pr
     strategy_id = str(ctx["strategy_id"])
     interval = max(0.02, float(ctx["lease_interval_s"]))
     controller = System1InstinctController(lease_table=leases, kill_latch=latch)
+    # Populated on the first forge/hedge command so the contagion kernel is not
+    # compiled on a plain lease-only boot.
+    forge_toolkit: dict[str, Any] = {}
 
     # Air-gap audit: the Ring 2 process must not hold broker credentials.  The
     # names are derived (never written as literals) so the substrate itself does
@@ -869,6 +1209,43 @@ def ring2_brain_worker(ctx: Mapping[str, Any]) -> None:  # pragma: no cover - pr
     heart.write(2, pid)
     while not _stopping(ctx):
         heart.write(2, pid)
+        # On-demand / scheduled closed loop.  Drained non-blockingly so the
+        # System 1 lease cadence is never delayed by a forge cycle in flight.
+        # Ring 2 receives *commands* only -- never a credential, never a signed
+        # order -- so this cannot widen the air gap (sec_004).
+        try:
+            command = ctx["brain_queue"].get_nowait()
+        except Empty:
+            command = None
+        except (EOFError, OSError):  # pragma: no cover - queue torn down
+            break
+        if isinstance(command, Mapping) and command.get("cmd") == FORGE_HEDGE_COMMAND:
+            try:
+                if not forge_toolkit:
+                    forge_toolkit.update(_forge_toolkit(leases, silo=silo))
+                _emit(
+                    ctx,
+                    _forge_and_hedge_cycle(
+                        ctx,
+                        command=dict(command),
+                        leases=leases,
+                        silo=silo,
+                        symbol=symbol,
+                        strategy_id=strategy_id,
+                        toolkit=forge_toolkit,
+                    ),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                _emit(
+                    ctx,
+                    {
+                        "type": "ring2_forge_error",
+                        "worker": RING2_WORKER,
+                        "pid": pid,
+                        "request_id": str(dict(command).get("request_id") or ""),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
         tick = make_flow_tick(
             symbol,
             last_price=100.0,
@@ -1068,6 +1445,11 @@ class RingProcessSupervisor:
         self._event_queue = Queue()
         self._ring0_queue = Queue()
         self._control_queue = Queue()
+        # Ring 3 -> Ring 2 command channel.  It carries *commands* only: never a
+        # credential and never a signed order.  The forge/hedge cycle it triggers
+        # emits an unsigned proposal that Ring 0 must independently verify and
+        # sign, so this queue cannot widen the air gap (sec_004, Law 2).
+        self._brain_queue = Queue()
         self._running = False
         self._fresh = bool(fresh_heartbeats)
         if autostart:
@@ -1118,6 +1500,7 @@ class RingProcessSupervisor:
             event_queue=self._event_queue,
             ring0_queue=self._ring0_queue,
             control_queue=self._control_queue,
+            brain_queue=self._brain_queue,
             tick_interval_s=self.tick_interval_s,
             lease_interval_s=self.lease_interval_s,
         )
@@ -1290,6 +1673,45 @@ class RingProcessSupervisor:
     def rearm(self) -> dict[str, Any]:
         command = {"cmd": "rearm"}
         self._control_queue.put(command)
+        return command
+
+    def run_forge_and_hedge_cycle(
+        self,
+        *,
+        strategy_id: str | None = None,
+        champion_fills_bps: Iterable[float] = (),
+        champion_symbols: Iterable[str] = (),
+        challengers: int = 4,
+        price_shock_bps: float = 120.0,
+        cascade_fragility_index: float | None = None,
+        tail_correlation: float = 0.68,
+        spot: float = 50_000.0,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """Ask the Ring 2 worker for one forge + tail-hedge cycle.
+
+        The command travels on the Ring 3 -> Ring 2 control channel and carries
+        only numbers and identifiers.  Nothing here can widen the air gap: the
+        worker answers with an *unsigned* proposal that Ring 0 verifies and
+        signs with its own key (``sec_004``, ADR-009, Law 3).
+        """
+        queue = getattr(self, "_brain_queue", None)
+        if queue is None:  # pragma: no cover - defensive
+            raise RuntimeError("Ring 2 command channel is not attached")
+        command: dict[str, Any] = {
+            "cmd": FORGE_HEDGE_COMMAND,
+            "request_id": request_id or uuid.uuid4().hex[:8],
+            "strategy_id": str(strategy_id or self.strategy_id),
+            "champion_fills_bps": [float(value) for value in champion_fills_bps],
+            "champion_symbols": [str(item) for item in champion_symbols],
+            "challengers": int(challengers),
+            "price_shock_bps": float(price_shock_bps),
+            "tail_correlation": float(tail_correlation),
+            "spot": float(spot),
+        }
+        if cascade_fragility_index is not None:
+            command["cascade_fragility_index"] = float(cascade_fragility_index)
+        queue.put(command)
         return command
 
     def halt_latch(self) -> None:

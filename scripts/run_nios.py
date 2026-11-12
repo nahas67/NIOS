@@ -152,7 +152,7 @@ class _HealthTable:
     def render(self) -> str:
         width = max(len(name) for name, _, _ in self.rows) if self.rows else 20
         lines = [
-            f"{'NIOS STEP 8 SMOKE CHECK':<{width}}  STATUS  DETAIL",
+            f"{'NIOS PHASE 4 FINAL CLOSURE SMOKE CHECK':<{width}}  STATUS  DETAIL",
             f"{'-' * width}  ------  {'-' * 42}",
         ]
         for name, status, detail in self.rows:
@@ -409,22 +409,178 @@ def run_smoke(
 
         table.check("MCP JSON-RPC / SSE transport", ring3_mcp_jsonrpc)
 
+        # ------------------------------------------------------------------
+        # Phase 3 organ coverage: rows 17-22 of the 22-row final closure table.
+        # ------------------------------------------------------------------
+
+        def phase3_process_supervisor() -> str:
+            from core.process_supervisor import RING_WORKERS, RingProcessSupervisor
+
+            # Construct only: spawning is the multiprocess harness' job.  The
+            # snapshot accessors are avoided because they attach (and reset)
+            # the shared heartbeat segment the live supervisor owns.
+            supervisor = RingProcessSupervisor(rings=(), fresh_heartbeats=False)
+            names = [supervisor.spec(index).name for index in range(4)]
+            assert names == list(RING_WORKERS), names
+            # The exact prefix is environment-scoped (``NIOS_SHM_PREFIX`` lets a
+            # test process carve out its own namespace), so the contract is the
+            # immutable ``nios`` root rather than a literal string.
+            assert str(supervisor.shm_prefix).startswith("nios"), supervisor.shm_prefix
+            assert callable(supervisor.run_forge_and_hedge_cycle), "forge cycle missing"
+            return f"{len(names)} ring workers, shm prefix {supervisor.shm_prefix}"
+
+        def phase3_crash_recovery() -> str:
+            from core.chaos_recovery import audit_recovery
+            from core.schemas import VaultName
+            from ring0_vault.ibor.ledger_outbox import IBORLedger, LedgerStore
+
+            recovery_dir = tempfile.mkdtemp(prefix="nios-smoke-recovery-")
+            path = os.path.join(recovery_dir, "ledger.sqlite3")
+            store = LedgerStore(path, probe=False)
+            ledger = IBORLedger(store, silos=["CRYPTO_BINANCE"])
+            ledger.open_silo("CRYPTO_BINANCE", funding_micros=1_000_000_000)
+            ledger.fund_vault("CRYPTO_BINANCE", VaultName.SPINAL_SCALPER, 100_000_000)
+            ledger.flush()
+            report = audit_recovery(path, silos=("CRYPTO_BINANCE",))
+            assert report.passed, report.to_dict()
+            assert report.invariant_holds, "double-entry invariant broken after recovery"
+            return (
+                f"recovered ledger balanced={report.balanced} "
+                f"invariant={report.invariant_holds}"
+            )
+
+        def phase3_multisilo_feed() -> str:
+            from ring2_brain.truth.live_public_feeds import MultiSiloFeedConnector
+
+            connector = MultiSiloFeedConnector()
+            try:
+                frames = connector.ingest_all()
+                feed_state = connector.status()
+            finally:
+                connector.close()
+            silos = sorted({frame.silo for frame in frames})
+            assert len(silos) == 4, silos
+            assert feed_state["kind"] == "multi_silo_dual_vendor", feed_state["kind"]
+            assert len(feed_state["venues"]) == 4, sorted(feed_state["venues"])
+            return (
+                f"{len(frames)} Lee-Ready frames across {len(silos)} silos "
+                f"({feed_state['feed_mode']})"
+            )
+
+        def phase3_testnet_bridge() -> str:
+            from core.schemas import UnsignedProposal, VaultName
+            from ring0_vault.ibor.ledger_outbox import (
+                CrashAtomicOutbox,
+                IBORLedger,
+                LedgerStore,
+            )
+            from ring0_vault.silos.key_vault.key_rotation import vault_key_status
+            from ring0_vault.silos.testnet_bridge import (
+                SANDBOX_VENUE_SPECS,
+                TestnetExecutionBridge,
+            )
+
+            sandbox_dir = tempfile.mkdtemp(prefix="nios-smoke-testnet-")
+            store = LedgerStore(os.path.join(sandbox_dir, "ledger.sqlite3"), probe=False)
+            ledger = IBORLedger(store, silos=["CRYPTO_BINANCE"])
+            ledger.open_silo("CRYPTO_BINANCE", funding_micros=10_000_000_000)
+            ledger.fund_vault("CRYPTO_BINANCE", VaultName.SPINAL_SCALPER, 5_000_000_000)
+            outbox = CrashAtomicOutbox(ledger)
+            bridge = TestnetExecutionBridge(outbox, ledger, allow_network=False)
+            try:
+                receipt = bridge.dispatch(
+                    "CRYPTO_BINANCE",
+                    "binance",
+                    UnsignedProposal(
+                        proposal_id="smoke-sandbox",
+                        strategy_id="smoke",
+                        silo="CRYPTO_BINANCE",
+                        vault=VaultName.SPINAL_SCALPER,
+                        symbol="BTCUSDT",
+                        side="BUY",
+                        qty=0.01,
+                        limit_price=100.0,
+                        expected_gross_bps=12.0,
+                        spread_bps=1.0,
+                        grounding_hash="a" * 64,
+                    ),
+                    sandbox=True,
+                )
+                bridge_state = bridge.status()
+            finally:
+                bridge.close()
+            assert len(SANDBOX_VENUE_SPECS) == 12, len(SANDBOX_VENUE_SPECS)
+            assert bridge_state["write_only_credentials"] is True
+            body = receipt.to_dict()
+            assert body["sandbox"] is True, body
+            assert body["write_only"] is True, body
+            assert body["raw_secret_returned"] is False, body
+            vault = vault_key_status()
+            assert vault["verifier_ring_read_only"] is True
+            assert vault["raw_secrets_exposed"] is False
+            assert int(vault["key_version"]) >= 1, vault["key_version"]
+            return (
+                f"{len(SANDBOX_VENUE_SPECS)} sandbox venues write-only, "
+                f"key v{vault['key_version']}, outbox {body['outbox_state']}"
+            )
+
+        def observability_metrics() -> str:
+            prometheus = client.get("/metrics")
+            assert prometheus.status_code == 200, prometheus.text
+            assert len(prometheus.text) > 256, len(prometheus.text)
+            payload = client.get("/api/v2/metrics/json")
+            assert payload.status_code == 200, payload.text
+            body = payload.json()
+            assert body.get("exposition"), sorted(body)
+            return (
+                f"/metrics {len(prometheus.text)} bytes, "
+                f"/api/v2/metrics/json {len(body)} keys"
+            )
+
+        def os_low_latency_auditor() -> str:
+            from core.os_tuning import audit_and_tune_os
+
+            report = audit_and_tune_os(apply=False, ring="ring1")
+            socket_report = report["socket"]
+            assert socket_report["tcp_nodelay"] == 1, socket_report
+            assert socket_report["so_keepalive"] == 1, socket_report
+            assert int(report["error_count"]) == 0, report["errors"]
+            return (
+                f"{report['applied_count']} applied / "
+                f"{report['recommended_count']} recommended, TCP_NODELAY=1"
+            )
+
+        table.check("Phase 3 four-ring OS process supervisor", phase3_process_supervisor)
+        table.check("Phase 3 crash-recovery / outbox audit", phase3_crash_recovery)
+        table.check("Multi-Silo Dual-Vendor Feed & Lee-Ready Flow", phase3_multisilo_feed)
+        table.check("Ring 0 Testnet Execution Bridge & Write-Only Vault", phase3_testnet_bridge)
+        table.check("Prometheus / OpenTelemetry Metrics Exporter", observability_metrics)
+        table.check("OS & Socket Low-Latency Tuning Auditor", os_low_latency_auditor)
+
+        # The runtime budget gates the exit code but is deliberately not a row:
+        # the release table is fixed at 22 hardware/software organ checks.
         elapsed_ms = (time.perf_counter() - started) * 1e3
-        table.add(
-            "Smoke runtime budget",
-            elapsed_ms < 120_000.0,
-            f"boot={boot_ms:.0f} ms, total={elapsed_ms:.0f} ms",
-        )
+        budget_ok = elapsed_ms < 120_000.0
+        budget_detail = f"boot={boot_ms:.0f} ms, total={elapsed_ms:.0f} ms"
     except Exception as exc:  # boot failure is the loudest failure
         table.add("Runtime boot", False, f"{type(exc).__name__}: {exc}")
+        budget_ok = False
+        budget_detail = "not measured (boot failure)"
     finally:
         if runtime is not None:
             runtime.close()
 
     print(table.render())
+    print(
+        f"ROWS={len(table.rows)}  RUNTIME BUDGET  "
+        f"{'PASS' if budget_ok else 'FAIL'}  {budget_detail}"
+    )
     print()
-    if table.ok:
-        print("SMOKE TEST PASSED: all four rings healthy, 5 MCP tools, UI served.")
+    if table.ok and budget_ok:
+        print(
+            "SMOKE TEST PASSED: all four rings healthy, 22 organs certified, "
+            "5 MCP tools, UI served."
+        )
         return 0
     print("SMOKE TEST FAILED: see FAIL rows above.")
     return 1
