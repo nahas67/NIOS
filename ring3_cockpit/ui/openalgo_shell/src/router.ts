@@ -12,7 +12,11 @@ export type PageKey =
   | 'verification'
   | 'control'
 
-/** Canonical URL path per page. */
+/** V1.1: physically separate workspaces + the three auth screens. */
+export type WorkspaceKey = 'paper' | 'live' | 'legacy'
+export type AuthScreen = 'setup' | 'login' | 'live-unlock' | null
+
+/** Canonical URL path per page (legacy, workspace-less aliases). */
 export const PAGE_PATHS: Record<PageKey, string> = {
   dashboard: '/dashboard',
   orders: '/orders',
@@ -23,6 +27,11 @@ export const PAGE_PATHS: Record<PageKey, string> = {
   ledger: '/ledger',
   verification: '/verification',
   control: '/control',
+}
+
+/** Workspace-qualified path for a page. */
+export function workspacePath(page: PageKey, workspace: 'paper' | 'live'): string {
+  return `/${workspace}/${page}`
 }
 
 const PATH_TO_PAGE: Record<string, PageKey> = {
@@ -63,14 +72,39 @@ function normalize(pathname: string): string {
   return trimmed === '' ? '/' : trimmed
 }
 
+/** Split `/paper/...`, `/live/...` and the auth screens out of a pathname. */
+export function parseRoute(pathname: string): {
+  workspace: WorkspaceKey
+  page: PageKey
+  authPage: AuthScreen
+} {
+  const path = normalize(pathname)
+  if (path === '/setup' || path === '/login' || path === '/live-unlock') {
+    return { workspace: 'legacy', page: 'dashboard', authPage: path.slice(1) as AuthScreen }
+  }
+  const match = /^\/(paper|live)(\/.*)?$/.exec(path)
+  if (match) {
+    const workspace = match[1] as 'paper' | 'live'
+    const rest = match[2] && match[2].length > 1 ? match[2] : '/dashboard'
+    return {
+      workspace,
+      page: PATH_TO_PAGE[rest] ?? 'dashboard',
+      authPage: null,
+    }
+  }
+  return { workspace: 'legacy', page: PATH_TO_PAGE[path] ?? 'dashboard', authPage: null }
+}
+
 /** Resolve a browser pathname to its page, defaulting to the dashboard. */
 export function pageFromPath(pathname: string): PageKey {
-  return PATH_TO_PAGE[normalize(pathname)] ?? 'dashboard'
+  return parseRoute(pathname).page
 }
 
 export interface RouteState {
   path: string
   page: PageKey
+  workspace: WorkspaceKey
+  authPage: AuthScreen
   go: (path: string) => void
 }
 
@@ -83,7 +117,7 @@ export interface RouteState {
  */
 export function useRoute(): RouteState {
   const [path, setPath] = useState<string>(() =>
-    typeof window === 'undefined' ? '/' : normalize(window.location.pathname)
+    typeof window === 'undefined' ? '/' : normalize(window.location.pathname),
   )
 
   useEffect(() => {
@@ -100,5 +134,12 @@ export function useRoute(): RouteState {
     setPath(target)
   }, [])
 
-  return { path, page: pageFromPath(path), go }
+  const parsed = parseRoute(path)
+  return {
+    path,
+    page: parsed.page,
+    workspace: parsed.workspace,
+    authPage: parsed.authPage,
+    go,
+  }
 }

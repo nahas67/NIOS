@@ -1529,3 +1529,12 @@ class SmartOMS:
                 if chaser.repegs
             },
         }
+
+    def reset_to_clean_slate(self) -> dict[str, Any]:
+        """Cancel every working peg and forget all order history (V1.1)."""
+        cleared = len(self._chasers)
+        events = len(self._events)
+        self._chasers.clear()
+        self._events.clear()
+        self._cards.clear()
+        return {"orders_cleared": cleared, "events_cleared": events}

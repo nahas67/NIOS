@@ -286,6 +286,8 @@ class NIOSCoreOrchestrator:
         bus: LocalJetStreamBus | None = None,
         key_vault_root: str | Path | None = None,
         require_registered_grounding: bool = False,
+        clean_slate: bool = False,
+        autopilot_enabled: bool | None = None,
     ) -> None:
         self.strategy_id = str(strategy_id)
         self.silos = tuple(str(s) for s in silos)
@@ -312,6 +314,16 @@ class NIOSCoreOrchestrator:
         self._autopilot_last_ns = 0
         self._autopilot_paused = False
         self._autopilot_last: dict[str, Any] = {}
+        # V1.1: a user-facing boot starts in a zero-demo clean slate with the
+        # tape OFF until the operator funds paper capital and presses PLAY.
+        # ``clean_slate=False`` (the default) preserves every pre-existing
+        # demo-seeded test and the ``--smoke-test`` pre-flight.
+        self._clean_slate = bool(clean_slate)
+        self._autopilot_enabled = (
+            (not self._clean_slate)
+            if autopilot_enabled is None
+            else bool(autopilot_enabled)
+        )
 
         # ---- Tier 1 / Tier 2 -------------------------------------------
         self.bus = bus if bus is not None else LocalJetStreamBus(self.workspace / "bus")
@@ -506,6 +518,99 @@ class NIOSCoreOrchestrator:
             autopilot_provider=self.autopilot_snapshot,
             forge_hedge_runner=self.run_forge_and_hedge_cycle,
         )
+        # V1.1: one sovereign operator per install.  An explicit
+        # ``key_vault_root`` (tests, CI, secondary installs) isolates the
+        # credential file; otherwise the gitignored Ring 0 vault is used.
+        from ring0_vault.silos.key_vault.operator_auth import (
+            OperatorAuth,
+            default_operator_auth,
+        )
+
+        self.control._operator_auth = (  # noqa: SLF001 - Ring 0 owns the vault
+            OperatorAuth(Path(key_vault_root) / "operator")
+            if key_vault_root is not None
+            else default_operator_auth()
+        )
+        self.control._clean_slate_active = self._clean_slate  # noqa: SLF001
+        if self._clean_slate:
+            # Demo funding already ran so every downstream constructor had a
+            # positive NAV; wipe it before the operator can ever observe it.
+            self.reset_to_clean_slate()
+
+    # -- V1.1 clean slate --------------------------------------------------
+    def reset_to_clean_slate(self) -> dict[str, Any]:
+        """Zero the whole workspace: 4 silos x 4 vaults, orders, nursery, tape.
+
+        After this call every number the cockpit can render is ``0`` except the
+        configuration constants (vault names, silo count, ratchet percentages),
+        and the double-entry invariant is ``sum(debits) == sum(credits) == 0``.
+        """
+        ledger_report = self.ledger.reset_to_clean_slate()
+        outbox_report = self.outbox.reset_to_clean_slate()
+        oms_report = self.oms.reset_to_clean_slate()
+        twin_report = self.twin.reset_to_clean_slate()
+        # Tier-0 leases: an expired lease must never survive a factory reset.
+        disarmed = 0
+        disarm_all = getattr(self.lease_table, "disarm_all", None)
+        if callable(disarm_all):
+            try:
+                disarmed = int(disarm_all() or 0)
+            except Exception:  # pragma: no cover - defensive
+                disarmed = 0
+        self._cards.clear()
+        self.mirror = ConformalMirror()
+        self._verdicts.clear()
+        self._last_gate_card = None
+        self._last_live_verdict = None
+        self._last_committed_reservation = None
+        self._autopilot_rounds = 0
+        self._autopilot_ticks = 0
+        self._autopilot_live_fills = 0
+        self._autopilot_last_ns = 0
+        self._autopilot_last = {}
+        self._autopilot_paused = True
+        self._autopilot_enabled = False
+        self._clean_slate = True
+        control = getattr(self, "control", None)
+        if control is not None:
+            control._clean_slate_active = True  # noqa: SLF001
+            control._autopilot_override = False  # noqa: SLF001
+        try:
+            self.token_ledger.reset()
+        except Exception:  # pragma: no cover - ledger may be immutable
+            pass
+        return {
+            "clean_slate": True,
+            "ledger": ledger_report,
+            "outbox": outbox_report,
+            "oms": oms_report,
+            "shadow_twin": twin_report,
+            "leases_disarmed": disarmed,
+            "shadow_fills": int(self.twin.shadow_fill_count(self.strategy_id)),
+            "live_fills": 0,
+            "token_spend_usd": float(getattr(self.token_ledger, "spend_usd", 0.0) or 0.0),
+            "autopilot": False,
+            "orders": [],
+        }
+
+    def set_autopilot(self, enabled: bool) -> dict[str, Any]:
+        """Operator PLAY/PAUSE for the paper tape (never starts live trading)."""
+        self._autopilot_enabled = bool(enabled)
+        self._autopilot_paused = not bool(enabled)
+        return self.autopilot_snapshot()
+
+    def fund_paper_capital(
+        self,
+        silo: str,
+        amount_units: float | int,
+        *,
+        vault: str | None = None,
+    ) -> dict[str, Any]:
+        """Deposit user-chosen Paper capital into one silo (``sec_009``)."""
+        amount_micros = int(round(float(amount_units) * 1_000_000))
+        result = self.ledger.fund_paper_capital(silo, amount_micros, vault=vault)
+        self._clean_slate = False
+        return result
 
     # -- properties -------------------------------------------------------
     @property
@@ -892,7 +997,7 @@ class NIOSCoreOrchestrator:
         """Live autopilot telemetry for ``GET /api/v2/cockpit/state``."""
         twin = self.twin
         return {
-            "enabled": True,
+            "enabled": bool(self._autopilot_enabled),
             "mode": "PAPER",
             "interval_ms": int(AUTOPILOT_INTERVAL_S * 1000),
             "instruments": dict(SILO_INSTRUMENTS),

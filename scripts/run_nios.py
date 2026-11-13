@@ -102,8 +102,16 @@ def build_runtime(
     workspace: str | Path | None = None,
     *,
     key_vault_root: str | Path | None = None,
+    clean_slate: bool = False,
 ):
-    """Boot the complete 4-ring runtime (or a caller-provided workspace)."""
+    """Boot the complete 4-ring runtime (or a caller-provided workspace).
+
+    ``clean_slate=True`` is the V1.1 *user-facing* boot: every silo, vault,
+    order, nursery fill and spend counter starts at zero and the paper tape is
+    OFF until the operator funds capital and presses PLAY.  Tests and the
+    ``--smoke-test`` pre-flight keep the historical demo-seeded runtime
+    (``clean_slate=False``) so all 278 pre-existing assertions stay valid.
+    """
     from core.orchestrator import NIOSCoreOrchestrator
 
     resolved = (
@@ -117,6 +125,7 @@ def build_runtime(
         seed_fills=60,
         funding_micros=5_000_000_000_000,
         daily_loss_stop_micros=5_000_000_000,
+        clean_slate=clean_slate,
     )
 
 
@@ -607,7 +616,7 @@ def run_server(
     print(f"[NIOS] live cockpit: {live_url(host, resolved)}")
     sys.stdout.flush()
 
-    runtime = build_runtime(workspace)
+    runtime = build_runtime(workspace, clean_slate=True)
     try:
         app = fastapi_app(runtime)
         uvicorn.run(app, host=host, port=resolved, log_level="info")

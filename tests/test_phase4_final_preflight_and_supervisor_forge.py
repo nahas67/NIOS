@@ -10,7 +10,7 @@ Four gates close the Main Core (Phases 1-3):
 * Gate 3 -- ``scripts/preflight_golive.py --json`` certifies the release with
   ``ready_for_live_cutover == True``, ``failed_gates == 0`` and a 64-character
   SHA-256 certificate digest.
-* Gate 4 -- the regression inventory grew from 17 to 18 suites while every
+* Gate 4 -- the regression inventory grew from 18 to 19 suites while every
   pre-existing Phase 1-3 suite stayed intact.
 
 Phase 4 Step 2 wires those organs into the Ring 3 control plane and cockpit:
@@ -311,7 +311,7 @@ def test_gate4_regression_inventory_is_eighteen_suites() -> None:
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 18, suites
+    assert len(suites) == 19, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"

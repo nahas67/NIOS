@@ -4,8 +4,10 @@ import { AppSidebar } from '@/components/app-sidebar'
 import { TopBar } from '@/components/top-bar'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useAuth } from '@/hooks/use-auth'
 import { useCockpit } from '@/hooks/use-cockpit'
 import { AnalyzerPage } from '@/pages/analyzer'
+import { LoginPage, LiveUnlockPage, SetupPage } from '@/pages/auth'
 import { BrainPage } from '@/pages/brain'
 import { ControlPage } from '@/pages/control'
 import { DashboardPage } from '@/pages/dashboard'
@@ -14,11 +16,13 @@ import { LedgerPage } from '@/pages/ledger'
 import { OrdersPage } from '@/pages/orders'
 import { QuantPage } from '@/pages/quant'
 import { VerificationPage } from '@/pages/verification'
+import { LiveWorkspacePage, PaperWorkspacePage } from '@/pages/workspace'
 import { legacyTabFor, pathForLegacyTab, useRoute } from '@/router'
 import type { LegacyTab } from '@/router'
 
 export function App() {
   const cockpit = useCockpit()
+  const auth = useAuth()
   const route = useRoute()
   const {
     state,
@@ -34,6 +38,7 @@ export function App() {
   } = cockpit
 
   const legacyTab = legacyTabFor(route.page)
+  const tier = auth.status?.tier ?? 'NONE'
 
   function renderPage() {
     switch (route.page) {
@@ -57,6 +62,87 @@ export function App() {
         return <DashboardPage state={state} cards={cards} />
     }
   }
+
+  // ---- V1.1 auth screens (first run, sign in, live elevation) ----------
+  if (route.authPage === 'setup') {
+    return (
+      <SetupPage
+        status={auth.status}
+        onAuthenticated={auth.applySession}
+        onDone={route.go}
+      />
+    )
+  }
+  if (route.authPage === 'login') {
+    return (
+      <LoginPage
+        status={auth.status}
+        onAuthenticated={auth.applySession}
+        onDone={route.go}
+      />
+    )
+  }
+  if (route.authPage === 'live-unlock') {
+    return (
+      <LiveUnlockPage
+        status={auth.status}
+        onAuthenticated={auth.applySession}
+        onDone={route.go}
+      />
+    )
+  }
+
+  // First-time entry: an uninitialised install lands on the operator setup.
+  if (auth.status && !auth.status.initialized && route.workspace === 'legacy' && route.path === '/') {
+    return (
+      <SetupPage
+        status={auth.status}
+        onAuthenticated={auth.applySession}
+        onDone={route.go}
+      />
+    )
+  }
+
+  // A workspace route requires a PAPER (or LIVE) session.
+  const needsLogin =
+    (route.workspace === 'paper' || route.workspace === 'live') &&
+    auth.status !== null &&
+    !auth.status.authenticated
+  if (needsLogin) {
+    return (
+      <LoginPage
+        status={auth.status}
+        onAuthenticated={auth.applySession}
+        onDone={route.go}
+      />
+    )
+  }
+
+  const workspaceBody =
+    route.workspace === 'paper' ? (
+      <PaperWorkspacePage path={route.path} tier={tier} onNavigate={route.go}>
+        {renderPage()}
+      </PaperWorkspacePage>
+    ) : route.workspace === 'live' ? (
+      <LiveWorkspacePage path={route.path} tier={tier} onNavigate={route.go}>
+        {renderPage()}
+      </LiveWorkspacePage>
+    ) : legacyTab ? (
+      <Tabs
+        value={legacyTab}
+        onValueChange={(next) => route.go(pathForLegacyTab(next as LegacyTab))}
+        className="gap-4"
+      >
+        <TabsList className="grid h-10 w-full max-w-[560px] grid-cols-3">
+          <TabsTrigger value="live">Live Cockpit</TabsTrigger>
+          <TabsTrigger value="xray">Brain &amp; Contagion</TabsTrigger>
+          <TabsTrigger value="control">Control Room</TabsTrigger>
+        </TabsList>
+        <TabsContent value={legacyTab}>{renderPage()}</TabsContent>
+      </Tabs>
+    ) : (
+      renderPage()
+    )
 
   return (
     <div className="dark">
@@ -109,23 +195,14 @@ export function App() {
               </div>
             ) : null}
 
-            <main className="relative flex-1 px-4 pb-10 pt-4 lg:px-6">
-              {legacyTab ? (
-                <Tabs
-                  value={legacyTab}
-                  onValueChange={(next) => route.go(pathForLegacyTab(next as LegacyTab))}
-                  className="gap-4"
-                >
-                  <TabsList className="grid h-10 w-full max-w-[560px] grid-cols-3">
-                    <TabsTrigger value="live">Live Cockpit</TabsTrigger>
-                    <TabsTrigger value="xray">Brain &amp; Contagion</TabsTrigger>
-                    <TabsTrigger value="control">Control Room</TabsTrigger>
-                  </TabsList>
-                  <TabsContent value={legacyTab}>{renderPage()}</TabsContent>
-                </Tabs>
-              ) : (
-                renderPage()
-              )}
+            <main
+              className={
+                route.workspace === 'legacy'
+                  ? 'relative flex-1 px-4 pb-10 pt-4 lg:px-6'
+                  : 'relative flex-1 pb-10'
+              }
+            >
+              {workspaceBody}
             </main>
 
             <footer className="relative z-10 border-t border-border/50 px-4 py-3 text-[10px] text-muted-foreground lg:px-6">

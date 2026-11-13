@@ -178,12 +178,12 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 278 tests / 18 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 283 tests / 19 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.1.0-V1`: `pytest tests -q` must report **278 passed, 0 failed, 0 warnings**
+Release seal for `v3.1.0-V1`: `pytest tests -q` must report **283 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 

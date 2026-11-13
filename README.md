@@ -158,7 +158,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**278 tests · 18 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**283 tests · 19 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -290,7 +290,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     278 tests across 18 suites
+tests/                     283 tests across 19 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 22-gate go-live readiness certificate (--strict / --fast)
@@ -308,7 +308,7 @@ start_nios.bat / .sh       1-click launch
 
 | Gate | Command | Required result |
 |---|---|---|
-| Unit / integration | `pytest tests -q` | **278 passed**, 0 failed, 0 warnings |
+| Unit / integration | `pytest tests -q` | **283 passed**, 0 failed, 0 warnings |
 | Smoke suite | `python scripts/run_nios.py --smoke-test` | **22/22 rows**, `EXIT=0` |
 | Go-live certificate | `python scripts/preflight_golive.py --fast` | **22/22 PASS**, `EXIT=0` |
 | Live 9-page burn-in | boot, sweep, shut down | **9/9 routes**, **7/7 page endpoints**, **12/12 controls** at `200 OK`, then empty `git status --porcelain` |

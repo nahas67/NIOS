@@ -804,6 +804,47 @@ class ChallengerEvalRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# V1.1 sovereign operator auth + dual workspace + clean slate
+# ---------------------------------------------------------------------------
+
+
+class AuthSetupRequest(BaseModel):
+    """``POST /api/v2/auth/setup`` -- first-run sovereign operator."""
+
+    username: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+    password: str = Field(..., min_length=8, max_length=256)
+    live_pin: str = Field(..., min_length=4, max_length=12, pattern=r"^[0-9]+$")
+    start_clean_slate: bool = True
+
+
+class AuthLoginRequest(BaseModel):
+    """``POST /api/v2/auth/login`` -- PAPER session."""
+
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class AuthElevateRequest(BaseModel):
+    """``POST /api/v2/auth/elevate-live`` -- second factor for LIVE."""
+
+    live_pin: str = Field(..., min_length=4, max_length=12, pattern=r"^[0-9]+$")
+
+
+class PaperFundingRequest(BaseModel):
+    """``POST /api/v2/control/ledger/fund-paper`` -- user-chosen capital."""
+
+    silo: str = Field(..., min_length=1, max_length=32)
+    amount_units: float = Field(..., gt=0.0, le=1_000_000_000.0)
+    vault: str | None = Field(default="ALL_CANONICAL", max_length=32)
+
+
+class AutopilotControlRequest(BaseModel):
+    """``POST /api/v2/control/workspace/autopilot`` -- PAPER tape play/pause."""
+
+    enabled: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Mutable control state
 # ---------------------------------------------------------------------------
 
@@ -957,6 +998,12 @@ class ControlPlane:
         # be scheduled inside the sub-millisecond hardware latch measurement.
         self._autopilot_tick_lock = threading.Lock()
         self._autopilot_active = False
+        # V1.1: operator PLAY/PAUSE override (``None`` = follow the runtime).
+        self._autopilot_override: bool | None = None
+        # V1.1 clean-slate flag surfaced on ``/api/v2/auth/status``.
+        self._clean_slate_active = False
+        # V1.1: per-process operator auth (Ring 0 vault, 0600, salted KDF).
+        self._operator_auth = None
         # ``sec_004``: the 4-ring topology is only real if the cockpit can prove
         # four distinct OS processes are alive.  The supervisor is injected so
         # single-process mode still renders (with an explicit "not attached").
@@ -4545,6 +4592,278 @@ class ControlPlane:
             "generated_at_ns": time.time_ns(),
         }
 
+    # ------------------------------------------------------------------
+    # V1.1 sovereign operator auth, dual workspace and clean slate
+    # ------------------------------------------------------------------
+    def operator_auth(self) -> Any:
+        """The Ring 0 operator vault (lazy, so imports stay one-directional)."""
+        if self._operator_auth is None:
+            from ring0_vault.silos.key_vault.operator_auth import (
+                default_operator_auth,
+            )
+
+            self._operator_auth = default_operator_auth()
+        return self._operator_auth
+
+    def auth_status(self, session_token: str | None = None) -> dict[str, Any]:
+        try:
+            payload = dict(self.operator_auth().status(session_token))
+        except Exception:  # pragma: no cover - corrupt vault is not a 500
+            payload = {
+                "initialized": False,
+                "authenticated": False,
+                "username": None,
+                "tier": "NONE",
+            }
+        payload["clean_slate_active"] = bool(self._clean_slate_active)
+        return payload
+
+    def auth_setup(self, request: AuthSetupRequest) -> dict[str, Any]:
+        from ring0_vault.silos.key_vault.operator_auth import (
+            OperatorAuthError,
+            OperatorExistsError,
+        )
+
+        try:
+            session = self.operator_auth().setup_operator(
+                request.username, request.password, request.live_pin
+            )
+        except OperatorExistsError as exc:
+            raise HTTPException(
+                status_code=409, detail="OPERATOR_ALREADY_INITIALIZED"
+            ) from exc
+        except OperatorAuthError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        report: dict[str, Any] = {}
+        if request.start_clean_slate:
+            report = self.reset_workspace()
+        self._clean_slate_active = bool(request.start_clean_slate)
+        return {
+            "ok": True,
+            **session.to_dict(),
+            "clean_slate": bool(self._clean_slate_active),
+            "workspace": report,
+        }
+
+    def auth_login(self, request: AuthLoginRequest) -> dict[str, Any]:
+        from ring0_vault.silos.key_vault.operator_auth import OperatorAuthError
+
+        try:
+            session = self.operator_auth().login_operator(
+                request.username, request.password
+            )
+        except OperatorAuthError as exc:
+            raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS") from exc
+        return {"ok": True, **session.to_dict()}
+
+    def auth_elevate_live(
+        self, session_token: str | None, request: AuthElevateRequest
+    ) -> dict[str, Any]:
+        from ring0_vault.silos.key_vault.operator_auth import (
+            LivePinRejected,
+            OperatorAuthError,
+            SessionInvalid,
+        )
+
+        auth = self.operator_auth()
+        try:
+            claims = auth.decode_session(session_token)
+        except SessionInvalid as exc:
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED") from exc
+        if str(claims.get("t")) != "PAPER":
+            raise HTTPException(status_code=409, detail="ALREADY_ELEVATED")
+        # 22-gate pre-flight is *checked and reported* on every elevation.  A
+        # PAPER-only install has no live broker handshake yet, so a non-green
+        # certificate is a warning rather than a hard block; the LIVE workspace
+        # surfaces the same certificate verbatim.
+        try:
+            certificate = self.preflight_state()
+        except Exception:  # pragma: no cover - defensive
+            certificate = {}
+        gates_passed = bool(
+            certificate.get("passed")
+            or certificate.get("ready")
+            or certificate.get("ok")
+        )
+        try:
+            session = auth.elevate_to_live(session_token or "", request.live_pin)
+        except LivePinRejected as exc:
+            raise HTTPException(status_code=403, detail="LIVE_PIN_REJECTED") from exc
+        except SessionInvalid as exc:
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED") from exc
+        except OperatorAuthError as exc:
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED") from exc
+        return {
+            "ok": True,
+            **session.to_dict(),
+            "preflight_ok": gates_passed,
+            "preflight": certificate,
+            "warnings": [] if gates_passed else ["PREFLIGHT_NOT_GREEN"],
+        }
+
+    def auth_logout(self, session_token: str | None) -> dict[str, Any]:
+        revoked = bool(self.operator_auth().revoke_session(session_token))
+        return {"ok": True, "revoked": revoked}
+
+    def reset_workspace(self) -> dict[str, Any]:
+        """Zero-demo factory reset of the *current* (Paper) workspace."""
+        owner = getattr(self.autopilot_runner, "__self__", None)
+        if owner is not None and hasattr(owner, "reset_to_clean_slate"):
+            report = dict(owner.reset_to_clean_slate())
+        else:  # pragma: no cover - a ControlPlane built without an orchestrator
+            report = {
+                "ledger": self.ledger.reset_to_clean_slate(),
+                "outbox": self.outbox.reset_to_clean_slate(),
+                "oms": self.oms.reset_to_clean_slate(),
+                "shadow_twin": self.shadow_twin.reset_to_clean_slate(),
+                "autopilot": False,
+            }
+        self._autopilot_override = False
+        self._clean_slate_active = True
+        self._cards.clear()
+        self._card_sequence = 0
+        self._kill_report = {}
+        return {
+            "reset": True,
+            "clean_slate": True,
+            "clean_slate_active": True,
+            "workspace": "paper",
+            **report,
+        }
+
+    def fund_paper(self, request: PaperFundingRequest) -> dict[str, Any]:
+        silo = str(request.silo).strip().upper()
+        known = set()
+        try:
+            known = {str(s).upper() for s in self._known_silos()}
+        except Exception:  # pragma: no cover - defensive
+            known = {str(s).upper() for s in self.ledger.silos}
+        if silo not in known:
+            raise HTTPException(status_code=404, detail="UNKNOWN_SILO")
+        owner = getattr(self.autopilot_runner, "__self__", None)
+        if owner is not None and hasattr(owner, "fund_paper_capital"):
+            report = owner.fund_paper_capital(
+                silo, float(request.amount_units), vault=request.vault
+            )
+        else:  # pragma: no cover - ControlPlane without an orchestrator
+            micros = int(round(float(request.amount_units) * 1_000_000))
+            report = self.ledger.fund_paper_capital(
+                silo, micros, vault=request.vault
+            )
+        self._clean_slate_active = False
+        return {
+            "ok": True,
+            "workspace": "paper",
+            "silo": silo,
+            "amount_units": float(request.amount_units),
+            "clean_slate_active": False,
+            **report,
+        }
+
+    def set_autopilot(self, request: AutopilotControlRequest) -> dict[str, Any]:
+        owner = getattr(self.autopilot_runner, "__self__", None)
+        if owner is not None and hasattr(owner, "set_autopilot"):
+            snapshot = owner.set_autopilot(bool(request.enabled))
+        else:  # pragma: no cover - ControlPlane without an orchestrator
+            raise HTTPException(status_code=400, detail="AUTOPILOT_UNAVAILABLE")
+        self._autopilot_override = bool(request.enabled)
+        return {"ok": True, "autopilot": dict(snapshot)}
+
+    def workspace_state(
+        self, workspace: str = "paper", session_token: str | None = None
+    ) -> dict[str, Any]:
+        """Strictly mode-scoped telemetry for ``/paper/*`` vs ``/live/*``."""
+        mode = str(workspace or "paper").strip().lower()
+        claims = None
+        try:
+            claims = self.operator_auth().authenticate(session_token)
+        except Exception:  # pragma: no cover - defensive
+            claims = None
+        tier = str((claims or {}).get("tier", "NONE"))
+
+        if mode == "live":
+            if claims is None:
+                raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
+            if tier != "LIVE":
+                raise HTTPException(
+                    status_code=403, detail="LIVE_ELEVATION_REQUIRED"
+                )
+            silos = {
+                silo_id: {
+                    "mode": self.broker_state(silo_id).get("mode"),
+                    "broker": self.broker_state(silo_id).get("broker"),
+                    "configured": bool(
+                        self.broker_state(silo_id).get("configured", False)
+                    ),
+                    "frozen": bool(self.broker_state(silo_id).get("frozen", False)),
+                }
+                for silo_id in self.registry.silo_ids()
+            }
+            return {
+                "workspace": "live",
+                "mode": "LIVE",
+                "tier": tier,
+                "username": (claims or {}).get("username"),
+                "silos": silos,
+                "broker_credentials": self.broker_credentials(),
+                "preflight": self.preflight_state(),
+                "feed": self.feed_state(),
+                "testnet": self._testnet_summary(),
+                "kill_switch": self._kill_report,
+                "live_fills": int(
+                    self.autopilot_state().get("live_fills", 0) or 0
+                ),
+                "generated_at_ns": time.time_ns(),
+            }
+
+        orders = self.orders_page()
+        ledger = self.ledger_page()
+        autopilot = self.autopilot_state()
+        twin = self.shadow_twin
+        required = int(_read(twin, "required_fills", 30) or 30)
+        try:
+            fills = int(twin.shadow_fill_count(self.strategy_id))
+            graduated = bool(twin.is_graduated(self.strategy_id))
+        except Exception:  # pragma: no cover - defensive
+            fills, graduated = 0, False
+        return {
+            "workspace": "paper",
+            "mode": "PAPER",
+            "tier": tier,
+            "username": (claims or {}).get("username"),
+            "clean_slate_active": bool(self._clean_slate_active),
+            "silos": {
+                silo_id: {
+                    "vaults": self._vaults(silo_id),
+                    "nav_micros": int(self.ledger.silo_nav_micros(silo_id)),
+                    "mode": self.broker_state(silo_id).get("mode"),
+                }
+                for silo_id in self.registry.silo_ids()
+            },
+            "orders": {
+                "working": orders.get("working_orders", []),
+                "events": orders.get("events", []),
+                "counts": orders.get("counts", {}),
+            },
+            "ledger": {
+                "vaults": ledger.get("silos", {}),
+                "double_entry": ledger.get("double_entry", {}),
+                "counts": ledger.get("counts", {}),
+            },
+            "shadow": {
+                "shadow_fills": fills,
+                "required_fills": required,
+                "remaining_fills": max(0, required - fills),
+                "graduated": graduated,
+                "live_fills": int(autopilot.get("live_fills", 0) or 0),
+            },
+            "autopilot": autopilot,
+            "token_spend_usd": float(
+                getattr(self.token_ledger, "spend_usd", 0.0) or 0.0
+            ),
+            "generated_at_ns": time.time_ns(),
+        }
+
     def state(self) -> dict[str, Any]:
         silos = {
             silo_id: {
@@ -4585,16 +4904,21 @@ class ControlPlane:
     def autopilot_state(self) -> dict[str, Any]:
         """Paper-shadow autopilot telemetry (``sec_013`` lifecycle)."""
         provider = self.autopilot_provider
+        snapshot: dict[str, Any]
         if callable(provider):
             try:
-                return dict(provider())
+                snapshot = dict(provider())
             except Exception:  # pragma: no cover - telemetry is non-fatal
-                return {"enabled": False, "error": "autopilot telemetry unavailable"}
-        return {
-            "enabled": False,
-            "mode": "PAPER",
-            "interval_ms": int(AUTOPILOT_INTERVAL_S * 1000),
-        }
+                snapshot = {"enabled": False, "error": "autopilot telemetry unavailable"}
+        else:
+            snapshot = {
+                "enabled": False,
+                "mode": "PAPER",
+                "interval_ms": int(AUTOPILOT_INTERVAL_S * 1000),
+            }
+        if self._autopilot_override is not None:
+            snapshot["enabled"] = bool(self._autopilot_override)
+        return snapshot
 
     # -- cards ------------------------------------------------------------
     def publish_card(self, card: PlainEnglishCockpitCard | Mapping[str, Any]) -> dict[str, Any]:
@@ -5179,6 +5503,11 @@ async def autopilot_paper_loop(
     control.begin_autopilot_tape()
     try:
         while max_rounds is None or rounds < max_rounds:
+            # V1.1: a clean-slate / user-paused workspace must emit zero ticks.
+            # The task stays alive so the operator's PLAY toggle is instant.
+            if not bool(control.autopilot_state().get("enabled", False)):
+                await asyncio.sleep(min(period, 0.05))
+                continue
             # Gate 22 isolation: a pre-flight certificate owns the interpreter
             # while it timing-probes the <1.0 ms hardware latch.  Skip the tick
             # (never block the event loop) until that run releases the tape.
@@ -5544,6 +5873,100 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         request: ChallengerEvalRequest,
     ) -> dict[str, Any]:
         return control.evaluate_challenger(request)
+
+    # ---- V1.1: sovereign operator authentication -----------------------
+    def _session_token(request: Request) -> str | None:
+        header = request.headers.get("X-NIOS-Session")
+        if header and header.strip():
+            return header.strip()
+        cookie = request.cookies.get("nios_session")
+        return cookie.strip() if cookie else None
+
+    @app.get("/api/v2/auth/status")
+    def auth_status(request: Request) -> dict[str, Any]:
+        return control.auth_status(_session_token(request))
+
+    @app.post("/api/v2/auth/setup")
+    def auth_setup(payload: AuthSetupRequest) -> JSONResponse:
+        result = control.auth_setup(payload)
+        response = JSONResponse(result)
+        response.set_cookie(
+            "nios_session",
+            str(result.get("token", "")),
+            httponly=True,
+            samesite="strict",
+            max_age=43_200,
+            path="/",
+        )
+        return response
+
+    @app.post("/api/v2/auth/login")
+    def auth_login(payload: AuthLoginRequest) -> JSONResponse:
+        result = control.auth_login(payload)
+        response = JSONResponse(result)
+        response.set_cookie(
+            "nios_session",
+            str(result.get("token", "")),
+            httponly=True,
+            samesite="strict",
+            max_age=43_200,
+            path="/",
+        )
+        return response
+
+    @app.post("/api/v2/auth/elevate-live")
+    def auth_elevate_live(
+        payload: AuthElevateRequest, request: Request
+    ) -> JSONResponse:
+        result = control.auth_elevate_live(_session_token(request), payload)
+        response = JSONResponse(result)
+        response.set_cookie(
+            "nios_session",
+            str(result.get("token", "")),
+            httponly=True,
+            samesite="strict",
+            max_age=1_800,
+            path="/",
+        )
+        return response
+
+    @app.post("/api/v2/auth/logout")
+    def auth_logout(request: Request) -> JSONResponse:
+        result = control.auth_logout(_session_token(request))
+        response = JSONResponse(result)
+        response.delete_cookie("nios_session", path="/")
+        return response
+
+    @app.post("/api/v2/auth/reset")
+    def auth_reset() -> dict[str, Any]:
+        """Factory reset: operator credentials + zero-demo workspace."""
+        control.operator_auth().reset_operator_workspace()
+        report = control.reset_workspace()
+        control._operator_auth = None  # noqa: SLF001 - Ring 3 internal
+        return {"ok": True, **report}
+
+    # ---- V1.1: dual /paper and /live workspaces -----------------------
+    @app.get("/api/v2/workspace/paper/state")
+    def workspace_paper_state(request: Request) -> dict[str, Any]:
+        return control.workspace_state("paper", _session_token(request))
+
+    @app.get("/api/v2/workspace/live/state")
+    def workspace_live_state(request: Request) -> dict[str, Any]:
+        return control.workspace_state("live", _session_token(request))
+
+    @app.post("/api/v2/control/workspace/reset")
+    def control_workspace_reset() -> dict[str, Any]:
+        return control.reset_workspace()
+
+    @app.post("/api/v2/control/workspace/autopilot")
+    def control_workspace_autopilot(
+        payload: AutopilotControlRequest,
+    ) -> dict[str, Any]:
+        return control.set_autopilot(payload)
+
+    @app.post("/api/v2/control/ledger/fund-paper")
+    def control_ledger_fund_paper(payload: PaperFundingRequest) -> dict[str, Any]:
+        return control.fund_paper(payload)
 
 
     # Registered before the SPA mount at "/" so /metrics is never shadowed.

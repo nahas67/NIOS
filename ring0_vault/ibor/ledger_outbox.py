@@ -998,6 +998,23 @@ class LedgerStore:
         return row is not None
 
     # -- lifecycle --------------------------------------------------------
+    def reset_journal(self) -> None:
+        """Truncate every mutable journal table (V1.1 clean-slate reset).
+
+        ``grounding_hash_store`` is deliberately **not** truncated: a SHA-256
+        grounding commitment is truth, not workspace state, and erasing it
+        would let an already-rejected numeric claim be replayed.
+        """
+        with self._lock:
+            for table in (
+                "ibor_double_entry_ledger",
+                "financial_outbox",
+                "order_ack_inbox",
+                "tax_lots",
+            ):
+                self._conn.execute(f"DELETE FROM {table}")
+            self._conn.commit()
+
     def flush(self) -> None:
         """Durability barrier -- call before handing an order to a socket."""
         with self._lock:
@@ -1047,6 +1064,7 @@ class IBORLedger:
         self._accounts: dict[tuple[str, str], VaultAccount] = {}
         self._transfers: dict[int, Transfer] = {}
         self._positions: dict[tuple[str, str], dict[str, int]] = {}
+        self._silos: set[str] = set()
         self._next_transfer_id = 1
         self._created_ns = int(now_ns if now_ns is not None else time.time_ns())
         for silo in silos:
@@ -1116,9 +1134,92 @@ class IBORLedger:
             self.account(silo, str(vault))
         for code in _EXTERNAL_CODES:
             self.account(silo, code)
+        self._silos.add(silo)
         if funding_micros:
             self.fund_cash(silo, funding_micros)
         return self.accounts(silo)
+
+    # -- clean slate (V1.1 zero-demo bootstrap) ----------------------------
+    @property
+    def silos(self) -> tuple[str, ...]:
+        """Silos whose seven accounts are currently materialised."""
+        return tuple(sorted(self._silos))
+
+    def reset_to_clean_slate(self) -> dict[str, Any]:
+        """Return every silo to ``0`` micros with a wiped journal.
+
+        The four vaults and three external counterparts are re-created empty,
+        so ``sum(debits) == sum(credits) == 0`` holds by construction and the
+        ``debits_must_not_exceed_credits`` invariant stays satisfied.  The
+        append-only SQLite journal is truncated too: otherwise a restart would
+        replay the demo funding rows straight back into the book.
+        """
+        with self._lock:
+            silos = tuple(sorted(self._silos))
+            self._accounts.clear()
+            self._transfers.clear()
+            self._positions.clear()
+            self._silos.clear()
+            self._next_transfer_id = 1
+            reset_journal = getattr(self.store, "reset_journal", None)
+            if callable(reset_journal):
+                reset_journal()
+            for silo in silos:
+                self.open_silo(silo)
+            return {
+                "clean_slate": True,
+                "silos": list(silos),
+                "vaults_per_silo": 4,
+                "micros": 0,
+                "debits_micros": 0,
+                "credits_micros": 0,
+                "transfers": 0,
+                "invariant": self.invariant_report(),
+            }
+
+    def fund_paper_capital(
+        self,
+        silo: str,
+        amount_micros: int,
+        *,
+        vault: VaultName | str | None = None,
+        now_ns: int | None = None,
+    ) -> dict[str, Any]:
+        """Mint user-supplied Paper capital as a balanced double entry.
+
+        ``EQUITY_CAPITAL -> CASH -> VAULTS`` is journalled with the existing
+        two-leg funding convention (the external ``REALIZED_PNL`` hub is the
+        equity counterpart), so the genesis deposit satisfies
+        ``sum(debits) == sum(credits)`` exactly.
+        """
+        amount = _check_money(int(amount_micros))
+        if amount <= 0:
+            raise LedgerError("paper funding amount must be positive")
+        silo = str(silo)
+        if silo not in self._silos:
+            self.open_silo(silo)
+        canonical = vault is None or str(vault) in ("", "ALL_CANONICAL")
+        targets: tuple[VaultName, ...] = (
+            ALL_VAULTS if canonical else (VaultName(str(vault)),)
+        )
+        self.fund_cash(silo, amount, now_ns=now_ns)
+        share = amount // len(targets)
+        remainder = amount - share * len(targets)
+        allocations: dict[str, int] = {}
+        for index, target in enumerate(targets):
+            part = share + (remainder if index == 0 else 0)
+            if part:
+                self.fund_vault(silo, target, part, now_ns=now_ns)
+            allocations[str(target)] = int(part)
+        return {
+            "silo": silo,
+            "amount_micros": int(amount),
+            "vault": "ALL_CANONICAL" if canonical else str(vault),
+            "allocations": allocations,
+            "vaults": {v: self.balance(silo, str(v)) for v in ALL_VAULTS},
+            "nav_micros": int(self.silo_nav_micros(silo)),
+            "invariant": self.invariant_report(),
+        }
 
     # -- primitives -------------------------------------------------------
     def _allocate_id(self) -> int:
@@ -1985,6 +2086,36 @@ class CrashAtomicOutbox:
             "latency_budget_ns": self.latency_budget_ns,
             "timeout_ns": self.timeout_ns,
         }
+
+    def reset_to_clean_slate(self) -> dict[str, Any]:
+        """Drop every reservation and its journal row (V1.1 clean slate).
+
+        The pending ledger transfers are voided first so no phantom hold can
+        survive the reset, then the durable outbox rows are deleted.
+        """
+        with self._lock:
+            voided = 0
+            for reservation in list(self._reservations.values()):
+                if not reservation.is_pending:
+                    continue
+                transfer_id = int(reservation.pending_transfer_id)
+                try:
+                    self.ledger.void_pending(transfer_id)
+                    voided += 1
+                except Exception:  # pragma: no cover - already replayed away
+                    pass
+            remaining = len(self._reservations)
+            self._reservations.clear()
+            self._by_transfer.clear()
+            self._last_latency_ns = 0
+            reset_journal = getattr(self.store, "reset_journal", None)
+            if callable(reset_journal):
+                reset_journal()
+            return {
+                "reservations_cleared": remaining,
+                "pending_voided": voided,
+                "pending": self.pending_count,
+            }
 
     # -- internals --------------------------------------------------------
     def _require(self, key: str) -> Reservation:

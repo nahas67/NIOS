@@ -392,6 +392,26 @@ class TokenBudgetLedger:
         self.active_system1_provider = "ollama-qwen2.5-3b"
         self.active_system2_provider = "deepseek-r1"
 
+    def reset(self) -> None:
+        """Zero today's spend, tokens and lock state (V1.1 clean slate)."""
+        with self._lock:
+            self._day = _utc_day(int(self.clock()))
+            self.spend_usd = 0.0
+            self.prompt_tokens = 0
+            self.completion_tokens = 0
+            self.calls = 0
+            self.system_spend_usd = {1: 0.0, 2: 0.0}
+            self.system_tokens = {
+                1: {"prompt": 0, "completion": 0},
+                2: {"prompt": 0, "completion": 0},
+            }
+            self.by_provider.clear()
+            self.locked = False
+            self.locked_reason = ""
+            self.locked_at_ns = 0
+            self.locked_providers = []
+            self.demoted_providers.clear()
+
     # -- accounting -------------------------------------------------------
     def record(
         self,

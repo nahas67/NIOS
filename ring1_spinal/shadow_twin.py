@@ -509,3 +509,20 @@ class ShadowExecutionTwin:
         for key in [key for key in self._orders if key[0] == token]:
             self._orders.pop(key, None)
         return removed
+
+    def reset_to_clean_slate(self) -> dict[str, int]:
+        """Zero the 30-fill nursery for every strategy (V1.1 clean slate).
+
+        ``required_fills`` is a configuration constant, not workspace state, so
+        a strategy that had graduated immediately returns to ``0 / 30`` and
+        must re-earn its live graduation.
+        """
+        fills = sum(len(rows) for rows in self._fills.values())
+        self._counts.clear()
+        self._fills.clear()
+        self._orders.clear()
+        self._sequence = 0
+        self._repeg_count = 0
+        self._residual_latency_ns_total = 0
+        self._settlement_errors.clear()
+        return {"shadow_fills": 0, "fills_cleared": int(fills)}
