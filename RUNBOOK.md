@@ -1,7 +1,9 @@
 # NIOS Production Operator Runbook
 
 **Document ID:** NIOS-OPS-2026-V3
-**Release:** `v3.0.0-PROD`
+**Release tag:** `v3.1.0-V1` (supersedes `v3.0.0-PROD`, which stays frozen)
+**Branch:** `V1`
+**Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
 **Operating constitution:** `AGENTS.md`
 
@@ -176,10 +178,14 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 18 suites, 0 failures, 0 warnings
-python scripts/preflight_golive.py --strict      # go-live readiness certificate
-python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive)
+python -m pytest tests -q                        # 278 tests / 18 suites, 0 failures, 0 warnings
+python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
+python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
+
+Release seal for `v3.1.0-V1`: `pytest tests -q` must report **278 passed, 0 failed, 0 warnings**
+and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
+prerequisites for re-tagging; neither may be waived.
 
 ### 3.3 Chaos / crash injection
 
@@ -343,12 +349,42 @@ until every latency-critical row is `APPLIED`. Never disable the audit to silenc
 
 ### 5.3 Canonical endpoint reference
 
+Every route below is registered on the Ring 3 gateway. `sec_016` still holds: market state is
+read-only and the only writes are the explicit control surfaces in this table.
+
+#### 5.3.1 Cockpit state (read-only)
+
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/v2/cockpit/health` | Ring status, version, configured venues |
 | `GET` | `/api/v2/cockpit/state` | Full hydration snapshot |
 | `GET` | `/api/v2/cockpit/stream` | SSE cockpit frames at 60 FPS |
 | `GET` | `/api/v2/cockpit/formal-proofs?refresh=` | TLA+ / VOPR / backend telemetry |
+
+#### 5.3.2 Page telemetry — 7 read-only endpoints
+
+One endpoint per non-dashboard page. Each returns the page header, ring ownership, live organ
+counts and the row set the SPA renders. None of them mutates state, opens a socket, or reads a
+credential.
+
+| Method | Path | Backing surface |
+|---|---|---|
+| `GET` | `/api/v2/cockpit/pages` | 9-page catalogue, alias map, platform-wide counts |
+| `GET` | `/api/v2/cockpit/orders` | SmartOMS blotter, Maker-Peg/TWAP slicers, outbox |
+| `GET` | `/api/v2/cockpit/analyzer` | 30-fill L2 shadow nursery, adverse selection |
+| `GET` | `/api/v2/cockpit/quant` | 490-factor scan, DCF / Black-Scholes, loaders |
+| `GET` | `/api/v2/cockpit/forge` | Alpha Forge leaderboard, plugins, SKILL.md catalog |
+| `GET` | `/api/v2/cockpit/ledger` | Double-entry journal, 35/15 ratchet, TigerBeetle + PG16 |
+| `GET` | `/api/v2/cockpit/mcp` | Read-only MCP catalogue + air-gap audit |
+| `GET` | `/api/v2/cockpit/skills/{skill_name}` | One SKILL.md document as structured Markdown |
+
+`/dashboard`, `/brain`, `/verification` and `/control` have no dedicated page endpoint — they
+hydrate from `GET /api/v2/cockpit/state` plus `GET /api/v2/cockpit/formal-proofs`.
+
+#### 5.3.3 Broker, feed, LLM and vault control
+
+| Method | Path | Purpose |
+|---|---|---|
 | `POST` | `/api/v2/control/brokers` | Paper/Live, fees, allocation, loss stop |
 | `GET`/`POST` | `/api/v2/control/brokers/credentials` | Masked inventory / write-only handshake |
 | `GET` | `/api/v2/control/brokers/testnet` | Sandbox bridge state |
@@ -364,11 +400,141 @@ until every latency-critical row is `APPLIED`. Never disable the audit to silenc
 | `GET`/`POST` | `/api/v2/control/extensions` | Skills / plugins / MCP / Forge |
 | `POST` | `/api/v2/control/vault/rotate-keys` | Zero-downtime Fernet + Ed25519 rotation |
 | `GET` | `/api/v2/control/vault/status` | Key version, fingerprint, OS tuning |
+
+#### 5.3.4 Workstation control — 12 interactive operator actions
+
+These are the Step 5–6 additions. Every one is explicit, audited and reversible; none of them
+places a live order, opens a venue socket, or unlocks a silo.
+
+| Method | Path | Effect |
+|---|---|---|
+| `POST` | `/api/v2/control/orders/paper` | Grounded paper order → outbox reservation → `SmartOMS` (Maker-Peg / TWAP-Iceberg) → 35/15/50 ratchet. No venue field exists. |
+| `POST` | `/api/v2/control/orders/cancel` | Cancel one `order_id` or `ALL`, voiding the matching pending outbox reservation. |
+| `POST` | `/api/v2/control/analyzer/shadow-burst` | Drive `rounds` paper autopilot ticks to approach the 30-fill shadow graduation threshold. |
+| `POST` | `/api/v2/control/quant/price-option` | Black-Scholes price + Greeks, sealed in a SHA-256 `GroundedFactPacket`. |
+| `POST` | `/api/v2/control/quant/scan` | 490-factor scan returning the top `k` candidates. |
+| `POST` | `/api/v2/control/ledger/reconcile` | `LiveReconciler.reconcile_all` + double-entry conservation proof. |
+| `POST` | `/api/v2/control/verification/chaos-drill` | Deterministic SIGKILL mid-outbox drill; lease sweep runs on an isolated SHM segment. |
+| `POST` | `/api/v2/control/verification/vopr` | Seeded VOPR fault campaign; same seed ⇒ same histogram. |
+| `POST` | `/api/v2/control/verification/os-tune` | Apply + audit OS low latency for the serving process; privileged rows stay `RECOMMENDED`. |
+| `POST` | `/api/v2/control/brain/mirofish-shock` | One five-archetype, three-tick contagion cascade with a reproducible digest. |
+| `POST` | `/api/v2/control/brain/committee-debate` | One grounded System 2 debate turn; `symbol=AUTO` debates the top scan candidate. |
+| `POST` | `/api/v2/control/forge/evaluate-challenger` | Nursery admission gate: `Deflated Sharpe >= 1.50` **and** `shadow_fills >= 30`, both read from the forge. |
+
+`/verification/*` calls are non-destructive by construction: the chaos drill uses an isolated
+shared-memory segment so a drill never disarms the live Ring 1 lease table, and the VOPR
+campaign is a pure simulator. `/brain/*` and `/forge/*` are Ring 2 surfaces that emit proposals
+and verdicts only — Ring 0 alone signs.
+
+#### 5.3.5 MCP bridge and metrics
+
+| Method | Path | Purpose |
+|---|---|---|
 | `GET` | `/api/v2/mcp/tools` | Read-only MCP catalogue + air-gap audit |
 | `POST` | `/api/v2/mcp/call` | Invoke one read-only MCP tool |
 | `GET` | `/api/v2/metrics` | Prometheus exposition |
 | `GET` | `/api/v2/metrics/json` | JSON telemetry |
 | `GET` | `/metrics` | Prometheus scrape alias |
+
+---
+
+## SOP 6 — Nine-Page Cockpit Workstation
+
+### 6.1 The nine pages
+
+The cockpit is a single React 19 SPA with nine production pages. `GET /api/v2/cockpit/pages`
+returns the authoritative catalogue, including the alias map; a direct navigation or browser
+refresh on any route is served by the SPA catch-all and never 404s.
+
+| # | Page | Route | Aliases | Ring | Summary |
+|---|---|---|---|---|---|
+| 1 | Dashboard | `/dashboard` | `/` | Ring 3 | 4-silo IBOR vault cards, SSE proof stream, 60 s leases |
+| 2 | Orders & Positions | `/orders` | `/positions` | Ring 0 | SmartOMS blotter, Maker-Peg/TWAP slicers, atomic outbox |
+| 3 | Shadow Analyzer | `/analyzer` | — | Ring 1 | 30-fill L2 shadow nursery, adverse-selection telemetry |
+| 4 | Quant & Valuation Lab | `/quant` | — | Ring 2 | 490-factor scanner, DCF/Black-Scholes, loader readiness |
+| 5 | Brain & Contagion X-Ray | `/brain` | `/xray` | Ring 2 | Ring isolation, MiroFish cascade, committee, SHA-256 proofs |
+| 6 | Alpha Forge & Plugins | `/forge` | — | Ring 2 | Nocturnal Forge leaderboard, plugins, SKILL.md catalog |
+| 7 | IBOR Ledger & Tax | `/ledger` | — | Ring 0 | Double-entry journal, 35/15 ratchet, TigerBeetle + PG16 |
+| 8 | Proofs, Chaos & Telemetry | `/verification` | — | Ring 0 | TLA+ BFS proofs, VOPR campaign, OS tuning, metrics |
+| 9 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | 22-gate pre-flight, credential vault, LLM switchboard, MCP |
+
+`/api` and `/metrics` are excluded from the catch-all, so an unknown API path still returns a
+real `404` instead of the SPA shell.
+
+### 6.2 Which page writes what
+
+| Page | Read path | Write path |
+|---|---|---|
+| `/dashboard` | `state`, `stream` | — |
+| `/orders` | `cockpit/orders` | `orders/paper`, `orders/cancel` |
+| `/analyzer` | `cockpit/analyzer` | `analyzer/shadow-burst` |
+| `/quant` | `cockpit/quant` | `quant/price-option`, `quant/scan` |
+| `/brain` | `state`, `formal-proofs` | `brain/mirofish-shock`, `brain/committee-debate` |
+| `/forge` | `cockpit/forge`, `skills/{name}` | `forge/evaluate-challenger` |
+| `/ledger` | `cockpit/ledger` | `ledger/reconcile` |
+| `/verification` | `formal-proofs` | `verification/chaos-drill`, `/vopr`, `/os-tune` |
+| `/control` | `cockpit/mcp`, `control/preflight` | `brokers`, `llms`, `killswitch`, `vault/*` |
+
+### 6.3 Non-destructive 9-page burn-in sweep
+
+Run this before declaring a documentation or UI release sealed. It never places a live order
+and never mutates a credential.
+
+```bash
+# 1. Pick a free port (never fight a daemon for 8000)
+python scripts/nios_port_check.py --scan 8000 8010
+
+# 2. Boot the unified server on the port it printed
+python scripts/run_nios.py --host 127.0.0.1 --port <PORT>
+
+# 3. Sweep all 9 SPA routes + 4 aliases (expect 200 + index.html on every one)
+#    /dashboard /orders /analyzer /quant /brain /forge /ledger /verification /control
+#    / /positions /xray /mcp
+
+# 4. Sweep the 7 page-telemetry endpoints + skills document
+#    /api/v2/cockpit/pages /orders /analyzer /quant /forge /ledger /mcp
+#    /api/v2/cockpit/skills/<skill_name>
+
+# 5. Sweep the 12 workstation controls with their documented payloads (expect 200)
+
+# 6. Shut down cleanly; `git status --porcelain` must be empty afterwards.
+```
+
+Acceptance: **9/9 routes**, **7/7 page endpoints**, **12/12 controls** at `200 OK`, then a clean
+`Ctrl+C` and an empty `git status --porcelain`. Any non-200 is a release blocker — do not retry
+around it, read the response body.
+
+### 6.4 Reference payloads
+
+```bash
+POST /api/v2/control/orders/paper
+{"silo":"CRYPTO_BINANCE","symbol":"BTC-USDT","side":"BUY","quantity":0.05,
+ "order_style":"MAKER_PEG","expected_gross_bps":24.0,"fill_immediately":true}
+
+POST /api/v2/control/orders/cancel    {"order_id":"ALL"}
+POST /api/v2/control/analyzer/shadow-burst {"silo":"CRYPTO_BINANCE","rounds":10}
+POST /api/v2/control/quant/price-option
+{"symbol":"BTC-OPT","spot":50000,"strike":46500,"volatility":0.62,
+ "days_to_expiry":30,"risk_free_rate":0.05,"option_type":"PUT"}
+POST /api/v2/control/quant/scan       {"top_k":15}
+POST /api/v2/control/ledger/reconcile {"silos":null}
+POST /api/v2/control/verification/chaos-drill {"iterations":120,"hold_ms":120,"seed":11}
+POST /api/v2/control/verification/vopr {"seed":7,"steps":250}
+POST /api/v2/control/verification/os-tune {"apply":true,"ring":"ring1"}
+POST /api/v2/control/brain/mirofish-shock
+{"symbol":"BTCUSDT","shock_bps":-45,"sentiment_tag":"panic","volatility_ratio":2.0,
+ "silo":"CRYPTO_BINANCE"}
+POST /api/v2/control/brain/committee-debate {"silo":"US_IBKR","symbol":"AUTO","spread_bps":3.0}
+POST /api/v2/control/forge/evaluate-challenger
+{"plugin_name":"challenger_alpha_7","candidate_sharpe":1.85,"shadow_fills":30,"silo":"US_IBKR"}
+```
+
+`committee-debate` (and `orders/paper`) reject an unknown `silo` with `422`; use a real silo id
+(`CRYPTO_BINANCE`, `INDIA_ZERODHA_DHAN`, `US_IBKR`, `FX_MT5`), not the short model default.
+
+A rejected challenger, a chaotic drill that reports a violation, or a committee verdict of
+`NO_TRADE` is **data, not an error**: fix the cause or accept the abstention. Never widen a
+threshold or bypass Ring 0 to turn a red row green.
 
 ---
 
