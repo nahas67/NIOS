@@ -76,13 +76,13 @@ export function QuantPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 2 - QUANT"
-        title="Factor matrix, valuation and the grounded pricer"
+        title="490-Factor Quant Lab"
         sub="A 5,000-instrument scan must land under 120 ms; only the top handful survives the tax-net floor and the conformal gate."
         actions={
           <>
             <StatusBadge tone="accent">{factors.length || "480+"} FACTORS</StatusBadge>
             <Btn size="sm" tone="primary" onClick={runScan} disabled={busy}>
-              {busy ? "Scanning..." : "Run 5,000 scan"}
+              {busy ? "Scanning..." : "Re-Scan 490 Factors"}
             </Btn>
           </>
         }

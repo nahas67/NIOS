@@ -70,7 +70,7 @@ export function BrokersPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 0 - VENUES"
-        title="Twelve-venue broker hub"
+        title="12-Venue Broker Hub"
         sub="Three venues per silo, each behind an encrypted adapter. Ring 2 never holds one of these keys and never opens an exchange socket."
         actions={
           <>

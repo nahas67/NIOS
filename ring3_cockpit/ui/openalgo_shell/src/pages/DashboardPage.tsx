@@ -57,7 +57,7 @@ export function DashboardPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="SOVEREIGN COMMAND"
-        title="Four-ring posture and total book"
+        title="Sovereign Command Dashboard"
         sub="One read-only surface over the IBOR, the shadow twin and the formal verification state. Nothing on this page can sign an order."
         actions={
           <>

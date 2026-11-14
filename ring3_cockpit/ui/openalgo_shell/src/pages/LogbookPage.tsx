@@ -84,7 +84,7 @@ export function LogbookPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 3 - AUDIT"
-        title="Trade logbook and execution journal"
+        title="Structured Trade Logbook"
         sub="Gross to cost drag to net. A win rate without the tax floor is a vanity metric, so the floor sits beside every aggregate."
         actions={
           <>

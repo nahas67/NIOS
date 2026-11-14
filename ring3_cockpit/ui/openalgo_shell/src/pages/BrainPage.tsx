@@ -80,7 +80,7 @@ export function BrainPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 2 - BICAMERAL BRAIN"
-        title="Contagion X-ray and committee transcript"
+        title="Brain & Contagion X-Ray"
         sub="Five archetypes propagate for three ticks before any deep thesis. A single-asset narrative is never treated as portfolio truth."
         actions={
           <>

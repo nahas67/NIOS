@@ -74,7 +74,7 @@ export function AgentsPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 2 - COGNITION"
-        title="Agent task hub"
+        title="Agent Task Hub"
         sub="Grounded research, not execution. An agent report cites its sources or it is rejected before it reaches a thesis."
         actions={
           <>

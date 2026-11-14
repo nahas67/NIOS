@@ -8,7 +8,7 @@
  */
 
 import { useState, type ReactNode } from "react";
-import { api, postCancelOrders } from "@/lib/api";
+import { api, postCancelOrders, postPaperOrder } from "@/lib/api";
 import { num, rows, str, titleCase } from "@/lib/format";
 import { useApi } from "@/lib/use-api";
 import { toast } from "@/lib/toast";
@@ -17,6 +17,7 @@ import {
   ConfirmModal,
   DataGrid,
   EmptyCleanSlate,
+  Field,
   MetricTile,
   SectionHeader,
   StatusBadge,
@@ -27,6 +28,13 @@ export function OrdersPage(): ReactNode {
   const page = useApi(() => api.orders(), []);
   const [cancelOpen, setCancelOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [ticket, setTicket] = useState({
+    symbol: "BTCUSDT",
+    side: "BUY",
+    quantity: 0.05,
+    order_style: "MAKER_PEG",
+  });
+  const [receipt, setReceipt] = useState<Record<string, unknown> | null>(null);
 
   const working = rows(page.data, "working_orders");
   const twaps = rows(page.data, "twap_icebergs");
@@ -54,11 +62,33 @@ export function OrdersPage(): ReactNode {
     }
   };
 
+  const submitOrder = async () => {
+    setBusy(true);
+    try {
+      const next = await postPaperOrder({
+        silo: "CRYPTO_BINANCE",
+        symbol: ticket.symbol,
+        side: ticket.side,
+        quantity: ticket.quantity,
+        order_style: ticket.order_style,
+        expected_gross_bps: 24.0,
+        fill_immediately: false,
+      });
+      setReceipt(next);
+      toast(`Paper order ${str(next, "status", "WORKING")}`, "success");
+      page.reload();
+    } catch (cause) {
+      toast(cause instanceof Error ? cause.message : "order rejected", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="nx-page">
       <SectionHeader
         kicker="RING 0 - SMART OMS"
-        title="Orders, slices and reconciled positions"
+        title="SmartOMS Orders & Positions"
         sub="Maker-Peg re-pegs at most twice on a 3-second clock; TWAP and Iceberg never exceed 10% of the top of book."
         actions={
           <>
@@ -90,6 +120,70 @@ export function OrdersPage(): ReactNode {
           sub="60s drift check, freeze above 0.01%"
         />
       </div>
+
+      <TerminalPanel
+        title="Paper order ticket"
+        subtitle="Grounded proposal, outbox reservation, then the in-silo ratchet"
+        actions={<StatusBadge tone="muted">PAPER ONLY</StatusBadge>}
+      >
+        <div className="nx-grid nx-grid--4">
+          <Field label="Symbol">
+            <input
+              className="nx-input"
+              value={ticket.symbol}
+              onChange={(event) => setTicket({ ...ticket, symbol: event.target.value.toUpperCase() })}
+            />
+          </Field>
+          <Field label="Side">
+            <select
+              className="nx-select"
+              value={ticket.side}
+              onChange={(event) => setTicket({ ...ticket, side: event.target.value })}
+            >
+              <option value="BUY">BUY</option>
+              <option value="SELL">SELL</option>
+            </select>
+          </Field>
+          <Field label="Quantity">
+            <input
+              className="nx-input"
+              type="number"
+              step="0.01"
+              value={ticket.quantity}
+              onChange={(event) => setTicket({ ...ticket, quantity: Number(event.target.value) })}
+            />
+          </Field>
+          <Field label="Order style">
+            <select
+              className="nx-select"
+              value={ticket.order_style}
+              onChange={(event) => setTicket({ ...ticket, order_style: event.target.value })}
+            >
+              <option value="MAKER_PEG">MAKER_PEG</option>
+              <option value="TWAP_ICEBERG">TWAP_ICEBERG</option>
+            </select>
+          </Field>
+        </div>
+        <div className="nx-row nx-row--between" style={{ marginTop: 10 }}>
+          <Btn tone="primary" size="sm" onClick={submitOrder} disabled={busy}>
+            Submit the paper order
+          </Btn>
+          <span className="nx-xs nx-dim nx-mono">POST /api/v2/control/orders/paper</span>
+        </div>
+        <div className="nx-hr" style={{ margin: "10px 0" }} />
+        <div className="nx-row nx-row--between">
+          <span className="nx-xs nx-muted">Order state</span>
+          <StatusBadge tone={receipt ? "bull" : "muted"}>
+            {receipt ? str(receipt, "status", "WORKING").toUpperCase() : "NOT SUBMITTED"}
+          </StatusBadge>
+        </div>
+        <div className="nx-row nx-row--between">
+          <span className="nx-xs nx-muted">grounding hash</span>
+          <span className="nx-mono nx-xs nx-dim nx-truncate" style={{ maxWidth: 280, display: "inline-block" }}>
+            {receipt ? str(receipt, "proposal.grounding_hash", "unhashed") : "-"}
+          </span>
+        </div>
+      </TerminalPanel>
 
       <div className="nx-grid nx-grid--2-1">
         <TerminalPanel

@@ -6,10 +6,11 @@
  * conformal lower bound.
  */
 
-import type { ReactNode } from "react";
-import { api } from "@/lib/api";
+import { useState, type ReactNode } from "react";
+import { api, postShadowBurst } from "@/lib/api";
 import { bool, num, rows, str } from "@/lib/format";
 import { useApi } from "@/lib/use-api";
+import { toast } from "@/lib/toast";
 import {
   Btn,
   DataGrid,
@@ -33,12 +34,28 @@ export function AnalyzerPage(): ReactNode {
   const q98 = num(page.data, "paper.q98_bps", 0);
   const netLb = num(page.data, "paper.net_lower_bound_bps", 0);
   const curve = Array.isArray(page.data?.paper) ? [] : [];
+  const [busy, setBusy] = useState(false);
+  const [burst, setBurst] = useState<Record<string, unknown> | null>(null);
+
+  const runBurst = async () => {
+    setBusy(true);
+    try {
+      const next = await postShadowBurst({ silo: "CRYPTO_BINANCE", rounds: 5 });
+      setBurst(next);
+      toast(`Shadow burst: ${String(next.shadow_fills ?? "0")} of 30 fills`, "success");
+      page.reload();
+    } catch (cause) {
+      toast(cause instanceof Error ? cause.message : "burst rejected", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="nx-page">
       <SectionHeader
         kicker="RING 2 - SHADOW TWIN"
-        title="Shadow execution and the graduation nursery"
+        title="Shadow Twin & 30-Fill Nursery"
         sub="Every candidate replays against the real L2 book with zero capital at risk. Live graduation needs thirty fills and a positive 98% conformal lower bound."
         actions={
           <>
@@ -48,12 +65,19 @@ export function AnalyzerPage(): ReactNode {
             <Btn size="sm" tone="ghost" onClick={page.reload}>
               Re-read nursery
             </Btn>
+            <Btn size="sm" tone="primary" onClick={runBurst} disabled={busy}>
+              Drive shadow burst
+            </Btn>
           </>
         }
       />
 
       <div className="nx-grid nx-grid--4">
-        <MetricTile label="Shadow fills" value={`${totalFills} / ${required}`} sub="per strategy" />
+        <MetricTile
+          label="Shadow fills"
+          value={`${totalFills} / ${required}`}
+          sub={burst ? `${str(burst, "shadow_fills", "0")} fills this burst` : "per strategy"}
+        />
         <MetricTile
           label="Q0.98 residual"
           value={`${q98.toFixed(1)} bps`}

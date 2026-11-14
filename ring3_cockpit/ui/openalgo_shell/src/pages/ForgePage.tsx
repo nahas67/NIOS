@@ -69,7 +69,7 @@ export function ForgePage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 2 - EVOLUTION"
-        title="Alpha Forge and skill inspector"
+        title="Alpha Forge & Skills"
         sub="Champions are demoted below +0.50 bps; a challenger is promoted only with Deflated Sharpe at or above 1.50 across thirty or more shadow fills."
         actions={
           <>

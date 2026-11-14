@@ -115,7 +115,7 @@ export function ControlPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 3 - SOVEREIGN CONTROL"
-        title="Control room, vault and MCP console"
+        title="Control Room & MCP"
         sub="Read-only telemetry plus four explicit control endpoints. The global kill switch lives in the live shell, behind a two-step confirmation."
         actions={
           <>

@@ -97,7 +97,7 @@ export function OptionsPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 2 - DERIVATIVES"
-        title="Options chain and multi-leg strategy lab"
+        title="Options Chain & Strategy Lab"
         sub="Symmetric strike ladder with Greeks beside a grounded expiry payoff. No leg is priced in the browser."
         actions={
           <>

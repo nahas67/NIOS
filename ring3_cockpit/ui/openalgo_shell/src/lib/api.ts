@@ -324,7 +324,7 @@ export function postCancelOrders(orderId = "ALL"): Promise<JsonRecord> {
 
 export function postShadowBurst(payload: {
   silo: string;
-  fills?: number;
+  rounds?: number;
   strategy_id?: string;
 }): Promise<JsonRecord> {
   return post<JsonRecord>("/api/v2/control/analyzer/shadow-burst", {

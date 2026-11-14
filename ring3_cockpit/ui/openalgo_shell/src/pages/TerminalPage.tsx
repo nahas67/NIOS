@@ -79,7 +79,7 @@ export function TerminalPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 1 - MARKET DATA"
-        title="Market terminal, L2 depth and charting"
+        title="Institutional Market Terminal"
         sub="Two vendors normalised independently. A resting quote is a hypothesis; only executed flow is treated as liquidity."
         actions={
           <>

@@ -63,7 +63,7 @@ export function LedgerPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 0 - IBOR"
-        title="Double-entry ledger and tax floors"
+        title="IBOR Double-Entry Ledger"
         sub="Money is a 128-bit integer. Every transfer is staged in TigerBeetle and reconciled against PostgreSQL every sixty seconds."
         actions={
           <>
@@ -71,7 +71,7 @@ export function LedgerPage(): ReactNode {
               {balanced ? "CONSERVED" : "DRIFT"}
             </StatusBadge>
             <Btn size="sm" tone="ghost" onClick={reconcile} disabled={busy}>
-              {busy ? "Reconciling..." : "Reconcile now"}
+              {busy ? "Reconciling..." : "Run 4-Silo Reconciler Sweep"}
             </Btn>
           </>
         }

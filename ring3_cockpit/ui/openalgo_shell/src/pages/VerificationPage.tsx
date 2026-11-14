@@ -84,7 +84,7 @@ export function VerificationPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 0 - VERIFICATION"
-        title="Formal proofs, VOPR and chaos drills"
+        title="Formal Proofs & Chaos"
         sub="KillSwitch, OrderLifecycle, Outbox and Reconciliation are machine checked. A drill that has not run is reported as unverified."
         actions={
           <>
@@ -169,13 +169,13 @@ export function VerificationPage(): ReactNode {
         <div className="nx-stack">
           <TerminalPanel title="Drills" subtitle="Non-destructive, seeded">
             <Btn tone="primary" block onClick={runDrill} disabled={busy}>
-              Run SIGKILL recovery drill
+              Isolated SIGKILL recovery drill
             </Btn>
             <Btn tone="ghost" block onClick={runVopr} disabled={busy} style={{ marginTop: 6 }}>
               Run seeded VOPR (5,000 steps)
             </Btn>
             <Btn tone="ghost" block onClick={runTuning} disabled={busy} style={{ marginTop: 6 }}>
-              OS low-latency audit
+              OS low-latency tuning & socket audit
             </Btn>
           </TerminalPanel>
 

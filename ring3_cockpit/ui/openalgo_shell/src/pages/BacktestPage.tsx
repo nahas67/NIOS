@@ -68,7 +68,7 @@ export function BacktestPage(): ReactNode {
     <div className="nx-page">
       <SectionHeader
         kicker="RING 2 - RESEARCH"
-        title="Walk-forward backtester"
+        title="Walk-Forward Backtester"
         sub="Purged K-fold, tax-net cost floor and a Deflated Sharpe promotion gate. A run below +0.50 bps is retired, not averaged in."
         actions={
           <>
