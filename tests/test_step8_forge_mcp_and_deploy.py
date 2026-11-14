@@ -551,7 +551,7 @@ def test_gate4_smoke_script_exits_zero() -> None:
     assert "SMOKE TEST PASSED" in completed.stdout, combined[-4000:]
     assert "Ring 0 sovereign vault / IBOR" in completed.stdout
     assert "Ring 3 read-only MCP bridge" in completed.stdout
-    assert "Unified server static React UI" in completed.stdout
+    assert "Unified server headless status document" in completed.stdout
 
 
 def test_gate4_no_frontend_build_is_required() -> None:

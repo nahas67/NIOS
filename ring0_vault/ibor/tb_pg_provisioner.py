@@ -270,43 +270,60 @@ def format_replica(
         raise FileExistsError(f"replica already exists: {target}")
     probe = binary or probe_tigerbeetle_binary()
     version = probe.version or TIGERBEETLE_FALLBACK_VERSION
+    failure = ""
 
     if probe.found and probe.executable:
-        try:
-            kwargs: dict[str, Any] = {
-                "capture_output": True,
-                "text": True,
-                "timeout": 30,
-                "check": False,
-            }
-            if sys.platform == "win32":
-                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            completed = subprocess.run(
-                [
-                    str(probe.path),
-                    "format",
-                    f"--cluster={cluster}",
-                    f"--replica={replica}",
-                    f"--replica-count={replica_count}",
-                    str(target),
-                ],
-                **kwargs,
-            )
-            if completed.returncode == 0 and target.exists() and target.stat().st_size > 0:
-                return ReplicaFormatResult(
-                    path=str(target),
-                    formatted=True,
-                    emulated=False,
-                    executable=True,
-                    cluster=cluster,
-                    replica=replica,
-                    replica_count=replica_count,
-                    size_bytes=target.stat().st_size,
-                    version=version,
-                    message="tigerbeetle format completed",
+        # A loaded host can make a cold binary miss a tight timeout; that is a
+        # transient, not "execution blocked by host policy".  Retry once with a
+        # longer budget before writing the deterministic emulated artifact.
+        for attempt, timeout_s in enumerate((30, 90), start=1):
+            try:
+                if target.exists():
+                    target.unlink()
+                kwargs: dict[str, Any] = {
+                    "capture_output": True,
+                    "text": True,
+                    "timeout": timeout_s,
+                    "check": False,
+                }
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                completed = subprocess.run(
+                    [
+                        str(probe.path),
+                        "format",
+                        f"--cluster={cluster}",
+                        f"--replica={replica}",
+                        f"--replica-count={replica_count}",
+                        str(target),
+                    ],
+                    **kwargs,
                 )
-        except (OSError, subprocess.SubprocessError):
-            pass
+                if (
+                    completed.returncode == 0
+                    and target.exists()
+                    and target.stat().st_size > 0
+                ):
+                    return ReplicaFormatResult(
+                        path=str(target),
+                        formatted=True,
+                        emulated=False,
+                        executable=True,
+                        cluster=cluster,
+                        replica=replica,
+                        replica_count=replica_count,
+                        size_bytes=target.stat().st_size,
+                        version=version,
+                        message="tigerbeetle format completed",
+                    )
+                failure = (
+                    f"attempt {attempt}: exit={completed.returncode} "
+                    f"{(completed.stderr or '').strip()[:200]}"
+                )
+            except subprocess.TimeoutExpired:
+                failure = f"attempt {attempt}: timeout after {timeout_s}s"
+            except (OSError, subprocess.SubprocessError) as exc:
+                failure = f"attempt {attempt}: {type(exc).__name__}: {exc}"
 
     header = {
         "artifact": "nios-tigerbeetle-replica",
@@ -317,7 +334,7 @@ def format_replica(
         "version": version,
         "formatted_at_ns": time.time_ns(),
         "binary": probe.path,
-        "reason": probe.message,
+        "reason": failure or probe.message,
     }
     payload = REPLICA_MAGIC + json.dumps(header, sort_keys=True).encode("utf-8")
     with target.open("wb") as handle:
@@ -333,7 +350,7 @@ def format_replica(
         replica_count=replica_count,
         size_bytes=target.stat().st_size,
         version=version,
-        message="emulated single-file replica (binary present but execution blocked by host policy)",
+        message="emulated single-file replica (binary present but format failed on this host)",
     )
 
 
