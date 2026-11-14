@@ -1,17 +1,16 @@
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { SessionProvider } from "@/lib/session";
+import { App } from "./App";
+import "./index.css";
 
-import App from './App'
-import './index.css'
+const container = document.getElementById("root");
+if (!container) throw new Error("NIOS cockpit root element is missing");
 
-const rootElement = document.getElementById('root')
-
-if (!rootElement) {
-  throw new Error('NIOS cockpit bootstrap failed: #root element is missing')
-}
-
-createRoot(rootElement).render(
+createRoot(container).render(
   <StrictMode>
-    <App />
-  </StrictMode>
-)
+    <SessionProvider>
+      <App />
+    </SessionProvider>
+  </StrictMode>,
+);

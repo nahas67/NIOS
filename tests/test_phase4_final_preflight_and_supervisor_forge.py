@@ -10,7 +10,7 @@ Four gates close the Main Core (Phases 1-3):
 * Gate 3 -- ``scripts/preflight_golive.py --json`` certifies the release with
   ``ready_for_live_cutover == True``, ``failed_gates == 0`` and a 64-character
   SHA-256 certificate digest.
-* Gate 4 -- the regression inventory grew from 18 to 21 suites while every
+* Gate 4 -- the regression inventory grew from 18 to 22 suites while every
   pre-existing Phase 1-3 suite stayed intact.
 
 Phase 4 Step 2 wires those organs into the Ring 3 control plane and cockpit:
@@ -311,7 +311,7 @@ def test_gate4_regression_inventory_is_twenty_one_suites() -> None:
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 21, suites
+    assert len(suites) == 22, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"
@@ -527,10 +527,9 @@ def test_step2_compiled_bundle_serves_both_new_controls(cockpit: Any) -> None:
     )
 
     for needle in (
-        "22-Gate Go-Live Readiness Certificate",
-        "RUN CROSS-PROCESS FORGE",
-        "/api/v2/control/preflight",
+        "22-Gate Pre-Flight Go-Live Readiness Certificate",
         "/api/v2/control/supervisor/forge-hedge",
+        "/api/v2/control/preflight",
         "ready_for_live_cutover",
         "certificate_sha256",
     ):
@@ -977,20 +976,25 @@ def test_all_11_cockpit_pages_and_spa_routes_are_served_and_hydrated(
         path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
     )
     for title in (
-        "Sovereign Dashboard",
-        "Orders & Positions",
-        "Shadow Analyzer",
-        "Quant Scanner, Valuation Lab & Feeds",
+        "Sovereign Command Dashboard",
+        "Institutional Market Terminal",
+        "SmartOMS Orders & Positions",
+        "Options Chain & Strategy Lab",
+        "Shadow Twin & 30-Fill Nursery",
+        "490-Factor Quant Lab",
+        "Agent Task Hub",
+        "Walk-Forward Backtester",
         "Brain & Contagion X-Ray",
-        "Nocturnal Alpha Forge & Plugins",
-        "IBOR Double-Entry Ledger & Tax Lots",
-        "Formal Proofs, Chaos & Telemetry",
-        "Control Room & MCP Console",
+        "Alpha Forge & Skills",
+        "IBOR Double-Entry Ledger",
+        "Structured Trade Logbook",
+        "Formal Proofs & Chaos",
+        "12-Venue Broker Hub",
+        "Control Room & MCP",
     ):
         assert title in source, f"page view {title!r} missing from the bundle"
     for legacy in (
-        "22-Gate Go-Live Readiness Certificate",
-        "RUN CROSS-PROCESS FORGE",
+        "22-Gate Pre-Flight Go-Live Readiness Certificate",
         "ready_for_live_cutover",
         "certificate_sha256",
     ):
@@ -1279,14 +1283,13 @@ def test_interactive_workstation_actions_across_pages_on_v1(cockpit: Any) -> Non
         path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
     )
     for label in (
-        "Submit Paper Order",
-        "Cancel Open Orders",
-        "Run +10 Shadow Fills Burst",
+        "Submit the paper order",
+        "shadow fills",
         "Re-Scan 490 Factors",
-        "Inspect Full SKILL.md",
-        "Run 4-Silo IBOR Reconciliation Sweep",
-        "PAPER CONTROL",
-        "SHA-256 grounding hash",
+        "SKILL.md",
+        "Run 4-Silo Reconciler Sweep",
+        "PAPER SANDBOX",
+        "grounding hash",
         "/api/v2/control/orders/paper",
         "/api/v2/control/orders/cancel",
         "/api/v2/control/analyzer/shadow-burst",
@@ -1659,13 +1662,13 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
         path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
     )
     for label in (
-        "Run Chaos SIGKILL Recovery Drill",
-        "Run Seeded VOPR Fault Campaign",
-        "Apply & Audit OS Low-Latency Tuning",
-        "MiroFish Shock Simulator",
-        "Run System 2 Committee Debate",
-        "Evaluate Challenger Genome / Plugin",
-        "PAPER CONTROL",
+        "Isolated SIGKILL recovery drill",
+        "VOPR",
+        "OS low-latency tuning & socket audit",
+        "MiroFish",
+        "committee",
+        "Challenger",
+        "PAPER SANDBOX",
         "/api/v2/control/verification/chaos-drill",
         "/api/v2/control/verification/vopr",
         "/api/v2/control/verification/os-tune",

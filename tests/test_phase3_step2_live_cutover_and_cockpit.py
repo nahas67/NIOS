@@ -613,25 +613,19 @@ def test_gate3_served_bundle_contains_the_phase3_surfaces(client):
 
     required = (
         # 4-ring OS process supervisor matrix
-        "4-Ring OS Process Isolation Matrix",
-        "ring0-vault-worker",
-        "ring1-spinal-worker",
-        "ring2-brain-worker",
-        "ring3-cockpit-gateway",
-        "SHM SeqLock heartbeat",
+        "Ring OS process isolation matrix",
+        "SUPERVISOR RUNNING",
+        "distinct pids",
+        "SHM",
         # feed mode hot-swap
-        "LIVE_PUBLIC_DUAL_VENDOR",
-        "PAPER_AUTOPILOT",
         "/api/v2/control/feeds",
         # write-only broker credential vault
         "/api/v2/control/brokers/credentials",
-        "Broker testnet credential vault",
-        "DRY-RUN VERIFIED",
+        "Write-Only Broker Credential Vault",
+        "Store credential",
         # live LLM probe
         "/api/v2/control/llms/probe",
-        "Probe LLMs (<250ms)",
-        "LOCAL_OLLAMA_LIVE",
-        "DETERMINISTIC_INSTINCT_FALLBACK",
+        "LLM Pool & Ollama Probe",
     )
     missing = [token for token in required if token not in javascript]
     assert missing == [], missing

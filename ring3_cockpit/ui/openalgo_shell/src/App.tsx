@@ -1,261 +1,152 @@
-import { AlertTriangle, X } from 'lucide-react'
+/**
+ * V1.4 application root.
+ *
+ * One router, two shells, four portals and fifteen workstations. The root is
+ * intentionally thin: it chooses a surface, guards the tier boundary and mounts
+ * the global command palette + toast bus. Every screen below it owns its data.
+ */
 
-import { AppSidebar } from '@/components/app-sidebar'
-import { TopBar } from '@/components/top-bar'
-import { Button } from '@/components/ui/button'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useAuth } from '@/hooks/use-auth'
-import { useCockpit } from '@/hooks/use-cockpit'
-import { AgentsPage } from '@/pages/agents'
-import { AnalyzerPage } from '@/pages/analyzer'
-import { SetupPage, LiveUnlockPage } from '@/pages/auth'
-import { LiveLoginPage, LoginGatewayPage, PaperLoginPage } from '@/pages/auth-views'
-import { BacktestPage } from '@/pages/backtest'
-import { BrainPage } from '@/pages/brain'
-import { BrokersPage } from '@/pages/brokers'
-import { ControlPage } from '@/pages/control'
-import { DashboardPage } from '@/pages/dashboard'
-import { ForgePage } from '@/pages/forge'
-import { LedgerPage } from '@/pages/ledger'
-import { LogbookPage } from '@/pages/logbook'
-import { OptionsPage } from '@/pages/options'
-import { OrdersPage } from '@/pages/orders'
-import { QuantPage } from '@/pages/quant'
-import { TerminalPage } from '@/pages/terminal'
-import { VerificationPage } from '@/pages/verification'
-import { LiveWorkspacePage, PaperWorkspacePage } from '@/pages/workspace'
-import { legacyTabFor, pathForLegacyTab, useRoute } from '@/router'
-import type { LegacyTab } from '@/router'
+import { useEffect, useMemo } from "react";
+import type { ComponentType, ReactNode } from "react";
+import { useLocation, navigate, pagePath, portalPath, type Portal } from "@/lib/router";
+import { useSession } from "@/lib/session";
+import { CommandPalette, openPalette } from "@/design-system/primitives";
+import { ToastHost } from "@/lib/toast";
+import { PaperShell } from "@/shells/PaperShell";
+import { LiveShell } from "@/shells/LiveShell";
+import { SetupPortal } from "@/portals/SetupPortal";
+import { GatewayPortal } from "@/portals/GatewayPortal";
+import { PaperLoginPortal } from "@/portals/PaperLoginPortal";
+import { LiveLoginPortal } from "@/portals/LiveLoginPortal";
+import { LiveUnlockModal } from "@/portals/LiveUnlockModal";
+import { DashboardPage } from "@/pages/DashboardPage";
+import { TerminalPage } from "@/pages/TerminalPage";
+import { OrdersPage } from "@/pages/OrdersPage";
+import { OptionsPage } from "@/pages/OptionsPage";
+import { AnalyzerPage } from "@/pages/AnalyzerPage";
+import { QuantPage } from "@/pages/QuantPage";
+import { AgentsPage } from "@/pages/AgentsPage";
+import { BacktestPage } from "@/pages/BacktestPage";
+import { BrainPage } from "@/pages/BrainPage";
+import { ForgePage } from "@/pages/ForgePage";
+import { LedgerPage } from "@/pages/LedgerPage";
+import { LogbookPage } from "@/pages/LogbookPage";
+import { VerificationPage } from "@/pages/VerificationPage";
+import { BrokersPage } from "@/pages/BrokersPage";
+import { ControlPage } from "@/pages/ControlPage";
+import type { PageKey } from "@/pages/registry";
 
-export function App() {
-  const cockpit = useCockpit()
-  const auth = useAuth()
-  const route = useRoute()
-  const {
-    state,
-    cards,
-    connected,
-    error,
-    killReport,
-    rearmReport,
-    lastFrameAt,
-    refresh,
-    kill,
-    rearm,
-  } = cockpit
+const PAGE_COMPONENTS: Record<PageKey, ComponentType> = {
+  dashboard: DashboardPage,
+  terminal: TerminalPage,
+  orders: OrdersPage,
+  options: OptionsPage,
+  analyzer: AnalyzerPage,
+  quant: QuantPage,
+  agents: AgentsPage,
+  backtest: BacktestPage,
+  brain: BrainPage,
+  forge: ForgePage,
+  ledger: LedgerPage,
+  logbook: LogbookPage,
+  verification: VerificationPage,
+  brokers: BrokersPage,
+  control: ControlPage,
+};
 
-  const legacyTab = legacyTabFor(route.page)
-  const tier = auth.status?.tier ?? 'NONE'
-
-  function renderPage() {
-    switch (route.page) {
-      case 'dashboard':
-        return <DashboardPage state={state} cards={cards} />
-      case 'terminal':
-        return <TerminalPage />
-      case 'orders':
-        return <OrdersPage />
-      case 'options':
-        return <OptionsPage />
-      case 'analyzer':
-        return <AnalyzerPage />
-      case 'quant':
-        return <QuantPage />
-      case 'agents':
-        return <AgentsPage />
-      case 'backtest':
-        return <BacktestPage />
-      case 'brain':
-        return <BrainPage state={state} />
-      case 'forge':
-        return <ForgePage />
-      case 'ledger':
-        return <LedgerPage />
-      case 'logbook':
-        return <LogbookPage />
-      case 'verification':
-        return <VerificationPage state={state} />
-      case 'brokers':
-        return <BrokersPage />
-      case 'control':
-        return <ControlPage state={state} onSaved={refresh} />
-      default:
-        return <DashboardPage state={state} cards={cards} />
-    }
-  }
-
-  // ---- V1.3 auth screens: gateway, two portals, setup and legacy unlock ----
-  if (route.authPage === 'setup') {
-    return (
-      <SetupPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
-    )
-  }
-  if (route.authPage === 'login') {
-    return <LoginGatewayPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
-  }
-  if (route.authPage === 'paper-login') {
-    return (
-      <PaperLoginPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
-    )
-  }
-  if (route.authPage === 'live-login') {
-    return (
-      <LiveLoginPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
-    )
-  }
-  if (route.authPage === 'live-unlock') {
-    return (
-      <LiveUnlockPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
-    )
-  }
-
-  // First-time entry: an uninitialised install lands on the operator setup.
-  if (
-    auth.status &&
-    !auth.status.initialized &&
-    route.workspace === 'legacy' &&
-    route.path === '/'
-  ) {
-    return (
-      <SetupPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
-    )
-  }
-
-  // A workspace route requires the matching portal session.
-  const needsLogin =
-    (route.workspace === 'paper' || route.workspace === 'live') &&
-    auth.status !== null &&
-    !auth.status.authenticated
-  if (needsLogin) {
-    return route.workspace === 'live' ? (
-      <LiveLoginPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
-    ) : (
-      <PaperLoginPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
-    )
-  }
-
-  const workspaceBody =
-    route.workspace === 'paper' ? (
-      <PaperWorkspacePage path={route.path} tier={tier} onNavigate={route.go}>
-        {renderPage()}
-      </PaperWorkspacePage>
-    ) : route.workspace === 'live' ? (
-      <LiveWorkspacePage
-        path={route.path}
-        tier={tier}
-        expiresNs={auth.status?.expires_ns ?? null}
-        onNavigate={route.go}
-      >
-        {renderPage()}
-      </LiveWorkspacePage>
-    ) : legacyTab ? (
-      <Tabs
-        value={legacyTab}
-        onValueChange={(next) => route.go(pathForLegacyTab(next as LegacyTab))}
-        className="gap-4"
-      >
-        <TabsList className="grid h-10 w-full max-w-[560px] grid-cols-3">
-          <TabsTrigger value="live">Live Cockpit</TabsTrigger>
-          <TabsTrigger value="xray">Brain &amp; Contagion</TabsTrigger>
-          <TabsTrigger value="control">Control Room</TabsTrigger>
-        </TabsList>
-        <TabsContent value={legacyTab}>{renderPage()}</TabsContent>
-      </Tabs>
-    ) : (
-      renderPage()
-    )
-
-  const shellMode =
-    route.workspace === 'live' ? 'live' : route.workspace === 'paper' ? 'paper' : 'legacy'
-
-  return (
-    <div className="dark">
-      <div
-        className={
-          route.workspace === 'legacy'
-            ? 'relative min-h-screen overflow-hidden bg-background text-foreground'
-            : 'relative min-h-screen overflow-hidden bg-[#06060a] text-foreground'
-        }
-      >
-        <div
-          aria-hidden
-          className={
-            route.workspace === 'legacy'
-              ? 'pointer-events-none absolute inset-0 opacity-70'
-              : 'pointer-events-none absolute inset-0 opacity-30'
-          }
-          style={{
-            backgroundImage:
-              'radial-gradient(60rem 30rem at 12% 0%, rgba(56,189,248,0.10), transparent 70%), radial-gradient(50rem 26rem at 88% 8%, rgba(168,85,247,0.10), transparent 70%), linear-gradient(rgba(148,163,184,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,0.05) 1px, transparent 1px)',
-            backgroundSize: 'auto, auto, 48px 48px, 48px 48px',
-          }}
-        />
-
-        <div className="relative z-10 flex min-h-screen">
-          <AppSidebar
-            page={route.page}
-            onNavigate={route.go}
-            state={state}
-            connected={connected}
-            mode={shellMode}
-          />
-
-          <div className="flex min-w-0 flex-1 flex-col">
-            <TopBar
-              state={state}
-              connected={connected}
-              killReport={killReport}
-              rearmReport={rearmReport}
-              lastFrameAt={lastFrameAt}
-              onKill={kill}
-              onRearm={rearm}
-              onFeedChanged={refresh}
-            />
-
-            {error ? (
-              <div className="mx-4 mt-3 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200 lg:mx-6">
-                <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-                <div className="flex-1">
-                  Ring 3 gateway: {error}. The cockpit will retry automatically.
-                </div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-5"
-                  onClick={cockpit.dismissError}
-                  aria-label="Dismiss gateway error"
-                >
-                  <X className="size-3" />
-                </Button>
-              </div>
-            ) : null}
-
-            <main
-              className={
-                route.workspace === 'legacy'
-                  ? 'relative flex-1 px-4 pb-10 pt-4 lg:px-6'
-                  : 'relative flex-1 pb-10'
-              }
-            >
-              {workspaceBody}
-            </main>
-
-            <footer className="relative z-10 border-t border-border/50 px-4 py-3 text-[10px] text-muted-foreground lg:px-6">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span>
-                  NIOS-ARC-2026-V3 · v{state?.version ?? '3.0.0-PROD'} · Ring 3 is read-only for
-                  market state · 15 production pages
-                </span>
-                <span>
-                  99.1% noise abstention · 98% split-conformal · 35/15 in-silo ratchet
-                </span>
-              </div>
-            </footer>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
+function goPortal(portal: Portal): void {
+  navigate(portalPath(portal));
 }
 
-export default App
+export function App(): ReactNode {
+  const location = useLocation();
+  const { session, status, loading } = useSession();
+
+  const targetPath = useMemo(() => {
+    if (location.workspace === "live") return pagePath(location.page, "live");
+    if (location.workspace === "paper") return pagePath(location.page, "paper");
+    return pagePath(location.page, "base");
+  }, [location.page, location.workspace]);
+
+  useEffect(() => {
+    if (location.portal || loading) return;
+    if (location.workspace === "live" && session?.tier !== "LIVE") {
+      navigate("/live/login", { replace: true });
+      return;
+    }
+    if (location.workspace === "paper" && !session) {
+      navigate("/paper/login", { replace: true });
+      return;
+    }
+    if (location.workspace === "base" && !session) {
+      navigate(status && status.initialized === false ? "/setup" : "/login", { replace: true });
+    }
+  }, [location.portal, location.workspace, loading, session, status]);
+
+  if (location.portal === "setup") return <><SetupPortal onPortal={goPortal} /><ToastHost /></>;
+  if (location.portal === "login") return <><GatewayPortal onPortal={goPortal} /><ToastHost /></>;
+  if (location.portal === "paper-login") return <><PaperLoginPortal onPortal={goPortal} /><ToastHost /></>;
+  if (location.portal === "live-login") return <><LiveLoginPortal onPortal={goPortal} /><ToastHost /></>;
+  if (location.portal === "live-unlock") return <><LiveUnlockModal onPortal={goPortal} /><ToastHost /></>;
+
+  if (loading) {
+    return (
+      <div className="boot-splash" role="status" aria-label="Hydrating the sovereign cockpit">
+        <div className="flex flex-col items-center gap-3">
+          <span className="brand-mark" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <ellipse cx="12" cy="12" rx="10" ry="5.4" stroke="#22d3ee" strokeWidth="1.3" />
+              <ellipse cx="12" cy="12" rx="6.6" ry="3.4" stroke="#a78bfa" strokeWidth="1.1" />
+              <circle cx="12" cy="12" r="1.5" fill="#a78bfa" />
+            </svg>
+          </span>
+          <p className="mono text-[10px] tracking-[0.16em] text-[var(--dim)] uppercase">hydrating four-ring cockpit</p>
+          <span className="shimmer h-1 w-40" />
+        </div>
+      </div>
+    );
+  }
+
+  const Page = PAGE_COMPONENTS[location.page];
+
+  const shellNavigate = (page: PageKey) => {
+    const workspace = location.workspace === "live" ? "live" : location.workspace === "paper" ? "paper" : "base";
+    navigate(pagePath(page, workspace));
+  };
+
+  const chrome = (
+    <>
+      <CommandPalette onNavigate={shellNavigate} />
+      <ToastHost />
+      <button type="button" className="sr-only" onClick={openPalette} aria-label="Open command palette">
+        Open command palette
+      </button>
+    </>
+  );
+
+  if (location.workspace === "live") {
+    return (
+      <>
+        <LiveShell page={location.page} onNavigate={shellNavigate} onPortal={goPortal}>
+          <Page />
+        </LiveShell>
+        {chrome}
+        <span className="sr-only" aria-live="polite">
+          {targetPath}
+        </span>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <PaperShell page={location.page} onNavigate={shellNavigate} onPortal={goPortal}>
+        <Page />
+      </PaperShell>
+      {chrome}
+      <span className="sr-only" aria-live="polite">
+        {targetPath}
+      </span>
+    </>
+  );
+}

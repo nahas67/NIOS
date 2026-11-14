@@ -862,32 +862,30 @@ def test_gate4_spa_routes_serve_the_cockpit_bundle(
 
 
 def test_gate4_spa_route_aliases_are_declared() -> None:
-    router_source = (SRC_ROOT / "router.ts").read_text(encoding="utf-8")
-    assert "'agents'" in router_source
-    assert "'backtest'" in router_source
-    assert "agents: '/agents'" in router_source
-    assert "backtest: '/backtest'" in router_source
-    assert "'/agents': 'agents'" in router_source
-    assert "'/backtest': 'backtest'" in router_source
+    router_source = (SRC_ROOT / "lib" / "router.ts").read_text(encoding="utf-8")
+    assert "pagePath" in router_source
+    assert "portalPath" in router_source
+    assert "popstate" in router_source
 
-    sidebar_source = (SRC_ROOT / "components" / "app-sidebar.tsx").read_text(
-        encoding="utf-8"
-    )
-    assert "key: 'agents'" in sidebar_source
-    assert "key: 'backtest'" in sidebar_source
+    registry_source = (SRC_ROOT / "pages" / "registry.ts").read_text(encoding="utf-8")
+    assert '"agents"' in registry_source
+    assert '"backtest"' in registry_source
+    assert '"/agents"' in registry_source
+    assert '"/backtest"' in registry_source
+
+    sidebar_source = (SRC_ROOT / "shells" / "Sidebar.tsx").read_text(encoding="utf-8")
+    assert "NAV_GROUPS" in sidebar_source
+    assert "agents" in sidebar_source
+    assert "backtest" in sidebar_source
 
     app_source = (SRC_ROOT / "App.tsx").read_text(encoding="utf-8")
-    assert "case 'agents':" in app_source
-    assert "case 'backtest':" in app_source
-    assert "15 production pages" in app_source
+    assert "AgentsPage" in app_source
+    assert "BacktestPage" in app_source
+    assert "PaperShell" in app_source
+    assert "LiveShell" in app_source
 
-    workspace_source = (SRC_ROOT / "pages" / "workspace.tsx").read_text(
-        encoding="utf-8"
-    )
-    assert "/paper/agents" in workspace_source
-    assert "/live/agents" in workspace_source
-    assert "/paper/backtest" in workspace_source
-    assert "/live/backtest" in workspace_source
+    palette_source = (SRC_ROOT / "design-system" / "primitives.tsx").read_text(encoding="utf-8")
+    assert "15 production pages" in palette_source
 
 
 def test_gate4_biome_lint_is_clean() -> None:

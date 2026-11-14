@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**396 tests · 21 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**404 tests · 22 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -198,6 +198,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 19 | `test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard |
 | 20 | `test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** 8 harvested strategies, grounded decision dashboard, 6 agent tasks, watchlist batch ranking, grounded Q&A follow-up, 5-timeframe backtester, 8-way comparison, 30-fill nursery gate |
 | 21 | `test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.3** separate `/paper/login` + `/live/login` portals, options chain (Greeks/PCR/Max Pain), six multi-leg payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15 pages × 3 route trees |
+| 22 | `test_v1_4_clean_room_masterpiece_ui.py` | **V1.4** clean-room rebuild: 15 bespoke workstations, dual-shell separation, four auth portals, six zero-dependency SVG charts, five-domain navigation, clean-slate rendering, biome-clean source |
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
 independent of whatever happens to be installed in the interpreter.
@@ -462,7 +463,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     396 tests across 21 suites
+tests/                     404 tests across 22 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 22-gate go-live readiness certificate (--strict / --fast)
@@ -476,18 +477,19 @@ start_nios.bat / .sh       1-click launch
 
 ---
 
-## Release seal — `v3.4.0-V1.3`
+## Release seal — `v3.5.0-V1.4`
 
 | Gate | Command | Required result |
 |---|---|---|
-| Unit / integration | `pytest tests -q` | **396 passed**, 0 failed, 0 warnings |
+| Unit / integration | `pytest tests -q` | **404 passed**, 0 failed, 0 warnings |
 | Smoke suite | `python scripts/run_nios.py --smoke-test` | **22/22 rows**, `EXIT=0` |
 | Go-live certificate | `python scripts/preflight_golive.py --fast` | **22/22 PASS**, `EXIT=0` |
-| Live `V1.3` burn-in | boot on `:8001`, clean slate (`logbook == []`, `vaults == 0`, `autopilot == false`), then `setup → login/paper → options/chain → options/strategy-payoff → terminal/quote → logbook/entry → workspace/reset → brokers/ping → login/live (bad PIN 403) → login/live → /paper/terminal → /live/brokers → auth/reset`, shut down | **45/45 routes at 200**, clean-slate on boot, port `8001` free afterwards, empty `git status --porcelain` |
+| Live `V1.4` burn-in | boot on `:8001` with the clean-room bundle, walk `/setup`, `/login`, `/paper/login`, `/live/login`, `/live-unlock` and all 45 page routes, then shut down | **50/50 routes at 200**, clean slate on boot, port `8001` free afterwards, empty `git status --porcelain` |
 
 The seal asserts nothing new about live capital: every silo still boots `PAPER`, the 22-gate
 certificate still governs a LIVE cutover, and `main` (`9a8ac5f` / `v3.0.0-PROD`), `V1`
-(`ff67b5c` / `v3.1.0-V1`) and `V1.1` (`99ea43a` / `v3.2.0-V1.1`) are untouched.
+(`ff67b5c` / `v3.1.0-V1`), `V1.1` (`99ea43a` / `v3.2.0-V1.1`), `V1.2` (`874d817` / `v3.3.0-V1.2`)
+and `V1.3` (`05c8575` / `v3.4.0-V1.3`) are untouched; the release ships on `V1.4`.
 
 ---
 

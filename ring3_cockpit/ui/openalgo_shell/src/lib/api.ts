@@ -1,51 +1,48 @@
+/**
+ * V1.4 typed gateway client.
+ *
+ * One request pipeline for every `/api/v2/*` route: JSON in, JSON out, the
+ * sovereign session token mirrored on `X-NIOS-Session` so an XHR still works
+ * when a strict cookie policy blocks storage, and a typed error that keeps the
+ * server's `detail` string intact for the operator.
+ */
+
 import type {
   AgentAssignPayload,
   AgentAssignReceipt,
-  AgentBatchWatchlistPayload,
   AgentBatchWatchlistReceipt,
-  AgentCancelReceipt,
-  AgentFollowupPayload,
   AgentFollowupReceipt,
   AgentsPageData,
   AnalyzerPageData,
-  BacktestComparePayload,
+  AuthSession,
+  AuthStatus,
   BacktestComparisonReceipt,
   BacktestPageData,
   BacktestReceipt,
-  BacktestRunPayload,
-  BrokerControlPayload,
-  BrokerCredentialPayload,
-  BrokerCredentialReport,
+  BacktestTimeframe,
   BrokerPingReceipt,
   BrokersPageData,
-  CancelOrdersPayload,
   CancelOrdersReceipt,
   ChallengerEvalReceipt,
   ChaosDrillReceipt,
   CockpitState,
   CommitteeDebateReceipt,
-  ExtensionsActionResponse,
-  ExtensionsControlPayload,
-  ExtensionsState,
-  FeedControlResponse,
-  FeedMode,
-  ForgeHedgeReceipt,
-  ForgePageData,
   FormalProofState,
+  ForgePageData,
   InteractiveQuantScan,
+  JsonRecord,
   KillReport,
   LedgerPageData,
   LedgerReconcileReceipt,
-  LLMControlPayload,
-  LLMProbeReport,
+  LiveWorkspaceState,
   LogbookEntryPayload,
-  LogbookEntryReceipt,
+  LogbookEntryRecord,
   LogbookPageData,
+  McpCallResult,
   McpPageData,
   MetricsSnapshot,
   MiroFishShockReceipt,
   NurseryPromotionReceipt,
-  OptionPricePayload,
   OptionPriceReceipt,
   OptionsChainReceipt,
   OptionsPageData,
@@ -54,766 +51,380 @@ import type {
   PagesIndex,
   PaperOrderPayload,
   PaperOrderReceipt,
+  PaperWorkspaceState,
   PreflightCertificate,
   QuantPageData,
-  QuantScanPayload,
-  RearmReport,
-  ShadowBurstPayload,
-  ShadowBurstReceipt,
   SkillMarkdownReceipt,
   StrategyPayoffReceipt,
-  SupervisorControlResponse,
   TerminalFrame,
   TerminalPageData,
-  VaultRotationReport,
-  VaultStatus,
   VoprCampaignReceipt,
-} from '@/types'
+} from "./types";
 
-const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? ''
+const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
+const TOKEN_KEY = "nios.session.v1";
 
 export class ApiError extends Error {
-  status: number
+  status: number;
 
   constructor(message: string, status: number) {
-    super(message)
-    this.name = 'ApiError'
-    this.status = status
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export function storedToken(): string | null {
+  try {
+    return window.sessionStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setStoredToken(token: string | null): void {
+  try {
+    if (token) window.sessionStorage.setItem(TOKEN_KEY, token);
+    else window.sessionStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* storage disabled: the HttpOnly cookie is still authoritative */
   }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = storedToken();
   const response = await fetch(`${API_BASE}${path}`, {
+    credentials: "same-origin",
     ...init,
     headers: {
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
+      ...(token ? { "X-NIOS-Session": token } : {}),
       ...(init?.headers ?? {}),
     },
-  })
-  const text = await response.text()
+  });
+  const body = await response.text();
   if (!response.ok) {
-    let detail = text
+    let detail = body;
     try {
-      const parsed = JSON.parse(text) as { detail?: unknown }
-      if (typeof parsed.detail === 'string') detail = parsed.detail
-      else if (Array.isArray(parsed.detail)) detail = JSON.stringify(parsed.detail)
+      const parsed = JSON.parse(body) as { detail?: unknown };
+      if (typeof parsed.detail === "string") detail = parsed.detail;
+      else if (Array.isArray(parsed.detail)) detail = JSON.stringify(parsed.detail);
     } catch {
-      // keep the raw body
+      /* keep the raw body */
     }
-    throw new ApiError(detail || `HTTP ${response.status}`, response.status)
+    throw new ApiError(detail || `HTTP ${response.status}`, response.status);
   }
-  return (text ? JSON.parse(text) : {}) as T
+  return (body ? JSON.parse(body) : {}) as T;
+}
+
+function post<T>(path: string, payload: JsonRecord = {}): Promise<T> {
+  return request<T>(path, { method: "POST", body: JSON.stringify(payload) });
 }
 
 export function streamUrl(): string {
-  return `${API_BASE}/api/v2/cockpit/stream`
+  return `${API_BASE}/api/v2/cockpit/stream`;
 }
 
-export function fetchState(): Promise<CockpitState> {
-  return request<CockpitState>('/api/v2/cockpit/state')
+export function metricsUrl(): string {
+  return `${API_BASE}/api/v2/metrics`;
 }
 
-/**
- * Phase 2 Step 4 telemetry: the four TLA+ state-space proofs, the deterministic
- * 1,000-step VOPR campaign, the TigerBeetle/PostgreSQL backends and the
- * TacticalSwing options tail-hedger.
- *
- * `refresh` re-runs the exhaustive BFS and the VOPR campaign server-side; without
- * it the gateway replays its cached result so the 5 s hydration poll stays cheap.
- */
-export function fetchFormalProofs(refresh = false): Promise<FormalProofState> {
-  const query = refresh ? '?refresh=true' : ''
-  return request<FormalProofState>(`/api/v2/cockpit/formal-proofs${query}`)
-}
+/* ------------------------------- auth ------------------------------- */
 
-export function postBroker(payload: BrokerControlPayload): Promise<unknown> {
-  return request('/api/v2/control/brokers', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
+export const authApi = {
+  status: () => request<AuthStatus>("/api/v2/auth/status"),
 
-export function postLLM(payload: LLMControlPayload): Promise<unknown> {
-  return request('/api/v2/control/llms', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
+  setup: (payload: { username: string; password: string; live_pin: string }) =>
+    post<AuthSession>("/api/v2/auth/setup", { ...payload, start_clean_slate: true }),
 
-export function postKillSwitch(reason = 'operator kill switch'): Promise<KillReport> {
-  return request<KillReport>('/api/v2/control/killswitch', {
-    method: 'POST',
-    body: JSON.stringify({ reason, flatten: true, confirm: true }),
-  })
-}
+  login: (payload: { username: string; password: string }) =>
+    post<AuthSession>("/api/v2/auth/login", payload),
 
-/**
- * Explicit human reset after a kill switch or ADR-009 vault stop.
- *
- * Clears the global kill latch, unfreezes every silo and puts them back into
- * ACTIVE trading state; the paper autopilot resumes without a restart.
- */
-export function postRearm(reason = 'cockpit re-arm'): Promise<RearmReport> {
-  return request<RearmReport>('/api/v2/control/rearm', {
-    method: 'POST',
-    body: JSON.stringify({ reason, operator: 'ring3.cockpit' }),
-  })
-}
+  loginPaper: (payload: { username: string; password: string }) =>
+    post<AuthSession>("/api/v2/auth/login/paper", payload),
 
-export function fetchExtensions(): Promise<ExtensionsState> {
-  return request<ExtensionsState>('/api/v2/control/extensions')
-}
+  loginLive: (payload: { username: string; password: string; live_pin: string }) =>
+    post<AuthSession>("/api/v2/auth/login/live", payload),
 
-export function postExtensions(
-  payload: ExtensionsControlPayload
-): Promise<ExtensionsActionResponse> {
-  return request<ExtensionsActionResponse>('/api/v2/control/extensions', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
+  elevate: (livePin: string) =>
+    post<AuthSession>("/api/v2/auth/elevate-live", { live_pin: livePin }),
 
-/* ------------------------------------------------------------------ *
- * Phase 3 Step 2 · feed hot-swap, write-only broker vault, LLM probe
- * ------------------------------------------------------------------ */
+  logout: () => post<{ ok: boolean; revoked: boolean }>("/api/v2/auth/logout"),
 
-/**
- * Hot-swap the market-data path without restarting any worker.
- *
- * `LIVE_PUBLIC_DUAL_VENDOR` runs one immediate four-silo dual-vendor poll, so
- * the response carries the per-silo receipt rather than a promise.
- */
-export function postFeedMode(
-  feedMode: FeedMode,
-  ingestCycle = true
-): Promise<FeedControlResponse> {
-  return request<FeedControlResponse>('/api/v2/control/feeds', {
-    method: 'POST',
-    body: JSON.stringify({
-      feed_mode: feedMode,
-      ingest_cycle: ingestCycle,
-      operator: 'ring3.cockpit',
+  resetEverything: (payload: { password: string; live_pin: string }) =>
+    post<JsonRecord>("/api/v2/auth/reset", payload),
+
+  resetWorkspace: () => post<JsonRecord>("/api/v2/control/workspace/reset"),
+
+  fundPaper: (payload: { silo: string; amount_units: number; vault?: string }) =>
+    post<JsonRecord>("/api/v2/control/ledger/fund-paper", payload),
+
+  setAutopilot: (enabled: boolean) =>
+    post<{ ok: boolean; autopilot: { enabled: boolean } }>(
+      "/api/v2/control/workspace/autopilot",
+      { enabled },
+    ),
+
+  paperState: () => request<PaperWorkspaceState>("/api/v2/workspace/paper/state"),
+
+  liveState: () => request<LiveWorkspaceState>("/api/v2/workspace/live/state"),
+
+  preflight: () => request<PreflightCertificate>("/api/v2/control/preflight"),
+};
+
+/* ------------------------------ read models ------------------------------ */
+
+export const api = {
+  state: () => request<CockpitState>("/api/v2/cockpit/state"),
+
+  formalProofs: (refresh = false) =>
+    request<FormalProofState>(`/api/v2/cockpit/formal-proofs${refresh ? "?refresh=true" : ""}`),
+
+  pages: () => request<PagesIndex>("/api/v2/cockpit/pages"),
+
+  terminal: () => request<TerminalPageData>("/api/v2/cockpit/terminal"),
+
+  terminalQuote: (payload: { symbol?: string; silo?: string; bars?: number; depth?: number }) =>
+    post<TerminalFrame>("/api/v2/control/terminal/quote", payload),
+
+  orders: () => request<OrdersPageData>("/api/v2/cockpit/orders"),
+
+  options: () => request<OptionsPageData>("/api/v2/cockpit/options"),
+
+  optionsChain: (payload: {
+    symbol?: string;
+    spot?: number;
+    volatility?: number;
+    days_to_expiry?: number;
+    strike_count?: number;
+    risk_free_rate?: number;
+  }) => post<OptionsChainReceipt>("/api/v2/control/options/chain", payload),
+
+  strategyPayoff: (payload: {
+    symbol?: string;
+    strategy: string;
+    spot?: number;
+    volatility?: number;
+    days_to_expiry?: number;
+    width_steps?: number;
+    risk_free_rate?: number;
+  }) => post<StrategyPayoffReceipt>("/api/v2/control/options/strategy-payoff", payload),
+
+  analyzer: () => request<AnalyzerPageData>("/api/v2/cockpit/analyzer"),
+
+  quant: (refresh = false) =>
+    request<QuantPageData>(`/api/v2/cockpit/quant${refresh ? "?refresh=true" : ""}`),
+
+  priceOption: (payload: {
+    spot: number;
+    strike: number;
+    volatility: number;
+    days_to_expiry: number;
+    risk_free_rate?: number;
+    kind?: "CALL" | "PUT";
+    [key: string]: unknown;
+  }) => post<OptionPriceReceipt>("/api/v2/control/quant/price-option", payload),
+
+  quantScan: (payload: { top_k?: number; universe_size?: number } = { top_k: 15 }) =>
+    post<InteractiveQuantScan>("/api/v2/control/quant/scan", payload),
+
+  agents: () => request<AgentsPageData>("/api/v2/cockpit/agents"),
+
+  assignAgent: (payload: AgentAssignPayload) =>
+    post<AgentAssignReceipt>("/api/v2/control/agents/assign", { ...payload }),
+
+  batchWatchlist: (payload: { silo: string; symbols: string[]; strategy_id?: string | null }) =>
+    post<AgentBatchWatchlistReceipt>("/api/v2/control/agents/batch-watchlist", { ...payload }),
+
+  agentFollowup: (payload: { task_id: string; question: string }) =>
+    post<AgentFollowupReceipt>("/api/v2/control/agents/followup", { ...payload }),
+
+  cancelAgentTasks: (taskId = "ALL") =>
+    post<JsonRecord>("/api/v2/control/agents/cancel", { task_id: taskId }),
+
+  backtest: () => request<BacktestPageData>("/api/v2/cockpit/backtest"),
+
+  runBacktest: (payload: {
+    silo: string;
+    symbol: string;
+    strategy_id: string;
+    bars: number;
+    timeframe: BacktestTimeframe;
+    initial_capital_units: number;
+    fast_window?: number | null;
+    slow_window?: number | null;
+    stop_loss_bps?: number | null;
+    take_profit_bps?: number | null;
+  }) => post<BacktestReceipt>("/api/v2/control/backtest/run", { ...payload }),
+
+  compareStrategies: (payload: {
+    silo: string;
+    symbol: string;
+    timeframe: BacktestTimeframe;
+    bars: number;
+  }) => post<BacktestComparisonReceipt>("/api/v2/control/backtest/compare-strategies", { ...payload }),
+
+  promoteToNursery: (backtestId: string) =>
+    post<NurseryPromotionReceipt>("/api/v2/control/backtest/promote-to-nursery", {
+      backtest_id: backtestId,
     }),
-  })
-}
 
-/**
- * Store a testnet / sandbox venue credential in Ring 0.
- *
- * The API key and secret are write-only: the response carries only `***last4`
- * plus the dry-run Ed25519 handshake receipt.
- */
-export function postBrokerCredentials(
-  payload: BrokerCredentialPayload
-): Promise<BrokerCredentialReport> {
-  return request<BrokerCredentialReport>('/api/v2/control/brokers/credentials', {
-    method: 'POST',
-    body: JSON.stringify({ sandbox: true, operator: 'ring3.cockpit', ...payload }),
-  })
-}
+  brain: () => request<JsonRecord>("/api/v2/cockpit/brain"),
 
-/** Probe every configured LLM endpoint under the strict 250 ms hard cap. */
-export function postLLMProbe(): Promise<LLMProbeReport> {
-  return request<LLMProbeReport>('/api/v2/control/llms/probe', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit' }),
-  })
-}
+  mirofishShock: (payload: {
+    symbol?: string;
+    shock_bps?: number;
+    sentiment_tag?: string;
+    volatility_ratio?: number;
+    spread_bps?: number;
+    gamma_flip_proximity?: number;
+    silo?: string;
+  }) => post<MiroFishShockReceipt>("/api/v2/control/brain/mirofish-shock", { ...payload }),
 
-/* ------------------------------------------------------------------ *
- * Phase 3 Step 3 — 4-ring OS supervisor control
- * ------------------------------------------------------------------ */
+  committeeDebate: (payload: { silo?: string; symbol?: string; spread_bps?: number }) =>
+    post<CommitteeDebateReceipt>("/api/v2/control/brain/committee-debate", { ...payload }),
 
-/**
- * Start / stop / crash-restart the four OS worker processes.
- *
- * `restart_ring` needs `ringIndex`; the response carries the previous and the
- * new PID so the cockpit can prove the worker really was replaced.
- */
-export function postSupervisor(
-  action: 'start' | 'stop' | 'restart_ring' | 'status',
-  ringIndex?: number
-): Promise<SupervisorControlResponse> {
-  return request<SupervisorControlResponse>('/api/v2/control/supervisor', {
-    method: 'POST',
-    body: JSON.stringify({
+  forge: () => request<ForgePageData>("/api/v2/cockpit/forge"),
+
+  evaluateChallenger: (payload: {
+    plugin_name: string;
+    candidate_sharpe?: number;
+    shadow_fills?: number;
+    silo?: string;
+  }) => post<ChallengerEvalReceipt>("/api/v2/control/forge/evaluate-challenger", { ...payload }),
+
+  forgeHedge: () =>
+    post<JsonRecord>("/api/v2/control/supervisor/forge-hedge", { operator: "ring3.cockpit" }),
+
+  skillMarkdown: (name: string) =>
+    request<SkillMarkdownReceipt>(`/api/v2/cockpit/skills/${encodeURIComponent(name)}`),
+
+  ledger: () => request<LedgerPageData>("/api/v2/cockpit/ledger"),
+
+  reconcile: (silos?: string[]) =>
+    post<LedgerReconcileReceipt>("/api/v2/control/ledger/reconcile", {
+      silos: silos ?? null,
+      operator: "ring3.cockpit",
+    }),
+
+  logbook: () => request<LogbookPageData>("/api/v2/cockpit/logbook"),
+
+  logbookEntry: (payload: LogbookEntryPayload) =>
+    post<{ ok: boolean; entry: LogbookEntryRecord; aggregate: LogbookPageData["aggregate"] }>(
+      "/api/v2/control/logbook/entry",
+      { ...payload },
+    ),
+
+  clearLogbook: () => post<JsonRecord>("/api/v2/control/logbook/clear"),
+
+  verification: () => request<JsonRecord>("/api/v2/cockpit/verification"),
+
+  chaosDrill: (payload: {
+    iterations?: number;
+    hold_ms?: number;
+    seed?: number;
+    silo?: string;
+    symbol?: string;
+  }) => post<ChaosDrillReceipt>("/api/v2/control/verification/chaos-drill", { ...payload }),
+
+  vopr: (payload: { seed?: number; steps?: number }) =>
+    post<VoprCampaignReceipt>("/api/v2/control/verification/vopr", { ...payload }),
+
+  osTune: (payload: { apply?: boolean; ring?: string }) =>
+    post<OsTuneReceipt>("/api/v2/control/verification/os-tune", { ...payload }),
+
+  brokers: () => request<BrokersPageData>("/api/v2/cockpit/brokers"),
+
+  brokerPing: (venue: string) =>
+    post<BrokerPingReceipt>("/api/v2/control/brokers/ping", {
+      venue,
+      operator: "ring3.cockpit",
+    }),
+
+  brokerCredentials: (payload: {
+    silo: string;
+    venue: string;
+    api_key: string;
+    api_secret: string;
+  }) => post<JsonRecord>("/api/v2/control/brokers/credentials", { sandbox: true, ...payload }),
+
+  mcp: () => request<McpPageData>("/api/v2/cockpit/mcp"),
+
+  mcpCall: (name: string, args: Record<string, unknown> = {}) =>
+    post<McpCallResult>("/api/v2/mcp/call", { name, arguments: args }),
+
+  preflight: (refresh = false) =>
+    request<PreflightCertificate>(`/api/v2/control/preflight${refresh ? "?refresh=true" : ""}`),
+
+  runPreflight: (fullSmoke = false, silo = "ALL") =>
+    post<PreflightCertificate>("/api/v2/control/preflight", {
+      full_smoke: fullSmoke,
+      silo,
+      refresh: true,
+    }),
+
+  vaultStatus: () => request<JsonRecord>("/api/v2/control/vault/status"),
+
+  rotateKeys: () =>
+    post<JsonRecord>("/api/v2/control/vault/rotate-keys", {
+      operator: "ring3.cockpit",
+      reason: "operator-initiated rotation",
+    }),
+
+  llmProbe: () =>
+    post<JsonRecord>("/api/v2/control/llms/probe", { operator: "ring3.cockpit" }),
+
+  supervisor: (action: "start" | "stop" | "restart_ring" | "status", ringIndex?: number) =>
+    post<JsonRecord>("/api/v2/control/supervisor", {
       action,
       ring_index: ringIndex ?? null,
-      operator: 'ring3.cockpit',
+      operator: "ring3.cockpit",
     }),
-  })
-}
 
-/* ------------------------------------------------------------------ *
- * Phase 3 Step 4 — Prometheus / OpenTelemetry metrics exporter
- * ------------------------------------------------------------------ */
+  feedMode: (feedMode: string, ingestCycle = true) =>
+    post<JsonRecord>("/api/v2/control/feeds", {
+      feed_mode: feedMode,
+      ingest_cycle: ingestCycle,
+      operator: "ring3.cockpit",
+    }),
 
-/** Standard Prometheus / OpenMetrics scrape target (text exposition). */
-export function metricsUrl(): string {
-  return `${API_BASE}/api/v2/metrics`
-}
+  metrics: () => request<MetricsSnapshot>("/api/v2/metrics/json"),
 
-/** Alias scrape path (`/metrics`) for a stock Prometheus job config. */
-export function metricsAliasUrl(): string {
-  return `${API_BASE}/metrics`
-}
+  killSwitch: (reason = "operator kill switch") =>
+    post<KillReport>("/api/v2/control/killswitch", { reason, flatten: true, confirm: true }),
 
-/** JSON telemetry consumed by the live cockpit memory/telemetry chip. */
-export function metricsJsonUrl(): string {
-  return `${API_BASE}/api/v2/metrics/json`
-}
+  rearm: (reason = "cockpit re-arm") =>
+    post<JsonRecord>("/api/v2/control/rearm", {
+      reason,
+      operator: "ring3.cockpit",
+    }),
 
-export function fetchMetrics(): Promise<MetricsSnapshot> {
-  return request<MetricsSnapshot>('/api/v2/metrics/json')
-}
+  extensions: () => request<JsonRecord>("/api/v2/control/extensions"),
+} as const;
 
-/* ------------------------------------------------------------------ *
- * Phase 3 Step 5 — Ring 0 zero-downtime key rotation + OS tuning
- * ------------------------------------------------------------------ */
+/* ------------------------------ order actions ------------------------------ */
 
-/** Current key version, archived Ed25519 keys and the OS tuning summary. */
-export function fetchVaultStatus(): Promise<VaultStatus> {
-  return request<VaultStatus>('/api/v2/control/vault/status')
-}
-
-/**
- * Rotate the Ring 0 Fernet master keys and Ed25519 order-signing keypair.
- *
- * Zero downtime and zero credential loss: stored LLM and broker secrets are
- * re-encrypted in place and the previous public key is archived so historical
- * signed orders still verify. The reply is proof-only — never secret material.
- */
-export function postVaultRotate(
-  operator = 'ring3.cockpit'
-): Promise<VaultRotationReport> {
-  return request<VaultRotationReport>('/api/v2/control/vault/rotate-keys', {
-    method: 'POST',
-    body: JSON.stringify({ operator, reason: 'operator-initiated rotation' }),
-  })
-}
-
-/* ------------------------------------------------------------------ *
- * Phase 4 Step 2 — 22-gate pre-flight go-live certificate
- * ------------------------------------------------------------------ */
-
-/**
- * Interactive readiness certificate (`GET /api/v2/control/preflight`).
- *
- * The server replays a short-lived in-process certificate and, by default, the
- * persisted 22-row smoke receipt for this commit, so the cockpit stays
- * responsive. `refresh` forces a fresh certification run.
- */
-export function fetchPreflight(refresh = false): Promise<PreflightCertificate> {
-  const query = refresh ? '?refresh=true' : ''
-  return request<PreflightCertificate>(`/api/v2/control/preflight${query}`)
-}
-
-/**
- * Full 22-gate certification (`POST /api/v2/control/preflight`).
- *
- * `fullSmoke=true` re-spawns the 22-row suite instead of replaying the receipt —
- * the release-gate form an operator runs before `confirm_live=true`.
- */
-export function postPreflight(
-  fullSmoke = false,
-  silo = 'ALL'
-): Promise<PreflightCertificate> {
-  return request<PreflightCertificate>('/api/v2/control/preflight', {
-    method: 'POST',
-    body: JSON.stringify({ full_smoke: fullSmoke, silo, refresh: true }),
-  })
-}
-
-/* ------------------------------------------------------------------ *
- * Phase 4 Step 2 — cross-process forge + tail-hedge cycle
- * ------------------------------------------------------------------ */
-
-/**
- * Run one closed-loop Nightly Alpha Forge + Tactical Tail-Hedger cycle.
- *
- * Ring 2 demotes decayed champions (disarming their leases), breeds challengers,
- * runs the contagion cascade and prices a grounded put; Ring 0 verifies and
- * Ed25519-signs it. The receipt is proof-only.
- */
-export function postSupervisorForgeHedge(): Promise<ForgeHedgeReceipt> {
-  return request<ForgeHedgeReceipt>('/api/v2/control/supervisor/forge-hedge', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit' }),
-  })
-}
-
-/* ------------------------------------------------------------------ *
- * Step 4 — read-only multi-page cockpit telemetry
- * ------------------------------------------------------------------ */
-
-/** Page catalog: eleven production pages, their routes and live counts. */
-export function fetchPages(): Promise<PagesIndex> {
-  return request<PagesIndex>('/api/v2/cockpit/pages')
-}
-
-/** SmartOMS blotter, Maker-Peg / TWAP slicers, atomic outbox and positions. */
-export function fetchOrdersPage(): Promise<OrdersPageData> {
-  return request<OrdersPageData>('/api/v2/cockpit/orders')
-}
-
-/** 30-fill L2 shadow graduation nursery plus adverse-selection telemetry. */
-export function fetchAnalyzerPage(): Promise<AnalyzerPageData> {
-  return request<AnalyzerPageData>('/api/v2/cockpit/analyzer')
-}
-
-/** 490-factor scanner, valuation lab, tail-hedger and loader readiness. */
-export function fetchQuantPage(refresh = false): Promise<QuantPageData> {
-  const query = refresh ? '?refresh=true' : ''
-  return request<QuantPageData>(`/api/v2/cockpit/quant${query}`)
-}
-
-/** Nocturnal Alpha Forge leaderboard, challenger plugins and skill catalog. */
-export function fetchForgePage(): Promise<ForgePageData> {
-  return request<ForgePageData>('/api/v2/cockpit/forge')
-}
-
-/** Double-entry IBOR journal, 35/15 ratchet preview and backend schema status. */
-export function fetchLedgerPage(): Promise<LedgerPageData> {
-  return request<LedgerPageData>('/api/v2/cockpit/ledger')
-}
-
-/** Air-gapped MCP tool inventory and its read-only invariants. */
-export interface McpCallResult {
-  name: string
-  ok: boolean
-  result?: unknown
-  error?: string
-  elapsed_ms: number
-}
-
-/**
- * Invoke one read-only MCP tool through the air-gapped Ring 3 bridge.
- *
- * The bridge rejects any tool that could read broker keys or sign an order, so a
- * successful receipt is proof-only telemetry.
- */
-export function callMcpTool(
-  name: string,
-  args: Record<string, unknown> = {}
-): Promise<McpCallResult> {
-  return request<McpCallResult>('/api/v2/mcp/call', {
-    method: 'POST',
-    body: JSON.stringify({ name, arguments: args }),
-  })
-}
-
-export function fetchMcpPage(): Promise<McpPageData> {
-  return request<McpPageData>('/api/v2/cockpit/mcp')
-}
-
-/* ------------------------------------------------------------------ *
- * Phase 4 Step 5 — interactive operator actions (paper-only)
- * ------------------------------------------------------------------ */
-
-/**
- * Submit a grounded PAPER order through the atomic outbox, Smart OMS and IBOR.
- *
- * The endpoint refuses with 409 when the global kill latch is HALTED or the
- * silo is frozen, so a click can never bypass the four-ring safety envelope.
- * A filled order applies the 35% / 15% / 50% in-silo ratchet on the receipt.
- */
 export function postPaperOrder(payload: PaperOrderPayload): Promise<PaperOrderReceipt> {
-  return request<PaperOrderReceipt>('/api/v2/control/orders/paper', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
+  return post<PaperOrderReceipt>("/api/v2/control/orders/paper", {
+    operator: "ring3.cockpit",
+    ...payload,
+  });
 }
 
-/**
- * Cancel one working order, or every open order when `order_id` is `ALL`.
- *
- * Pending outbox reservations are voided with the same atomic call so the
- * blotter and the outbox ledger never disagree after a cancel.
- */
-export function postCancelOrders(
-  payload: CancelOrdersPayload = {}
-): Promise<CancelOrdersReceipt> {
-  return request<CancelOrdersReceipt>('/api/v2/control/orders/cancel', {
-    method: 'POST',
-    body: JSON.stringify({ order_id: 'ALL', operator: 'ring3.cockpit', ...payload }),
-  })
+export function postCancelOrders(orderId = "ALL"): Promise<CancelOrdersReceipt> {
+  return post<CancelOrdersReceipt>("/api/v2/control/orders/cancel", {
+    order_id: orderId,
+    operator: "ring3.cockpit",
+  });
 }
 
-/**
- * Drive N shadow execution ticks through the L2 twin for one silo.
- *
- * One tick does not always resolve a fill (the twin posts a maker peg, then
- * fills on a later tick), so the gateway keeps ticking until the requested
- * fills land or the ceiling is reached.
- */
-export function postShadowBurst(payload: ShadowBurstPayload): Promise<ShadowBurstReceipt> {
-  return request<ShadowBurstReceipt>('/api/v2/control/analyzer/shadow-burst', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-/**
- * Price a European option and seal every input and Greek into a SHA-256
- * `GroundedFactPacket` verified by the numerical grounding verifier.
- */
-export function postPriceOption(payload: OptionPricePayload): Promise<OptionPriceReceipt> {
-  return request<OptionPriceReceipt>('/api/v2/control/quant/price-option', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-/** Re-run the 490-factor vectorized scan and return the fresh ranking. */
-export function postQuantScan(payload: QuantScanPayload = { top_k: 15 }): Promise<InteractiveQuantScan> {
-  return request<InteractiveQuantScan>('/api/v2/control/quant/scan', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-/**
- * Load one full `SKILL.md` on demand (progressive disclosure, sec_016).
- *
- * The gateway only reads inside the skill registry root and answers 404 for an
- * unknown or path-traversing name.
- */
-export function fetchSkillMarkdown(name: string): Promise<SkillMarkdownReceipt> {
-  return request<SkillMarkdownReceipt>(
-    `/api/v2/cockpit/skills/${encodeURIComponent(name)}`
-  )
-}
-
-/** Reconcile all four silos and prove `sum(debits) == sum(credits)`. */
-export function postLedgerReconcile(
-  silos?: string[]
-): Promise<LedgerReconcileReceipt> {
-  return request<LedgerReconcileReceipt>('/api/v2/control/ledger/reconcile', {
-    method: 'POST',
-    body: JSON.stringify({ silos: silos ?? null, operator: 'ring3.cockpit' }),
-  })
-}
-
-/* ------------------------------------------------------------------ *
- * Phase 4 Step 6 — /verification, /brain and /forge operator actions
- * ------------------------------------------------------------------ */
-
-/**
- * SIGKILL a worker mid-outbox and prove every ``sec_009`` reboot invariant.
- *
- * The drill replays the journal and returns `pending_after == 0`,
- * `duplicate_transfer_ids == 0`, a stale lease swept to `DISARMED` and
- * `sum(debits) == sum(credits)` — never a promise that they should hold.
- */
-export function postChaosDrill(payload: {
-  iterations?: number
-  hold_ms?: number
-  seed?: number
-  silo?: string
-  symbol?: string
-}): Promise<ChaosDrillReceipt> {
-  return request<ChaosDrillReceipt>('/api/v2/control/verification/chaos-drill', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-/**
- * Run the seeded deterministic VOPR fault campaign.
- *
- * Same seed + same step count always reproduce the same fault histogram, so a
- * red row is a reproducible defect rather than a flake.
- */
-export function postVoprCampaign(payload: {
-  seed?: number
-  steps?: number
-}): Promise<VoprCampaignReceipt> {
-  return request<VoprCampaignReceipt>('/api/v2/control/verification/vopr', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-/**
- * Apply and audit OS / socket low-latency tuning.
- *
- * Rows the serving process may not change stay `RECOMMENDED` with their exact
- * command; they are reported, never silently skipped.
- */
-export function postOsTune(payload: {
-  apply?: boolean
-  ring?: string
-}): Promise<OsTuneReceipt> {
-  return request<OsTuneReceipt>('/api/v2/control/verification/os-tune', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-/**
- * Simulate one five-archetype, three-tick MiroFish contagion cascade.
- *
- * Deterministic for a given shock vector: the returned SHA-256 digest commits
- * to the inputs and outputs, never to wall-clock jitter.
- */
-export function postMiroFishShock(payload: {
-  symbol?: string
-  shock_bps?: number
-  sentiment_tag?: string
-  volatility_ratio?: number
-  spread_bps?: number
-  gamma_flip_proximity?: number
-  silo?: string
-}): Promise<MiroFishShockReceipt> {
-  return request<MiroFishShockReceipt>('/api/v2/control/brain/mirofish-shock', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-/**
- * Run one grounded System 2 committee debate and seal the transcript.
- *
- * Every numerical claim is re-computed by `NumericalGroundingVerifier`; a
- * fabricated figure aborts the debate with `UNGROUNDED-NUMERICAL-CLAIM`.
- */
-export function postCommitteeDebate(payload: {
-  silo?: string
-  symbol?: string
-  spread_bps?: number
-}): Promise<CommitteeDebateReceipt> {
-  return request<CommitteeDebateReceipt>('/api/v2/control/brain/committee-debate', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-/**
- * Evaluate a challenger genome/plugin against the forge nursery gates.
- *
- * Promotion requires `Deflated Sharpe >= 1.50` **and** `>= 30` shadow fills,
- * both read from the forge — never from the request.
- */
-export function postEvaluateChallenger(payload: {
-  plugin_name: string
-  candidate_sharpe?: number
-  shadow_fills?: number
-  silo?: string
-}): Promise<ChallengerEvalReceipt> {
-  return request<ChallengerEvalReceipt>('/api/v2/control/forge/evaluate-challenger', {
-    method: 'POST',
-    body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
-  })
-}
-
-// ---------------------------------------------------------------------------
-// V1.2 - agent task assignment workstation (/agents)
-// ---------------------------------------------------------------------------
-
-/** Read the six specialist agents, eight strategies and the task queue. */
-export function fetchAgentsPage(): Promise<AgentsPageData> {
-  return request<AgentsPageData>('/api/v2/cockpit/agents')
-}
-
-/**
- * Assign one grounded task to a Ring 2 specialist agent.
- *
- * Ring 2 emits research only: the receipt carries a SHA-256 `grounding_sha256`
- * and never an order, a broker key, or an IBOR write.
- */
-export function postAgentTask(payload: AgentAssignPayload): Promise<AgentAssignReceipt> {
-  return request<AgentAssignReceipt>('/api/v2/control/agents/assign', {
-    method: 'POST',
-    body: JSON.stringify({ ...payload }),
-  })
-}
-
-/** Read one task together with its full grounded markdown report. */
-export function fetchAgentTask(taskId: string): Promise<AgentAssignReceipt> {
-  return request<AgentAssignReceipt>(
-    `/api/v2/control/agents/tasks/${encodeURIComponent(taskId)}`,
-  )
-}
-
-/** Cancel one task, or pass `ALL` to clear the whole queue. */
-export function postCancelAgentTasks(taskId = 'ALL'): Promise<AgentCancelReceipt> {
-  return request<AgentCancelReceipt>('/api/v2/control/agents/cancel', {
-    method: 'POST',
-    body: JSON.stringify({ task_id: taskId }),
-  })
-}
-
-/**
- * Run the decision dashboard across a whole watchlist in one batch.
- *
- * The backend ranks every symbol by `signal_score` and `operation_advice`
- * and seals the entire ranking into one SHA-256 `GroundedFactPacket`.
- */
-export function postAgentBatchWatchlist(
-  payload: AgentBatchWatchlistPayload,
-): Promise<AgentBatchWatchlistReceipt> {
-  return request<AgentBatchWatchlistReceipt>(
-    '/api/v2/control/agents/batch-watchlist',
-    { method: 'POST', body: JSON.stringify({ ...payload }) },
-  )
-}
-
-/**
- * Ask a grounded follow-up against a completed agent task.
- *
- * The answer may only cite metrics already committed in that task's
- * `GroundedFactPacket`; the server rejects an ungrounded answer.
- */
-export function postAgentFollowup(
-  payload: AgentFollowupPayload,
-): Promise<AgentFollowupReceipt> {
-  return request<AgentFollowupReceipt>('/api/v2/control/agents/followup', {
-    method: 'POST',
-    body: JSON.stringify({ ...payload }),
-  })
-}
-
-// ---------------------------------------------------------------------------
-// V1.2 - walk-forward backtesting workstation (/backtest)
-// ---------------------------------------------------------------------------
-
-/** Read the strategy catalog, silo cost-floor table and saved runs. */
-export function fetchBacktestPage(): Promise<BacktestPageData> {
-  return request<BacktestPageData>('/api/v2/cockpit/backtest')
-}
-
-/**
- * Run a deterministic tax-net walk-forward backtest.
- *
- * Every trade is charged the silo's statutory floor (India STT is 5.50 bps of
- * the 8.50 bps total) before the Deflated Sharpe gate is computed.
- */
-export function postRunBacktest(payload: BacktestRunPayload): Promise<BacktestReceipt> {
-  return request<BacktestReceipt>('/api/v2/control/backtest/run', {
-    method: 'POST',
-    body: JSON.stringify({ ...payload }),
-  })
-}
-
-/**
- * Run all eight harvested strategies on the exact same bar series.
- *
- * Every row is already tax-net: the silo floor (India 8.50 bps including
- * 5.50 bps STT, crypto 16.00, US 2.80, FX 1.60) is deducted per trade before
- * the Deflated Sharpe gate is evaluated.
- */
-export function postCompareStrategies(
-  payload: BacktestComparePayload,
-): Promise<BacktestComparisonReceipt> {
-  return request<BacktestComparisonReceipt>(
-    '/api/v2/control/backtest/compare-strategies',
-    { method: 'POST', body: JSON.stringify({ ...payload }) },
-  )
-}
-
-/**
- * Promote a passing run into the 30-fill shadow nursery.
- *
- * Rejected with HTTP 409 unless the Deflated Sharpe clears 1.50 and the tax-net
- * edge clears +0.50 bps. The nursery never starts above 0/30 fills.
- */
-export function postPromoteToNursery(backtestId: string): Promise<NurseryPromotionReceipt> {
-  return request<NurseryPromotionReceipt>(
-    '/api/v2/control/backtest/promote-to-nursery',
-    { method: 'POST', body: JSON.stringify({ backtest_id: backtestId }) },
-  )
-}
-
-
-// ---------------------------------------------------------------------------
-// V1.3 - options chain, market terminal, trade logbook and the broker hub
-// ---------------------------------------------------------------------------
-
-/** Read the optionable underlyings, the six strategy templates and a live NIFTY chain. */
-export function fetchOptionsPage(): Promise<OptionsPageData> {
-  return request<OptionsPageData>('/api/v2/cockpit/options')
-}
-
-/** Build one grounded Call/Put chain with Greeks, PCR and Max Pain. */
-export function postOptionsChain(payload: {
-  symbol?: string
-  spot?: number
-  volatility?: number
-  days_to_expiry?: number
-  strike_count?: number
-  risk_free_rate?: number
-}): Promise<OptionsChainReceipt> {
-  return request<OptionsChainReceipt>('/api/v2/control/options/chain', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
-
-/** Price one multi-leg template and return its 25-point expiry payoff curve. */
-export function postStrategyPayoff(payload: {
-  symbol?: string
-  strategy: string
-  spot?: number
-  volatility?: number
-  days_to_expiry?: number
-  width_steps?: number
-  risk_free_rate?: number
-}): Promise<StrategyPayoffReceipt> {
-  return request<StrategyPayoffReceipt>('/api/v2/control/options/strategy-payoff', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
-
-/** Read the multi-silo watchlist plus a live BTC terminal frame. */
-export function fetchTerminalPage(): Promise<TerminalPageData> {
-  return request<TerminalPageData>('/api/v2/cockpit/terminal')
-}
-
-/** Re-frame one symbol: quotes, candles, L2 ladder and the Lee-Ready tape. */
-export function postTerminalQuote(payload: {
-  symbol?: string
-  silo?: string
-  bars?: number
-  depth?: number
-}): Promise<TerminalFrame> {
-  return request<TerminalFrame>('/api/v2/control/terminal/quote', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
-
-/** Read the trade logbook, its aggregates and the silo cost floors. */
-export function fetchLogbookPage(): Promise<LogbookPageData> {
-  return request<LogbookPageData>('/api/v2/cockpit/logbook')
-}
-
-/** Record one structured trade: gross/net P&L, cost drag bps and R-multiple. */
-export function postLogbookEntry(
-  payload: LogbookEntryPayload,
-): Promise<LogbookEntryReceipt> {
-  return request<LogbookEntryReceipt>('/api/v2/control/logbook/entry', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
-
-/** Zero the journal (used by the clean-slate workflow). */
-export function postLogbookClear(): Promise<Record<string, unknown>> {
-  return request<Record<string, unknown>>('/api/v2/control/logbook/clear', {
-    method: 'POST',
-  })
-}
-
-/** Read the 12-venue adapter matrix across all four silos. */
-export function fetchBrokersPage(): Promise<BrokersPageData> {
-  return request<BrokersPageData>('/api/v2/cockpit/brokers')
-}
-
-/** Ping one venue adapter and prove the Ring 0 Ed25519 signer round-trips. */
-export function postBrokerPing(venue: string): Promise<BrokerPingReceipt> {
-  return request<BrokerPingReceipt>('/api/v2/control/brokers/ping', {
-    method: 'POST',
-    body: JSON.stringify({ venue, operator: 'ring3.cockpit' }),
-  })
+export function postShadowBurst(payload: {
+  silo: string;
+  fills?: number;
+  strategy_id?: string;
+}): Promise<JsonRecord> {
+  return post<JsonRecord>("/api/v2/control/analyzer/shadow-burst", {
+    operator: "ring3.cockpit",
+    ...payload,
+  });
 }

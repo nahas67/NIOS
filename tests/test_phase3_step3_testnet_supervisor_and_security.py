@@ -1049,7 +1049,7 @@ def test_gate4_control_endpoint_dispatches_a_sandbox_order(
 
 def test_gate5_test_inventory_and_rebuilt_cockpit_bundle() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 21, [path.name for path in test_files]
+    assert len(test_files) == 22, [path.name for path in test_files]
     assert (
         ROOT / "tests" / "test_phase3_step3_testnet_supervisor_and_security.py"
         in test_files
@@ -1064,11 +1064,11 @@ def test_gate5_test_inventory_and_rebuilt_cockpit_bundle() -> None:
     assets = sorted((BUNDLE_DIR / "assets").glob("*.js"))
     assert assets, "no bundled JavaScript chunk"
     bundle = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in assets)
-    assert "START 4 RINGS" in bundle
-    assert "RESTART RING 1" in bundle
+    assert "Ring OS process isolation matrix" in bundle
+    assert "SUPERVISOR RUNNING" in bundle
     assert "/api/v2/control/supervisor" in bundle
     # Phase 3 Step 4 telemetry surface.
-    assert "Prometheus / OpenTelemetry telemetry" in bundle
+    assert "Prometheus / OpenTelemetry mirror" in bundle
     assert "/api/v2/metrics" in bundle
 
 

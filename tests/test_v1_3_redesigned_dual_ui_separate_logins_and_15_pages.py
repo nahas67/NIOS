@@ -866,75 +866,106 @@ def test_gate4_unknown_api_path_is_not_swallowed_by_the_spa(client) -> None:
 
 
 def test_gate4_router_sidebar_and_shells_are_wired() -> None:
-    router_source = (SRC_ROOT / "router.ts").read_text(encoding="utf-8")
-    for key in PAGE_KEYS:
-        assert f"'{key}'" in router_source, key
-        assert f"{key}: '/{key}'" in router_source, key
-        assert f"'/{key}': '{key}'" in router_source, key
-    assert "'paper-login'" in router_source
-    assert "'live-login'" in router_source
-    assert "'/paper/login'" in router_source
-    assert "'/live/login'" in router_source
-    assert "PAGE_ORDER" in router_source
+    """The V1.4 clean-room layout keeps every V1.3 navigation contract."""
 
-    sidebar_source = (SRC_ROOT / "components" / "app-sidebar.tsx").read_text(
-        encoding="utf-8"
-    )
+    registry = (SRC_ROOT / "pages" / "registry.ts").read_text(encoding="utf-8")
+    for key in PAGE_KEYS:
+        assert f'key: "{key}"' in registry, key
     for label in (
         "Core Execution",
-        "Quant & Options",
-        "Bicameral Brain & Agents",
-        "Ledger & Verification",
+        "Quant & Research",
+        "Bicameral Brain",
+        "Ledger & Audit",
         "Sovereign Control",
     ):
-        assert label in sidebar_source, label
-    assert "NAV_GROUPS" in sidebar_source
-    assert "aria-expanded" in sidebar_source
+        assert label in registry, label
+    assert "NAV_GROUPS" in registry
+    assert "PageKey" in registry
+
+    sidebar = (SRC_ROOT / "shells" / "Sidebar.tsx").read_text(encoding="utf-8")
+    assert "aria-expanded" in sidebar
+    assert "NAV_GROUPS" in sidebar
+    assert "aria-current" in sidebar
     for key in PAGE_KEYS:
-        assert f"key: '{key}'" in sidebar_source, key
+        assert key in sidebar, key
 
-    app_source = (SRC_ROOT / "App.tsx").read_text(encoding="utf-8")
-    for key in PAGE_KEYS:
-        assert f"case '{key}':" in app_source, key
-    assert "15 production pages" in app_source
-    assert "PaperLoginPage" in app_source
-    assert "LiveLoginPage" in app_source
+    router = (SRC_ROOT / "lib" / "router.ts").read_text(encoding="utf-8")
+    for route in ("/setup", "/login", "/paper/login", "/live/login", "/live-unlock"):
+        assert route in router, route
+    assert "pagePath" in router
+    assert "popstate" in router
 
-    workspace_source = (SRC_ROOT / "pages" / "workspace.tsx").read_text(encoding="utf-8")
-    for key in PAGE_KEYS:
-        assert f"/paper/{key}" in workspace_source, key
-        assert f"/live/{key}" in workspace_source, key
-    # The two shells must be physically different ribbons.
-    assert "PAPER SANDBOX" in workspace_source
-    assert "LIVE PRODUCTION — REAL CAPITAL" in workspace_source
-    assert "Deposit paper capital" in workspace_source
-    # Live must never render a paper deposit or shadow-burst control.
-    live_block = workspace_source.split("export function LiveShell", 1)[1]
-    assert "Deposit paper capital" not in live_block
-    assert "shadow-burst" not in live_block
-    assert "Lock live vault (drop to paper)" in live_block
+    app = (SRC_ROOT / "App.tsx").read_text(encoding="utf-8")
+    for name in (
+        "DashboardPage",
+        "TerminalPage",
+        "OrdersPage",
+        "OptionsPage",
+        "AnalyzerPage",
+        "QuantPage",
+        "AgentsPage",
+        "BacktestPage",
+        "BrainPage",
+        "ForgePage",
+        "LedgerPage",
+        "LogbookPage",
+        "VerificationPage",
+        "BrokersPage",
+        "ControlPage",
+    ):
+        assert name in app, name
+    assert "PaperShell" in app
+    assert "LiveShell" in app
+    assert "CommandPalette" in app
 
-    auth_views = (SRC_ROOT / "pages" / "auth-views.tsx").read_text(encoding="utf-8")
-    assert "LoginGatewayPage" in auth_views
-    assert "PaperLoginPage" in auth_views
-    assert "LiveLoginPage" in auth_views
-    assert "ENTER PAPER SANDBOX" in auth_views.upper()
-    assert "LIVE SOVEREIGN VAULT" in auth_views
-    assert "SIMULATED EXECUTION ONLY (ALL VALUES START AT 0)" in auth_views
-    assert "live_pin" in auth_views
-    assert "loginLive" in auth_views
+    paper = (SRC_ROOT / "shells" / "PaperShell.tsx").read_text(encoding="utf-8")
+    assert "PAPER SANDBOX" in paper
+    assert "Deposit Paper Capital" in paper
+    assert "Reset All Values to Zero" in paper
+    assert "Autopilot" in paper
 
-    for page in ("options", "terminal", "logbook", "brokers"):
-        source = (SRC_ROOT / "pages" / f"{page}.tsx").read_text(encoding="utf-8")
-        assert "PageShell" in source, page
+    live = (SRC_ROOT / "shells" / "LiveShell.tsx").read_text(encoding="utf-8")
+    assert "LIVE PRODUCTION — REAL CAPITAL" in live
+    assert "EMERGENCY KILL SWITCH" in live
+    assert "Lock Live Vault (Drop to Paper)" in live
+    assert "22-gate" in live.lower()
+    live_lower = live.lower()
+    # Live must never render a paper deposit or a shadow-burst control.
+    assert "deposit paper capital" not in live_lower
+    assert "shadow-burst" not in live_lower
+    assert "reset all values to zero" not in live_lower
+
+    gateway = (SRC_ROOT / "portals" / "GatewayPortal.tsx").read_text(encoding="utf-8")
+    assert "ENTER PAPER SANDBOX" in gateway
+    assert "LIVE SOVEREIGN VAULT" in gateway
+
+    paper_login = (SRC_ROOT / "portals" / "PaperLoginPortal.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "SIMULATED EXECUTION ONLY (ALL VALUES START AT 0)" in paper_login
+    assert "loginPaper" in paper_login
+
+    live_login = (SRC_ROOT / "portals" / "LiveLoginPortal.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "live_pin" in live_login
+    assert "loginLive" in live_login
+    assert "acknowledged" in live_login
+    assert "PIN" in live_login
 
     css = (SRC_ROOT / "index.css").read_text(encoding="utf-8")
+    css += (SRC_ROOT / "design-system" / "tokens.css").read_text(encoding="utf-8")
     assert "backdrop-filter: blur" in css
     assert ".nios-shell-paper" in css
     assert ".nios-shell-live" in css
     assert ".nios-iso-plane" in css
     assert ".nios-hazard" in css
     assert ".nios-tabular" in css
+
+    for page in PAGE_KEYS:
+        source = (SRC_ROOT / "pages" / f"{page[:1].upper()}{page[1:]}Page.tsx").read_text(encoding="utf-8")
+        assert "SectionHeader" in source, page
+        assert "PageShell" not in source, page
 
 
 def test_gate4_biome_lint_is_clean() -> None:
