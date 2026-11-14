@@ -4711,8 +4711,10 @@ class ControlPlane:
             certificate = self.preflight_state()
         except Exception:  # pragma: no cover - defensive
             certificate = {}
-        gates_passed = bool(
-            certificate.get("passed")
+        failed_gates = int(certificate.get("failed_gates", 0) or 0)
+        gates_passed = failed_gates == 0 and bool(
+            certificate.get("ready_for_live_cutover")
+            or certificate.get("passed")
             or certificate.get("ready")
             or certificate.get("ok")
         )
