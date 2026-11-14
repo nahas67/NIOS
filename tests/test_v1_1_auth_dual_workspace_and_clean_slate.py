@@ -307,7 +307,7 @@ def test_gate2b_autopilot_stays_off_until_operator_starts_it(client, paper_sessi
     assert paused.json()["autopilot"]["enabled"] is False
 
 
-def test_gate3_paper_and_live_routes_and_bundle(client):
+def test_gate3_paper_and_live_routes_and_headless_document(client):
     routes = [
         "/login",
         "/setup",
@@ -340,33 +340,20 @@ def test_gate3_paper_and_live_routes_and_bundle(client):
         response = client.get(route)
         assert response.status_code == 200, route
         assert "text/html" in response.headers.get("content-type", "")
+        assert "headless-backend" in response.text
+        assert "<script" not in response.text.lower()
 
-    # API paths must never be swallowed by the SPA fallback.
+    # API paths must never be swallowed by the fallback.
     missing = client.get("/api/v2/does-not-exist")
     assert missing.status_code in (401, 403, 404)
 
     index_html = UI_ROOT / "dist" / "index.html"
     assert index_html.exists()
-    bundle = index_html.read_text(encoding="utf-8")
-    assert "<script" in bundle
-
-    # The compiled source tree must lint clean (0 errors, 0 warnings).
-    npx = shutil.which("npx")
-    if npx is None or not (UI_ROOT / "node_modules").exists():  # pragma: no cover
-        pytest.skip("node toolchain is not installed in this checkout")
-    completed = subprocess.run(
-        f'"{npx}" biome lint src/',
-        cwd=str(UI_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-        shell=True,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    combined = f"{completed.stdout}{completed.stderr}".lower()
-    assert "error" not in combined
-    assert "warning" not in combined
+    document = index_html.read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "<script" not in document.lower()
+    assert not (UI_ROOT / "package.json").exists()
+    assert not (UI_ROOT / "src").exists()
 
 
 def test_gate3b_workspace_state_contracts(client, paper_session):
@@ -383,13 +370,14 @@ def test_gate3b_workspace_state_contracts(client, paper_session):
     }
     assert "double_entry" in paper_body["ledger"]
     assert "autopilot" in paper_body
+    assert paper_body["workspace_mode"] == "PAPER"
+    assert "payload_sha256" in paper_body
 
-    # The SPA bundle must ship the dedicated workspace chunks.
-    assets = list((UI_ROOT / "dist" / "assets").glob("*.js"))
-    assert assets
-    joined = "".join(path.read_text(encoding="utf-8") for path in assets)
-    for marker in ("PAPER SANDBOX", "Live Production", "Clean Slate"):
-        assert marker.lower() in joined.lower(), marker
+    # V1.6: the workspace contract is the API, with no frontend bundle.
+    document = (UI_ROOT / "dist" / "index.html").read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "<script" not in document.lower()
+    assert not (UI_ROOT / "dist" / "assets").exists()
 
 
 # ---------------------------------------------------------------------------

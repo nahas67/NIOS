@@ -1452,21 +1452,33 @@ class IBORLedger:
         side: str = "",
         qty_micros: int = 0,
         price_micros: int = 0,
+        components: Mapping[str, int] | None = None,
+        component_bps: Mapping[str, float] | None = None,
         now_ns: int | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         """Deduct accrued STT, TDS, stamp duty and fees on every fill.
 
         The charges are debited from the trading vault and credited to the
         ``FEE_TAX_ACCRUAL`` bucket, then journalled as a tax lot so the
         point-in-time NAV and the auditor's cost basis agree (``sec_009``).
+
+        ``components`` carries the itemized statutory breakdown produced by
+        :mod:`ring0_vault.ibor.tax_and_cost_engine`; it is persisted with the
+        tax lot so a later audit can prove the drag was not a single lump
+        number.  Every amount is an exact integer micro-unit.
         """
-        notional = _check_money(notional_micros)
+        notional = _check_money(int(notional_micros))
         fee_micros = _apply_bps(notional, 2.0 * fee_bps)
         stt_micros = _apply_bps(notional, stt_bps)
         tds_micros = _apply_bps(notional, tds_bps)
         stamp_micros = _apply_bps(notional, stamp_bps)
         tax_micros = _apply_bps(notional, tax_bps)
         total = fee_micros + stt_micros + tds_micros + stamp_micros + tax_micros
+        itemized = {str(key): int(value) for key, value in (components or {}).items()}
+        if itemized:
+            # The itemized statutory lines are authoritative: the ledger
+            # posting always equals their exact integer sum.
+            total = sum(itemized.values())
         if total > 0:
             self.transfer_now(
                 silo,
@@ -1489,6 +1501,11 @@ class IBORLedger:
                 "stamp_micros": stamp_micros,
                 "fee_micros": fee_micros + tax_micros,
                 "opened_ns": int(now_ns if now_ns is not None else time.time_ns()),
+                "components_micros": itemized,
+                "component_bps": {
+                    str(key): float(value)
+                    for key, value in (component_bps or {}).items()
+                },
             }
         )
         return {
@@ -1498,6 +1515,10 @@ class IBORLedger:
             "tds_micros": tds_micros,
             "stamp_micros": stamp_micros,
             "total_micros": total,
+            "components_micros": itemized,
+            "component_bps": {
+                str(key): float(value) for key, value in (component_bps or {}).items()
+            },
         }
 
     # -- positions --------------------------------------------------------

@@ -1,27 +1,20 @@
-"""V1.5 - clean-room institutional financial terminal UI.
+"""V1.6 - headless institutional terminal contract (supersedes the V1.5 suite).
 
-Gate inventory for the flat-terminal release (``v3.6.0-V1.5``):
+``v3.7.0-V1.6`` is backend-only.  The institutional number contract that the
+V1.5 terminal rendered is now enforced directly on the API:
 
-1. The V1.5 source tree exists exactly where the blueprint says it does, and the
-   withdrawn V1.4 illustration module is gone.
-2. The compiled ``dist/`` bundle carries all twelve institutional colour tokens
-   and the global ``tabular-nums`` rule.
-3. There is zero glassmorphism, zero drop shadow, zero neon bloom, zero gradient
-   fill and zero pill radius anywhere in ``src/`` or ``dist/``.
-4. All fifty routes - fifteen pages x three workspaces plus five portals - answer
-   ``200 text/html`` from the built bundle.
-5. Paper and live shells stay physically separated; the live surface renders the
-   hazard ribbon, the 22-gate chip, the 30-minute lease and the two-step kill
-   switch and never a deposit, a reset or an autopilot transport.
-6. The six flat SVG charts render without a gradient primitive.
-7. Radius discipline: every module radius sits between 4px and 8px.
-
-Nothing in this suite signs an order, reads a broker secret or writes the IBOR.
+1. Every client route answers one deterministic, zero-JavaScript document.
+2. Money telemetry is integer micro-units; no float can be presented as money.
+3. The four statutory cost floors are exact and itemized on orders, backtests
+   and logbook rows.
+4. The 15-page catalogue and the two workspace trees are complete.
+5. Paper and Live remain separated at the API boundary.
 """
 
 from __future__ import annotations
 
-import re
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -29,7 +22,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 UI_ROOT = ROOT / "ring3_cockpit" / "ui" / "openalgo_shell"
-SRC_ROOT = UI_ROOT / "src"
 DIST_ROOT = UI_ROOT / "dist"
 
 if str(ROOT) not in sys.path:
@@ -38,24 +30,9 @@ if str(ROOT) not in sys.path:
 from core.orchestrator import NIOSCoreOrchestrator  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-USERNAME = "terminal"
-PASSWORD = "flat-terminal-9"
+USERNAME = "terminal-operator"
+PASSWORD = "institutional-9"
 LIVE_PIN = "246810"
-
-TOKENS = {
-    "canvas": "#0d0e10",
-    "surface": "#16181c",
-    "raised": "#22242a",
-    "hairline": "#27292e",
-    "accent": "#f96316",
-    "text": "#f4f5f7",
-    "text_secondary": "#8c9099",
-    "text_muted": "#5a5e66",
-    "bull": "#38b27b",
-    "bull_tint": "#172b23",
-    "bear": "#e05555",
-    "bear_tint": "#2d191a",
-}
 
 PAGE_KEYS = (
     "dashboard",
@@ -75,73 +52,37 @@ PAGE_KEYS = (
     "control",
 )
 
-PAGE_COMPONENTS = {
-    "dashboard": "DashboardPage",
-    "terminal": "TerminalPage",
-    "orders": "OrdersPage",
-    "options": "OptionsPage",
-    "analyzer": "AnalyzerPage",
-    "quant": "QuantPage",
-    "agents": "AgentsPage",
-    "backtest": "BacktestPage",
-    "brain": "BrainPage",
-    "forge": "ForgePage",
-    "ledger": "LedgerPage",
-    "logbook": "LogbookPage",
-    "verification": "VerificationPage",
-    "brokers": "BrokersPage",
-    "control": "ControlPage",
+STATUTORY_FLOORS = {
+    "INDIA_ZERODHA_DHAN": 8.50,
+    "CRYPTO_BINANCE": 16.00,
+    "US_IBKR": 2.80,
+    "FX_MT5": 1.60,
 }
 
-CHARTS = (
-    "CandlestickChart.tsx",
-    "DepthLadderChart.tsx",
-    "PayoffCurveChart.tsx",
-    "EquityDrawdownChart.tsx",
-    "ContagionFlowGraph.tsx",
-    "RadialGauge.tsx",
-)
 
-PORTAL_ROUTES = (
-    "/setup",
-    "/login",
-    "/paper/login",
-    "/live/login",
-    "/live-unlock",
-)
-
-FORBIDDEN = (
-    "backdrop-filter",
-    "backdrop-blur",
-    "box-shadow",
-    "lineargradient",
-    "radialgradient",
-    "rounded-full",
-    "rounded-xl",
-    "rounded-2xl",
-    "9999px",
-)
-
-
-def _routes() -> list[str]:
+def _fifty_routes() -> list[str]:
     routes: list[str] = []
     for key in PAGE_KEYS:
         routes.append(f"/{key}")
         routes.append(f"/paper/{key}")
         routes.append(f"/live/{key}")
-    routes.extend(PORTAL_ROUTES)
+    routes.extend(
+        (
+            "/",
+            "/positions",
+            "/chain",
+            "/journal",
+            "/venues",
+            "/xray",
+            "/mcp",
+            "/setup",
+            "/login",
+            "/paper/login",
+            "/live/login",
+            "/live-unlock",
+        )
+    )
     return routes
-
-
-def _source_files() -> list[Path]:
-    return [path for path in SRC_ROOT.rglob("*") if path.is_file()]
-
-
-def _bundle_text() -> str:
-    css = "\n".join(path.read_text(encoding="utf-8") for path in DIST_ROOT.glob("assets/*.css"))
-    js = "\n".join(path.read_text(encoding="utf-8") for path in DIST_ROOT.glob("assets/*.js"))
-    html = (DIST_ROOT / "index.html").read_text(encoding="utf-8")
-    return f"{css}\n{js}\n{html}"
 
 
 @pytest.fixture(scope="module")
@@ -180,237 +121,160 @@ def operator(client) -> None:
     assert response.status_code == 200, response.text
 
 
-# ---------------------------------------------------------------------------
-# Gate 1 - clean-room architecture
-# ---------------------------------------------------------------------------
-
-
-def test_v1_5_flat_terminal_source_layout() -> None:
-    required = [
-        "index.css",
-        "main.tsx",
-        "App.tsx",
-        "design-system/tokens.css",
-        "design-system/primitives.tsx",
-        "design-system/ring-topology.tsx",
-        "charts/kit.tsx",
-        "shells/PaperShell.tsx",
-        "shells/LiveShell.tsx",
-        "shells/Sidebar.tsx",
-        "portals/SetupPortal.tsx",
-        "portals/GatewayPortal.tsx",
-        "portals/PaperLoginPortal.tsx",
-        "portals/LiveLoginPortal.tsx",
-        "portals/LiveUnlockModal.tsx",
-        "lib/api.ts",
-        "lib/router.ts",
-        "lib/format.ts",
-        "lib/session.tsx",
-        "lib/toast.tsx",
-        "lib/types.ts",
-        "lib/use-api.ts",
-        "pages/registry.ts",
-    ]
-    required.extend(f"charts/{name}" for name in CHARTS)
-    required.extend(f"pages/{PAGE_COMPONENTS[key]}.tsx" for key in PAGE_KEYS)
-
-    missing = [relative for relative in required if not (SRC_ROOT / relative).exists()]
-    assert not missing, missing
-
-    withdrawn = [
-        "design-system/isometric-rings.tsx",
-        "index.css.bak",
-        "components/page-shell.tsx",
-    ]
-    survivors = [relative for relative in withdrawn if (SRC_ROOT / relative).exists()]
-    assert not survivors, survivors
-
-
-def test_v1_5_tokens_are_the_institutional_palette() -> None:
-    tokens = (SRC_ROOT / "design-system" / "tokens.css").read_text(encoding="utf-8")
-    for name, value in TOKENS.items():
-        assert value in tokens, name
-    assert "font-variant-numeric: tabular-nums" in tokens
-    assert "--nx-r-1: 4px" in tokens
-    assert "--nx-r-2: 6px" in tokens
-    assert "--nx-r-3: 8px" in tokens
-    assert "tabular-nums" in (SRC_ROOT / "index.css").read_text(encoding="utf-8")
+def _headers(client) -> dict[str, str]:
+    token = client.post(
+        "/api/v2/auth/login/paper",
+        json={"username": USERNAME, "password": PASSWORD},
+    ).json()["token"]
+    return {"X-NIOS-Session": token}
 
 
 # ---------------------------------------------------------------------------
-# Gate 2 - flat surfaces only
+# Gate 1 - fifty routes, one headless document
 # ---------------------------------------------------------------------------
 
 
-def test_v1_5_zero_glass_zero_shadow_zero_pill() -> None:
-    for path in _source_files():
-        text = path.read_text(encoding="utf-8", errors="replace").lower()
-        for forbidden in FORBIDDEN:
-            assert forbidden not in text, f"{forbidden} found in {path.name}"
-    bundle = _bundle_text().lower()
-    for forbidden in FORBIDDEN:
-        assert forbidden not in bundle, forbidden
-
-
-def test_v1_5_charts_are_flat_and_gradient_free() -> None:
-    for name in CHARTS:
-        source = (SRC_ROOT / "charts" / name).read_text(encoding="utf-8")
-        assert "linearGradient" not in source, name
-        assert "radialGradient" not in source, name
-        assert "strokeWidth" in source, name
-
-    kit = (SRC_ROOT / "charts" / "kit.tsx").read_text(encoding="utf-8")
-    for key in ("grid", "accent", "bull", "bear"):
-        assert key in kit, key
-    assert "#27292E" in kit
-
-
-def test_v1_5_radius_scale_is_tight() -> None:
-    css = (SRC_ROOT / "index.css").read_text(encoding="utf-8")
-    radii = {int(value) for value in re.findall(r"border-radius:\s*(\d+)px", css)}
-    assert radii, "no numeric border radius declared"
-    assert max(radii) <= 8, radii
-    assert min(radii) >= 1, radii
-    tokens = (SRC_ROOT / "design-system" / "tokens.css").read_text(encoding="utf-8")
-    token_radii = {int(value) for value in re.findall(r"--nx-r-\d:\s*(\d+)px", tokens)}
-    assert token_radii == {4, 6, 8}, token_radii
-
-
-# ---------------------------------------------------------------------------
-# Gate 3 - the compiled bundle
-# ---------------------------------------------------------------------------
-
-
-def test_v1_5_bundle_carries_every_token_and_tabular_nums() -> None:
-    bundle = _bundle_text().lower()
-    for name, value in TOKENS.items():
-        assert value in bundle, name
-    assert "tabular-nums" in bundle
-    assert "assets/" in (DIST_ROOT / "index.html").read_text(encoding="utf-8")
-
-    for marker in ("paper sandbox", "live production", "clean slate", "15 production pages"):
-        assert marker in bundle, marker
-
-
-# ---------------------------------------------------------------------------
-# Gate 4 - every route serves the flat bundle
-# ---------------------------------------------------------------------------
-
-
-def test_v1_5_fifty_routes_serve_html(client, operator) -> None:
-    routes = _routes()
-    assert len(routes) == 50
+def test_v1_6_fifty_routes_serve_the_headless_document(client) -> None:
+    index_bytes = (DIST_ROOT / "index.html").read_bytes()
+    routes = _fifty_routes()
+    assert len(routes) >= 50, len(routes)
     for route in routes:
         response = client.get(route)
-        assert response.status_code == 200, f"{route}: {response.text[:200]}"
-        assert "text/html" in response.headers.get("content-type", ""), route
-        assert '<div id="root">' in response.text, route
+        assert response.status_code == 200, route
+        assert response.headers["content-type"].startswith("text/html"), route
+        assert response.content == index_bytes, route
 
 
-# ---------------------------------------------------------------------------
-# Gate 5 - shell separation and terminal primitives
-# ---------------------------------------------------------------------------
-
-
-def test_v1_5_dual_shells_are_strictly_separated() -> None:
-    paper = (SRC_ROOT / "shells" / "PaperShell.tsx").read_text(encoding="utf-8")
-    live = (SRC_ROOT / "shells" / "LiveShell.tsx").read_text(encoding="utf-8")
-
-    assert "PAPER SANDBOX" in paper
-    assert "Deposit Paper Capital" in paper
-    assert "Reset to Zero" in paper
-    assert "Autopilot" in paper
-    assert "Switch to Live Vault" in paper
-    assert "EMERGENCY KILL SWITCH" not in paper
-
-    assert "LIVE PRODUCTION" in live
-    assert "REAL CAPITAL" in live
-    assert "EMERGENCY KILL SWITCH" in live
-    assert "Lock Live Vault" in live
-    assert "22-gate" in live.lower()
-    assert "expiresAtMs" in live
-
-    lowered = live.lower()
-    for forbidden in (
-        "deposit paper capital",
-        "reset to zero",
-        "shadow-burst",
-        "shadow fills burst",
-        "autopilot play",
-        "pause autopilot",
-    ):
+def test_v1_6_document_has_no_style_framework() -> None:
+    text = (DIST_ROOT / "index.html").read_text(encoding="utf-8")
+    lowered = text.lower()
+    for forbidden in ("tailwind", "react", "vite", "styled-components", "emotion"):
         assert forbidden not in lowered, forbidden
+    assert "<script" not in lowered
+    assert "backdrop-filter" not in lowered
 
 
-def test_v1_5_portals_guard_the_three_factor_door() -> None:
-    live_login = (SRC_ROOT / "portals" / "LiveLoginPortal.tsx").read_text(encoding="utf-8")
-    assert "live_pin" in live_login
-    assert "loginLive" in live_login
-    assert "acknowledged" in live_login
-    assert "REAL CAPITAL" in live_login.upper()
-    assert "22" in live_login
-    assert "password" in live_login.lower()
-
-    paper_login = (SRC_ROOT / "portals" / "PaperLoginPortal.tsx").read_text(encoding="utf-8")
-    assert "loginPaper" in paper_login
-    assert "live_pin" not in paper_login
-    assert "/paper/dashboard" in paper_login
-
-    setup = (SRC_ROOT / "portals" / "SetupPortal.tsx").read_text(encoding="utf-8")
-    assert "live_pin" in setup
-    assert "CLEAN_SLATE" in setup
-    assert "All Vaults = 0" in setup
-
-    gateway = (SRC_ROOT / "portals" / "GatewayPortal.tsx").read_text(encoding="utf-8")
-    assert "PAPER SANDBOX" in gateway
-    assert "LIVE SOVEREIGN VAULT" in gateway
+# ---------------------------------------------------------------------------
+# Gate 2 - integer money and exact statutory floors
+# ---------------------------------------------------------------------------
 
 
-def test_v1_5_pages_are_bespoke_workstations() -> None:
-    for key in PAGE_KEYS:
-        source = (SRC_ROOT / "pages" / f"{PAGE_COMPONENTS[key]}.tsx").read_text(encoding="utf-8")
-        assert "SectionHeader" in source, key
-        assert "PageShell" not in source, key
-        panels = sum(
-            marker in source
-            for marker in ("TerminalPanel", "MetricTile", "StatusBadge", "DeltaBadge")
-        )
-        assert panels >= 2, key
-        assert "export function" in source, key
+def test_v1_6_statutory_floors_are_exact(client) -> None:
+    ledger = client.get("/api/v2/cockpit/ledger").json()
+    costs = ledger["statutory_costs"]
+    assert set(costs) == set(STATUTORY_FLOORS)
+    for silo, expected in STATUTORY_FLOORS.items():
+        row = costs[silo]
+        assert row["cost_floor_bps"] == expected, silo
+        breakdown = row["breakdown"]
+        assert breakdown["total_bps"] == expected, silo
+        assert breakdown["reconciles"] is True, silo
+        assert sum(breakdown["component_micros"].values()) == breakdown["total_micros"]
+        assert all(isinstance(v, int) for v in breakdown["component_micros"].values())
+
+    india = costs["INDIA_ZERODHA_DHAN"]["breakdown"]["component_bps"]
+    assert set(india) == {
+        "stt_bps",
+        "exchange_txn_bps",
+        "sebi_turnover_bps",
+        "stamp_duty_bps",
+        "gst_18pct_bps",
+        "brokerage_bps",
+        "modeled_slippage_bps",
+    }
+    crypto = costs["CRYPTO_BINANCE"]["breakdown"]["component_bps"]
+    assert set(crypto) == {
+        "maker_taker_fee_bps",
+        "funding_rate_8h_bps",
+        "liquidation_insurance_bps",
+        "modeled_slippage_bps",
+    }
+    us = costs["US_IBKR"]["breakdown"]["component_bps"]
+    assert set(us) == {
+        "sec_section31_bps",
+        "finra_taf_bps",
+        "occ_clearing_bps",
+        "commission_bps",
+        "modeled_slippage_bps",
+    }
+    fx = costs["FX_MT5"]["breakdown"]["component_bps"]
+    assert set(fx) == {
+        "raw_spread_bps",
+        "ecn_commission_bps",
+        "tom_next_swap_bps",
+        "modeled_slippage_bps",
+    }
 
 
-def test_v1_5_router_catalog_and_palette_cover_every_route() -> None:
-    registry = (SRC_ROOT / "pages" / "registry.ts").read_text(encoding="utf-8")
-    for key in PAGE_KEYS:
-        assert f'key: "{key}"' in registry, key
-    for label in (
-        "Core Execution",
-        "Quant & Research",
-        "Bicameral Brain",
-        "Ledger & Audit",
-        "Sovereign Control",
-    ):
-        assert label in registry, label
+def test_v1_6_risk_telemetry_is_integer_micros(client) -> None:
+    body = client.get("/api/v2/cockpit/orders").json()
+    for silo, row in body["risk"].items():
+        for field in (
+            "nav_micros",
+            "gross_exposure_micros",
+            "net_exposure_micros",
+            "margin_used_micros",
+            "free_margin_micros",
+            "realized_pnl_micros",
+            "unrealized_pnl_micros",
+            "total_tax_paid_micros",
+        ):
+            assert isinstance(row[field], int), (silo, field)
+        assert row["free_margin_micros"] >= 0
+        assert row["cvar_99_bps"] >= row["var_99_bps"]
 
-    router = (SRC_ROOT / "lib" / "router.ts").read_text(encoding="utf-8")
-    for route in PORTAL_ROUTES:
-        assert route in router, route
-    assert "popstate" in router
-    assert "pagePath" in router
 
-    sidebar = (SRC_ROOT / "shells" / "Sidebar.tsx").read_text(encoding="utf-8")
-    assert "NAV_GROUPS" in sidebar
-    assert "aria-current" in sidebar
-    assert "aria-expanded" in sidebar
+# ---------------------------------------------------------------------------
+# Gate 3 - page catalogue and dual workspace tree
+# ---------------------------------------------------------------------------
 
-    primitives = (SRC_ROOT / "design-system" / "primitives.tsx").read_text(encoding="utf-8")
-    assert "CommandPalette" in primitives
-    assert "metaKey" in primitives and "ctrlKey" in primitives
-    assert "15 production pages" in primitives
-    assert "TerminalPanel" in primitives
-    assert "ConfirmModal" in primitives
 
-    app = (SRC_ROOT / "App.tsx").read_text(encoding="utf-8")
-    for component in PAGE_COMPONENTS.values():
-        assert component in app, component
-    assert "PaperShell" in app and "LiveShell" in app
+def test_v1_6_fifteen_page_catalogue(client) -> None:
+    body = client.get("/api/v2/cockpit/pages").json()
+    assert body["page_count"] == 15
+    assert {page["key"] for page in body["pages"]} == set(PAGE_KEYS)
+    assert body["counts"]["silos"] >= 4
+
+
+def test_v1_6_dual_workspace_boundary(client, operator) -> None:
+    headers = _headers(client)
+    paper = client.get("/api/v2/workspace/paper/state", headers=headers)
+    assert paper.status_code == 200
+    assert paper.json()["workspace_mode"] == "PAPER"
+
+    assert client.get("/api/v2/workspace/live/state").status_code in (401, 403)
+    client.cookies.clear()
+    assert client.get("/api/v2/workspace/live/state").status_code == 401
+    assert (
+        client.get("/api/v2/workspace/live/state", headers=headers).status_code
+        == 403
+    )
+
+    live = client.post(
+        "/api/v2/auth/login/live",
+        json={"username": USERNAME, "password": PASSWORD, "live_pin": LIVE_PIN},
+    )
+    assert live.status_code == 200, live.text
+    live_headers = {"X-NIOS-Session": live.json()["token"]}
+    live_state = client.get("/api/v2/workspace/live/state", headers=live_headers)
+    assert live_state.status_code == 200
+    assert live_state.json()["workspace_mode"] == "LIVE"
+
+
+# ---------------------------------------------------------------------------
+# Gate 4 - the digest is deterministic
+# ---------------------------------------------------------------------------
+
+
+def test_v1_6_payload_digest_is_reproducible() -> None:
+    from ring3_cockpit.gateway.payload_envelope import enclose
+
+    payload = {"page": "quant", "factors": 490, "nested": {"a": 1}}
+    first = enclose(payload, workspace_mode="PAPER", generated_at_ns=1)
+    second = enclose(payload, workspace_mode="PAPER", generated_at_ns=1)
+    assert first["payload_sha256"] == second["payload_sha256"]
+    body = {k: v for k, v in first.items() if k != "payload_sha256"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    assert first["payload_sha256"] == hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()

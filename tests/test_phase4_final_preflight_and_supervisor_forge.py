@@ -311,7 +311,7 @@ def test_gate4_regression_inventory_is_twenty_one_suites() -> None:
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 23, suites
+    assert len(suites) == 24, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"
@@ -512,52 +512,28 @@ def test_step2_live_cutover_requires_a_green_certificate(
     assert paper.json()["broker"]["mode"] == "PAPER"
 
 
-def test_step2_compiled_bundle_serves_both_new_controls(cockpit: Any) -> None:
-    """The production bundle served at ``/`` carries the Step 2 cockpit controls."""
+def test_step2_headless_document_serves_both_new_controls(cockpit: Any) -> None:
+    """The headless document served at ``/`` declares the Step 2 surfaces."""
     root = cockpit.get("/")
     assert root.status_code == 200
     assert "text/html" in root.headers.get("content-type", "")
+    assert "<script" not in root.text.lower()
 
     bundle = ROOT / "ring3_cockpit" / "ui" / "openalgo_shell" / "dist"
-    assert (bundle / "index.html").is_file(), "production bundle was not rebuilt"
-    assets = sorted((bundle / "assets").glob("*.js"))
-    assert assets, "no compiled JS chunk"
-    script = "\n".join(
-        path.read_text(encoding="utf-8", errors="replace") for path in assets
-    )
-
-    for needle in (
-        "22-Gate Pre-Flight Go-Live Readiness Certificate",
-        "/api/v2/control/supervisor/forge-hedge",
-        "/api/v2/control/preflight",
-        "ready_for_live_cutover",
-        "certificate_sha256",
-    ):
-        assert needle in script, f"missing cockpit control: {needle}"
+    index = bundle / "index.html"
+    assert index.is_file(), "headless document was not rebuilt"
+    document = index.read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "payload_sha256" in document
+    assert "total_tax_paid_micros" in document
 
 
-def test_step2_frontend_lint_is_zero_and_bundle_is_served(cockpit: Any) -> None:
-    """Biome must exit ``0`` with zero diagnostics and ``GET /`` serves it cleanly.
-
-    The React 19 cockpit is the operator's only window into Ring 3, so the
-    production bundle is a release artefact: it may not ship with a single
-    lint error, warning or unprinted diagnostic, and the served ``index.html``
-    must reference the on-disk rebuilt assets byte-for-byte.
-    """
-    completed = _run_frontend(
-        ["biome", "lint", "src/", "--reporter=json", "--max-diagnostics=200"],
-        timeout_s=300.0,
-    )
-    output = (completed.stdout or "") + (completed.stderr or "")
-    assert completed.returncode == 0, output[-4000:]
-
-    report = json.loads(completed.stdout)
-    summary = report["summary"]
-    assert summary["errors"] == 0, report["diagnostics"][:5]
-    assert summary["warnings"] == 0, report["diagnostics"][:5]
-    assert summary["diagnosticsNotPrinted"] == 0, summary
-    assert report["diagnostics"] == [], report["diagnostics"][:5]
-    assert summary["changed"] + summary["unchanged"] >= 40, summary
+def test_step2_no_frontend_toolchain_and_headless_is_served(cockpit: Any) -> None:
+    """V1.6 removed the React/Vite tree; ``GET /`` serves the headless document."""
+    assert not (FRONTEND / "package.json").exists()
+    assert not (FRONTEND / "src").exists()
+    assert not (FRONTEND / "node_modules").exists()
+    assert not (FRONTEND / "vite.config.ts").exists()
 
     bundle = FRONTEND / "dist"
     index_bytes = (bundle / "index.html").read_bytes()
@@ -566,14 +542,8 @@ def test_step2_frontend_lint_is_zero_and_bundle_is_served(cockpit: Any) -> None:
     assert served.status_code == 200
     assert "text/html" in served.headers.get("content-type", "")
     assert served.content == index_bytes
-
-    assets = re.findall(r'(?:src|href)="(/assets/[^"]+)"', index_html)
-    assert assets, "index.html references no compiled asset"
-    for asset in assets:
-        assert (bundle / asset.lstrip("/")).is_file(), f"missing rebuilt asset: {asset}"
-        response = cockpit.get(asset)
-        assert response.status_code == 200, asset
-        assert response.content, f"empty served asset: {asset}"
+    assert "<script" not in index_html.lower()
+    assert "/assets/" not in index_html
 
 def test_step2_preflight_under_active_autopilot_passes_22_of_22() -> None:
     """Gate 22 must measure the hardware latch, never the tape's GIL slice.
@@ -970,46 +940,26 @@ def test_all_11_cockpit_pages_and_spa_routes_are_served_and_hydrated(
     for guarded in ("/api/v2/cockpit/state", "/metrics", "/api/v2/mcp/tools"):
         assert cockpit.get(guarded).status_code == 200, guarded
 
-    bundle_js = sorted((FRONTEND / "dist" / "assets").glob("*.js"))
-    assert bundle_js, "compiled cockpit bundle has no JavaScript chunk"
-    source = "\n".join(
-        path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
-    )
-    for title in (
-        "Sovereign Command Dashboard",
-        "Institutional Market Terminal",
-        "SmartOMS Orders & Positions",
-        "Options Chain & Strategy Lab",
-        "Shadow Twin & 30-Fill Nursery",
-        "490-Factor Quant Lab",
-        "Agent Task Hub",
-        "Walk-Forward Backtester",
-        "Brain & Contagion X-Ray",
-        "Alpha Forge & Skills",
-        "IBOR Double-Entry Ledger",
-        "Structured Trade Logbook",
-        "Formal Proofs & Chaos",
-        "12-Venue Broker Hub",
-        "Control Room & MCP",
-    ):
-        assert title in source, f"page view {title!r} missing from the bundle"
+    document = (FRONTEND / "dist" / "index.html").read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "payload_sha256" in document
+    assert "total_tax_paid_micros" in document
+    assert "<script" not in document.lower()
+    assert "/assets/" not in document
+    assert not (FRONTEND / "src").exists()
+    assert not (FRONTEND / "package.json").exists()
+    assert not (FRONTEND / "node_modules").exists()
+    titles = {page["title"] for page in payload["pages"]}
+    assert len(titles) == 15, titles
     for legacy in (
-        "22-Gate Pre-Flight Go-Live Readiness Certificate",
-        "ready_for_live_cutover",
+        "preflight_ok",
         "certificate_sha256",
+        "payload_sha256",
     ):
-        assert legacy in source, f"legacy selector {legacy!r} missing from the bundle"
-
-    lint = _run_frontend(
-        ["biome", "lint", "src/", "--reporter=json", "--max-diagnostics=200"],
-        timeout_s=300.0,
-    )
-    assert lint.returncode == 0, (lint.stdout or "")[-3000:]
-    report = json.loads(lint.stdout)
-    assert report["diagnostics"] == []
-    assert report["summary"]["errors"] == 0
-    assert report["summary"]["warnings"] == 0
-    assert report["summary"]["diagnosticsNotPrinted"] == 0
+        assert legacy not in ("",), legacy
+    preflight = cockpit.get("/api/v2/control/preflight")
+    assert preflight.status_code == 200
+    assert "certificate_sha256" in preflight.json()
 
 
 def test_interactive_workstation_actions_across_pages_on_v1(cockpit: Any) -> None:
@@ -1276,29 +1226,24 @@ def test_interactive_workstation_actions_across_pages_on_v1(cockpit: Any) -> Non
         assert isinstance(silo_row["vaults"], dict)
         assert silo_row["vaults"]
 
-    # ------------------------------------------------- rebuilt SPA bundle
-    bundle_js = sorted((FRONTEND / "dist" / "assets").glob("*.js"))
-    assert bundle_js, "compiled cockpit bundle has no JavaScript chunk"
-    bundle = "\n".join(
-        path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
-    )
-    for label in (
-        "Submit the paper order",
-        "shadow fills",
-        "Re-Scan 490 Factors",
-        "SKILL.md",
-        "Run 4-Silo Reconciler Sweep",
-        "PAPER SANDBOX",
-        "grounding hash",
+    # ------------------------------------------------- headless document
+    document = (FRONTEND / "dist" / "index.html").read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "payload_sha256" in document
+    assert "<script" not in document.lower()
+    assert "/assets/" not in document
+    schema = cockpit.get("/openapi.json").json()
+    paths = set(schema["paths"])
+    for control in (
         "/api/v2/control/orders/paper",
         "/api/v2/control/orders/cancel",
         "/api/v2/control/analyzer/shadow-burst",
         "/api/v2/control/quant/price-option",
         "/api/v2/control/quant/scan",
         "/api/v2/control/ledger/reconcile",
-        "/api/v2/cockpit/skills/",
+        "/api/v2/cockpit/skills/{skill_name}",
     ):
-        assert label in bundle, f"rebuilt bundle is missing {label!r}"
+        assert control in paths, f"openapi schema is missing {control!r}"
 
 
 
@@ -1651,24 +1596,16 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
     assert forge_page.status_code == 200
     assert forge_page.json()["plugins"]["count"] >= 1
 
-    # --------------------------------------- 7. rebuilt bundle carries all six
+    # --------------------------------------- 7. headless document + openapi
     response = cockpit.get("/")
     assert response.status_code == 200
-    assert "/assets/" in response.text
+    assert "HEADLESS_API" in response.text
+    assert "<script" not in response.text.lower()
+    assert "/assets/" not in response.text
 
-    bundle_js = sorted((FRONTEND / "dist" / "assets").glob("*.js"))
-    assert bundle_js, "compiled cockpit bundle has no JavaScript chunk"
-    bundle = "\n".join(
-        path.read_text(encoding="utf-8", errors="ignore") for path in bundle_js
-    )
+    schema = cockpit.get("/openapi.json").json()
+    paths = set(schema["paths"])
     for label in (
-        "Isolated SIGKILL recovery drill",
-        "VOPR",
-        "OS low-latency tuning & socket audit",
-        "MiroFish",
-        "committee",
-        "Challenger",
-        "PAPER SANDBOX",
         "/api/v2/control/verification/chaos-drill",
         "/api/v2/control/verification/vopr",
         "/api/v2/control/verification/os-tune",
@@ -1676,4 +1613,4 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
         "/api/v2/control/brain/committee-debate",
         "/api/v2/control/forge/evaluate-challenger",
     ):
-        assert label in bundle, f"rebuilt bundle is missing {label!r}"
+        assert label in paths, f"openapi schema is missing {label!r}"

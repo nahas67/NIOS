@@ -861,31 +861,18 @@ def test_gate4_spa_routes_serve_the_cockpit_bundle(
     assert "text/html" in response.headers.get("content-type", "")
 
 
-def test_gate4_spa_route_aliases_are_declared() -> None:
-    router_source = (SRC_ROOT / "lib" / "router.ts").read_text(encoding="utf-8")
-    assert "pagePath" in router_source
-    assert "portalPath" in router_source
-    assert "popstate" in router_source
-
-    registry_source = (SRC_ROOT / "pages" / "registry.ts").read_text(encoding="utf-8")
-    assert '"agents"' in registry_source
-    assert '"backtest"' in registry_source
-    assert '"/agents"' in registry_source
-    assert '"/backtest"' in registry_source
-
-    sidebar_source = (SRC_ROOT / "shells" / "Sidebar.tsx").read_text(encoding="utf-8")
-    assert "NAV_GROUPS" in sidebar_source
-    assert "agents" in sidebar_source
-    assert "backtest" in sidebar_source
-
-    app_source = (SRC_ROOT / "App.tsx").read_text(encoding="utf-8")
-    assert "AgentsPage" in app_source
-    assert "BacktestPage" in app_source
-    assert "PaperShell" in app_source
-    assert "LiveShell" in app_source
-
-    palette_source = (SRC_ROOT / "design-system" / "primitives.tsx").read_text(encoding="utf-8")
-    assert "15 production pages" in palette_source
+def test_gate4_page_aliases_are_declared_in_the_backend() -> None:
+    """V1.6: the alias map lives in the Ring 3 page catalogue, not a router."""
+    source = (
+        ROOT / "ring3_cockpit" / "gateway" / "control_plane.py"
+    ).read_text(encoding="utf-8")
+    for key in ('"agents"', '"backtest"', '"/agents"', '"/backtest"'):
+        assert key in source, key
+    assert '"aliases"' in source
+    assert '"group"' in source
+    document = (UI_ROOT / "dist" / "index.html").read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "<script" not in document.lower()
 
 
 def test_gate4_biome_lint_is_clean() -> None:
@@ -904,13 +891,16 @@ def test_gate4_biome_lint_is_clean() -> None:
     assert completed.returncode == 0, (completed.stdout + completed.stderr)[-4000:]
 
 
-def test_gate4_cockpit_bundle_is_built() -> None:
+def test_gate4_headless_document_is_built() -> None:
     index_html = UI_ROOT / "dist" / "index.html"
-    assert index_html.exists(), "run `npm run build` in ring3_cockpit/ui/openalgo_shell"
+    assert index_html.exists(), "the headless status document is missing"
     text = index_html.read_text(encoding="utf-8")
-    assert "assets/" in text
-    assets = list((UI_ROOT / "dist" / "assets").glob("*.js"))
-    assert assets, "dist/assets has no JavaScript bundle"
+    assert "headless-backend" in text
+    assert "HEADLESS_API" in text
+    assert "<script" not in text.lower()
+    assert "/assets/" not in text
+    assert not (UI_ROOT / "src").exists()
+    assert not (UI_ROOT / "package.json").exists()
 
 def test_gate5_watchlist_batch_qa_followup_and_8_strategy_comparison(
     client,

@@ -394,12 +394,13 @@ def run_smoke(
             assert index.exists(), f"missing {index}"
             response = client.get("/")
             assert response.status_code == 200, response.text
-            assert "root" in response.text.lower(), "React root div missing"
+            assert "<script" not in response.text.lower(), "a script tag leaked into the headless document"
+            assert "HEADLESS_API" in response.text, "headless manifest marker missing"
             assets = list((SMOKE_UI_ROOT / "assets").glob("*"))
-            assert assets, "compiled asset bundle missing"
-            return f"index.html + {len(assets)} assets served at /"
+            assert not assets, "a compiled frontend bundle is still present"
+            return "headless status document served at / (0 JavaScript assets)"
 
-        table.check("Unified server static React UI", ring3_static)
+        table.check("Unified server headless status document", ring3_static)
 
         def ring3_mcp_jsonrpc() -> str:
             response = client.post(

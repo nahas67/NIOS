@@ -43,11 +43,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import gc
 import hashlib
 import json
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -56,12 +58,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal, Mapping
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+from core.instrument_registry import (
+    registry as instrument_registry,
+)
 from core.nats_bus import STREAM_RING3_COCKPIT, LocalJetStreamBus
 from core.schemas import (
     LEASE_TTL_NS,
@@ -80,6 +85,10 @@ from ring0_vault.ibor.ledger_outbox import (
     IBORLedger,
     SiloGuard,
 )
+from ring0_vault.ibor.tax_and_cost_engine import (
+    COST_FLOOR_BPS as STATUTORY_COST_FLOOR_BPS,
+    cost_engine as statutory_cost_engine,
+)
 from ring0_vault.silos.key_vault.llm_credentials import LLMKeyVault
 from ring0_vault.silos.key_vault.key_rotation import (
     rotate_ring0_vault_keys,
@@ -93,6 +102,14 @@ from ring0_vault.silos.silo_registry import (
     store_and_verify_broker_credentials,
 )
 from ring1_spinal.silo_worker import SiloCostFloor
+from ring2_brain.quant.catalog import FACTOR_TAXONOMIES
+from ring3_cockpit.gateway.payload_envelope import (
+    enclose,
+    payload_digest,
+    risk_telemetry,
+    silo_risk_telemetry,
+    workspace_mode_of,
+)
 
 __all__ = [
     "ARCHETYPE_GROUPS",
@@ -332,6 +349,22 @@ def _round_strike(value: float, step: float, precision: int) -> float:
     return round(snapped, int(precision))
 
 
+def _serialised_control(method: Any) -> Any:
+    """Run one mutating control-plane method under the instance RLock.
+
+    V1.6: a paper order's reserve -> submit -> fill sequence must be atomic with
+    respect to ``orders/cancel`` and ``ledger/fund-paper``; otherwise a
+    concurrent cancel could void a reservation between reserve and commit.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Phase 4 Step 2 -- pre-flight cache and closed-loop forge drill defaults
@@ -350,7 +383,85 @@ FORGE_HEDGE_DRILL_FILLS_BPS: tuple[float, ...] = (-1.4, -1.1, -1.9, -0.8, -1.2, 
 # ---------------------------------------------------------------------------
 
 
-class BrokerControlRequest(BaseModel):
+class StrictRequest(BaseModel):
+    """Base class for every Ring 3 request model (V1.6 hardening).
+
+    * ``allow_inf_nan=False`` rejects ``NaN`` / ``+Inf`` / ``-Inf`` at the
+      schema boundary, so a non-finite number can never reach an engine, the
+      ledger or the JSON encoder.
+    * a catch-all validator rejects absurd magnitudes (``|x| > 1e18``) before a
+      field-specific bound is even considered.
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _finite_and_bounded(cls, value: Any, info: Any) -> Any:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError(f"{info.field_name} must be finite")
+            if abs(value) > 1e18:
+                raise ValueError(f"{info.field_name} is out of bounds")
+        elif isinstance(value, int) and abs(value) > 10**18:
+            raise ValueError(f"{info.field_name} is out of bounds")
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, float) and not math.isfinite(item):
+                    raise ValueError(f"{info.field_name} must be finite")
+        return value
+
+    @field_validator(
+        "symbol",
+        "silo",
+        "strategy_id",
+        "order_id",
+        "task_id",
+        "backtest_id",
+        "venue",
+        "plugin_name",
+        "skill_name",
+        "setup_strategy",
+        "symbols",
+        mode="before",
+        check_fields=False,
+    )
+    @classmethod
+    def _identifier_safe(cls, value: Any, info: Any) -> Any:
+        """Reject path traversal, null bytes and separators (V1.6 hardening)."""
+
+        def _check(token: Any) -> Any:
+            if not isinstance(token, str):
+                return token
+            if "\x00" in token or "/" in token or "\\" in token or ".." in token:
+                raise ValueError(f"{info.field_name} contains an unsafe character")
+            return token
+
+        if isinstance(value, (list, tuple)):
+            return [_check(item) for item in value]
+        return _check(value)
+
+
+#: Identifier grammar: letters, digits, dot, dash, underscore, colon.  A path
+#: separator, a null byte or a traversal token can never match.
+IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,127}$"
+
+
+def _identifier(value: str, *, field_name: str = "identifier") -> str:
+    """Harden one path/query identifier against traversal and injection."""
+    token = str(value or "").strip()
+    if not token:
+        raise HTTPException(status_code=404, detail=f"UNKNOWN_{field_name.upper()}")
+    if "\x00" in token or "/" in token or "\\" in token or token in (".", ".."):
+        raise HTTPException(status_code=404, detail=f"UNKNOWN_{field_name.upper()}")
+    if not re.match(IDENTIFIER_PATTERN, token):
+        raise HTTPException(status_code=404, detail=f"UNKNOWN_{field_name.upper()}")
+    return token
+
+
+class BrokerControlRequest(StrictRequest):
     """``POST /api/v2/control/brokers`` payload (``sec_016``)."""
 
     silo: str = Field(..., min_length=1)
@@ -394,7 +505,7 @@ class BrokerControlRequest(BaseModel):
         return clean
 
 
-class LLMControlRequest(BaseModel):
+class LLMControlRequest(StrictRequest):
     """``POST /api/v2/control/llms`` payload (``sec_016``).
 
     ``api_key`` is a :class:`SecretStr`: Pydantic never renders it in ``repr``,
@@ -419,7 +530,7 @@ class LLMControlRequest(BaseModel):
         return int(token)
 
 
-class KillSwitchRequest(BaseModel):
+class KillSwitchRequest(StrictRequest):
     """``POST /api/v2/control/killswitch`` payload."""
 
     reason: str = "manual operator kill switch"
@@ -427,14 +538,14 @@ class KillSwitchRequest(BaseModel):
     confirm: bool = True
 
 
-class RearmRequest(BaseModel):
+class RearmRequest(StrictRequest):
     """``POST /api/v2/control/rearm`` payload (explicit human reset)."""
 
     reason: str = "operator re-arm"
     operator: str = "ring3.operator"
 
 
-class VaultRotationRequest(BaseModel):
+class VaultRotationRequest(StrictRequest):
     """``POST /api/v2/control/vault/rotate-keys`` payload (Phase 3 Step 5).
 
     Rotation is non-destructive and zero-downtime, so it needs no ``confirm``
@@ -445,7 +556,7 @@ class VaultRotationRequest(BaseModel):
     reason: str = "scheduled zero-downtime rotation"
 
 
-class ExtensionsControlRequest(BaseModel):
+class ExtensionsControlRequest(StrictRequest):
     """``POST /api/v2/control/extensions`` payload (Step 8).
 
     ``target`` selects the surface; ``forge`` triggers a manual nocturnal audit,
@@ -469,7 +580,7 @@ class ExtensionsControlRequest(BaseModel):
         return token
 
 
-class FeedControlRequest(BaseModel):
+class FeedControlRequest(StrictRequest):
     """``POST /api/v2/control/feeds`` payload (Phase 3 Step 2).
 
     Hot-swaps the market-data path between the deterministic paper autopilot and
@@ -497,7 +608,7 @@ class FeedControlRequest(BaseModel):
         return aliases[token]
 
 
-class BrokerCredentialRequest(BaseModel):
+class BrokerCredentialRequest(StrictRequest):
     """``POST /api/v2/control/brokers/credentials`` payload (``sec_011``).
 
     ``api_key`` and ``api_secret`` are :class:`SecretStr`, so Pydantic never
@@ -521,7 +632,7 @@ class BrokerCredentialRequest(BaseModel):
         return token
 
 
-class LLMProbeRequest(BaseModel):
+class LLMProbeRequest(StrictRequest):
     """``POST /api/v2/control/llms/probe`` payload (``sec_016``).
 
     The probe is read-only: it measures reachability and latency under the
@@ -532,7 +643,7 @@ class LLMProbeRequest(BaseModel):
     operator: str = "ring3.operator"
 
 
-class SupervisorControlRequest(BaseModel):
+class SupervisorControlRequest(StrictRequest):
     """``POST /api/v2/control/supervisor`` payload (``sec_004``).
 
     ``action`` is one of ``start`` / ``stop`` / ``restart_ring`` / ``status``.
@@ -594,7 +705,7 @@ class SupervisorControlRequest(BaseModel):
         return aliases[token]
 
 
-class PreflightRequest(BaseModel):
+class PreflightRequest(StrictRequest):
     """``POST /api/v2/control/preflight`` payload (Phase 4 Step 2).
 
     ``full_smoke=False`` is the interactive fast path: gate 5 replays the
@@ -614,7 +725,7 @@ class PreflightRequest(BaseModel):
         return token or "ALL"
 
 
-class ForgeHedgeRequest(BaseModel):
+class ForgeHedgeRequest(StrictRequest):
     """``POST /api/v2/control/supervisor/forge-hedge`` payload (Step 2).
 
     The endpoint runs one *closed-loop* cycle: Ring 2 audits/demotes the
@@ -635,7 +746,7 @@ class ForgeHedgeRequest(BaseModel):
     operator: str = "ring3.operator"
 
 
-class TestnetOrderRequest(BaseModel):
+class TestnetOrderRequest(StrictRequest):
     """``POST /api/v2/control/brokers/testnet-order`` payload (``sec_011``).
 
     Sandbox-only by construction: ``sandbox`` must be ``True`` and
@@ -684,7 +795,7 @@ class TestnetOrderRequest(BaseModel):
         return True
 
 
-class PaperOrderRequest(BaseModel):
+class PaperOrderRequest(StrictRequest):
     """``POST /api/v2/control/orders/paper`` payload (Step 5, ``sec_018`` Law 4).
 
     Paper-only by construction: there is no venue field and no credential is
@@ -704,6 +815,7 @@ class PaperOrderRequest(BaseModel):
     top_of_book_qty: float = Field(default=1_000.0, gt=0.0)
     fill_immediately: bool = True
     strategy_id: str | None = None
+    idempotency_key: str | None = Field(default=None, max_length=128)
     operator: str = "ring3.operator"
 
     @field_validator("silo")
@@ -739,7 +851,7 @@ class PaperOrderRequest(BaseModel):
         return aliases[token]
 
 
-class CancelOrdersRequest(BaseModel):
+class CancelOrdersRequest(StrictRequest):
     """``POST /api/v2/control/orders/cancel`` payload (Step 5).
 
     ``order_id`` may be one ``SmartOMS`` order id or the literal ``ALL``.
@@ -759,7 +871,7 @@ class CancelOrdersRequest(BaseModel):
         return token or "ALL"
 
 
-class ShadowBurstRequest(BaseModel):
+class ShadowBurstRequest(StrictRequest):
     """``POST /api/v2/control/analyzer/shadow-burst`` payload (Step 5).
 
     Drives ``rounds`` paper autopilot ticks so the operator can graduate a
@@ -780,7 +892,7 @@ class ShadowBurstRequest(BaseModel):
         return token
 
 
-class OptionPriceRequest(BaseModel):
+class OptionPriceRequest(StrictRequest):
     """``POST /api/v2/control/quant/price-option`` payload (Step 5, ``sec_017``).
 
     Every input and every Greek is sealed into a SHA-256
@@ -788,8 +900,8 @@ class OptionPriceRequest(BaseModel):
     """
 
     symbol: str = Field(default="NIOS.OPT", min_length=1)
-    spot: float = Field(..., gt=0.0)
-    strike: float = Field(..., gt=0.0)
+    spot: float = Field(..., gt=0.0, le=100_000_000_000.0)
+    strike: float = Field(..., gt=0.0, le=100_000_000_000.0)
     volatility: float = Field(..., gt=0.0, le=20.0)
     days_to_expiry: float = Field(..., gt=0.0, le=36_500.0)
     risk_free_rate: float = Field(default=0.05, ge=-1.0, le=1.0)
@@ -805,14 +917,14 @@ class OptionPriceRequest(BaseModel):
         return token
 
 
-class QuantScanRequest(BaseModel):
+class QuantScanRequest(StrictRequest):
     """``POST /api/v2/control/quant/scan`` payload (Step 5)."""
 
     top_k: int = Field(default=15, ge=1, le=500)
     operator: str = "ring3.operator"
 
 
-class LedgerReconcileRequest(BaseModel):
+class LedgerReconcileRequest(StrictRequest):
     """``POST /api/v2/control/ledger/reconcile`` payload (Step 5, ``sec_009``).
 
     Runs ``LiveReconciler.reconcile_all`` across every silo (or the requested
@@ -823,7 +935,7 @@ class LedgerReconcileRequest(BaseModel):
     operator: str = "ring3.operator"
 
 
-class ChaosDrillRequest(BaseModel):
+class ChaosDrillRequest(StrictRequest):
     """``POST /api/v2/control/verification/chaos-drill`` payload (Step 6).
 
     Deterministic SIGKILL drill: a worker is killed mid-outbox, the ledger is
@@ -856,7 +968,7 @@ class ChaosDrillRequest(BaseModel):
         return token
 
 
-class VoprCampaignRequest(BaseModel):
+class VoprCampaignRequest(StrictRequest):
     """``POST /api/v2/control/verification/vopr`` payload (Step 6, ``sec_009``).
 
     Seeded deterministic fault campaign: the same seed and step count always
@@ -868,7 +980,7 @@ class VoprCampaignRequest(BaseModel):
     operator: str = "ring3.operator"
 
 
-class OsTuneRequest(BaseModel):
+class OsTuneRequest(StrictRequest):
     """``POST /api/v2/control/verification/os-tune`` payload (Step 6).
 
     ``apply=True`` applies everything the *serving process* is permitted to
@@ -889,13 +1001,13 @@ class OsTuneRequest(BaseModel):
         return token
 
 
-class MiroFishShockRequest(BaseModel):
+class MiroFishShockRequest(StrictRequest):
     """``POST /api/v2/control/brain/mirofish-shock`` payload (Step 6).
 
     One five-archetype, three-tick contagion cascade under a synthesised shock.
     The cascade is deterministic for a given shock vector, so the returned
     SHA-256 digest is a reproducible commitment to the simulation inputs and
-    outputs — never to wall-clock jitter.
+    outputs Ã¢â‚¬â€ never to wall-clock jitter.
     """
 
     symbol: str = Field(default="BTCUSDT", min_length=1, max_length=32)
@@ -924,7 +1036,7 @@ class MiroFishShockRequest(BaseModel):
         return token
 
 
-class CommitteeDebateRequest(BaseModel):
+class CommitteeDebateRequest(StrictRequest):
     """``POST /api/v2/control/brain/committee-debate`` payload (Step 6).
 
     ``symbol`` may be ``AUTO`` to debate whichever candidate the 490-factor
@@ -954,7 +1066,7 @@ class CommitteeDebateRequest(BaseModel):
         return token
 
 
-class ChallengerEvalRequest(BaseModel):
+class ChallengerEvalRequest(StrictRequest):
     """``POST /api/v2/control/forge/evaluate-challenger`` payload (Step 6).
 
     A candidate genome/plugin is admitted to the nursery only with
@@ -984,7 +1096,7 @@ class ChallengerEvalRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AuthSetupRequest(BaseModel):
+class AuthSetupRequest(StrictRequest):
     """``POST /api/v2/auth/setup`` -- first-run sovereign operator."""
 
     username: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
@@ -993,20 +1105,20 @@ class AuthSetupRequest(BaseModel):
     start_clean_slate: bool = True
 
 
-class AuthLoginRequest(BaseModel):
+class AuthLoginRequest(StrictRequest):
     """``POST /api/v2/auth/login`` -- PAPER session."""
 
     username: str = Field(..., min_length=1, max_length=64)
     password: str = Field(..., min_length=1, max_length=256)
 
 
-class AuthElevateRequest(BaseModel):
+class AuthElevateRequest(StrictRequest):
     """``POST /api/v2/auth/elevate-live`` -- second factor for LIVE."""
 
     live_pin: str = Field(..., min_length=4, max_length=12, pattern=r"^[0-9]+$")
 
 
-class AuthResetRequest(BaseModel):
+class AuthResetRequest(StrictRequest):
     """``POST /api/v2/auth/reset`` -- credential-gated factory reset.
 
     Both factors default to empty so a *clean-slate* install (no operator on
@@ -1019,7 +1131,7 @@ class AuthResetRequest(BaseModel):
     live_pin: str = Field(default="", max_length=12)
 
 
-class PaperFundingRequest(BaseModel):
+class PaperFundingRequest(StrictRequest):
     """``POST /api/v2/control/ledger/fund-paper`` -- user-chosen capital."""
 
     silo: str = Field(..., min_length=1, max_length=32)
@@ -1027,13 +1139,13 @@ class PaperFundingRequest(BaseModel):
     vault: str | None = Field(default="ALL_CANONICAL", max_length=32)
 
 
-class AutopilotControlRequest(BaseModel):
+class AutopilotControlRequest(StrictRequest):
     """``POST /api/v2/control/workspace/autopilot`` -- PAPER tape play/pause."""
 
     enabled: bool = False
 
 
-class AgentAssignRequest(BaseModel):
+class AgentAssignRequest(StrictRequest):
     """``POST /api/v2/control/agents/assign`` -- dispatch a Ring 2 agent task."""
 
     agent_id: str
@@ -1044,13 +1156,13 @@ class AgentAssignRequest(BaseModel):
     priority: str = "NORMAL"
 
 
-class AgentCancelRequest(BaseModel):
+class AgentCancelRequest(StrictRequest):
     """``POST /api/v2/control/agents/cancel`` -- cancel one task or clear all."""
 
     task_id: str = "ALL"
 
 
-class AgentBatchWatchlistRequest(BaseModel):
+class AgentBatchWatchlistRequest(StrictRequest):
     """``POST /api/v2/control/agents/batch-watchlist`` -- ranked batch scan."""
 
     silo: str = "US_IBKR"
@@ -1059,14 +1171,14 @@ class AgentBatchWatchlistRequest(BaseModel):
     priority: str = "NORMAL"
 
 
-class AgentFollowupRequest(BaseModel):
+class AgentFollowupRequest(StrictRequest):
     """``POST /api/v2/control/agents/followup`` -- grounded strategy Q&A."""
 
     task_id: str = Field(..., min_length=1, max_length=64)
     question: str = Field(..., min_length=1, max_length=2000)
 
 
-class BacktestRunRequest(BaseModel):
+class BacktestRunRequest(StrictRequest):
     """``POST /api/v2/control/backtest/run`` -- tax-net walk-forward run."""
 
     silo: str = "US_IBKR"
@@ -1081,7 +1193,7 @@ class BacktestRunRequest(BaseModel):
     take_profit_bps: float | None = None
 
 
-class BacktestCompareRequest(BaseModel):
+class BacktestCompareRequest(StrictRequest):
     """``POST /api/v2/control/backtest/compare-strategies`` -- 8-way matrix."""
 
     silo: str = "US_IBKR"
@@ -1090,7 +1202,7 @@ class BacktestCompareRequest(BaseModel):
     bars: int = 252
 
 
-class NurseryPromoteRequest(BaseModel):
+class NurseryPromoteRequest(StrictRequest):
     """``POST /api/v2/control/backtest/promote-to-nursery`` -- DSR-gated."""
 
     backtest_id: str
@@ -1101,14 +1213,14 @@ class NurseryPromoteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AuthPaperLoginRequest(BaseModel):
+class AuthPaperLoginRequest(StrictRequest):
     """``POST /api/v2/auth/login/paper`` -- PAPER portal (username + password)."""
 
     username: str = Field(..., min_length=1, max_length=64)
     password: str = Field(..., min_length=1, max_length=256)
 
 
-class AuthLiveLoginRequest(BaseModel):
+class AuthLiveLoginRequest(StrictRequest):
     """``POST /api/v2/auth/login/live`` -- atomic three-factor LIVE portal.
 
     ``live_pin`` defaults to empty on purpose: a *missing* PIN must be a
@@ -1121,18 +1233,18 @@ class AuthLiveLoginRequest(BaseModel):
     live_pin: str = Field(default="", max_length=12)
 
 
-class OptionsChainRequest(BaseModel):
+class OptionsChainRequest(StrictRequest):
     """``POST /api/v2/control/options/chain`` -- one grounded option chain."""
 
     symbol: str = Field(default="NIFTY", min_length=1, max_length=32)
-    spot: float | None = Field(default=None, gt=0.0)
+    spot: float | None = Field(default=None, gt=0.0, le=100_000_000_000.0)
     volatility: float | None = Field(default=None, gt=0.0, le=5.0)
     days_to_expiry: int | None = Field(default=None, ge=1, le=730)
     strike_count: int = Field(default=11, ge=3, le=31)
     risk_free_rate: float | None = Field(default=None, ge=-0.05, le=0.5)
 
 
-class StrategyPayoffRequest(BaseModel):
+class StrategyPayoffRequest(StrictRequest):
     """``POST /api/v2/control/options/strategy-payoff`` -- multi-leg builder."""
 
     symbol: str = Field(default="NIFTY", min_length=1, max_length=32)
@@ -1144,14 +1256,14 @@ class StrategyPayoffRequest(BaseModel):
         "IRON_CONDOR",
         "PROTECTIVE_PUT",
     ] = "BULL_CALL_SPREAD"
-    spot: float | None = Field(default=None, gt=0.0)
+    spot: float | None = Field(default=None, gt=0.0, le=100_000_000_000.0)
     volatility: float | None = Field(default=None, gt=0.0, le=5.0)
     days_to_expiry: int | None = Field(default=None, ge=1, le=730)
     risk_free_rate: float | None = Field(default=None, ge=-0.05, le=0.5)
     width_steps: int = Field(default=1, ge=1, le=6)
 
 
-class TerminalQuoteRequest(BaseModel):
+class TerminalQuoteRequest(StrictRequest):
     """``POST /api/v2/control/terminal/quote`` -- one grounded terminal frame."""
 
     symbol: str = Field(default="BTCUSDT", min_length=1, max_length=32)
@@ -1160,23 +1272,23 @@ class TerminalQuoteRequest(BaseModel):
     depth: int = Field(default=10, ge=5, le=10)
 
 
-class LogbookEntryRequest(BaseModel):
+class LogbookEntryRequest(StrictRequest):
     """``POST /api/v2/control/logbook/entry`` -- one structured trade journal."""
 
     silo: str = Field(..., min_length=1, max_length=32)
     symbol: str = Field(..., min_length=1, max_length=32)
     side: Literal["LONG", "SHORT", "BUY", "SELL"] = "LONG"
     setup_strategy: str = Field(default="", max_length=64)
-    entry_price: float = Field(..., gt=0.0)
-    exit_price: float = Field(..., gt=0.0)
+    entry_price: float = Field(..., gt=0.0, le=100_000_000_000.0)
+    exit_price: float = Field(..., gt=0.0, le=100_000_000_000.0)
     quantity: float = Field(..., gt=0.0, le=1_000_000_000.0)
-    stop_loss: float = Field(default=0.0, ge=0.0)
+    stop_loss: float = Field(default=0.0, ge=0.0, le=100_000_000_000.0)
     thesis: str = Field(default="", max_length=4000)
     lessons_learned: str = Field(default="", max_length=4000)
     workspace: Literal["PAPER", "LIVE"] = "PAPER"
 
 
-class BrokerPingRequest(BaseModel):
+class BrokerPingRequest(StrictRequest):
     """``POST /api/v2/control/brokers/ping`` -- adapter signing probe."""
 
     venue: str = Field(..., min_length=1, max_length=48)
@@ -1369,6 +1481,14 @@ class ControlPlane:
         # V1.3 trade logbook and execution journal (clean-slate aware).
         self._logbook_entries: list[dict[str, Any]] = []
         self._logbook_sequence: int = 0
+        # V1.6 concurrency + idempotency hardening: one re-entrant lock guards
+        # every mutable control-plane structure, and a bounded receipt cache
+        # makes ``idempotency_key`` submissions replay the original receipt
+        # instead of double-debiting the vault.
+        self._state_lock = threading.RLock()
+        self._idempotent_receipts: dict[str, dict[str, Any]] = {}
+        self._idempotency_order: list[str] = []
+        self._max_idempotent_receipts = 4_096
         # Phase 3 Step 3: the Ring 0 sandbox execution bridge.  Injected so tests
         # can supply a mock httpx transport, or built lazily on first use.
         self.testnet_bridge = testnet_bridge
@@ -2582,6 +2702,7 @@ class ControlPlane:
     def _halted(self) -> bool:
         return bool(getattr(self.kill_latch, "is_halted", False))
 
+    @_serialised_control
     def submit_paper_order(self, request: PaperOrderRequest) -> dict[str, Any]:
         """Route one grounded **paper** order through outbox -> OMS -> IBOR.
 
@@ -2608,6 +2729,19 @@ class ControlPlane:
                 status_code=422,
                 detail=f"unknown silo {request.silo!r}; expected one of {known}",
             )
+        idem = str(request.idempotency_key or "").strip()
+        if idem:
+            if len(idem) > 128 or any(ch in idem for ch in "\x00/\\"):
+                raise HTTPException(status_code=422, detail="INVALID_IDEMPOTENCY_KEY")
+            with self._state_lock:
+                cached = self._idempotent_receipts.get(idem)
+                if cached is not None:
+                    return {
+                        **cached,
+                        "duplicate": True,
+                        "idempotent_replay": True,
+                        "generated_at_ns": time.time_ns(),
+                    }
         guard = self.guard
         if guard is not None and bool(guard.is_frozen(request.silo)):
             raise HTTPException(
@@ -2624,10 +2758,31 @@ class ControlPlane:
             if request.limit_price is not None
             else self._PAPER_REFERENCE_PRICES.get(request.silo, 100.0)
         )
+        symbol = str(request.symbol).strip().upper()
+        instrument_spec = None
+        instrument_check = None
+        try:
+            instrument_spec = instrument_registry.get(request.silo, symbol)
+        except KeyError:
+            instrument_spec = None
+        if instrument_spec is not None:
+            instrument_check = instrument_registry.validate_order(
+                request.silo, symbol, float(request.quantity), price
+            )
+            if not instrument_check.ok:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"INSTRUMENT_REJECTED: {instrument_check.reason}",
+                )
+            if instrument_check.price_changed:
+                price = float(instrument_check.adjusted_price)
         half_spread = max(price * 0.0001, price * (request.spread_bps / 10_000.0) / 2.0)
         book = (price - half_spread, price + half_spread)
-        proposal_id = f"paper-{request.silo.lower()}-{uuid.uuid4().hex[:12]}"
-        symbol = str(request.symbol).strip().upper()
+        proposal_id = (
+            f"paper-idem-{_sha256_hex(idem)[:24]}"
+            if idem
+            else f"paper-{request.silo.lower()}-{uuid.uuid4().hex[:12]}"
+        )
         proposal = UnsignedProposal(
             proposal_id=proposal_id,
             strategy_id=str(request.strategy_id or self.strategy_id),
@@ -2654,6 +2809,43 @@ class ControlPlane:
             reservation = self.outbox.reserve(
                 proposal, cost_floor=self.cost_floor(request.silo), now_ns=now
             )
+            if getattr(reservation, "duplicate", False):
+                duplicate_row = _jsonable(
+                    self.outbox.get(reservation.outbox_idempotency_key)
+                ) or {}
+                return {
+                    "status": "DUPLICATE",
+                    "mode": "PAPER",
+                    "page": "orders",
+                    "duplicate": True,
+                    "idempotent_replay": True,
+                    "silo": request.silo,
+                    "symbol": symbol,
+                    "side": proposal.side,
+                    "quantity": float(proposal.qty),
+                    "order_style": request.order_style,
+                    "order_id": str(
+                        duplicate_row.get("broker_order_id")
+                        or reservation.outbox_idempotency_key
+                    ),
+                    "filled": False,
+                    "fill_price": float(price),
+                    "notional_micros": int(reservation.notional_micros),
+                    "realized_net_micros": 0,
+                    "statutory_cost": statutory_cost_engine.breakdown(
+                        request.silo, int(reservation.notional_micros)
+                    ).to_dict(),
+                    "instrument": instrument_spec.to_dict() if instrument_spec else None,
+                    "instrument_check": (
+                        instrument_check.to_dict() if instrument_check else None
+                    ),
+                    "receipt": (
+                        duplicate_row
+                        if isinstance(duplicate_row, dict)
+                        else {"value": duplicate_row}
+                    ),
+                    "generated_at_ns": time.time_ns(),
+                }
             order_row: dict[str, Any]
             order_id: str
             filled = False
@@ -2729,7 +2921,10 @@ class ControlPlane:
         reservation_row = _jsonable(receipt) if receipt is not None else {}
         if not isinstance(reservation_row, dict):
             reservation_row = {"value": reservation_row}
-        return {
+        statutory = statutory_cost_engine.breakdown(
+            request.silo, notional_micros
+        ).to_dict()
+        response = {
             "status": "FILLED" if filled else "WORKING",
             "mode": "PAPER",
             "page": "orders",
@@ -2743,6 +2938,9 @@ class ControlPlane:
             "fill_price": float(price),
             "notional_micros": notional_micros,
             "realized_net_micros": realized_net_micros if filled else 0,
+            "statutory_cost": statutory,
+            "instrument": instrument_spec.to_dict() if instrument_spec else None,
+            "instrument_check": instrument_check.to_dict() if instrument_check else None,
             "ratchet": {
                 "applied": bool(filled and realized_net_micros > 0),
                 "long_term_pct": 35,
@@ -2768,11 +2966,22 @@ class ControlPlane:
             "law": "sec_018 Law 4 - paper only; no broker credential is read",
             "generated_at_ns": time.time_ns(),
         }
+        if idem:
+            with self._state_lock:
+                self._idempotent_receipts[idem] = response
+                self._idempotency_order.append(idem)
+                if len(self._idempotency_order) > self._max_idempotent_receipts:
+                    oldest = self._idempotency_order.pop(0)
+                    self._idempotent_receipts.pop(oldest, None)
+        return response
 
+    @_serialised_control
     def cancel_paper_orders(self, request: CancelOrdersRequest) -> dict[str, Any]:
         """Cancel working ``SmartOMS`` orders and void their outbox holds."""
 
         target = str(request.order_id or "ALL").strip()
+        if target.upper() != "ALL":
+            target = _identifier(target, field_name="order")
         known = self._known_silos()
         silo = str(request.silo).strip().upper() if request.silo else None
         if silo is not None and known and silo not in known:
@@ -2872,6 +3081,7 @@ class ControlPlane:
             "generated_at_ns": time.time_ns(),
         }
 
+    @_serialised_control
     def shadow_burst(self, request: ShadowBurstRequest) -> dict[str, Any]:
         """Drive ``rounds`` paper ticks through the 30-fill shadow nursery."""
 
@@ -3161,6 +3371,7 @@ class ControlPlane:
             or token in {".", ".."}
             or "/" in token
             or "\\" in token
+            or "\x00" in token
             or ".." in token
             or len(token) > 128
         ):
@@ -3221,6 +3432,7 @@ class ControlPlane:
             "generated_at_ns": time.time_ns(),
         }
 
+    @_serialised_control
     def reconcile_ledger(self, request: LedgerReconcileRequest) -> dict[str, Any]:
         """4-silo ``LiveReconciler`` sweep + double-entry conservation proof."""
 
@@ -4477,9 +4689,10 @@ class ControlPlane:
 
     def agent_task(self, task_id: str) -> dict[str, Any]:
         """``GET /api/v2/control/agents/tasks/{task_id}`` -- full report."""
-        task = self.task_dispatcher.task_dict(str(task_id))
+        token = _identifier(task_id, field_name="task")
+        task = self.task_dispatcher.task_dict(token)
         if task is None:
-            raise KeyError(f"UNKNOWN_TASK: {task_id}")
+            raise KeyError(f"UNKNOWN_TASK: {token}")
         return task
 
     def cancel_agent_tasks(self, request: AgentCancelRequest) -> dict[str, Any]:
@@ -4519,6 +4732,17 @@ class ControlPlane:
             take_profit_bps=request.take_profit_bps,
         )
         receipt["run_count"] = self.backtest_engine.run_count
+        receipt["statutory_cost"] = statutory_cost_engine.breakdown(
+            request.silo,
+            int(
+                round(
+                    float(request.initial_capital_units) * 1_000_000
+                )
+            ),
+        ).to_dict()
+        receipt["cost_floor_bps"] = float(
+            STATUTORY_COST_FLOOR_BPS.get(request.silo, 0.0)
+        )
         return receipt
 
     def compare_backtest_strategies(
@@ -4534,7 +4758,9 @@ class ControlPlane:
 
     def promote_backtest(self, request: NurseryPromoteRequest) -> dict[str, Any]:
         """``POST /api/v2/control/backtest/promote-to-nursery`` -- DSR gated."""
-        return self.backtest_engine.promote_to_nursery(str(request.backtest_id))
+        return self.backtest_engine.promote_to_nursery(
+            _identifier(request.backtest_id, field_name="backtest")
+        )
 
     # -- multi-page read-only telemetry (Step 4: full cockpit) ------------
     # ------------------------------------------------------------------
@@ -5404,7 +5630,11 @@ class ControlPlane:
         notional = abs(entry_price * quantity)
         gross_pnl = (exit_price - entry_price) * quantity * direction
         cost_bps = float(LOGBOOK_COST_BPS_BY_SILO.get(silo, 0.0))
-        cost_drag = notional * cost_bps / 10_000.0
+        notional_micros = int(round(notional * 1_000_000))
+        statutory = statutory_cost_engine.breakdown(
+            silo, notional_micros, side=("SELL" if direction > 0 else "BUY")
+        )
+        cost_drag = statutory.total_micros / 1_000_000.0
         net_pnl = gross_pnl - cost_drag
         if request.stop_loss > 0.0:
             risk_per_unit = abs(entry_price - float(request.stop_loss))
@@ -5412,10 +5642,12 @@ class ControlPlane:
             risk_per_unit = max(1e-9, abs(entry_price) * 0.01)
         r_multiple = ((exit_price - entry_price) * direction) / max(1e-9, risk_per_unit)
         outcome = "WIN" if net_pnl > 0.0 else ("LOSS" if net_pnl < 0.0 else "FLAT")
-        self._logbook_sequence += 1
+        with self._state_lock:
+            self._logbook_sequence += 1
+            sequence = self._logbook_sequence
         record = {
-            "entry_id": f"log_{self._logbook_sequence:04d}",
-            "sequence": self._logbook_sequence,
+            "entry_id": f"log_{sequence:04d}",
+            "sequence": sequence,
             "silo": silo,
             "symbol": symbol,
             "side": side,
@@ -5425,9 +5657,12 @@ class ControlPlane:
             "quantity": round(quantity, 6),
             "stop_loss": round(float(request.stop_loss), 6),
             "notional": round(notional, 4),
+            "notional_micros": notional_micros,
             "gross_pnl": round(gross_pnl, 4),
             "cost_bps": cost_bps,
             "cost_drag": round(cost_drag, 4),
+            "cost_drag_micros": int(statutory.total_micros),
+            "statutory_cost": statutory.to_dict(),
             "net_pnl": round(net_pnl, 4),
             "net_bps": round(net_pnl / max(1e-9, notional) * 10_000.0, 4),
             "r_multiple": round(r_multiple, 4),
@@ -5437,12 +5672,14 @@ class ControlPlane:
             "lessons_learned": str(request.lessons_learned),
             "recorded_at_ns": time.time_ns(),
         }
-        self._logbook_entries.append(record)
+        with self._state_lock:
+            self._logbook_entries.append(record)
         return {
             "ok": True,
             "page": "logbook",
             "workspace": request.workspace,
             "entry": record,
+            "statutory_cost": statutory.to_dict(),
             "counts": self.logbook_page()["counts"],
             "aggregate": self.logbook_page()["aggregate"],
             "law": "sec_014 - statutory cost drag deducted from gross P&L",
@@ -5588,7 +5825,7 @@ class ControlPlane:
             silo_for_venue,
         )
 
-        venue = str(request.venue).strip().lower()
+        venue = _identifier(str(request.venue).strip().lower(), field_name="venue")
         if venue not in BROKER_CREDENTIAL_VENUES:
             raise HTTPException(status_code=422, detail=f"UNKNOWN_VENUE:{venue}")
         probes = {probe.name: probe for probe in probe_donor_adapters()}
@@ -5636,12 +5873,21 @@ class ControlPlane:
     # ------------------------------------------------------------------
     def auth_login_paper(self, request: AuthPaperLoginRequest) -> dict[str, Any]:
         """``POST /api/v2/auth/login/paper`` -- mint a PAPER-tier session."""
-        from ring0_vault.silos.key_vault.operator_auth import OperatorAuthError
+        from ring0_vault.silos.key_vault.operator_auth import (
+            OperatorAuthError,
+            OperatorAuthLocked,
+        )
 
         try:
             session = self.operator_auth().login_paper(
                 request.username, request.password
             )
+        except OperatorAuthLocked as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="TOO_MANY_ATTEMPTS",
+                headers={"Retry-After": str(exc.retry_after_s)},
+            ) from exc
         except OperatorAuthError as exc:
             raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS") from exc
         return {
@@ -5664,6 +5910,7 @@ class ControlPlane:
         from ring0_vault.silos.key_vault.operator_auth import (
             LivePinRejected,
             OperatorAuthError,
+            OperatorAuthLocked,
         )
 
         pin = str(request.live_pin or "").strip()
@@ -5686,6 +5933,12 @@ class ControlPlane:
             )
         except LivePinRejected as exc:
             raise HTTPException(status_code=403, detail="LIVE_PIN_REJECTED") from exc
+        except OperatorAuthLocked as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="TOO_MANY_ATTEMPTS",
+                headers={"Retry-After": str(exc.retry_after_s)},
+            ) from exc
         except OperatorAuthError as exc:
             raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS") from exc
         return {
@@ -6001,6 +6254,22 @@ class ControlPlane:
                 if isinstance(positions, dict)
                 else 0,
             },
+            "statutory_costs": {
+                silo: {
+                    "cost_floor_bps": float(STATUTORY_COST_FLOOR_BPS.get(silo, 0.0)),
+                    "reference_notional_micros": 1_000_000,
+                    "breakdown": statutory_cost_engine.breakdown(
+                        silo, 1_000_000
+                    ).to_dict(),
+                }
+                for silo in self.registry.silo_ids()
+            },
+            "risk": risk_telemetry(
+                self.ledger,
+                self.registry.silo_ids(),
+                registry=instrument_registry,
+                cost_floors=STATUTORY_COST_FLOOR_BPS,
+            ),
             "generated_at_ns": time.time_ns(),
         }
 
@@ -6145,6 +6414,21 @@ class ControlPlane:
         hedger = _jsonable(_read(self.tail_hedger, "status", {}))
         if not isinstance(hedger, dict):
             hedger = {"status": hedger}
+        try:
+            from ring2_brain.quant.catalog import (
+                FACTOR_TAXONOMIES,
+                catalog_snapshot,
+                engines_snapshot,
+                loaders_snapshot,
+            )
+
+            catalog = catalog_snapshot()
+            loader_rows = loaders_snapshot()
+            engine_rows = engines_snapshot()
+        except Exception as exc:  # pragma: no cover - telemetry is non-fatal
+            catalog = {"available": False, "error": type(exc).__name__}
+            loader_rows = {"available": False, "error": type(exc).__name__}
+            engine_rows = {"available": False, "error": type(exc).__name__}
         return {
             "page": "quant",
             "title": "Quant & Valuation Lab",
@@ -6156,6 +6440,10 @@ class ControlPlane:
                 "kernels": int(_read(self.scanner, "sparse_kernels", 0) or 0),
                 "warm": bool(_read(self.scanner, "warm", False)),
             },
+            "factor_catalog": catalog,
+            "factor_taxonomies": list(FACTOR_TAXONOMIES),
+            "data_loaders": loader_rows,
+            "regional_engines": engine_rows,
             "valuation": valuation,
             "tail_hedger": hedger,
             "datasets": datasets,
@@ -6273,6 +6561,21 @@ class ControlPlane:
             },
             "invariant": _jsonable(self.ledger.invariant_report()),
             "backends": backends,
+            "statutory_costs": {
+                silo: {
+                    "cost_floor_bps": float(STATUTORY_COST_FLOOR_BPS.get(silo, 0.0)),
+                    "breakdown": statutory_cost_engine.breakdown(
+                        silo, 1_000_000
+                    ).to_dict(),
+                }
+                for silo in self.registry.silo_ids()
+            },
+            "risk": risk_telemetry(
+                self.ledger,
+                self.registry.silo_ids(),
+                registry=instrument_registry,
+                cost_floors=STATUTORY_COST_FLOOR_BPS,
+            ),
             "counts": {
                 "silos": len(silos),
                 "vaults": len(silos) * len(list(VaultName)),
@@ -6410,12 +6713,21 @@ class ControlPlane:
         }
 
     def auth_login(self, request: AuthLoginRequest) -> dict[str, Any]:
-        from ring0_vault.silos.key_vault.operator_auth import OperatorAuthError
+        from ring0_vault.silos.key_vault.operator_auth import (
+            OperatorAuthError,
+            OperatorAuthLocked,
+        )
 
         try:
             session = self.operator_auth().login_operator(
                 request.username, request.password
             )
+        except OperatorAuthLocked as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="TOO_MANY_ATTEMPTS",
+                headers={"Retry-After": str(exc.retry_after_s)},
+            ) from exc
         except OperatorAuthError as exc:
             raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS") from exc
         return {"ok": True, **session.to_dict()}
@@ -6426,6 +6738,7 @@ class ControlPlane:
         from ring0_vault.silos.key_vault.operator_auth import (
             LivePinRejected,
             OperatorAuthError,
+            OperatorAuthLocked,
             SessionInvalid,
         )
 
@@ -6455,6 +6768,12 @@ class ControlPlane:
             session = auth.elevate_to_live(session_token or "", request.live_pin)
         except LivePinRejected as exc:
             raise HTTPException(status_code=403, detail="LIVE_PIN_REJECTED") from exc
+        except OperatorAuthLocked as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="TOO_MANY_ATTEMPTS",
+                headers={"Retry-After": str(exc.retry_after_s)},
+            ) from exc
         except SessionInvalid as exc:
             raise HTTPException(status_code=401, detail="AUTH_REQUIRED") from exc
         except OperatorAuthError as exc:
@@ -6491,6 +6810,7 @@ class ControlPlane:
         """
         from ring0_vault.silos.key_vault.operator_auth import (
             OperatorAuthError,
+            OperatorAuthLocked,
             ResetCredentialsMissing,
             ResetCredentialsRejected,
         )
@@ -6502,6 +6822,12 @@ class ControlPlane:
             )
         except ResetCredentialsMissing as exc:
             raise HTTPException(status_code=401, detail="AUTH_REQUIRED") from exc
+        except OperatorAuthLocked as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="TOO_MANY_ATTEMPTS",
+                headers={"Retry-After": str(exc.retry_after_s)},
+            ) from exc
         except (ResetCredentialsRejected, OperatorAuthError) as exc:
             raise HTTPException(
                 status_code=403, detail="INVALID_CREDENTIALS"
@@ -6512,6 +6838,7 @@ class ControlPlane:
         # without falling back to the process-wide default vault.
         return {"ok": True, "credential": credential, **report}
 
+    @_serialised_control
     def reset_workspace(self) -> dict[str, Any]:
         """Zero-demo factory reset of the *current* (Paper) workspace."""
         owner = getattr(self.autopilot_runner, "__self__", None)
@@ -6542,6 +6869,7 @@ class ControlPlane:
             **report,
         }
 
+    @_serialised_control
     def fund_paper(self, request: PaperFundingRequest) -> dict[str, Any]:
         silo = str(request.silo).strip().upper()
         known = set()
@@ -7340,9 +7668,11 @@ async def autopilot_paper_loop(
 def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -> FastAPI:
     """Build the Ring 3 ASGI app around an existing control plane.
 
-    The compiled React 19 bundle is mounted at ``/`` when
-    ``ring3_cockpit/ui/openalgo_shell/dist/index.html`` exists; API routes keep
-    precedence because the static mount is registered last.
+    V1.6 is **headless**: there is no React/Vite application in the tree.  A
+    client route is answered with a deterministic, zero-JavaScript status
+    document (``dist/index.html`` when present, otherwise an in-process
+    manifest), while ``/api/v2/*`` keeps precedence because the static mount is
+    registered last.
     """
     from contextlib import asynccontextmanager
 
@@ -7401,6 +7731,95 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         allow_headers=["*"],
     )
     app.state.control = control
+
+    #: V1.6: every cockpit/workspace payload carries the deterministic
+    #: envelope (schema_version, generated_at_ns, clean_slate_active,
+    #: workspace_mode, payload_sha256) plus the per-silo risk telemetry.  The
+    #: middleware only touches the exact JSON read paths, so the SSE stream and
+    #: the Prometheus endpoints are untouched.
+    envelope_paths = frozenset(
+        {
+            "/api/v2/cockpit/state",
+            "/api/v2/cockpit/pages",
+            "/api/v2/cockpit/orders",
+            "/api/v2/cockpit/options",
+            "/api/v2/cockpit/terminal",
+            "/api/v2/cockpit/analyzer",
+            "/api/v2/cockpit/quant",
+            "/api/v2/cockpit/agents",
+            "/api/v2/cockpit/backtest",
+            "/api/v2/cockpit/forge",
+            "/api/v2/cockpit/ledger",
+            "/api/v2/cockpit/logbook",
+            "/api/v2/cockpit/brokers",
+            "/api/v2/cockpit/mcp",
+            "/api/v2/workspace/paper/state",
+            "/api/v2/workspace/live/state",
+        }
+    )
+
+    @app.middleware("http")
+    async def _envelope_middleware(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        if (
+            request.method != "GET"
+            or request.url.path not in envelope_paths
+            or response.status_code != 200
+            or "application/json" not in response.headers.get("content-type", "")
+        ):
+            return response
+        raw = b""
+        async for chunk in response.body_iterator:
+            raw += chunk
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):  # pragma: no cover - defensive
+            return Response(
+                content=raw,
+                status_code=response.status_code,
+                headers={
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower() not in ("content-length", "content-encoding")
+                },
+                media_type="application/json",
+            )
+        if not isinstance(payload, dict):  # pragma: no cover - defensive
+            return Response(content=raw, media_type="application/json")
+        try:
+            risk = risk_telemetry(
+                control.ledger,
+                control.registry.silo_ids(),
+                registry=instrument_registry,
+                cost_floors=STATUTORY_COST_FLOOR_BPS,
+            )
+        except Exception:  # pragma: no cover - telemetry is non-fatal
+            risk = {}
+        enriched = enclose(
+            payload,
+            workspace_mode=(
+                "LIVE"
+                if request.url.path.startswith("/api/v2/workspace/live")
+                else payload.get("mode") or payload.get("workspace") or "PAPER"
+            ),
+            clean_slate_active=bool(
+                getattr(control, "_clean_slate_active", False)
+            ),
+            risk=risk,
+        )
+        body = json.dumps(enriched, default=str, ensure_ascii=True).encode("utf-8")
+        headers = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower() not in ("content-length", "content-encoding")
+        }
+        headers["content-length"] = str(len(body))
+        return Response(
+            content=body,
+            status_code=200,
+            headers=headers,
+            media_type="application/json",
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(
@@ -7968,22 +8387,46 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     if getattr(control, "mcp", None) is not None:
         control.mcp.register_routes(app)
 
-    # ---- Step 8: unified production server serves the React bundle ------
+    # ---- V1.6: headless backend status document ---------------------------
+    # There is no React/Vite frontend any more.  A direct navigation or browser
+    # refresh on any client route still answers ``200 text/html`` with a
+    # deterministic, zero-JavaScript status manifest, so route-existence checks
+    # keep passing without shipping an application.
     bundle = (
         Path(static_dir)
         if static_dir is not None
         else Path(__file__).resolve().parents[1] / "ui" / "openalgo_shell" / "dist"
     )
     index_html = bundle / "index.html"
-    if index_html.exists():
-        # SPA catch-all: client-side routes (/orders, /quant, ...) must never
-        # 404 on a direct navigation or a browser refresh. Registered after
-        # every /api route and /metrics so nothing is shadowed.
-        @app.get("/{full_path:path}", include_in_schema=False)
-        async def cockpit_spa_fallback(full_path: str) -> Any:
-            head = full_path.split("/", 1)[0]
-            if head in {"api", "metrics"}:
-                raise HTTPException(status_code=404, detail="Not Found")
+
+    def _headless_html() -> str:
+        manifest = {
+            "schema_version": "v1.6.headless-backend",
+            "document_id": DOCUMENT_ID,
+            "platform_version": PLATFORM_VERSION,
+            "frontend": "NONE",
+            "javascript": 0,
+            "mode": "HEADLESS_API",
+            "api_root": "/api/v2",
+            "health": "/api/v2/cockpit/health",
+            "status": control.system_status().get("status", "ARMED"),
+        }
+        return (
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>NIOS Headless Backend</title></head><body>"
+            "<h1>NIOS Ring 3 - Headless Backend</h1>"
+            "<pre id=\"nios-status\">"
+            + json.dumps(manifest, indent=2, sort_keys=True)
+            + "</pre></body></html>"
+        )
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def cockpit_spa_fallback(full_path: str) -> Any:
+        head = full_path.split("/", 1)[0]
+        if head in {"api", "metrics"}:
+            raise HTTPException(status_code=404, detail="Not Found")
+        if index_html.is_file():
             root = bundle.resolve()
             if full_path:
                 candidate = (bundle / full_path).resolve()
@@ -7996,7 +8439,9 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
                 if candidate.is_file():
                     return FileResponse(candidate)
             return FileResponse(index_html, media_type="text/html")
+        return Response(content=_headless_html(), media_type="text/html")
 
+    if bundle.is_dir():
         from fastapi.staticfiles import StaticFiles
 
         app.mount(

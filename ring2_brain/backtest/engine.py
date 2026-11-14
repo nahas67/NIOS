@@ -37,9 +37,11 @@ never influence that fold's score.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from statistics import NormalDist
@@ -461,6 +463,17 @@ def _summarise(receipt: Mapping[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Engine
 # --------------------------------------------------------------------------- #
+def _serialised(method: Any) -> Any:
+    """Run one mutating engine method under the instance RLock."""
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class WalkForwardBacktestEngine:
     """Deterministic, tax-net, Purged K-Fold walk-forward backtester."""
 
@@ -475,6 +488,7 @@ class WalkForwardBacktestEngine:
         "_plugins",
         "_shadow_twin",
         "_strategy_id_tag",
+        "_lock",
     )
 
     def __init__(
@@ -503,6 +517,9 @@ class WalkForwardBacktestEngine:
         self._plugins = plugins
         self._shadow_twin = shadow_twin
         self._strategy_id_tag = "walk-forward-v1"
+        # V1.6: concurrent HTTP runs must never interleave the run counter or
+        # the nursery admission decision.
+        self._lock = threading.RLock()
 
     # -- wiring ----------------------------------------------------------- #
     def attach(self, *, plugins: Any = None, shadow_twin: Any = None) -> None:
@@ -618,6 +635,7 @@ class WalkForwardBacktestEngine:
         }
 
     # -- main entry point -------------------------------------------------- #
+    @_serialised
     def run(
         self,
         *,
@@ -864,6 +882,7 @@ class WalkForwardBacktestEngine:
         return dict(receipt)
 
     # -- comparison ------------------------------------------------------- #
+    @_serialised
     def compare_strategies(
         self,
         *,
@@ -971,6 +990,7 @@ class WalkForwardBacktestEngine:
         }
 
     # -- nursery ----------------------------------------------------------- #
+    @_serialised
     def promote_to_nursery(self, backtest_id: str) -> dict[str, Any]:
         """Register a passing run into the 30-fill L2 shadow nursery."""
 
@@ -1615,7 +1635,7 @@ def _render_receipt(
     trade_count: int,
     promotable: bool,
 ) -> str:
-    doc = _Doc(f"Walk-Forward Backtest Receipt — {symbol}")
+    doc = _Doc(f"Walk-Forward Backtest Receipt â€” {symbol}")
     doc.para(
         "Deterministic tax-net walk-forward run produced entirely inside Ring 2. "
         "No order was signed and no broker credential was read."
@@ -1661,7 +1681,7 @@ def _render_receipt(
     doc.kv("Dsr gate", metrics.get("dsr_gate"))
     doc.note(
         "Gate verdict",
-        "PASS — clearing the nursery threshold" if promotable else "FAIL — below threshold",
+        "PASS â€” clearing the nursery threshold" if promotable else "FAIL â€” below threshold",
     )
     doc.text("")
 
@@ -1712,6 +1732,6 @@ def _render_receipt(
     )
     doc.note(
         "Authority",
-        "Ring 2 research only — no order signing, no broker key access",
+        "Ring 2 research only â€” no order signing, no broker key access",
     )
     return doc.build()

@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**415 tests · 23 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**430 tests · 24 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -199,7 +199,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 20 | `test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** 8 harvested strategies, grounded decision dashboard, 6 agent tasks, watchlist batch ranking, grounded Q&A follow-up, 5-timeframe backtester, 8-way comparison, 30-fill nursery gate |
 | 21 | `test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.3** separate `/paper/login` + `/live/login` portals, options chain (Greeks/PCR/Max Pain), six multi-leg payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15 pages × 3 route trees |
 | 22 | `test_v1_4_clean_room_masterpiece_ui.py` | **V1.4** clean-room rebuild: 15 bespoke workstations, dual-shell separation, four auth portals, six zero-dependency SVG charts, five-domain navigation, clean-slate rendering, biome-clean source |
-| 23 | `test_v1_5_institutional_terminal_ui.py` | **V1.5** flat institutional terminal: zero glass / zero shadow / zero pill, twelve exact colour tokens, `tabular-nums` on every figure, six flat gradient-free charts, 50-route HTML sweep, paper/live shell invariants |
+| 23 | `test_v1_5_institutional_terminal_ui.py` | **V1.6** headless institutional contract: 50-route status document, integer micro money, exact itemized statutory floors, 15-page catalogue, dual workspace boundary, reproducible payload digest |
+| 24 | `test_v1_6_backend_bug_hunt_security_and_data_completeness.py` | **V1.6** master instrument registry + lot/tick/freeze enforcement, itemized statutory cost engine, adversarial numerical/boundary fuzzing, 32-thread idempotency + double-entry conservation, auth brute-force lockout + secret non-leakage |
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
 independent of whatever happens to be installed in the interpreter.
@@ -464,7 +465,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     415 tests across 23 suites
+tests/                     430 tests across 24 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 22-gate go-live readiness certificate (--strict / --fast)
@@ -482,7 +483,7 @@ start_nios.bat / .sh       1-click launch
 
 | Gate | Command | Required result |
 |---|---|---|
-| Unit / integration | `pytest tests -q` | **415 passed**, 0 failed, 0 warnings |
+| Unit / integration | `pytest tests -q` | **430 passed**, 0 failed, 0 warnings |
 | Smoke suite | `python scripts/run_nios.py --smoke-test` | **22/22 rows**, `EXIT=0` |
 | Go-live certificate | `python scripts/preflight_golive.py --fast` | **22/22 PASS**, `EXIT=0` |
 | Live `V1.5` burn-in | boot on `:8001` with the flat terminal bundle, walk `/setup`, `/paper/login`, `/live/login` and all 45 page routes, then shut down | **50/50 routes at 200**, clean slate on boot, port `8001` free afterwards, empty `git status --porcelain` |

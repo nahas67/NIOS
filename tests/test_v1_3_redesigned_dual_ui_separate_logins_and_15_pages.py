@@ -865,137 +865,71 @@ def test_gate4_unknown_api_path_is_not_swallowed_by_the_spa(client) -> None:
     assert response.status_code in (401, 403, 404)
 
 
-def test_gate4_router_sidebar_and_shells_are_wired() -> None:
-    """The V1.4 clean-room layout keeps every V1.3 navigation contract."""
-
-    registry = (SRC_ROOT / "pages" / "registry.ts").read_text(encoding="utf-8")
+def test_gate4_pages_api_carries_every_workstation() -> None:
+    """V1.6 is headless: the 15-page catalogue lives in the backend."""
+    root = Path(__file__).resolve().parents[1]
+    source = (
+        root / "ring3_cockpit" / "gateway" / "control_plane.py"
+    ).read_text(encoding="utf-8")
     for key in PAGE_KEYS:
-        assert f'key: "{key}"' in registry, key
-    for label in (
-        "Core Execution",
-        "Quant & Research",
-        "Bicameral Brain",
-        "Ledger & Audit",
-        "Sovereign Control",
+        assert f'"key": "{key}"' in source, key
+    for group in (
+        "CORE_EXECUTION",
+        "QUANT_OPTIONS",
+        "BICAMERAL_BRAIN",
+        "LEDGER_VERIFICATION",
+        "SOVEREIGN_CONTROL",
     ):
-        assert label in registry, label
-    assert "NAV_GROUPS" in registry
-    assert "PageKey" in registry
+        assert group in source, group
 
-    sidebar = (SRC_ROOT / "shells" / "Sidebar.tsx").read_text(encoding="utf-8")
-    assert "aria-expanded" in sidebar
-    assert "NAV_GROUPS" in sidebar
-    assert "aria-current" in sidebar
-    for key in PAGE_KEYS:
-        assert key in sidebar, key
+    # The headless document is the only client asset.
+    document = (UI_ROOT / "dist" / "index.html").read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "<script" not in document.lower()
+    assert not (SRC_ROOT).exists()
 
-    router = (SRC_ROOT / "lib" / "router.ts").read_text(encoding="utf-8")
-    for route in ("/setup", "/login", "/paper/login", "/live/login", "/live-unlock"):
-        assert route in router, route
-    assert "pagePath" in router
-    assert "popstate" in router
 
-    app = (SRC_ROOT / "App.tsx").read_text(encoding="utf-8")
-    for name in (
-        "DashboardPage",
-        "TerminalPage",
-        "OrdersPage",
-        "OptionsPage",
-        "AnalyzerPage",
-        "QuantPage",
-        "AgentsPage",
-        "BacktestPage",
-        "BrainPage",
-        "ForgePage",
-        "LedgerPage",
-        "LogbookPage",
-        "VerificationPage",
-        "BrokersPage",
-        "ControlPage",
+def test_gate4_auth_portals_are_api_routes(client) -> None:
+    """The four auth portals remain first-class API surfaces."""
+    schema = client.get("/openapi.json").json()
+    paths = set(schema["paths"])
+    for route in (
+        "/api/v2/auth/setup",
+        "/api/v2/auth/login",
+        "/api/v2/auth/login/paper",
+        "/api/v2/auth/login/live",
+        "/api/v2/auth/elevate-live",
+        "/api/v2/auth/logout",
+        "/api/v2/auth/reset",
     ):
-        assert name in app, name
-    assert "PaperShell" in app
-    assert "LiveShell" in app
-    assert "CommandPalette" in app
-
-    paper = (SRC_ROOT / "shells" / "PaperShell.tsx").read_text(encoding="utf-8")
-    assert "PAPER SANDBOX" in paper
-    assert "Deposit Paper Capital" in paper
-    assert "Reset All Values to Zero" in paper
-    assert "Autopilot" in paper
-
-    live = (SRC_ROOT / "shells" / "LiveShell.tsx").read_text(encoding="utf-8")
-    assert "LIVE PRODUCTION — REAL CAPITAL" in live
-    assert "EMERGENCY KILL SWITCH" in live
-    assert "Lock Live Vault (Drop to Paper)" in live
-    assert "22-gate" in live.lower()
-    live_lower = live.lower()
-    # Live must never render a paper deposit or a shadow-burst control.
-    assert "deposit paper capital" not in live_lower
-    assert "shadow-burst" not in live_lower
-    assert "reset all values to zero" not in live_lower
-
-    gateway = (SRC_ROOT / "portals" / "GatewayPortal.tsx").read_text(encoding="utf-8")
-    assert "ENTER PAPER SANDBOX" in gateway
-    assert "LIVE SOVEREIGN VAULT" in gateway
-
-    paper_login = (SRC_ROOT / "portals" / "PaperLoginPortal.tsx").read_text(
-        encoding="utf-8"
-    )
-    assert "SIMULATED EXECUTION ONLY (ALL VALUES START AT 0)" in paper_login
-    assert "loginPaper" in paper_login
-
-    live_login = (SRC_ROOT / "portals" / "LiveLoginPortal.tsx").read_text(
-        encoding="utf-8"
-    )
-    assert "live_pin" in live_login
-    assert "loginLive" in live_login
-    assert "acknowledged" in live_login
-    assert "PIN" in live_login
-
-    css = (SRC_ROOT / "index.css").read_text(encoding="utf-8")
-    css += (SRC_ROOT / "design-system" / "tokens.css").read_text(encoding="utf-8")
-    assert "backdrop-filter" not in css
-    assert "box-shadow" not in css
-    assert "#0d0e10" in css
-    assert "#f96316" in css
-    assert ".nios-shell-paper" in css
-    assert ".nios-shell-live" in css
-    assert ".nios-iso-plane" in css
-    assert ".nios-hazard" in css
-    assert ".nios-tabular" in css
-
-    for page in PAGE_KEYS:
-        source = (SRC_ROOT / "pages" / f"{page[:1].upper()}{page[1:]}Page.tsx").read_text(encoding="utf-8")
-        assert "SectionHeader" in source, page
-        assert "PageShell" not in source, page
+        assert route in paths, route
 
 
-def test_gate4_biome_lint_is_clean() -> None:
-    npx = shutil.which("npx")
-    if npx is None:  # pragma: no cover - node toolchain is optional
-        pytest.skip("npx is not available on this host")
-
-    completed = subprocess.run(
-        [npx, "biome", "lint", "src/"],
-        cwd=str(UI_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=600,
-        check=False,
-    )
-    assert completed.returncode == 0, (completed.stdout + completed.stderr)[-4000:]
-    combined = f"{completed.stdout}{completed.stderr}".lower()
-    assert "found 0 errors" in combined or "checked" in combined
 
 
-def test_gate4_cockpit_bundle_is_built_with_both_shells() -> None:
+def test_gate4_no_frontend_toolchain_remains() -> None:
+    """V1.6 removed React/Vite/Biome: there is nothing to lint."""
+    assert not (UI_ROOT / "package.json").exists()
+    assert not (UI_ROOT / "package-lock.json").exists()
+    assert not (UI_ROOT / "vite.config.ts").exists()
+    assert not (UI_ROOT / "biome.json").exists()
+    assert not (UI_ROOT / "tsconfig.json").exists()
+    assert not (SRC_ROOT).exists()
+    assert not (UI_ROOT / "node_modules").exists()
+    assert not (UI_ROOT / "public").exists()
+
+
+
+
+def test_gate4_headless_document_is_built() -> None:
     index_html = UI_ROOT / "dist" / "index.html"
-    assert index_html.exists(), "run `npm run build` in ring3_cockpit/ui/openalgo_shell"
+    assert index_html.exists(), "the headless status document is missing"
     text = index_html.read_text(encoding="utf-8")
-    assert "assets/" in text
-    assets = list((UI_ROOT / "dist" / "assets").glob("*.js"))
-    assert assets, "dist/assets has no JavaScript bundle"
-    joined = "".join(path.read_text(encoding="utf-8") for path in assets)
-    for marker in ("PAPER SANDBOX", "LIVE PRODUCTION", "Clean slate", "15 production pages"):
-        assert marker.lower() in joined.lower(), marker
+    assert "headless-backend" in text
+    assert "HEADLESS_API" in text
+    assert "payload_sha256" in text
+    assert "<script" not in text.lower()
+    assert "/assets/" not in text
+    assert not (UI_ROOT / "dist" / "assets").exists()
+
+

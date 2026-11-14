@@ -1,0 +1,36 @@
+{
+  "schema_version": "v1.6.headless-backend",
+  "generated_by": "ring3_cockpit/gateway/control_plane.py",
+  "frontend": "NONE",
+  "javascript": 0,
+  "css_framework": "NONE",
+  "runtime": "FastAPI REST + SSE",
+  "api_root": "/api/v2",
+  "contracts": {
+    "envelope": [
+      "schema_version",
+      "generated_at_ns",
+      "clean_slate_active",
+      "workspace_mode",
+      "payload_sha256"
+    ],
+    "risk_telemetry": [
+      "gross_exposure_micros",
+      "net_exposure_micros",
+      "margin_used_micros",
+      "free_margin_micros",
+      "var_99_bps",
+      "cvar_99_bps",
+      "max_drawdown_bps",
+      "realized_pnl_micros",
+      "unrealized_pnl_micros",
+      "total_tax_paid_micros"
+    ],
+    "statutory_floors_bps": {
+      "INDIA_ZERODHA_DHAN": 8.5,
+      "CRYPTO_BINANCE": 16.0,
+      "US_IBKR": 2.8,
+      "FX_MT5": 1.6
+    }
+  }
+}

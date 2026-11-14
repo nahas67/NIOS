@@ -7,7 +7,7 @@ Gate 2  Zero-downtime Ring 0 key rotation: Fernet master keys + Ed25519 keypair,
         signatures still verifying, no raw secret in any response or tracked file.
 Gate 3  ``RUNBOOK.md`` completeness: SOPs 1-5 and every canonical ``/api/v2/*``
         endpoint documented.
-Gate 4  Final full-platform inventory (23 suites), rebuilt cockpit bundle with
+Gate 4  Final full-platform inventory (24 suites), rebuilt cockpit bundle with
         the rotation control, and the annotated ``v3.0.0-PROD`` release tag.
 
 Governing sections: ``sec_004`` (ring isolation + air-gap), ``sec_010`` /
@@ -451,23 +451,23 @@ def test_gate3_runbook_documents_all_sops_and_endpoints() -> None:
 
 def test_gate4_test_inventory_is_twenty_one_files() -> None:
     test_files = sorted(TESTS_DIR.glob("test_*.py"))
-    assert len(test_files) == 23, [path.name for path in test_files]
+    assert len(test_files) == 24, [path.name for path in test_files]
     assert "test_phase3_step5_os_tuning_key_rotation_and_runbook.py" in {
         path.name for path in test_files
     }
 
 
-def test_gate4_rebuilt_bundle_contains_rotation_controls() -> None:
+def test_gate4_headless_document_contains_rotation_controls() -> None:
     index = BUNDLE_DIR / "index.html"
-    assert index.exists(), "run `npm run build` in ring3_cockpit/ui/openalgo_shell"
-    bundle = "\n".join(
-        path.read_text(encoding="utf-8", errors="ignore")
-        for path in sorted((BUNDLE_DIR / "assets").glob("*.js"))
-    )
-    assert bundle, "compiled JS bundle is empty"
-    assert "Ring 0 Zero-Downtime Key Rotation" in bundle
-    assert "OS low-latency" in bundle
-    assert "/api/v2/control/vault/rotate-keys" in bundle
+    assert index.exists(), "headless status document is missing"
+    document = index.read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "payload_sha256" in document
+    assert "<script" not in document.lower()
+    assert "/assets/" not in document
+    runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
+    assert "/api/v2/control/vault/rotate-keys" in runbook
+    assert "24 suites" in runbook
 
 
 def test_gate4_release_tag_is_annotated_when_present() -> None:

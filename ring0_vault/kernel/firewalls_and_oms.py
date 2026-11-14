@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 import time
 import gc
 import functools
@@ -37,6 +38,11 @@ from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 from typing import Any, Iterable, Mapping
 
+from core.instrument_registry import (
+    InstrumentCheck,
+    InstrumentRegistry,
+    registry as default_instrument_registry,
+)
 from core.nats_bus import STREAM_RING0_EXECUTION, STREAM_RING3_COCKPIT
 from core.schemas import (
     PlainEnglishCockpitCard,
@@ -1202,6 +1208,8 @@ class SmartOMS:
         ledger: IBORLedger | None = None,
         ratchet: InSiloProfitRatchet | None = None,
         slicer: TwapIcebergSlicer | None = None,
+        instruments: InstrumentRegistry | None = None,
+        strict_instruments: bool = False,
     ) -> None:
         self.outbox = outbox
         self.bus = bus
@@ -1209,9 +1217,59 @@ class SmartOMS:
         self.ledger = ledger if ledger is not None else outbox.ledger
         self.ratchet = ratchet if ratchet is not None else InSiloProfitRatchet(self.ledger)
         self.slicer = slicer if slicer is not None else TwapIcebergSlicer()
+        self.instruments = (
+            instruments if instruments is not None else default_instrument_registry
+        )
+        self.strict_instruments = bool(strict_instruments)
+        self._lock = threading.RLock()
         self._chasers: dict[str, MakerPegChaser] = {}
         self._events: list[ExecutionEvent] = []
         self._cards: list[PlainEnglishCockpitCard] = []
+
+    # -- contract enforcement ---------------------------------------------
+    def validate_proposal(self, proposal: Any) -> InstrumentCheck:
+        """Enforce lot size, tick grid and exchange freeze quantity.
+
+        A known instrument is validated strictly: an off-lot quantity, a
+        quantity above the freeze limit or (with ``strict_instruments``) an
+        off-tick price raises :class:`ValueError`, which the gateway maps to
+        ``422``.  An instrument outside the canonical registry is reported as
+        ``SPEC_MISSING`` and, unless ``strict_instruments`` is set, allowed
+        through so the paper tape can still exercise the ratchet sweep assets
+        (``VOO``, ``RELIANCE.NS``) that are not order-entry instruments.
+        """
+        try:
+            spec = self.instruments.get(str(proposal.silo), str(proposal.symbol))
+        except KeyError:
+            if self.strict_instruments:
+                raise ValueError(
+                    f"unknown instrument {proposal.silo}/{proposal.symbol}"
+                ) from None
+            return InstrumentCheck(
+                ok=True,
+                reason="SPEC_MISSING",
+                symbol=str(proposal.symbol).upper(),
+                silo=str(proposal.silo).upper(),
+                quantity=float(proposal.qty),
+                price=float(proposal.limit_price),
+                adjusted_price=float(proposal.limit_price),
+                price_changed=False,
+                lot_multiple=0.0,
+                ticks=0,
+                notional_micros=0,
+            )
+        check = self.instruments.validate_order(
+            str(proposal.silo),
+            str(proposal.symbol),
+            float(proposal.qty),
+            float(proposal.limit_price),
+            round_price=not self.strict_instruments,
+        )
+        if not check.ok:
+            raise ValueError(check.reason)
+        if check.price_changed:
+            object.__setattr__(proposal, "limit_price", float(check.adjusted_price))
+        return check
 
     # -- submission -------------------------------------------------------
     def submit_maker_peg(
@@ -1224,32 +1282,34 @@ class SmartOMS:
     ) -> MakerPegChaser:
         stamp = int(now_ns if now_ns is not None else time.time_ns())
         bid, ask = float(book[0]), float(book[1])
-        chaser = MakerPegChaser(
-            order_id=str(proposal.proposal_id),
-            silo=str(proposal.silo),
-            symbol=str(proposal.symbol),
-            side=str(proposal.side),
-            qty=float(proposal.qty),
-            outbox_key=reservation.outbox_idempotency_key,
-            price=(bid if str(proposal.side).upper() == "BUY" else ask),
-            created_ns=stamp,
-        )
-        self._chasers[chaser.order_id] = chaser
-        self.publish_execution(
-            ExecutionEvent(
-                event_type="MAKER_PEG_POSTED",
-                silo=chaser.silo,
-                symbol=chaser.symbol,
-                order_id=chaser.order_id,
-                side=chaser.side,
-                qty=chaser.qty,
-                price=chaser.price,
-                state="WORKING",
-                reason="post-only maker peg at best bid/ask",
-                timestamp_ns=stamp,
+        with self._lock:
+            self.validate_proposal(proposal)
+            chaser = MakerPegChaser(
+                order_id=str(proposal.proposal_id),
+                silo=str(proposal.silo),
+                symbol=str(proposal.symbol),
+                side=str(proposal.side),
+                qty=float(proposal.qty),
+                outbox_key=reservation.outbox_idempotency_key,
+                price=(bid if str(proposal.side).upper() == "BUY" else ask),
+                created_ns=stamp,
             )
-        )
-        return chaser
+            self._chasers[chaser.order_id] = chaser
+            self.publish_execution(
+                ExecutionEvent(
+                    event_type="MAKER_PEG_POSTED",
+                    silo=chaser.silo,
+                    symbol=chaser.symbol,
+                    order_id=chaser.order_id,
+                    side=chaser.side,
+                    qty=chaser.qty,
+                    price=chaser.price,
+                    state="WORKING",
+                    reason="post-only maker peg at best bid/ask",
+                    timestamp_ns=stamp,
+                )
+            )
+            return chaser
 
     def submit_twap(
         self,
@@ -1259,23 +1319,25 @@ class SmartOMS:
         now_ns: int | None = None,
     ) -> IcebergPlan:
         plan = self.slicer.plan(float(proposal.qty), top_of_book_qty)
-        self.publish_execution(
-            ExecutionEvent(
-                event_type="TWAP_PLANNED",
-                silo=str(proposal.silo),
-                symbol=str(proposal.symbol),
-                order_id=str(proposal.proposal_id),
-                side=str(proposal.side),
-                qty=plan.parent_qty,
-                price=float(proposal.limit_price),
-                state="PLANNED",
-                reason=(
-                    f"{plan.slice_count} child slice(s), max {plan.book_pct * 100:.1f}% "
-                    f"of top-of-book depth"
-                ),
-                timestamp_ns=int(now_ns if now_ns is not None else time.time_ns()),
+        with self._lock:
+            self.validate_proposal(proposal)
+            self.publish_execution(
+                ExecutionEvent(
+                    event_type="TWAP_PLANNED",
+                    silo=str(proposal.silo),
+                    symbol=str(proposal.symbol),
+                    order_id=str(proposal.proposal_id),
+                    side=str(proposal.side),
+                    qty=plan.parent_qty,
+                    price=float(proposal.limit_price),
+                    state="PLANNED",
+                    reason=(
+                        f"{plan.slice_count} child slice(s), max {plan.book_pct * 100:.1f}% "
+                        f"of top-of-book depth"
+                    ),
+                    timestamp_ns=int(now_ns if now_ns is not None else time.time_ns()),
+                )
             )
-        )
         return plan
 
     # -- book updates -----------------------------------------------------
@@ -1291,38 +1353,40 @@ class SmartOMS:
         if chaser is None:
             return "UNKNOWN"
         stamp = int(now_ns if now_ns is not None else time.time_ns())
-        previous = chaser.state
-        state = chaser.on_book(bid, ask, now_ns=stamp)
-        if state == "REPEGGED":
-            self.publish_execution(
-                ExecutionEvent(
-                    event_type="MAKER_PEG_REPEG",
-                    silo=chaser.silo,
-                    symbol=chaser.symbol,
-                    order_id=chaser.order_id,
-                    side=chaser.side,
-                    qty=chaser.qty,
-                    price=chaser.price,
-                    state="WORKING",
-                    reason=f"re-peg {chaser.repegs}/{chaser.max_repegs}",
-                    timestamp_ns=stamp,
+        with self._lock:
+            previous = chaser.state
+            state = chaser.on_book(bid, ask, now_ns=stamp)
+            if state == "REPEGGED":
+                self.publish_execution(
+                    ExecutionEvent(
+                        event_type="MAKER_PEG_REPEG",
+                        silo=chaser.silo,
+                        symbol=chaser.symbol,
+                        order_id=chaser.order_id,
+                        side=chaser.side,
+                        qty=chaser.qty,
+                        price=chaser.price,
+                        state="WORKING",
+                        reason=f"re-peg {chaser.repegs}/{chaser.max_repegs}",
+                        timestamp_ns=stamp,
+                    )
                 )
-            )
-        elif state == "CANCELED" and previous != "CANCELED":
-            self._resolve_cancel(chaser, reason=chaser.cancel_reason, now_ns=stamp)
-        return state
+            elif state == "CANCELED" and previous != "CANCELED":
+                self._resolve_cancel(chaser, reason=chaser.cancel_reason, now_ns=stamp)
+            return state
 
     def sweep_deadlines(self, *, now_ns: int | None = None) -> list[str]:
         """Hard-cancel every chaser whose 3.0 s deadline has elapsed."""
         stamp = int(now_ns if now_ns is not None else time.time_ns())
         cancelled: list[str] = []
-        for chaser in list(self._chasers.values()):
-            if not chaser.is_working:
-                continue
-            if stamp - chaser.created_ns >= chaser.timeout_ns:
-                chaser.mark_canceled("3.0s maker-peg hard cancel")
-                self._resolve_cancel(chaser, reason=chaser.cancel_reason, now_ns=stamp)
-                cancelled.append(chaser.order_id)
+        with self._lock:
+            for chaser in list(self._chasers.values()):
+                if not chaser.is_working:
+                    continue
+                if stamp - chaser.created_ns >= chaser.timeout_ns:
+                    chaser.mark_canceled("3.0s maker-peg hard cancel")
+                    self._resolve_cancel(chaser, reason=chaser.cancel_reason, now_ns=stamp)
+                    cancelled.append(chaser.order_id)
         return cancelled
 
     # -- resolution -------------------------------------------------------
@@ -1335,39 +1399,40 @@ class SmartOMS:
         now_ns: int | None = None,
     ) -> Reservation:
         stamp = int(now_ns if now_ns is not None else time.time_ns())
-        chaser = self._chasers.get(str(order_id))
-        if chaser is None:
-            raise KeyError(f"unknown order {order_id!r}")
-        chaser.mark_filled(price)
-        reservation = self.outbox.commit(
-            chaser.outbox_key,
-            broker_order_id=chaser.order_id,
-            now_ns=stamp,
-            realized_net_micros=realized_net_micros,
-            ratchet=self.ratchet,
-        )
-        self.publish_execution(
-            ExecutionEvent(
-                event_type="ORDER_FILLED",
-                silo=chaser.silo,
-                symbol=chaser.symbol,
-                order_id=chaser.order_id,
-                side=chaser.side,
-                qty=chaser.qty,
-                price=chaser.price,
-                state="FILLED",
-                reason=(
-                    "outbox reservation posted"
-                    + (
-                        f"; in-silo ratchet swept {realized_net_micros} micros"
-                        if realized_net_micros
-                        else ""
-                    )
-                ),
-                timestamp_ns=stamp,
+        with self._lock:
+            chaser = self._chasers.get(str(order_id))
+            if chaser is None:
+                raise KeyError(f"unknown order {order_id!r}")
+            chaser.mark_filled(price)
+            reservation = self.outbox.commit(
+                chaser.outbox_key,
+                broker_order_id=chaser.order_id,
+                now_ns=stamp,
+                realized_net_micros=realized_net_micros,
+                ratchet=self.ratchet,
             )
-        )
-        return reservation
+            self.publish_execution(
+                ExecutionEvent(
+                    event_type="ORDER_FILLED",
+                    silo=chaser.silo,
+                    symbol=chaser.symbol,
+                    order_id=chaser.order_id,
+                    side=chaser.side,
+                    qty=chaser.qty,
+                    price=chaser.price,
+                    state="FILLED",
+                    reason=(
+                        "outbox reservation posted"
+                        + (
+                            f"; in-silo ratchet swept {realized_net_micros} micros"
+                            if realized_net_micros
+                            else ""
+                        )
+                    ),
+                    timestamp_ns=stamp,
+                )
+            )
+            return reservation
 
     def on_ack(self, ack: BrokerAck) -> Reservation | None:
         """Route a broker ack through the idempotent outbox inbox."""

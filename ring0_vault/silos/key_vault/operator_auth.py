@@ -34,6 +34,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import threading
@@ -52,6 +53,7 @@ __all__ = [
     "OperatorExistsError",
     "OperatorSession",
     "LivePinRejected",
+    "OperatorAuthLocked",
     "ResetCredentialsMissing",
     "ResetCredentialsRejected",
     "SessionInvalid",
@@ -78,6 +80,15 @@ LIVE_SESSION_TTL_S = 30 * 60
 MIN_PASSWORD_LEN = 8
 MIN_PIN_LEN = 4
 MAX_PIN_LEN = 12
+
+#: Brute-force lockout: ``MAX_FAILED_ATTEMPTS`` consecutive failures inside
+#: ``FAILURE_WINDOW_S`` lock the door for ``BASE_LOCKOUT_S`` (doubling for every
+#: further failure up to ``MAX_LOCKOUT_S``).  A successful authentication, a
+#: factory reset or a test-fixture reset clears the counter.
+MAX_FAILED_ATTEMPTS = 5
+FAILURE_WINDOW_S = 15 * 60
+BASE_LOCKOUT_S = 60.0
+MAX_LOCKOUT_S = 60 * 60.0
 
 _VAULT_ENV = "NIOS_OPERATOR_AUTH_DIR"
 _DEFAULT_VAULT = Path(__file__).resolve().parent / ".secrets"
@@ -117,6 +128,19 @@ class ResetCredentialsRejected(OperatorAuthError):
     The caller *did* attempt authentication, so the gateway maps this to
     ``403 INVALID_CREDENTIALS`` rather than a generic 401.
     """
+
+
+class OperatorAuthLocked(OperatorAuthError):
+    """Too many consecutive failed attempts; the door is temporarily shut.
+
+    Carries ``retry_after_s`` so the gateway can emit a standards-compliant
+    ``429 TOO_MANY_ATTEMPTS`` with a ``Retry-After`` header.  The lock is
+    persisted next to the credential so a process restart cannot reset it.
+    """
+
+    def __init__(self, message: str, *, retry_after_s: int = 60) -> None:
+        super().__init__(message)
+        self.retry_after_s = max(1, int(retry_after_s))
 
 
 @dataclass(frozen=True)
@@ -200,6 +224,10 @@ class OperatorAuth:
         *,
         filename: str = "operator_auth.json",
         now_ns=None,
+        max_failed_attempts: int = MAX_FAILED_ATTEMPTS,
+        failure_window_s: float = FAILURE_WINDOW_S,
+        base_lockout_s: float = BASE_LOCKOUT_S,
+        max_lockout_s: float = MAX_LOCKOUT_S,
     ) -> None:
         root = (
             Path(vault_dir)
@@ -210,6 +238,10 @@ class OperatorAuth:
         self._lock = threading.RLock()
         self._now_ns = now_ns or time.time_ns
         self._revoked: set[str] = set()
+        self.max_failed_attempts = max(1, int(max_failed_attempts))
+        self.failure_window_s = max(1.0, float(failure_window_s))
+        self.base_lockout_s = max(1.0, float(base_lockout_s))
+        self.max_lockout_s = max(self.base_lockout_s, float(max_lockout_s))
 
     # -- paths -------------------------------------------------------------
     @property
@@ -238,6 +270,81 @@ class OperatorAuth:
                 return self._load() is not None
             except OperatorAuthError:
                 return False
+
+    # -- brute-force lockout ----------------------------------------------
+    def lockout_state(self) -> dict[str, Any]:
+        """Read-only view of the persisted lockout counter."""
+        with self._lock:
+            record = self._load()
+            state = dict((record or {}).get("lockout") or {})
+            now = int(self._now_ns())
+            until = int(state.get("locked_until_ns", 0) or 0)
+            return {
+                "failures": int(state.get("failures", 0) or 0),
+                "first_failure_ns": int(state.get("first_ns", 0) or 0),
+                "locked_until_ns": until,
+                "locked": until > now,
+                "retry_after_s": (
+                    max(0, math.ceil((until - now) / 1_000_000_000))
+                    if until > now
+                    else 0
+                ),
+                "max_failed_attempts": self.max_failed_attempts,
+                "failure_window_s": self.failure_window_s,
+            }
+
+    def _check_lockout(self, record: Mapping[str, Any]) -> None:
+        """Raise :class:`OperatorAuthLocked` while the door is shut."""
+        state = dict(record.get("lockout") or {})
+        if not state:
+            return
+        now = int(self._now_ns())
+        until = int(state.get("locked_until_ns", 0) or 0)
+        if until > now:
+            raise OperatorAuthLocked(
+                "TOO_MANY_ATTEMPTS: too many consecutive failed attempts",
+                retry_after_s=max(1, math.ceil((until - now) / 1_000_000_000)),
+            )
+        first = int(state.get("first_ns", 0) or 0)
+        window_ns = int(self.failure_window_s * 1_000_000_000)
+        if until and now - until > window_ns and now - first > window_ns:
+            # A long-expired lock starts a fresh window on the next attempt.
+            self._write_lockout(record, {"failures": 0, "first_ns": 0, "locked_until_ns": 0})
+
+    def _register_failure(self, record: Mapping[str, Any]) -> None:
+        """Persist one failed attempt and arm the exponential lockout."""
+        now = int(self._now_ns())
+        state = dict(record.get("lockout") or {})
+        window_ns = int(self.failure_window_s * 1_000_000_000)
+        first = int(state.get("first_ns", 0) or 0)
+        if not first or now - first > window_ns:
+            state = {"failures": 0, "first_ns": now, "locked_until_ns": 0}
+        failures = int(state.get("failures", 0) or 0) + 1
+        state["failures"] = failures
+        state.setdefault("first_ns", now)
+        if failures >= self.max_failed_attempts:
+            exponent = min(failures - self.max_failed_attempts, 6)
+            lock_s = min(self.base_lockout_s * (2**exponent), self.max_lockout_s)
+            state["locked_until_ns"] = now + int(lock_s * 1_000_000_000)
+        self._write_lockout(record, state)
+
+    def _clear_failures(self, record: Mapping[str, Any]) -> None:
+        state = dict(record.get("lockout") or {})
+        if state.get("failures") or state.get("locked_until_ns"):
+            self._write_lockout(
+                record, {"failures": 0, "first_ns": 0, "locked_until_ns": 0}
+            )
+
+    def _write_lockout(
+        self, record: Mapping[str, Any], state: Mapping[str, Any]
+    ) -> None:
+        payload = dict(record)
+        payload["lockout"] = dict(state)
+        payload["updated_ns"] = int(self._now_ns())
+        try:
+            _atomic_write(self._path, payload)
+        except OSError:  # pragma: no cover - read-only vault keeps the in-memory verdict
+            pass
 
     # -- registration ------------------------------------------------------
     def setup_operator(
@@ -323,8 +430,11 @@ class OperatorAuth:
             record = self._load()
             if record is None:
                 raise OperatorAuthFailed("no operator registered")
+            self._check_lockout(record)
             if not self._verify_password(record, username, password):
+                self._register_failure(record)
                 raise OperatorAuthFailed("invalid credentials")
+            self._clear_failures(record)
             return self._issue(record, PAPER_TIER)
 
     def login_paper(self, username: str, password: str) -> OperatorSession:
@@ -359,12 +469,16 @@ class OperatorAuth:
             record = self._load()
             if record is None:
                 raise OperatorAuthFailed("no operator registered")
+            self._check_lockout(record)
             password_ok = self._verify_password(record, username, password)
             pin_ok = self._verify_pin(record, pin)
             if not password_ok:
+                self._register_failure(record)
                 raise OperatorAuthFailed("invalid credentials")
             if not pin_ok:
+                self._register_failure(record)
                 raise LivePinRejected("live PIN rejected")
+            self._clear_failures(record)
             return self._issue(record, LIVE_TIER)
 
     # -- elevation ---------------------------------------------------------
@@ -374,8 +488,11 @@ class OperatorAuth:
             record = self._load()
             if record is None:  # pragma: no cover - token implies a record
                 raise OperatorAuthFailed("no operator registered")
+            self._check_lockout(record)
             if not self._verify_pin(record, live_pin):
+                self._register_failure(record)
                 raise LivePinRejected("live PIN rejected")
+            self._clear_failures(record)
             # The PAPER token is single-use for elevation: revoke it so a
             # replayed cookie can never mint a second LIVE session.
             self._revoked.add(str(session_token))
@@ -473,6 +590,7 @@ class OperatorAuth:
                 "issued_ns": int((claims or {}).get("issued_ns", 0) or 0),
                 "expires_ns": int((claims or {}).get("expires_ns", 0) or 0),
                 "clean_slate_active": False,
+                "lockout": self.lockout_state(),
             }
 
     def verify_reset_credentials(
@@ -500,6 +618,7 @@ class OperatorAuth:
             record = self._load()
             if record is None:
                 return False
+            self._check_lockout(record)
             secret = str(password or "")
             pin = str(live_pin or "").strip()
             if not secret or not pin:
@@ -517,7 +636,9 @@ class OperatorAuth:
             pw_ok = hmac.compare_digest(_derive_scrypt(secret, pw_salt), pw_expected)
             pin_ok = hmac.compare_digest(_derive_pbkdf2(pin, pin_salt), pin_expected)
             if not (pw_ok and pin_ok):
+                self._register_failure(record)
                 raise ResetCredentialsRejected("password or live PIN rejected")
+            self._clear_failures(record)
             return True
 
     def reset_operator_workspace(

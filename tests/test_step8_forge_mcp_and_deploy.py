@@ -477,11 +477,13 @@ def test_gate3_plugin_starts_in_shadow_and_enters_forge_as_challenger() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate4_unified_app_serves_api_and_react_bundle(client: TestClient) -> None:
+def test_gate4_unified_app_serves_api_and_headless_document(client: TestClient) -> None:
     index = client.get("/")
     assert index.status_code == 200, index.text
-    assert "root" in index.text.lower()
-    assert "/assets/" in index.text
+    assert "text/html" in index.headers.get("content-type", "")
+    assert "headless-backend" in index.text
+    assert "<script" not in index.text.lower()
+    assert "/assets/" not in index.text
     assert (DIST_ROOT / "index.html").exists()
 
     health = client.get("/api/v2/cockpit/health")
@@ -552,23 +554,13 @@ def test_gate4_smoke_script_exits_zero() -> None:
     assert "Unified server static React UI" in completed.stdout
 
 
-def test_gate4_npm_build_succeeds() -> None:
-    npm = shutil.which("npm") or shutil.which("npm.cmd")
-    if npm is None:
-        pytest.skip("npm is not installed in this environment")
-    completed = subprocess.run(
-        (
-            ["cmd", "/c", "npm", "run", "build"]
-            if os.name == "nt"
-            else ["npm", "run", "build"]
-        ),
-        cwd=str(UI_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    combined = completed.stdout + completed.stderr
-    assert completed.returncode == 0, combined[-4000:]
-    assert (DIST_ROOT / "index.html").exists()
-    assets = list((DIST_ROOT / "assets").glob("*.js"))
-    assert assets, "vite build produced no JavaScript asset"
+def test_gate4_no_frontend_build_is_required() -> None:
+    """V1.6: the React/Vite build was removed; the document is checked in."""
+    assert not (UI_ROOT / "package.json").exists()
+    assert not (UI_ROOT / "vite.config.ts").exists()
+    index = DIST_ROOT / "index.html"
+    assert index.exists()
+    document = index.read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "<script" not in document.lower()
+    assert not (DIST_ROOT / "assets").exists()

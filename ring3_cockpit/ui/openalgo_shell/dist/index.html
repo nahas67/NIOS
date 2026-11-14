@@ -1,29 +1,62 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
-    <meta name="theme-color" content="#0D0E10" />
-    <meta
-      name="description"
-      content="NIOS Glass Cockpit - institutional financial terminal for the four-ring sovereign trading system. Flat matte surfaces, paper sandbox and live vault."
-    />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-    />
-    <title>NIOS Glass Cockpit - Institutional Financial Terminal</title>
-    <!-- Critical inline paint: the canvas is already the terminal colour before any
-         stylesheet or module resolves, so there is zero flash of unstyled content. -->
-    <style>html,body,#root{height:100%;margin:0;padding:0}html{--lightningcss-light: ;--lightningcss-dark:initial;color-scheme:dark}body{color:#f4f5f7;-webkit-font-smoothing:antialiased;text-rendering:optimizelegibility;background:#0d0e10;font-family:Inter,Geist,Plus Jakarta Sans,ui-sans-serif,system-ui,sans-serif;font-size:13px;font-weight:400;line-height:1.45}#root:empty:after{content:"";background:#0d0e10;position:fixed;inset:0}</style>
-    <script type="module" crossorigin src="/assets/index-DyCcy7Ws.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CY3ldcf8.css">
-  </head>
-  <body style="background: #0d0e10; color: #f4f5f7">
-    <div id="root"></div>
-  </body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="nios-frontend" content="NONE">
+<meta name="nios-mode" content="HEADLESS_API">
+<title>NIOS Headless Backend</title>
+<style>
+:root{color-scheme:dark}
+html,body{margin:0;padding:0;background:#05070b;color:#cfd6e4;
+font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{padding:24px 28px 0}
+h1{margin:0;font-size:16px;letter-spacing:.08em;text-transform:uppercase;color:#e8ecf5}
+p.sub{margin:6px 0 0;color:#8b95a7}
+pre{margin:20px 28px 28px;padding:18px;border:1px solid #1b2230;background:#0a0e15;
+color:#9fd7c0;overflow:auto;white-space:pre-wrap}
+footer{padding:0 28px 28px;color:#5f6878}
+</style>
+</head>
+<body>
+<header>
+<h1>NIOS Ring 3 &mdash; Headless Backend</h1>
+<p class="sub">No frontend application is shipped. This document is a deterministic, zero-JavaScript status manifest.</p>
+</header>
+<pre id="nios-headless-manifest">{
+  "schema_version": "v1.6.headless-backend",
+  "document_id": "NIOS-ARC-2026-V3",
+  "frontend": "NONE",
+  "javascript": 0,
+  "css_framework": "NONE",
+  "mode": "HEADLESS_API",
+  "api_root": "/api/v2",
+  "health": "/api/v2/cockpit/health",
+  "state": "/api/v2/cockpit/state",
+  "pages": "/api/v2/cockpit/pages",
+  "paper_state": "/api/v2/workspace/paper/state",
+  "live_state": "/api/v2/workspace/live/state",
+  "metrics": "/api/v2/metrics",
+  "payload_envelope": [
+    "schema_version",
+    "generated_at_ns",
+    "clean_slate_active",
+    "workspace_mode",
+    "payload_sha256"
+  ],
+  "risk_telemetry": [
+    "gross_exposure_micros",
+    "net_exposure_micros",
+    "margin_used_micros",
+    "free_margin_micros",
+    "var_99_bps",
+    "cvar_99_bps",
+    "max_drawdown_bps",
+    "realized_pnl_micros",
+    "unrealized_pnl_micros",
+    "total_tax_paid_micros"
+  ]
+}</pre>
+<footer>Client routes return this document with <code>200 OK</code>; the application is the REST/SSE API only.</footer>
+</body>
 </html>

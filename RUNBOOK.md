@@ -1,8 +1,8 @@
 # NIOS Production Operator Runbook
 
 **Document ID:** NIOS-OPS-2026-V3
-**Release tag:** `v3.6.0-V1.5` (supersedes `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
-**Branch:** `V1.5`
+**Release tag:** `v3.7.0-V1.6` (supersedes `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
+**Branch:** `V1.6`
 **Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
 **Operating constitution:** `AGENTS.md`
@@ -389,12 +389,12 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 23 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 24 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.6.0-V1.5`: `pytest tests -q` must report **415 passed, 0 failed, 0 warnings**
+Release seal for `v3.6.0-V1.5`: `pytest tests -q` must report **430 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
@@ -424,7 +424,8 @@ prerequisites for re-tagging; neither may be waived.
 | 20 | `tests/test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** `daily_stock_analysis` harvest (8 strategies, grounded decision dashboard), 6 specialist agent tasks, tax-net walk-forward backtester, 30-fill nursery gate, 11-page SPA |
 | 21 | `tests/test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.3** separate `/paper/login` + `/live/login` portals, options chain with Greeks/PCR/Max Pain, six multi-leg payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15 pages across all three route trees |
 | 22 | `tests/test_v1_4_clean_room_masterpiece_ui.py` | **V1.4** clean-room rebuild: 15 bespoke workstation pages, dual-shell separation, four auth portals, six zero-dependency SVG charts, biome-clean source, clean-slate rendering |
-| 23 | `tests/test_v1_5_institutional_terminal_ui.py` | **V1.5** flat institutional terminal: zero glass / zero shadow / zero pill, twelve exact colour tokens, `tabular-nums` on every figure, six flat gradient-free charts, 50-route HTML sweep, paper/live shell invariants |
+| 23 | `tests/test_v1_5_institutional_terminal_ui.py` | **V1.6** headless institutional contract: 50-route status document, integer micro money, exact itemized statutory floors, 15-page catalogue, dual workspace boundary, reproducible payload digest |
+| 24 | `tests/test_v1_6_backend_bug_hunt_security_and_data_completeness.py` | **V1.6** master instrument registry + lot/tick/freeze enforcement, itemized statutory cost engine, adversarial numerical/boundary fuzzing, 32-thread idempotency + double-entry conservation, auth brute-force lockout + secret non-leakage |
 
 ### 3.3 Chaos / crash injection
 

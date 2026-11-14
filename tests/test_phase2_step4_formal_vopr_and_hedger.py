@@ -310,7 +310,7 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
 
 def test_gate5_full_test_inventory_is_twenty_one_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 23, [path.name for path in test_files]
+    assert len(test_files) == 24, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
     assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
     # Phase 3 Step 1 adds process isolation, the live TigerBeetle replica and the
@@ -370,34 +370,22 @@ def certified_client(tmp_path_factory: pytest.TempPathFactory):
         runtime.close()
 
 
-def test_gate6_compiled_cockpit_bundle_exists_and_is_served(certified_client) -> None:
+def test_gate6_headless_status_document_exists_and_is_served(certified_client) -> None:
+    """V1.6: no React bundle; every client route serves the headless manifest."""
     index = DIST_ROOT / "index.html"
-    assert index.is_file(), f"run `npm run build` in {DIST_ROOT.parent}"
+    assert index.is_file(), "the headless status document is missing"
     html = index.read_text(encoding="utf-8")
-    assert '<div id="root">' in html
-    assert "/assets/" in html
+    assert "headless-backend" in html
+    assert "<script" not in html.lower()
+    assert "/assets/" not in html
+    assert "HEADLESS_API" in html
 
-    js_bundles = sorted((DIST_ROOT / "assets").glob("*.js"))
-    css_bundles = sorted((DIST_ROOT / "assets").glob("*.css"))
-    assert js_bundles, "vite emitted no JS bundle"
-    assert css_bundles, "vite emitted no CSS bundle"
-    assert sum(path.stat().st_size for path in js_bundles) > 100_000
-
-    served = certified_client.get("/")
-    assert served.status_code == 200, served.text
-    assert '<div id="root">' in served.text
-
-    bundle = js_bundles[0]
-    assert f"/assets/{bundle.name}" in served.text, "index.html does not reference the built bundle"
-    asset = certified_client.get(f"/assets/{bundle.name}")
-    assert asset.status_code == 200
-    assert asset.content == bundle.read_bytes()
-
-    stylesheet = css_bundles[0]
-    assert f"/assets/{stylesheet.name}" in served.text
-    served_css = certified_client.get(f"/assets/{stylesheet.name}")
-    assert served_css.status_code == 200
-    assert served_css.content == stylesheet.read_bytes()
+    for route in ("/", "/dashboard", "/orders", "/paper/dashboard", "/live/control"):
+        served = certified_client.get(route)
+        assert served.status_code == 200, route
+        assert "text/html" in served.headers.get("content-type", "")
+        assert "headless-backend" in served.text
+        assert "<script" not in served.text.lower()
 
 
 def test_gate6_formal_proofs_endpoint_certifies_phase2_step4(certified_client) -> None:
