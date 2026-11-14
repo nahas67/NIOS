@@ -1,165 +1,180 @@
 /**
- * `/setup` — first-run sovereign operator onboarding.
+ * First-run setup portal.
  *
- * Creates the single operator, the six-digit live PIN and a guaranteed
- * clean-slate workspace: every vault zero, no orders, autopilot off.
+ * Creates the single sovereign operator and initialises every silo, vault,
+ * order book, logbook row and performance counter at exactly zero. This screen
+ * is the only place a `live_pin` is ever chosen.
  */
 
 import { useState, type ReactNode } from "react";
-import { ArrowLeft, ArrowRight, CheckCircle2, Fingerprint } from "lucide-react";
-import type { Portal } from "@/lib/router";
-import { navigate } from "@/lib/router";
 import { authApi } from "@/lib/api";
-import { useAction } from "@/lib/use-api";
+import type { Portal } from "@/lib/router";
 import { useSession } from "@/lib/session";
-import { pushToast } from "@/lib/toast";
-import type { AuthSession } from "@/lib/types";
-import { PortalScaffold } from "./PortalScaffold";
-import { ErrorBlock, StatusPill } from "@/design-system/primitives";
+import { toast } from "@/lib/toast";
+import { Btn, Field } from "@/design-system/primitives";
+import { RingTopology } from "@/design-system/ring-topology";
 
-const CLEAN_SLATE = [
-  "All Vaults = 0",
-  "Orders = 0",
-  "Autopilot = OFF",
-  "Shadow nursery 0/30",
-  "Logbook empty",
+const CLEAN_SLATE_ROWS = [
+  ["All Vaults = 0", "ReserveYield - LongTermCompounder - TacticalSwing - SpinalScalper"],
+  ["All NAV = 0", "Four silos, sixteen vaults, no opening balance"],
+  ["All Orders = 0", "No working order, no fill, no shadow fill"],
+  ["All Logbook = 0", "No trade row, no R-multiple, no cost drag"],
+  ["Autopilot = OFF", "Nothing runs until an operator arms it"],
 ];
 
 export function SetupPortal({ onPortal }: { onPortal: (portal: Portal) => void }): ReactNode {
   const { signIn } = useSession();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [pin, setPin] = useState("");
-  const setup = useAction<AuthSession>();
-
-  const pinValid = /^\d{6}$/.test(pin);
-  const passwordValid = password.length >= 8;
-  const ready = username.trim().length >= 3 && passwordValid && pinValid && !setup.busy;
+  const [confirm, setConfirm] = useState("");
+  const [livePin, setLivePin] = useState("");
+  const [ack, setAck] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const submit = async () => {
-    if (!ready) return;
-    const receipt = await setup.run(() =>
-      authApi.setup({ username: username.trim(), password, live_pin: pin }),
-    );
-    if (receipt) {
-      signIn(receipt);
-      pushToast("Sovereign operator created", "Clean slate sealed · 0 everywhere", "ok");
-      navigate("/login");
+    setError(null);
+    if (username.trim().length < 3) return setError("Username must be at least 3 characters.");
+    if (password.length < 8) return setError("Password must be at least 8 characters.");
+    if (password !== confirm) return setError("Password confirmation does not match.");
+    if (!/^\d{6}$/.test(livePin)) return setError("The live PIN must be exactly six digits.");
+    if (!ack) return setError("Acknowledge that live mode can sign real orders.");
+    setBusy(true);
+    try {
+      const session = await authApi.setup({
+        username: username.trim(),
+        password,
+        live_pin: livePin,
+      });
+      signIn(session);
+      toast("Sovereign operator created. Every value starts at zero.", "success");
+      onPortal("login");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "setup rejected");
+    } finally {
+      setBusy(false);
     }
   };
 
   return (
-    <PortalScaffold
-      mode="neutral"
-      eyebrow="First run · sovereign onboarding"
-      title="Create the operator"
-      subtitle="One operator, one live PIN, one clean slate. NIOS never ships with demo capital, demo orders or a pre-armed autopilot."
-      aside={
-        <div className="flex h-full flex-col justify-between gap-8">
-          <div>
-            <p className="eyebrow">Clean-slate initialization</p>
-            <h2 className="mt-2 text-[22px] leading-tight font-semibold">Nothing is pre-funded. Nothing is pre-armed.</h2>
-            <p className="mt-2 text-[12px] leading-relaxed text-[var(--muted)]">
-              The setup call creates the operator, seals the live PIN and initialises all four silos at exactly zero. You
-              can verify every one of these values in the ledger before the first deposit.
+    <div className="nx-portal">
+      <header className="nx-portal-top">
+        <span className="nx-sidebar-brand-mark" aria-hidden="true">
+          N
+        </span>
+        <div className="nx-sidebar-brand-text">
+          <span className="nx-sidebar-brand-title">NIOS</span>
+          <span className="nx-sidebar-brand-sub">Sovereign Operator Setup</span>
+        </div>
+        <span className="nx-badge nx-badge--muted" style={{ marginLeft: "auto" }}>
+          FIRST BOOT
+        </span>
+      </header>
+
+      <div className="nx-portal-body">
+        <div className="nx-portal-card nx-portal-card--wide">
+          <div className="nx-portal-title">
+            <span className="nx-kicker">BOOTSTRAP</span>
+            <h1>Create the sovereign operator</h1>
+            <p>
+              One human identity owns the cockpit. Two credentials open the paper sandbox; the six-digit
+              live PIN is the third factor that unlocks the funded vault.
             </p>
-            <ul className="mt-5 flex flex-col gap-2">
-              {CLEAN_SLATE.map((item) => (
-                <li key={item} className="glass row gap-2 px-3 py-2">
-                  <CheckCircle2 size={13} className="text-[var(--pos)]" aria-hidden="true" />
-                  <span className="mono text-[11px] text-[var(--ink-soft)]">{item}</span>
-                </li>
-              ))}
-            </ul>
           </div>
-          <div className="rounded-[var(--r-md)] border border-[var(--line)] bg-[var(--panel-sunken)] p-3">
-            <div className="row">
-              <Fingerprint size={15} className="text-[var(--accent)]" aria-hidden="true" />
-              <p className="text-[12px] font-medium">Two independent secrets</p>
+
+          <div className="nx-grid nx-grid--1-2">
+            <div className="nx-stack">
+              <RingTopology active="ring3" />
+              <div className="nx-panel">
+                <div className="nx-panel-head">
+                  <div className="nx-panel-title">
+                    <strong>CLEAN_SLATE initialisation</strong>
+                    <span>Nothing is seeded, funded or pre-traded</span>
+                  </div>
+                </div>
+                <div className="nx-panel-body nx-stack">
+                  {CLEAN_SLATE_ROWS.map(([title, body]) => (
+                    <div className="nx-list-item" key={title}>
+                      <span className="nx-badge nx-badge--muted">0</span>
+                      <span className="nx-stack" style={{ gap: 0 }}>
+                        <span className="nx-strong nx-sm">{title}</span>
+                        <span className="nx-xs nx-muted">{body}</span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
-            <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--muted)]">
-              The password opens the paper sandbox. The six-digit PIN is only ever checked by the live vault door and is
-              never stored in the browser.
-            </p>
+
+            <form
+              className="nx-portal-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submit();
+              }}
+            >
+              {error ? (
+                <div className="nx-portal-err" role="alert">
+                  {error}
+                </div>
+              ) : null}
+
+              <Field label="Operator username">
+                <input
+                  className="nx-input"
+                  autoComplete="username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  placeholder="sovereign"
+                />
+              </Field>
+              <Field label="Password" hint="Minimum 8 characters. Stored as an Argon2 digest.">
+                <input
+                  className="nx-input"
+                  type="password"
+                  autoComplete="new-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                />
+              </Field>
+              <Field label="Confirm password">
+                <input
+                  className="nx-input"
+                  type="password"
+                  autoComplete="new-password"
+                  value={confirm}
+                  onChange={(event) => setConfirm(event.target.value)}
+                />
+              </Field>
+              <Field label="Six-digit live PIN" hint="Third factor for /api/v2/auth/login/live.">
+                <input
+                  className="nx-input"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={livePin}
+                  onChange={(event) => setLivePin(event.target.value.replace(/\D/g, ""))}
+                  placeholder="000000"
+                />
+              </Field>
+
+              <label className="nx-check">
+                <input type="checkbox" checked={ack} onChange={(event) => setAck(event.target.checked)} />
+                <span>
+                  I understand that the live vault can sign real orders with real capital, and that live
+                  mode only unlocks after the 22-gate pre-flight certificate passes.
+                </span>
+              </label>
+
+              <Btn tone="primary" block onClick={() => void submit()} disabled={busy}>
+                {busy ? "Initialising..." : "Initialise sovereign workspace"}
+              </Btn>
+              <button type="button" className="nx-portal-note" onClick={() => onPortal("login")}>
+                An operator already exists? Go to the gateway.
+              </button>
+            </form>
           </div>
         </div>
-      }
-      footer={
-        <div className="row-between">
-          <button type="button" className="btn btn-sm btn-ghost" onClick={() => onPortal("login")}>
-            <ArrowLeft size={11} aria-hidden="true" />
-            Back to the doors
-          </button>
-          <StatusPill value="sealed clean slate" tone="accent2" />
-        </div>
-      }
-    >
-      <form
-        className="flex flex-col gap-3"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void submit();
-        }}
-      >
-        <div className="chip-row">
-          <StatusPill value="all vaults = 0" tone="accent" />
-          <StatusPill value="orders = 0" tone="accent" />
-          <StatusPill value="autopilot = off" tone="accent2" />
-        </div>
-
-        <label className="field">
-          <span className="field-label">Operator username</span>
-          <input
-            className="input"
-            value={username}
-            autoComplete="username"
-            onChange={(event) => setUsername(event.target.value)}
-            aria-label="Operator username"
-            required
-            minLength={3}
-          />
-        </label>
-        <label className="field">
-          <span className="field-label">Password · minimum 8 characters</span>
-          <input
-            className="input"
-            type="password"
-            value={password}
-            autoComplete="new-password"
-            onChange={(event) => setPassword(event.target.value)}
-            aria-label="Operator password"
-            aria-invalid={password !== "" && !passwordValid}
-            required
-            minLength={8}
-          />
-        </label>
-        <label className="field">
-          <span className="field-label">Six-digit live PIN</span>
-          <input
-            className="input tnum tracking-[0.5em]"
-            inputMode="numeric"
-            pattern="\d{6}"
-            maxLength={6}
-            value={pin}
-            autoComplete="off"
-            onChange={(event) => setPin(event.target.value.replace(/\D/g, "").slice(0, 6))}
-            aria-label="Six digit live PIN"
-            aria-invalid={pin !== "" && !pinValid}
-            required
-          />
-        </label>
-
-        {setup.error ? <ErrorBlock message={setup.error} /> : null}
-
-        <button type="submit" className="btn btn-accent mt-1" disabled={!ready}>
-          {setup.busy ? "Sealing the slate…" : "Create operator & seal clean slate"}
-          <ArrowRight size={12} aria-hidden="true" />
-        </button>
-
-        <p className="mono text-[9px] leading-relaxed tracking-[0.06em] text-[var(--dim)] uppercase">
-          start_clean_slate=true · 0 real capital · zero broker keys provisioned
-        </p>
-      </form>
-    </PortalScaffold>
+      </div>
+    </div>
   );
 }

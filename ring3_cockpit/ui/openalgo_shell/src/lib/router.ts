@@ -49,22 +49,57 @@ export function parsePath(pathname: string, search = ""): RouteLocation {
   }
 
   if (clean === "/paper") {
-    return { path: clean, search, portal: null, workspace: "paper", page: "dashboard", unknown: false };
+    return {
+      path: clean,
+      search,
+      portal: null,
+      workspace: "paper",
+      page: "dashboard",
+      unknown: false,
+    };
   }
   if (clean === "/live") {
-    return { path: clean, search, portal: null, workspace: "live", page: "dashboard", unknown: false };
+    return {
+      path: clean,
+      search,
+      portal: null,
+      workspace: "live",
+      page: "dashboard",
+      unknown: false,
+    };
   }
   if (clean.startsWith("/paper/")) {
     const page = pageFromSegment(clean.slice("/paper/".length));
-    return { path: clean, search, portal: null, workspace: "paper", page: page ?? "dashboard", unknown: page === null };
+    return {
+      path: clean,
+      search,
+      portal: null,
+      workspace: "paper",
+      page: page ?? "dashboard",
+      unknown: page === null,
+    };
   }
   if (clean.startsWith("/live/")) {
     const page = pageFromSegment(clean.slice("/live/".length));
-    return { path: clean, search, portal: null, workspace: "live", page: page ?? "dashboard", unknown: page === null };
+    return {
+      path: clean,
+      search,
+      portal: null,
+      workspace: "live",
+      page: page ?? "dashboard",
+      unknown: page === null,
+    };
   }
 
   const page = pageFromSegment(clean);
-  return { path: clean, search, portal: null, workspace: "base", page: page ?? "dashboard", unknown: page === null };
+  return {
+    path: clean,
+    search,
+    portal: null,
+    workspace: "base",
+    page: page ?? "dashboard",
+    unknown: page === null,
+  };
 }
 
 export function currentLocation(): RouteLocation {

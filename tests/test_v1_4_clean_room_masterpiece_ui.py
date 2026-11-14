@@ -175,7 +175,7 @@ def test_v1_4_clean_room_source_layout() -> None:
         "App.tsx",
         "design-system/tokens.css",
         "design-system/primitives.tsx",
-        "design-system/isometric-rings.tsx",
+        "design-system/ring-topology.tsx",
         "charts/CandlestickChart.tsx",
         "charts/DepthLadderChart.tsx",
         "charts/PayoffCurveChart.tsx",
@@ -220,9 +220,8 @@ def test_v1_4_clean_room_source_layout() -> None:
     tokens = (SRC_ROOT / "design-system" / "tokens.css").read_text(encoding="utf-8")
     for marker in (
         "--obsidian",
-        "#07090f",
-        "rgba(15, 20, 34, 0.72)",
-        "backdrop-filter: blur(18px)",
+        "#0d0e10",
+        "#27292e",
         "font-variant-numeric: tabular-nums",
         ".nios-shell-paper",
         ".nios-shell-live",
@@ -261,13 +260,13 @@ def test_v1_4_dual_shells_are_strictly_separated() -> None:
 
     assert "PAPER SANDBOX" in paper
     assert "Deposit Paper Capital" in paper
-    assert "Reset All Values to Zero" in paper
+    assert "Reset to Zero" in paper
     assert "Autopilot" in paper
     assert "Switch to Live Vault" in paper
 
     assert "LIVE PRODUCTION — REAL CAPITAL" in live
     assert "EMERGENCY KILL SWITCH" in live
-    assert "Lock Live Vault (Drop to Paper)" in live
+    assert "Lock Live Vault" in live
     assert "22-gate" in live.lower()
     assert "EMERGENCY KILL SWITCH".lower() in live.lower()
     assert "expiresAtMs" in live or "LEASE" in live
@@ -359,7 +358,7 @@ def test_v1_4_pages_are_bespoke_workstations() -> None:
         assert "PageShell" not in source, key
         panels = sum(
             marker in source
-            for marker in ("GlassPanel", "SpecularCard", "MetricTile", "StatusPill")
+            for marker in ("TerminalPanel", "MetricTile", "StatusBadge", "DeltaBadge")
         )
         assert panels >= 2, key
         assert "export function" in source, key

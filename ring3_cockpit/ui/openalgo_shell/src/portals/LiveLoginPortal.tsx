@@ -1,23 +1,25 @@
 /**
- * `/live/login` — the three-factor armoured vault door.
+ * Live login - three factors and an explicit real-capital acknowledgement.
  *
- * Password + six-digit live PIN + an explicit acknowledgement that the capital
- * is real. The 22-gate pre-flight certificate is fetched before the form is
- * usable so the operator can see exactly what is red.
+ * The door reads the 22-gate pre-flight certificate before it renders, so an
+ * operator can never mistake a degraded vault for a ready one.
  */
 
-import { useMemo, useState, type ReactNode } from "react";
-import { ArrowLeft, ArrowRight, LockKeyhole, ShieldAlert } from "lucide-react";
-import type { Portal } from "@/lib/router";
-import { navigate } from "@/lib/router";
+import { useState, type ReactNode } from "react";
 import { authApi } from "@/lib/api";
-import { useAction, useResource } from "@/lib/use-api";
+import { navigate, type Portal } from "@/lib/router";
 import { useSession } from "@/lib/session";
-import { pushToast } from "@/lib/toast";
-import type { AuthSession } from "@/lib/types";
-import { PortalScaffold } from "./PortalScaffold";
-import { ErrorBlock, StatusPill } from "@/design-system/primitives";
+import { toast } from "@/lib/toast";
+import { useApi } from "@/lib/use-api";
 import { num } from "@/lib/format";
+import { Btn, Field, StatusBadge } from "@/design-system/primitives";
+import { Glyph } from "@/shells/icons";
+
+const FACTORS = [
+  ["1", "Username", "Sovereign operator identity"],
+  ["2", "Password", "Argon2 digest, same credential as paper"],
+  ["3", "Six-digit live PIN", "Separate secret, never sent to the paper door"],
+];
 
 export function LiveLoginPortal({ onPortal }: { onPortal: (portal: Portal) => void }): ReactNode {
   const { signIn } = useSession();
@@ -25,195 +27,178 @@ export function LiveLoginPortal({ onPortal }: { onPortal: (portal: Portal) => vo
   const [password, setPassword] = useState("");
   const [pin, setPin] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
-  const login = useAction<AuthSession>();
-  const preflight = useResource("live-door-preflight", () => authApi.preflight(), 15_000);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const preflight = useApi(() => authApi.preflight(), []);
 
-  const certificate = preflight.data;
-  const passed = certificate?.passed_gates ?? 0;
-  const total = certificate?.total_gates ?? 22;
-  const ready = certificate?.ready_for_live_cutover === true;
-  const failed = certificate?.failed_gate_ids ?? [];
-
-  const gates = useMemo(() => (certificate?.gates ?? []).slice(0, 22), [certificate]);
-
-  const pinValid = /^\d{6}$/.test(pin);
-  const canSubmit = username.trim() !== "" && password !== "" && pinValid && acknowledged && !login.busy;
+  const passed = num(preflight.data, "passed_gates", num(preflight.data, "certificate.passed_gates", 0));
+  const total = num(preflight.data, "total_gates", num(preflight.data, "certificate.total_gates", 22));
+  const ready = total > 0 && passed >= total;
 
   const submit = async () => {
-    if (!canSubmit) return;
-    const receipt = await login.run(() => authApi.loginLive({ username: username.trim(), password, live_pin: pin }));
-    if (receipt) {
-      signIn(receipt);
-      pushToast("Live vault unlocked", "30 minute lease · every order is Ring 0 signed", "warn");
-      navigate("/live/dashboard");
+    setError(null);
+    if (!username.trim() || !password) return setError("Username and password are required.");
+    if (!/^\d{6}$/.test(pin)) return setError("The live PIN must be exactly six digits.");
+    if (!acknowledged) return setError("Acknowledge that live mode signs orders with real capital.");
+    setBusy(true);
+    try {
+      const session = await authApi.loginLive({
+        username: username.trim(),
+        password,
+        live_pin: pin,
+      });
+      signIn(session);
+      toast("Live sovereign vault unlocked. Lease is 30 minutes.", "success");
+      navigate("/live/dashboard", { replace: true });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "live login rejected");
+    } finally {
+      setBusy(false);
     }
   };
 
   return (
-    <PortalScaffold
-      mode="live"
-      eyebrow="Live portal · three factors"
-      title="Open the live sovereign vault"
-      subtitle="Real capital. A 30-minute lease. Ring 0 signs every order and the 22-gate pre-flight must be green before the door opens."
-      aside={
-        <div className="flex h-full flex-col justify-between gap-7">
-          <div>
-            <div className="row-between">
-              <p className="eyebrow">22-gate pre-flight</p>
-              <StatusPill
-                value={ready ? "CERTIFIED" : certificate ? "NOT READY" : "PROBING"}
-                tone={ready ? "ok" : certificate ? "bad" : "neutral"}
-              />
-            </div>
-            <h2 className="mt-2 text-[22px] leading-tight font-semibold">
-              {passed}/{total} gates certified for this build.
-            </h2>
-            <p className="mt-1 text-[11.5px] text-[var(--muted)]">
-              {certificate?.release ? `Release ${certificate.release}` : "Awaiting the certificate"} · signer{" "}
-              {certificate?.certificate_sha256 ? `${certificate.certificate_sha256.slice(0, 12)}…` : "—"}
-            </p>
+    <div className="nx-portal">
+      <header className="nx-portal-top">
+        <span className="nx-sidebar-brand-mark" aria-hidden="true" style={{ borderColor: "#472527", color: "#E05555" }}>
+          <Glyph name="shield" size={13} />
+        </span>
+        <div className="nx-sidebar-brand-text">
+          <span className="nx-sidebar-brand-title">NIOS</span>
+          <span className="nx-sidebar-brand-sub">Live Sovereign Vault Access</span>
+        </div>
+        <span style={{ marginLeft: "auto" }}>
+          <StatusBadge tone="bear" large dot>
+            🔒 LIVE PRODUCTION — REAL CAPITAL
+          </StatusBadge>
+        </span>
+      </header>
 
-            <div className="mt-4 max-h-[260px] overflow-y-auto rounded-[var(--r-md)] border border-[var(--line)]">
-              <table className="table table-compact">
-                <thead>
-                  <tr>
-                    <th scope="col">Gate</th>
-                    <th scope="col">Status</th>
-                    <th scope="col" className="text-right">
-                      ms
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {gates.length === 0 ? (
-                    <tr>
-                      <td colSpan={3} className="text-[var(--dim)]">
-                        Reading the certificate…
-                      </td>
-                    </tr>
-                  ) : (
-                    gates.map((gate) => (
-                      <tr key={gate.gate}>
-                        <td className="max-w-[190px] truncate" title={gate.label}>
-                          {gate.label}
-                        </td>
-                        <td>
-                          <StatusPill
-                            value={gate.status}
-                            tone={gate.status.toUpperCase() === "PASS" ? "ok" : gate.status.toUpperCase() === "WARN" ? "warn" : "bad"}
-                          />
-                        </td>
-                        <td className="num">{gate.duration_ms != null ? num(gate.duration_ms, 1) : "—"}</td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
+      <div className="nx-portal-body">
+        <div className="nx-portal-card" style={{ maxWidth: 520 }}>
+          <div className="nx-portal-title">
+            <span className="nx-kicker">THREE-FACTOR DOOR</span>
+            <h1>Unlock the live vault</h1>
+            <p>
+              This surface signs real orders. Ring 0 verifies the SHA-256 digest, the instrument whitelist,
+              the notional cap, the 98% conformal gate and the tail-copula shield on every proposal.
+            </p>
+          </div>
+
+          <div className="nx-panel" style={{ borderColor: ready ? "#234235" : "#472527" }}>
+            <div className="nx-panel-head">
+              <div className="nx-panel-title">
+                <strong>22-gate pre-flight</strong>
+                <span>
+                  {ready ? "Certificate complete - vault may be unlocked" : "Certificate incomplete - the vault will refuse live orders"}
+                </span>
+              </div>
+              <div className="nx-panel-actions">
+                <StatusBadge tone={ready ? "bull" : "bear"}>
+                  {passed}/{total} PASS
+                </StatusBadge>
+              </div>
             </div>
-            {failed.length > 0 ? (
-              <p className="mono mt-2 text-[10px] text-[var(--neg)]">failing: {failed.slice(0, 4).join(" · ")}</p>
+            <div className="nx-panel-body">
+              <div className="nx-meter">
+                <div
+                  className={`nx-meter-fill${ready ? " nx-meter-fill--bull" : " nx-meter-fill--bear"}`}
+                  style={{ width: `${total > 0 ? Math.min(100, (passed / total) * 100) : 0}%` }}
+                />
+              </div>
+              <div className="nx-row nx-row--between" style={{ marginTop: 6 }}>
+                <span className="nx-xs nx-muted">
+                  {preflight.error ? `preflight unavailable: ${preflight.error}` : "GET /api/v2/control/preflight"}
+                </span>
+                <Btn size="sm" tone="ghost" onClick={preflight.reload}>
+                  Re-read
+                </Btn>
+              </div>
+            </div>
+          </div>
+
+          <div className="nx-stack" style={{ gap: 6 }}>
+            {FACTORS.map(([index, label, detail]) => (
+              <div className="nx-list-item" key={label}>
+                <span className="nx-badge nx-badge--muted">{index}</span>
+                <span className="nx-stack" style={{ gap: 0 }}>
+                  <span className="nx-sm nx-strong">{label}</span>
+                  <span className="nx-xs nx-muted">{detail}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <form
+            className="nx-portal-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submit();
+            }}
+          >
+            {error ? (
+              <div className="nx-portal-err" role="alert">
+                {error}
+              </div>
             ) : null}
+            <Field label="Username">
+              <input
+                className="nx-input"
+                autoComplete="username"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+              />
+            </Field>
+            <Field label="Password">
+              <input
+                className="nx-input"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </Field>
+            <Field label="Six-digit live PIN" hint="The PIN is rate-limited and never persisted in the browser.">
+              <input
+                className="nx-input"
+                type="password"
+                inputMode="numeric"
+                maxLength={6}
+                autoComplete="off"
+                value={pin}
+                onChange={(event) => setPin(event.target.value.replace(/\D/g, ""))}
+                placeholder="000000"
+              />
+            </Field>
+
+            <label className="nx-check">
+              <input
+                type="checkbox"
+                checked={acknowledged}
+                onChange={(event) => setAcknowledged(event.target.checked)}
+              />
+              <span>
+                I acknowledge that this vault holds REAL CAPITAL, that live orders are irreversible once
+                signed, and that the 22-gate certificate above is my pre-flight evidence.
+              </span>
+            </label>
+
+            <Btn tone="danger" block onClick={() => void submit()} disabled={busy}>
+              {busy ? "Verifying three factors..." : "Unlock live sovereign vault"}
+            </Btn>
+          </form>
+
+          <div className="nx-hr" />
+          <div className="nx-row nx-row--between">
+            <button type="button" className="nx-portal-note" onClick={() => onPortal("paper-login")}>
+              Use the paper sandbox instead
+            </button>
+            <button type="button" className="nx-portal-note" onClick={() => onPortal("login")}>
+              Back to the dual gateway
+            </button>
           </div>
-
-          <div className="rounded-[var(--r-md)] border border-[rgba(244,63,94,0.4)] bg-[rgba(244,63,94,0.08)] p-3">
-            <div className="row">
-              <ShieldAlert size={15} className="text-[#f43f5e]" aria-hidden="true" />
-              <p className="text-[12px] font-medium text-[#fecdd3]">This door trades real money.</p>
-            </div>
-            <p className="mt-1.5 text-[11px] leading-relaxed text-[#fda4af]">
-              Crossing it does not change the kernel; it changes the counterparty. The 98% conformal gate still abstains on
-              ~99% of tape, and the kill switch still fires in under a millisecond.
-            </p>
-          </div>
         </div>
-      }
-      footer={
-        <div className="row-between">
-          <button type="button" className="btn btn-sm btn-ghost" onClick={() => onPortal("login")}>
-            <ArrowLeft size={11} aria-hidden="true" />
-            Both doors
-          </button>
-          <button type="button" className="btn btn-sm btn-ghost" onClick={() => onPortal("paper-login")}>
-            Use the paper sandbox instead
-          </button>
-        </div>
-      }
-    >
-      <form
-        className="flex flex-col gap-3"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void submit();
-        }}
-      >
-        <div className="row gap-2 rounded-[var(--r-sm)] border border-[rgba(245,158,11,0.3)] bg-[rgba(245,158,11,0.08)] px-3 py-2">
-          <LockKeyhole size={13} className="text-[#f59e0b]" aria-hidden="true" />
-          <p className="mono text-[9.5px] tracking-[0.08em] text-[#fcd34d] uppercase">three-factor · armed vault door</p>
-        </div>
-
-        <label className="field">
-          <span className="field-label">Username</span>
-          <input
-            className="input"
-            value={username}
-            autoComplete="username"
-            onChange={(event) => setUsername(event.target.value)}
-            aria-label="Live username"
-            required
-          />
-        </label>
-        <label className="field">
-          <span className="field-label">Password</span>
-          <input
-            className="input"
-            type="password"
-            value={password}
-            autoComplete="current-password"
-            onChange={(event) => setPassword(event.target.value)}
-            aria-label="Live password"
-            required
-          />
-        </label>
-        <label className="field">
-          <span className="field-label">Six-digit live PIN</span>
-          <input
-            className="input tnum tracking-[0.5em]"
-            inputMode="numeric"
-            pattern="\d{6}"
-            maxLength={6}
-            value={pin}
-            autoComplete="off"
-            onChange={(event) => setPin(event.target.value.replace(/\D/g, "").slice(0, 6))}
-            aria-label="Six digit live PIN"
-            aria-invalid={pin !== "" && !pinValid}
-            required
-          />
-        </label>
-
-        <label className="check mt-1">
-          <input
-            type="checkbox"
-            checked={acknowledged}
-            onChange={(event) => setAcknowledged(event.target.checked)}
-            aria-label="Acknowledge that live trading uses real capital"
-          />
-          <span>
-            I understand this workspace places <span className="text-[#fecdd3]">real orders with real capital</span>, that
-            the session expires after 30 minutes, and that the kill switch flattens every silo.
-          </span>
-        </label>
-
-        {login.error ? <ErrorBlock message={login.error} /> : null}
-
-        <button type="submit" className="btn btn-danger mt-1" disabled={!canSubmit}>
-          {login.busy ? "Opening vault…" : "Enter live sovereign vault"}
-          <ArrowRight size={12} aria-hidden="true" />
-        </button>
-
-        <p className="mono text-[9px] leading-relaxed tracking-[0.06em] text-[var(--dim)] uppercase">
-          live pin rejected with 403 · no elevation from a paper token · pre-flight {passed}/{total}
-        </p>
-      </form>
-    </PortalScaffold>
+      </div>
+    </div>
   );
 }

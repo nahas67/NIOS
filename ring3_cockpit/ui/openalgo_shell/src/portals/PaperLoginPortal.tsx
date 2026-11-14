@@ -1,133 +1,109 @@
 /**
- * `/paper/login` — cyan/lavender glass door into the simulated workspace.
+ * Paper login - two factors, no capital.
  */
 
 import { useState, type ReactNode } from "react";
-import { ArrowLeft, ArrowRight, Boxes } from "lucide-react";
-import type { Portal } from "@/lib/router";
-import { navigate } from "@/lib/router";
 import { authApi } from "@/lib/api";
-import { useAction } from "@/lib/use-api";
+import { navigate, type Portal } from "@/lib/router";
 import { useSession } from "@/lib/session";
-import { pushToast } from "@/lib/toast";
-import type { AuthSession } from "@/lib/types";
-import { PortalScaffold } from "./PortalScaffold";
-import { ErrorBlock, StatusPill } from "@/design-system/primitives";
+import { toast } from "@/lib/toast";
+import { Btn, Field, StatusBadge } from "@/design-system/primitives";
+import { Glyph } from "@/shells/icons";
 
 export function PaperLoginPortal({ onPortal }: { onPortal: (portal: Portal) => void }): ReactNode {
   const { signIn } = useSession();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const login = useAction<AuthSession>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const submit = async () => {
-    const receipt = await login.run(() => authApi.loginPaper({ username: username.trim(), password }));
-    if (receipt) {
-      signIn(receipt);
-      pushToast("Paper sandbox unlocked", "12 hour simulated session", "ok");
-      navigate("/paper/dashboard");
+    setError(null);
+    if (!username.trim() || !password) return setError("Username and password are required.");
+    setBusy(true);
+    try {
+      const session = await authApi.loginPaper({ username: username.trim(), password });
+      signIn(session);
+      toast("Paper sandbox unlocked", "success");
+      navigate("/paper/dashboard", { replace: true });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "login rejected");
+    } finally {
+      setBusy(false);
     }
   };
 
   return (
-    <PortalScaffold
-      mode="paper"
-      eyebrow="Paper portal · two fields"
-      title="Enter the paper sandbox"
-      subtitle="Simulated capital, zero broker reach. This door mints a 12-hour PAPER session and starts on a clean slate."
-      aside={
-        <div className="flex h-full flex-col justify-between gap-8">
-          <div>
-            <p className="eyebrow">Sandbox contract</p>
-            <h2 className="mt-2 text-[22px] leading-tight font-semibold">
-              Research the market with the full kernel, none of the capital.
-            </h2>
-            <ul className="mt-5 flex flex-col gap-3 text-[12px] text-[var(--muted)]">
-              {[
-                "Deposit simulated capital into any of the four silos.",
-                "Burst shadow fills to walk the 0/30 graduation nursery.",
-                "Reset every value to zero at any time — the logbook included.",
-                "Switch to the live vault only by re-authenticating at its own door.",
-              ].map((item) => (
-                <li key={item} className="flex gap-2">
-                  <span className="mt-1.5 h-1 w-1 flex-none rounded-full bg-[#22d3ee]" aria-hidden="true" />
-                  {item}
-                </li>
-              ))}
-            </ul>
-          </div>
-          <div className="glass p-4">
-            <div className="row">
-              <Boxes size={16} className="text-[#22d3ee]" aria-hidden="true" />
-              <p className="text-[12px] font-medium">SIMULATED EXECUTION ONLY (ALL VALUES START AT 0)</p>
-            </div>
-            <p className="mono mt-2 text-[10px] leading-relaxed text-[var(--dim)]">
-              Ring 2 is still air-gapped here. The paper simulator shares the deterministic kernel, so every fill, ratchet
-              and conformal residual is real telemetry — only the capital is synthetic.
+    <div className="nx-portal">
+      <header className="nx-portal-top">
+        <span className="nx-sidebar-brand-mark" aria-hidden="true">
+          <Glyph name="coin" size={13} />
+        </span>
+        <div className="nx-sidebar-brand-text">
+          <span className="nx-sidebar-brand-title">NIOS</span>
+          <span className="nx-sidebar-brand-sub">Paper Sandbox Access</span>
+        </div>
+        <StatusBadge tone="neutral" dot>
+          SIMULATED EXECUTION ONLY (ALL VALUES START AT 0)
+        </StatusBadge>
+      </header>
+
+      <div className="nx-portal-body">
+        <div className="nx-portal-card">
+          <div className="nx-portal-title">
+            <span className="nx-kicker">TWO-FACTOR DOOR</span>
+            <h1>Enter the paper sandbox</h1>
+            <p>
+              Username and password are enough here. No live PIN is collected on this surface, and the
+              gateway issues a PAPER-tier session only.
             </p>
           </div>
-        </div>
-      }
-      footer={
-        <div className="row-between">
-          <button type="button" className="btn btn-sm btn-ghost" onClick={() => onPortal("login")}>
-            <ArrowLeft size={11} aria-hidden="true" />
-            Both doors
-          </button>
-          <p className="mono text-[9px] tracking-[0.08em] text-[var(--dim)] uppercase">session TTL 12h · paper tier</p>
-        </div>
-      }
-    >
-      <form
-        className="flex flex-col gap-3"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void submit();
-        }}
-      >
-        <label className="field">
-          <span className="field-label">Username</span>
-          <input
-            className="input"
-            value={username}
-            autoComplete="username"
-            onChange={(event) => setUsername(event.target.value)}
-            aria-label="Paper username"
-            required
-          />
-        </label>
-        <label className="field">
-          <span className="field-label">Password</span>
-          <input
-            className="input"
-            type="password"
-            value={password}
-            autoComplete="current-password"
-            onChange={(event) => setPassword(event.target.value)}
-            aria-label="Paper password"
-            required
-          />
-        </label>
 
-        {login.error ? <ErrorBlock message={login.error} /> : null}
-
-        <button type="submit" className="btn btn-accent mt-1" disabled={login.busy || !username || !password}>
-          {login.busy ? "Opening sandbox…" : "Enter paper sandbox"}
-          <ArrowRight size={12} aria-hidden="true" />
-        </button>
-
-        <div className="row-between mt-1">
-          <StatusPill value="no live pin required" tone="accent" />
-          <button
-            type="button"
-            className="btn btn-sm btn-ghost"
-            onClick={() => onPortal("setup")}
-            aria-label="First-run setup"
+          <form
+            className="nx-portal-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submit();
+            }}
           >
-            First-run setup
-          </button>
+            {error ? (
+              <div className="nx-portal-err" role="alert">
+                {error}
+              </div>
+            ) : null}
+            <Field label="Username">
+              <input
+                className="nx-input"
+                autoComplete="username"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+              />
+            </Field>
+            <Field label="Password">
+              <input
+                className="nx-input"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </Field>
+            <Btn tone="primary" block onClick={() => void submit()} disabled={busy}>
+              {busy ? "Authenticating..." : "Unlock paper sandbox"}
+            </Btn>
+          </form>
+
+          <div className="nx-hr" />
+          <div className="nx-row nx-row--between">
+            <button type="button" className="nx-portal-note" onClick={() => onPortal("login")}>
+              Back to the dual gateway
+            </button>
+            <button type="button" className="nx-portal-note" onClick={() => onPortal("live-login")}>
+              I need the live vault
+            </button>
+          </div>
         </div>
-      </form>
-    </PortalScaffold>
+      </div>
+    </div>
   );
 }

@@ -1,157 +1,135 @@
 /**
- * Shared chart geometry.
+ * Flat SVG chart kit.
  *
- * Every visualisation in `src/charts` is a hand-built responsive SVG: no chart
- * runtime, no canvas, no layout thrash. These helpers keep the scales, the
- * crosshair maths and the tabular tooltip identical across all six charts.
+ * One geometry helper, one frame, one legend. Every visualisation in the
+ * terminal draws with a 1px hairline grid on the module surface and never with
+ * a gradient fill, so a printed screenshot stays legible and a retina display
+ * shows a crisp line rather than a bloom.
  */
 
-import { useCallback, useMemo, useState, type PointerEvent, type ReactNode } from "react";
+import type { ReactNode } from "react";
 
-export const VB_W = 720;
+export const CHART = {
+  grid: "#27292E",
+  axis: "#5A5E66",
+  text: "#8C9099",
+  strong: "#F4F5F7",
+  surface: "#16181C",
+  canvas: "#0D0E10",
+  raised: "#22242A",
+  accent: "#F96316",
+  bull: "#38B27B",
+  bullFill: "#172B23",
+  bullLine: "#234235",
+  bear: "#E05555",
+  bearFill: "#2D191A",
+  bearLine: "#472527",
+} as const;
 
-export interface Domain {
-  min: number;
-  max: number;
-}
-
-export function domainOf(values: number[], paddingPct = 0.06): Domain {
-  const clean = values.filter((value) => Number.isFinite(value));
-  if (clean.length === 0) return { min: 0, max: 1 };
-  let min = Math.min(...clean);
-  let max = Math.max(...clean);
-  if (min === max) {
-    const bump = Math.abs(min) * 0.02 || 1;
-    min -= bump;
-    max += bump;
-  }
-  const pad = (max - min) * paddingPct;
-  return { min: min - pad, max: max + pad };
-}
-
-export function scale(value: number, domain: Domain, size: number): number {
-  const span = domain.max - domain.min || 1;
-  return ((value - domain.min) / span) * size;
-}
-
-export function invert(value: number, domain: Domain, size: number): number {
-  const span = domain.max - domain.min || 1;
-  return domain.min + (value / (size || 1)) * span;
-}
-
-export function ticks(domain: Domain, count = 4): number[] {
-  if (count <= 0) return [];
-  return Array.from({ length: count + 1 }, (_, index) => domain.min + ((domain.max - domain.min) * index) / count);
+export function scale(domainMin: number, domainMax: number, size: number): (value: number) => number {
+  const span = domainMax - domainMin;
+  if (!Number.isFinite(span) || span === 0) return () => size / 2;
+  return (value: number) => ((value - domainMin) / span) * size;
 }
 
 export function linePath(points: Array<[number, number]>): string {
   if (points.length === 0) return "";
-  return points.map(([x, y], index) => `${index === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+  return points
+    .map(([x, y], index) => `${index === 0 ? "M" : "L"}${x.toFixed(2)} ${y.toFixed(2)}`)
+    .join(" ");
 }
 
 export function areaPath(points: Array<[number, number]>, baseline: number): string {
   if (points.length === 0) return "";
   const first = points[0];
   const last = points[points.length - 1];
-  return `M${first[0].toFixed(2)},${baseline.toFixed(2)} ${points
-    .map(([x, y]) => `L${x.toFixed(2)},${y.toFixed(2)}`)
-    .join(" ")} L${last[0].toFixed(2)},${baseline.toFixed(2)} Z`;
+  return `${linePath(points)} L${last[0].toFixed(2)} ${baseline.toFixed(2)} L${first[0].toFixed(2)} ${baseline.toFixed(2)} Z`;
 }
 
-export interface PointerState {
-  index: number | null;
-  x: number;
-  bind: {
-    onPointerMove: (event: PointerEvent<SVGSVGElement>) => void;
-    onPointerLeave: () => void;
-  };
+export function extent(values: number[], fallback: [number, number] = [0, 1]): [number, number] {
+  const clean = values.filter((value) => Number.isFinite(value));
+  if (clean.length === 0) return fallback;
+  let min = clean[0];
+  let max = clean[0];
+  for (const value of clean) {
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+  if (min === max) return [min - 1, max + 1];
+  return [min, max];
 }
 
-/** Map a pointer position onto an index of `length` samples. */
-export function useCrosshair(length: number, vbWidth = VB_W): PointerState {
-  const [index, setIndex] = useState<number | null>(null);
-
-  const onPointerMove = useCallback(
-    (event: PointerEvent<SVGSVGElement>) => {
-      if (length <= 0) return;
-      const rect = event.currentTarget.getBoundingClientRect();
-      if (rect.width <= 0) return;
-      const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-      setIndex(Math.min(length - 1, Math.round(ratio * (length - 1))));
-    },
-    [length],
-  );
-
-  const onPointerLeave = useCallback(() => setIndex(null), []);
-
-  const x = useMemo(() => {
-    if (index === null || length <= 1) return 0;
-    return (index / (length - 1)) * vbWidth;
-  }, [index, length, vbWidth]);
-
-  return { index, x, bind: { onPointerMove, onPointerLeave } };
+export interface ChartLegendItem {
+  label: string;
+  color: string;
+  dashed?: boolean;
 }
 
-export function ChartTooltip({
-  x,
-  children,
-  width = 196,
-}: {
-  x: number;
-  children: ReactNode;
-  width?: number;
-}): ReactNode {
-  const pct = Math.min(94, Math.max(6, (x / VB_W) * 100));
+export function ChartLegend({ items }: { items: ChartLegendItem[] }): ReactNode {
   return (
-    <div
-      className="pointer-events-none absolute top-2 z-10 rounded-[var(--r-sm)] border border-[var(--line-strong)] bg-[rgba(6,9,16,0.96)] px-2.5 py-2 shadow-[0_18px_40px_-22px_#000]"
-      style={{ left: `${pct}%`, width, transform: "translateX(-50%)" }}
-      role="tooltip"
-    >
-      {children}
+    <div className="nx-chart-legend">
+      {items.map((item) => (
+        <span key={item.label} className="nx-chart-key">
+          <i
+            className="nx-chart-swatch"
+            aria-hidden="true"
+            style={{
+              background: item.dashed ? "transparent" : item.color,
+              borderTop: item.dashed ? `1px dashed ${item.color}` : undefined,
+            }}
+          />
+          {item.label}
+        </span>
+      ))}
     </div>
   );
 }
 
-export function TooltipRow({ label, value, tone }: { label: string; value: ReactNode; tone?: string }): ReactNode {
-  return (
-    <div className="flex items-center justify-between gap-3 text-[10px]">
-      <span className="text-[var(--dim)]">{label}</span>
-      <span className={`mono tnum ${tone ?? "text-[var(--ink-soft)]"}`}>{value}</span>
-    </div>
-  );
+export interface ChartFrameProps {
+  label: string;
+  legend?: ChartLegendItem[];
+  empty?: string;
+  children?: ReactNode;
+  /** Plot rectangle in viewBox units. */
+  box: { x: number; y: number; w: number; h: number };
+  viewBox: string;
+  height: number;
+  action?: ReactNode;
 }
 
-export function GridLines({
-  domain,
-  plotH,
-  plotW,
-  left,
-  top,
-  count = 4,
-  format,
-}: {
-  domain: Domain;
-  plotH: number;
-  plotW: number;
-  left: number;
-  top: number;
-  count?: number;
-  format: (value: number) => string;
-}): ReactNode {
-  return (
-    <g>
-      {ticks(domain, count).map((value) => {
-        const y = top + plotH - scale(value, domain, plotH);
-        return (
-          <g key={value}>
-            <line x1={left} x2={left + plotW} y1={y} y2={y} stroke="rgba(148,163,184,0.09)" strokeDasharray="2 4" />
-            <text x={left - 6} y={y + 3} textAnchor="end" className="iso-ring-label" style={{ fontSize: 8 }}>
-              {format(value)}
-            </text>
-          </g>
-        );
-      })}
-    </g>
-  );
+/** Grid, axis baseline and the empty-state text shared by every chart. */
+export function plotGrid(box: { x: number; y: number; w: number; h: number }, rows = 4, cols = 6) {
+  const lines = [];
+  for (let row = 0; row <= rows; row += 1) {
+    const y = box.y + (box.h / rows) * row;
+    lines.push(
+      <line
+        key={`r${row}`}
+        x1={box.x}
+        y1={y}
+        x2={box.x + box.w}
+        y2={y}
+        stroke={CHART.grid}
+        strokeWidth={1}
+        shapeRendering="crispEdges"
+      />,
+    );
+  }
+  for (let col = 0; col <= cols; col += 1) {
+    const x = box.x + (box.w / cols) * col;
+    lines.push(
+      <line
+        key={`c${col}`}
+        x1={x}
+        y1={box.y}
+        x2={x}
+        y2={box.y + box.h}
+        stroke={CHART.grid}
+        strokeWidth={1}
+        shapeRendering="crispEdges"
+        opacity={col === 0 || col === cols ? 1 : 0.5}
+      />,
+    );
+  }
+  return lines;
 }

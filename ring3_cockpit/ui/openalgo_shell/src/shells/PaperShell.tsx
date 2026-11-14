@@ -1,267 +1,182 @@
 /**
  * Paper sandbox shell.
  *
- * Obsidian canvas, cyan + lavender glass, and the four synthetic controls that
- * only ever exist in a paper workspace: deposit simulated capital, zero every
- * value, play/pause the autopilot, and walk through the door into the live
- * vault (which re-authenticates; the paper token is never elevated in place).
+ * Slate neutral because nothing here touches real capital: a simulated NAV
+ * readout, the autopilot transport, a funding door and a hard reset to zero.
+ * The live armament - hazard ribbon, lease countdown, kill switch - is absent by
+ * construction, not hidden by a flag.
  */
 
-import { useMemo, useState, type ReactNode } from "react";
-import { ArrowRight, Lock, Pause, Play, Plus, RotateCcw } from "lucide-react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { authApi } from "@/lib/api";
+import { money } from "@/lib/format";
+import { toast } from "@/lib/toast";
+import { useApi } from "@/lib/use-api";
 import { PAGE_BY_KEY } from "@/pages/registry";
+import { Btn, ConfirmModal, Field, StatusBadge } from "@/design-system/primitives";
+import { Glyph } from "./icons";
 import { Sidebar } from "./Sidebar";
 import type { ShellProps } from "./types";
-import { authApi } from "@/lib/api";
-import { useAction, useResource } from "@/lib/use-api";
-import { useSession } from "@/lib/session";
-import { pushToast, toastError } from "@/lib/toast";
-import { money, num } from "@/lib/format";
-import {
-  ConfirmDangerModal,
-  StatusPill,
-  TabularValue,
-} from "@/design-system/primitives";
+import { bool, num, pick, str } from "@/lib/format";
 
-const SILOS = ["CRYPTO_BINANCE", "INDIA_ZERODHA_DHAN", "US_IBKR", "FX_MT5"];
-
-function DepositModal({
-  open,
-  onClose,
-  onDone,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onDone: () => void;
-}): ReactNode {
-  const [silo, setSilo] = useState(SILOS[0]);
-  const [amount, setAmount] = useState("100000");
-  const funding = useAction<Record<string, unknown>>();
-
-  if (!open) return null;
-
-  const submit = async () => {
-    const units = Number(amount);
-    if (!Number.isFinite(units) || units <= 0) {
-      pushToast("Enter a positive capital amount", undefined, "warn");
-      return;
-    }
-    const receipt = await funding.run(() => authApi.fundPaper({ silo, amount_units: units }));
-    if (receipt) {
-      pushToast("Paper capital deposited", `${silo} · ${units.toLocaleString()} units`, "ok");
-      onDone();
-      onClose();
-    } else if (funding.error) {
-      toastError("Deposit rejected", funding.error);
-    }
-  };
-
-  return (
-    <div className="overlay overlay-center">
-      <button
-        type="button"
-        className="overlay-backdrop"
-        aria-label="Close deposit dialog"
-        onClick={onClose}
-      />
-      <div
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Deposit paper capital"
-      >
-        <header className="flex items-center justify-between border-b border-[var(--line)] p-4">
-          <div>
-            <p className="eyebrow">Simulated capital</p>
-            <h2 className="text-[14px] font-semibold">Deposit paper capital</h2>
-          </div>
-          <StatusPill value="zero real risk" tone="accent" />
-        </header>
-        <div className="grid gap-3 p-4">
-          <label className="field">
-            <span className="field-label">Target silo</span>
-            <select className="select" value={silo} onChange={(event) => setSilo(event.target.value)} aria-label="Target silo">
-              {SILOS.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="field">
-            <span className="field-label">Amount (account units)</span>
-            <input
-              className="input tnum"
-              inputMode="decimal"
-              value={amount}
-              onChange={(event) => setAmount(event.target.value)}
-              aria-label="Paper capital amount"
-            />
-          </label>
-          <p className="mono text-[10px] text-[var(--dim)]">
-            Credited to ReserveYield first; the 35 / 15 / 50 ratchet only applies to realised profit.
-          </p>
-          <div className="flex justify-end gap-2">
-            <button type="button" className="btn btn-ghost" onClick={onClose}>
-              Cancel
-            </button>
-            <button type="button" className="btn btn-accent" onClick={() => void submit()} disabled={funding.busy}>
-              {funding.busy ? "Depositing…" : "Deposit paper capital"}
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export function PaperShell({ page, children, onNavigate, onPortal }: ShellProps): ReactNode {
-  const meta = PAGE_BY_KEY[page];
-  const { username, signOut } = useSession();
-  const state = useResource("paper-workspace-state", () => authApi.paperState(), 12_000);
-  const autopilot = useAction<{ ok: boolean }>();
-  const [depositOpen, setDepositOpen] = useState(false);
+export function PaperShell({ page, onNavigate, onPortal, children }: ShellProps): ReactNode {
+  const [collapsed, setCollapsed] = useState(false);
+  const [fundOpen, setFundOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
-  const [resetting, setResetting] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [silo, setSilo] = useState("INDIA");
+  const [amount, setAmount] = useState("100000");
+  const paper = useApi(() => authApi.paperState(), []);
 
-  const navMicros = useMemo(() => {
-    const silos = state.data?.silos ?? {};
-    return Object.values(silos).reduce((sum, silo) => sum + (Number(silo.nav_micros) || 0), 0);
-  }, [state.data]);
+  const nav = paper.data;
+  const autopilotEnabled = bool(nav, "autopilot.enabled");
+  const totalMicros = num(nav, "nav.total_micros", num(nav, "nav_micros", 0));
+  const cleanSlate = bool(nav, "clean_slate_active", true);
+  const meta = PAGE_BY_KEY[page];
 
-  const autopilotOn = Boolean(state.data?.autopilot?.enabled);
-  const shadowFills = state.data?.shadow?.shadow_fills ?? 0;
-  const requiredFills = state.data?.shadow?.required_fills ?? 30;
-  const working = state.data?.orders?.counts?.working ?? 0;
+  const toggleAutopilot = useCallback(async () => {
+    try {
+      const next = await authApi.setAutopilot(!autopilotEnabled);
+      toast(next.autopilot.enabled ? "Autopilot engaged" : "Autopilot paused", "success");
+      paper.reload();
+    } catch (cause) {
+      toast(cause instanceof Error ? cause.message : "autopilot rejected", "error");
+    }
+  }, [autopilotEnabled, paper]);
 
-  const toggleAutopilot = async () => {
-    const receipt = await autopilot.run(() => authApi.setAutopilot(!autopilotOn));
-    if (receipt) {
-      pushToast(autopilotOn ? "Autopilot paused" : "Autopilot running", "Paper feed only", "ok");
-      state.reload();
-    } else if (autopilot.error) {
-      toastError("Autopilot control rejected", autopilot.error);
+  useEffect(() => {
+    const timer = window.setInterval(() => paper.reload(), 15000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const fund = async () => {
+    setBusy(true);
+    try {
+      await authApi.fundPaper({ silo, amount_units: Number(amount) || 0 });
+      toast(`Funded ${silo} with ${amount} paper units`, "success");
+      setFundOpen(false);
+      paper.reload();
+    } catch (cause) {
+      toast(cause instanceof Error ? cause.message : "funding rejected", "error");
+    } finally {
+      setBusy(false);
     }
   };
 
-  const resetWorkspace = async () => {
-    setResetting(true);
+  const reset = async () => {
+    setBusy(true);
     try {
       await authApi.resetWorkspace();
-      pushToast("Paper workspace zeroed", "All vaults, orders and the logbook return to 0", "ok");
-      state.reload();
+      toast("Paper workspace reset to zero", "success");
       setResetOpen(false);
-    } catch (problem) {
-      toastError("Reset rejected", problem instanceof Error ? problem.message : "unknown failure");
+      paper.reload();
+    } catch (cause) {
+      toast(cause instanceof Error ? cause.message : "reset rejected", "error");
     } finally {
-      setResetting(false);
+      setBusy(false);
     }
   };
 
-  const leave = async () => {
-    await signOut();
-    onPortal("login");
-  };
-
   return (
-    <div className="shell nios-shell-paper" data-collapsed={false}>
-      <Sidebar
-        workspace="paper"
-        active={page}
-        onNavigate={onNavigate}
-        badges={{
-          orders: String(working),
-          analyzer: `${shadowFills}/${requiredFills}`,
-          dashboard: autopilotOn ? "AUTO" : "OFF",
-        }}
-        username={username}
-        tier="PAPER"
-        onSignOut={() => void leave()}
-      />
+    <div className="nx-app nx-app--paper nios-shell-paper">
+      <Sidebar page={page} collapsed={collapsed} onToggle={() => setCollapsed(!collapsed)} onNavigate={onNavigate} />
 
-      <div className="main">
-        <header className="topbar">
-          <div className="topbar-title">
-            <h1>{meta.title}</h1>
-            <span className="topbar-meta">
-              {meta.route} · {meta.ring} · simulated execution
-            </span>
+      <div className="nx-main">
+        <header className="nx-topbar">
+          <span className="sr-only">Paper sandbox control bar</span>
+          <div className="nx-topbar-title">
+            <strong>{meta.title}</strong>
+            <span>Paper sandbox - simulated fills only</span>
           </div>
-          <div className="ml-auto flex items-center gap-2">
-            <span className="pill pill-accent">
-              <span className="pill-dot pulse" aria-hidden="true" />
-              PAPER
-            </span>
-            <button type="button" className="btn btn-sm" onClick={() => onPortal("live-login")}>
-              <Lock size={12} aria-hidden="true" />
+
+          <div className="nx-topbar-spacer" />
+
+          <div className="nx-topbar-cluster">
+            <StatusBadge tone="neutral" dot title="Workspace tier">
+              PAPER SANDBOX
+            </StatusBadge>
+            <StatusBadge tone={cleanSlate ? "muted" : "accent"} title="Clean slate state">
+              {cleanSlate ? "CLEAN SLATE 0" : "FUNDED"}
+            </StatusBadge>
+            {autopilotEnabled ? (
+              <StatusBadge tone="bull" dot>
+                AUTOPILOT RUNNING
+              </StatusBadge>
+            ) : (
+              <StatusBadge tone="muted">AUTOPILOT PAUSED</StatusBadge>
+            )}
+
+            <div className="nx-topbar-readout">
+              <span>Simulated NAV</span>
+              <strong>{money(totalMicros)}</strong>
+            </div>
+
+            <Btn size="sm" tone="ghost" onClick={toggleAutopilot}>
+              {autopilotEnabled ? "Pause Autopilot" : "Play Autopilot"}
+            </Btn>
+            <Btn size="sm" onClick={() => setFundOpen(true)}>
+              Deposit Paper Capital
+            </Btn>
+            <Btn size="sm" tone="ghost" onClick={() => setResetOpen(true)}>
+              Reset All Values to Zero
+            </Btn>
+            <Btn size="sm" tone="primary" onClick={() => onPortal("live-login")}>
+              <Glyph name="shield" size={12} />
               Switch to Live Vault
-            </button>
+            </Btn>
           </div>
         </header>
 
-        <div className="ribbon" role="status">
-          <span className="pill-dot" aria-hidden="true" />
-          PAPER SANDBOX — SIMULATED CAPITAL (ZERO REAL RISK)
-          <span className="dim">·</span>
-          <span className="tnum">NAV {money(navMicros)}</span>
-          <span className="dim">·</span>
-          <span>{autopilotOn ? "autopilot running" : "autopilot paused"}</span>
-          <div className="ml-auto flex flex-wrap items-center gap-1.5">
-            <button type="button" className="btn btn-sm" onClick={() => setDepositOpen(true)}>
-              <Plus size={12} aria-hidden="true" />
-              Deposit Paper Capital
-            </button>
-            <button type="button" className="btn btn-sm" onClick={() => void toggleAutopilot()} disabled={autopilot.busy}>
-              {autopilotOn ? <Pause size={12} aria-hidden="true" /> : <Play size={12} aria-hidden="true" />}
-              {autopilotOn ? "Pause Autopilot" : "Play Autopilot"}
-            </button>
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => setResetOpen(true)}>
-              <RotateCcw size={12} aria-hidden="true" />
-              Reset All Values to Zero
-            </button>
-          </div>
-        </div>
-
-        {navMicros === 0 ? (
-          <div className="border-b border-[var(--line)] bg-[var(--accent-soft)] px-5 py-2">
-            <div className="row-between mx-auto max-w-[1680px]">
-              <p className="text-[12px] text-[var(--accent)]">
-                Clean slate — every vault is 0 and no order has ever been placed. Fund the sandbox to begin.
-              </p>
-              <button type="button" className="btn btn-sm btn-accent" onClick={() => setDepositOpen(true)}>
-                Fund sandbox
-                <ArrowRight size={11} aria-hidden="true" />
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        <main className="content" id="main-content">
-          <div className="content-inner">{children}</div>
-        </main>
+        <main className="nx-content">{children}</main>
       </div>
 
-      <DepositModal open={depositOpen} onClose={() => setDepositOpen(false)} onDone={state.reload} />
+      <ConfirmModal
+        open={fundOpen}
+        title="Deposit paper capital"
+        description="Simulated units only. The paper ledger is a mirror; it can never settle against a broker."
+        confirmLabel="Fund sandbox"
+        busy={busy}
+        onConfirm={fund}
+        onClose={() => setFundOpen(false)}
+      >
+        <Field label="Silo">
+          <select className="nx-select" value={silo} onChange={(event) => setSilo(event.target.value)}>
+            <option value="INDIA">INDIA</option>
+            <option value="US">US</option>
+            <option value="FX">FX</option>
+            <option value="CRYPTO">CRYPTO</option>
+          </select>
+        </Field>
+        <Field label="Units" hint="Deposits are written to the ReserveYield vault.">
+          <input
+            className="nx-input"
+            inputMode="numeric"
+            value={amount}
+            onChange={(event) => setAmount(event.target.value)}
+          />
+        </Field>
+        <p className="nx-portal-note">
+          Current sandbox NAV {money(totalMicros)} across {Object.keys((pick(nav, "silos") as object) ?? {}).length || 0} silos.
+          {str(nav, "autopilot.mode") ? ` Autopilot mode ${str(nav, "autopilot.mode")}.` : ""}
+        </p>
+      </ConfirmModal>
 
-      <ConfirmDangerModal
+      <ConfirmModal
         open={resetOpen}
-        title="Zero the paper workspace"
-        body={
-          <span>
-            Every paper vault returns to zero, all working orders are cancelled, the shadow nursery resets to{" "}
-            <span className="mono">0/{requiredFills}</span> and the autopilot stops. Type RESET to confirm.
-          </span>
-        }
-        requireText="RESET"
-        confirmLabel="Reset All Values to Zero"
-        busy={resetting}
-        onCancel={() => setResetOpen(false)}
-        onConfirm={() => void resetWorkspace()}
-      />
-
-      <div className="sr-only" aria-live="polite">
-        Paper NAV <TabularValue value={navMicros} kind="money" />, {num(shadowFills, 0)} of {num(requiredFills, 0)} shadow fills.
-      </div>
+        title="Reset to zero"
+        description="This clears every paper order, fill, logbook row and shadow-fill counter. It cannot be undone."
+        confirmLabel="Reset to Zero"
+        tone="danger"
+        busy={busy}
+        onConfirm={reset}
+        onClose={() => setResetOpen(false)}
+      >
+        <p className="nx-portal-note">
+          The live vault is not touched. Live capital can only be changed from the live shell behind a
+          step-up PIN.
+        </p>
+      </ConfirmModal>
     </div>
   );
 }

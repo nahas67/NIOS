@@ -955,7 +955,10 @@ def test_gate4_router_sidebar_and_shells_are_wired() -> None:
 
     css = (SRC_ROOT / "index.css").read_text(encoding="utf-8")
     css += (SRC_ROOT / "design-system" / "tokens.css").read_text(encoding="utf-8")
-    assert "backdrop-filter: blur" in css
+    assert "backdrop-filter" not in css
+    assert "box-shadow" not in css
+    assert "#0d0e10" in css
+    assert "#f96316" in css
     assert ".nios-shell-paper" in css
     assert ".nios-shell-live" in css
     assert ".nios-iso-plane" in css

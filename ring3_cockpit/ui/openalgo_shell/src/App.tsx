@@ -1,9 +1,10 @@
 /**
- * V1.4 application root.
+ * V1.5 application root.
  *
- * One router, two shells, four portals and fifteen workstations. The root is
+ * One router, two shells, five portals and fifteen workstations. The root is
  * intentionally thin: it chooses a surface, guards the tier boundary and mounts
- * the global command palette + toast bus. Every screen below it owns its data.
+ * the global command palette plus the toast bus. Every screen below it owns its
+ * own data.
  */
 
 import { useEffect, useMemo } from "react";
@@ -58,6 +59,20 @@ function goPortal(portal: Portal): void {
   navigate(portalPath(portal));
 }
 
+function BootSplash(): ReactNode {
+  return (
+    <div className="nx-boot" role="status" aria-label="Hydrating the sovereign cockpit">
+      <div className="nx-boot-inner">
+        <span className="nx-kicker">NIOS</span>
+        <p className="nx-xs nx-muted" style={{ letterSpacing: "0.16em" }}>
+          HYDRATING FOUR-RING COCKPIT
+        </p>
+        <span className="nx-boot-rule" />
+      </div>
+    </div>
+  );
+}
+
 export function App(): ReactNode {
   const location = useLocation();
   const { session, status, loading } = useSession();
@@ -83,34 +98,49 @@ export function App(): ReactNode {
     }
   }, [location.portal, location.workspace, loading, session, status]);
 
-  if (location.portal === "setup") return <><SetupPortal onPortal={goPortal} /><ToastHost /></>;
-  if (location.portal === "login") return <><GatewayPortal onPortal={goPortal} /><ToastHost /></>;
-  if (location.portal === "paper-login") return <><PaperLoginPortal onPortal={goPortal} /><ToastHost /></>;
-  if (location.portal === "live-login") return <><LiveLoginPortal onPortal={goPortal} /><ToastHost /></>;
-  if (location.portal === "live-unlock") return <><LiveUnlockModal onPortal={goPortal} /><ToastHost /></>;
-
-  if (loading) {
+  if (location.portal === "setup")
     return (
-      <div className="boot-splash" role="status" aria-label="Hydrating the sovereign cockpit">
-        <div className="flex flex-col items-center gap-3">
-          <span className="brand-mark" aria-hidden="true">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <ellipse cx="12" cy="12" rx="10" ry="5.4" stroke="#22d3ee" strokeWidth="1.3" />
-              <ellipse cx="12" cy="12" rx="6.6" ry="3.4" stroke="#a78bfa" strokeWidth="1.1" />
-              <circle cx="12" cy="12" r="1.5" fill="#a78bfa" />
-            </svg>
-          </span>
-          <p className="mono text-[10px] tracking-[0.16em] text-[var(--dim)] uppercase">hydrating four-ring cockpit</p>
-          <span className="shimmer h-1 w-40" />
-        </div>
-      </div>
+      <>
+        <SetupPortal onPortal={goPortal} />
+        <ToastHost />
+      </>
     );
-  }
+  if (location.portal === "login")
+    return (
+      <>
+        <GatewayPortal onPortal={goPortal} />
+        <ToastHost />
+      </>
+    );
+  if (location.portal === "paper-login")
+    return (
+      <>
+        <PaperLoginPortal onPortal={goPortal} />
+        <ToastHost />
+      </>
+    );
+  if (location.portal === "live-login")
+    return (
+      <>
+        <LiveLoginPortal onPortal={goPortal} />
+        <ToastHost />
+      </>
+    );
+  if (location.portal === "live-unlock")
+    return (
+      <>
+        <LiveUnlockModal onPortal={goPortal} />
+        <ToastHost />
+      </>
+    );
+
+  if (loading) return <BootSplash />;
 
   const Page = PAGE_COMPONENTS[location.page];
 
   const shellNavigate = (page: PageKey) => {
-    const workspace = location.workspace === "live" ? "live" : location.workspace === "paper" ? "paper" : "base";
+    const workspace =
+      location.workspace === "live" ? "live" : location.workspace === "paper" ? "paper" : "base";
     navigate(pagePath(page, workspace));
   };
 

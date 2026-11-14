@@ -1,247 +1,280 @@
 /**
- * OHLCV candles with MA5 / MA10 / MA20 / VWAP overlays and a volume pane.
- * Hand-built SVG: one path per moving average, one rect per candle, a single
- * crosshair that snaps to the nearest bar index.
+ * Candlestick tape.
+ *
+ * Bullish bodies are emerald-sage, bearish bodies coral-crimson, moving averages
+ * and VWAP are flat 1px lines, volume is a flat bar row. Hover draws a hairline
+ * crosshair and a matte readout - no gradient, no glow.
  */
 
-import type { ReactNode } from "react";
-import { isFiniteNumber, num, price } from "@/lib/format";
-import {
-  ChartTooltip,
-  GridLines,
-  TooltipRow,
-  VB_W,
-  areaPath,
-  domainOf,
-  linePath,
-  scale,
-  ticks,
-  useCrosshair,
-} from "./kit";
+import { useMemo, useState, type ReactNode } from "react";
+import { CHART, ChartLegend, extent, linePath, plotGrid, scale } from "./kit";
 
 export interface Candle {
-  index?: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
+  t: string | number;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
 }
 
 export interface CandlestickChartProps {
-  candles: Candle[];
-  series?: {
-    ma5?: number[];
-    ma10?: number[];
-    ma20?: number[];
-    vwap?: number[];
-  };
-  symbol?: string;
+  bars: Candle[];
   height?: number;
+  symbol?: string;
 }
 
-const MARGIN = { left: 58, right: 14, top: 14 };
-const VOLUME_H = 46;
-const AXIS_H = 18;
+const BOX = { x: 54, y: 12, w: 640, h: 186 };
+const VOL = { x: 54, y: 218, w: 640, h: 44 };
 
-function seriesPath(values: number[] | undefined, count: number, plotW: number, plotH: number, domain: { min: number; max: number }, left: number, top: number): string {
-  if (!values || values.length === 0) return "";
-  const length = Math.min(count, values.length);
-  const points: Array<[number, number]> = [];
-  for (let index = 0; index < length; index += 1) {
-    const value = values[index];
-    if (!isFiniteNumber(value)) continue;
-    const x = left + (count === 1 ? plotW / 2 : (index / (count - 1)) * plotW);
-    points.push([x, top + plotH - scale(value, domain, plotH)]);
+function sma(values: number[], window: number): Array<number | null> {
+  const output: Array<number | null> = [];
+  let sum = 0;
+  for (let index = 0; index < values.length; index += 1) {
+    sum += values[index];
+    if (index >= window) sum -= values[index - window];
+    output.push(index >= window - 1 ? sum / window : null);
   }
-  return linePath(points);
+  return output;
 }
 
-export function CandlestickChart({ candles, series, symbol = "—", height = 340 }: CandlestickChartProps): ReactNode {
-  const vbHeight = height;
-  const plotW = VB_W - MARGIN.left - MARGIN.right;
-  const plotH = vbHeight - MARGIN.top - VOLUME_H - AXIS_H;
-  const count = candles.length;
-  const crosshair = useCrosshair(count);
+export function CandlestickChart({ bars, height = 300, symbol = "NIOS" }: CandlestickChartProps): ReactNode {
+  const [hover, setHover] = useState<number | null>(null);
 
-  if (count === 0) {
+  const model = useMemo(() => {
+    if (bars.length === 0) return null;
+    const highs = bars.map((bar) => bar.h);
+    const lows = bars.map((bar) => bar.l);
+    const [lo, hi] = extent([...highs, ...lows]);
+    const pad = (hi - lo) * 0.06;
+    const y = scale(lo - pad, hi + pad, BOX.h);
+    const step = BOX.w / bars.length;
+    const bodyW = Math.max(1.6, Math.min(9, step * 0.62));
+    const closes = bars.map((bar) => bar.c);
+    const ma5 = sma(closes, 5);
+    const ma10 = sma(closes, 10);
+    const ma20 = sma(closes, 20);
+    let pv = 0;
+    let vol = 0;
+    const vwap: Array<number | null> = [];
+    for (let index = 0; index < bars.length; index += 1) {
+      const bar = bars[index];
+      pv += bar.c * bar.v;
+      vol += bar.v;
+      vwap.push(vol > 0 ? pv / vol : null);
+    }
+    const maxVol = Math.max(...bars.map((bar) => bar.v), 1);
+    const x = (index: number) => BOX.x + step * (index + 0.5);
+    const yPrice = (value: number) => BOX.y + BOX.h - y(value);
+    const trace = (series: Array<number | null>) =>
+      linePath(
+        series
+          .map((value, index) => (value === null ? null : [x(index), yPrice(value)] as [number, number]))
+          .filter((point): point is [number, number] => point !== null),
+      );
+    return {
+      step,
+      bodyW,
+      x,
+      yPrice,
+      lo: lo - pad,
+      hi: hi + pad,
+      maxVol,
+      ma5: trace(ma5),
+      ma10: trace(ma10),
+      ma20: trace(ma20),
+      vwap: trace(vwap),
+    };
+  }, [bars]);
+
+  if (!model) {
     return (
-      <div className="empty" style={{ minHeight: height }}>
-        <p className="text-[12px] text-[var(--dim)]">No bars in the terminal frame yet.</p>
+      <div className="nx-stack">
+        <svg className="nx-chart" viewBox="0 0 720 300" style={{ height }} role="img" aria-label="Candlestick tape empty">
+          <title>Candlestick tape - no frames</title>
+          {plotGrid(BOX)}
+          {plotGrid(VOL, 1, 6)}
+          <text x={BOX.x + BOX.w / 2} y={BOX.y + BOX.h / 2} textAnchor="middle" fill={CHART.axis} fontSize={11}>
+            NO TAPE CAPTURED - awaiting the first dual-vendor frame
+          </text>
+        </svg>
+        <ChartLegend
+          items={[
+            { label: "MA5", color: CHART.accent },
+            { label: "MA10", color: CHART.text },
+            { label: "MA20", color: CHART.axis },
+            { label: "VWAP", color: CHART.bull },
+          ]}
+        />
       </div>
     );
   }
 
-  const highs: number[] = candles.map((candle) => candle.high);
-  const lows: number[] = candles.map((candle) => candle.low);
-  const overlays = [series?.ma5, series?.ma10, series?.ma20, series?.vwap].flatMap((values) =>
-    values ? values.filter(isFiniteNumber) : [],
-  );
-  const domain = domainOf([...highs, ...lows, ...overlays], 0.04);
-  const volumeMax = Math.max(...candles.map((candle) => candle.volume), 1);
-  const slot = plotW / count;
-  const bodyW = Math.max(1.4, Math.min(8, slot * 0.58));
-  const volumeTop = MARGIN.top + plotH + 10;
-
-  const xAt = (index: number) => MARGIN.left + (count === 1 ? plotW / 2 : (index / (count - 1)) * plotW);
-  const yAt = (value: number) => MARGIN.top + plotH - scale(value, domain, plotH);
-
-  const hovered = crosshair.index !== null ? candles[crosshair.index] : null;
-  const hoveredMa = crosshair.index !== null
-    ? {
-        ma5: series?.ma5?.[crosshair.index],
-        ma10: series?.ma10?.[crosshair.index],
-        ma20: series?.ma20?.[crosshair.index],
-        vwap: series?.vwap?.[crosshair.index],
-      }
-    : null;
+  const hovered = hover !== null ? bars[hover] : null;
 
   return (
-    <div className="relative w-full">
+    <div className="nx-stack">
       <svg
-        viewBox={`0 0 ${VB_W} ${vbHeight}`}
-        width="100%"
-        height={vbHeight}
+        className="nx-chart"
+        viewBox="0 0 720 300"
+        style={{ height }}
         role="img"
-        aria-label={`${symbol} candlestick chart with ${count} bars, moving averages and volume`}
-        {...crosshair.bind}
-        style={{ touchAction: "none" }}
+        aria-label={`${symbol} candlestick tape`}
+        onMouseMove={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          const local = ((event.clientX - rect.left) / rect.width) * 720;
+          const index = Math.round((local - BOX.x) / model.step - 0.5);
+          setHover(index >= 0 && index < bars.length ? index : null);
+        }}
+        onMouseLeave={() => setHover(null)}
       >
-        <GridLines domain={domain} plotH={plotH} plotW={plotW} left={MARGIN.left} top={MARGIN.top} format={(value) => price(value)} />
+        <title>{`${symbol} candlestick tape`}</title>
+        {plotGrid(BOX)}
+        {plotGrid(VOL, 1, 6)}
 
-        {ticks(domain, 4).map((value) => (
-          <line
-            key={`anchor-${value}`}
-            x1={MARGIN.left}
-            x2={VB_W - MARGIN.right}
-            y1={MARGIN.top + plotH - scale(value, domain, plotH)}
-            y2={MARGIN.top + plotH - scale(value, domain, plotH)}
-            stroke="rgba(148,163,184,0.05)"
-          />
-        ))}
-
-        {candles.map((candle, index) => {
-          const x = xAt(index);
-          const up = candle.close >= candle.open;
-          const color = up ? "#34d399" : "#fb7185";
-          const yOpen = yAt(candle.open);
-          const yClose = yAt(candle.close);
-          const bodyTop = Math.min(yOpen, yClose);
-          const bodyHeight = Math.max(1, Math.abs(yClose - yOpen));
-          const volumeH = (candle.volume / volumeMax) * VOLUME_H;
+        {[0, 0.25, 0.5, 0.75, 1].map((fraction) => {
+          const price = model.hi - (model.hi - model.lo) * fraction;
           return (
-            <g key={candle.index ?? index}>
-              <line x1={x} x2={x} y1={yAt(candle.high)} y2={yAt(candle.low)} stroke={color} strokeWidth={1} opacity={0.85} />
-              <rect
-                x={x - bodyW / 2}
-                y={bodyTop}
-                width={bodyW}
-                height={bodyHeight}
-                fill={up ? "rgba(52,211,153,0.22)" : "rgba(251,113,133,0.24)"}
+            <text
+              key={fraction}
+              x={BOX.x - 7}
+              y={BOX.y + BOX.h * fraction + 3}
+              textAnchor="end"
+              fill={CHART.axis}
+              fontSize={8.5}
+            >
+              {price.toFixed(2)}
+            </text>
+          );
+        })}
+
+        {bars.map((bar, index) => {
+          const up = bar.c >= bar.o;
+          const color = up ? CHART.bull : CHART.bear;
+          const cx = model.x(index);
+          const top = model.yPrice(Math.max(bar.o, bar.c));
+          const bottom = model.yPrice(Math.min(bar.o, bar.c));
+          const bodyH = Math.max(1, bottom - top);
+          const volH = (bar.v / model.maxVol) * VOL.h;
+          return (
+            <g key={`${bar.t}-${index}`}>
+              <line
+                x1={cx}
+                y1={model.yPrice(bar.h)}
+                x2={cx}
+                y2={model.yPrice(bar.l)}
                 stroke={color}
-                strokeWidth={0.9}
+                strokeWidth={1}
               />
               <rect
-                x={x - bodyW / 2}
-                y={volumeTop + (VOLUME_H - volumeH)}
-                width={bodyW}
-                height={Math.max(0.6, volumeH)}
-                fill={color}
-                opacity={0.32}
+                x={cx - model.bodyW / 2}
+                y={top}
+                width={model.bodyW}
+                height={bodyH}
+                fill={up ? CHART.bullFill : CHART.bearFill}
+                stroke={color}
+                strokeWidth={1}
+              />
+              <rect
+                x={cx - model.bodyW / 2}
+                y={VOL.y + VOL.h - volH}
+                width={model.bodyW}
+                height={volH}
+                fill={up ? CHART.bullFill : CHART.bearFill}
+                stroke={color}
+                strokeWidth={0.5}
               />
             </g>
           );
         })}
 
-        {series?.ma5 ? (
-          <path d={seriesPath(series.ma5, count, plotW, plotH, domain, MARGIN.left, MARGIN.top)} fill="none" stroke="#22d3ee" strokeWidth={1.2} opacity={0.9} />
-        ) : null}
-        {series?.ma10 ? (
-          <path d={seriesPath(series.ma10, count, plotW, plotH, domain, MARGIN.left, MARGIN.top)} fill="none" stroke="#a78bfa" strokeWidth={1.2} opacity={0.9} />
-        ) : null}
-        {series?.ma20 ? (
-          <path d={seriesPath(series.ma20, count, plotW, plotH, domain, MARGIN.left, MARGIN.top)} fill="none" stroke="#f59e0b" strokeWidth={1.2} opacity={0.85} />
-        ) : null}
-        {series?.vwap ? (
-          <path
-            d={seriesPath(series.vwap, count, plotW, plotH, domain, MARGIN.left, MARGIN.top)}
-            fill="none"
-            stroke="#94a3b8"
-            strokeWidth={1.1}
-            strokeDasharray="5 4"
-            opacity={0.9}
-          />
-        ) : null}
+        <path d={model.ma5} fill="none" stroke={CHART.accent} strokeWidth={1} />
+        <path d={model.ma10} fill="none" stroke={CHART.text} strokeWidth={1} />
+        <path d={model.ma20} fill="none" stroke={CHART.axis} strokeWidth={1} />
+        <path d={model.vwap} fill="none" stroke={CHART.bull} strokeWidth={1} strokeDasharray="3 3" />
 
-        {series?.vwap && series.vwap.length > 0 ? (
-          <path
-            d={areaPath(
-              series.vwap
-                .map((value, index) => {
-                  if (!isFiniteNumber(value)) return null;
-                  return [xAt(index), yAt(value)] as [number, number];
-                })
-                .filter((point): point is [number, number] => point !== null),
-              MARGIN.top + plotH,
-            )}
-            fill="url(#vwap-fade)"
-            opacity={0.18}
-          />
-        ) : null}
-
-        <defs>
-          <linearGradient id="vwap-fade" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#94a3b8" stopOpacity="0.55" />
-            <stop offset="100%" stopColor="#94a3b8" stopOpacity="0" />
-          </linearGradient>
-        </defs>
-
-        <line x1={MARGIN.left} x2={VB_W - MARGIN.right} y1={volumeTop - 4} y2={volumeTop - 4} stroke="rgba(148,163,184,0.12)" />
-        <text x={MARGIN.left - 6} y={volumeTop + 9} textAnchor="end" className="iso-ring-label" style={{ fontSize: 8 }}>
-          VOL
-        </text>
-
-        <text x={MARGIN.left} y={vbHeight - 5} className="iso-ring-label" style={{ fontSize: 8 }}>
-          t-{count}
-        </text>
-        <text x={VB_W - MARGIN.right} y={vbHeight - 5} textAnchor="end" className="iso-ring-label" style={{ fontSize: 8 }}>
-          now
-        </text>
-
-        {crosshair.index !== null ? (
+        {hover !== null && hovered ? (
           <g>
-            <line x1={crosshair.x} x2={crosshair.x} y1={MARGIN.top} y2={volumeTop + VOLUME_H} stroke="rgba(226,232,240,0.28)" strokeDasharray="3 3" />
-            <circle cx={crosshair.x} cy={MARGIN.top} r={2.4} fill="#e2e8f0" />
+            <line
+              x1={model.x(hover)}
+              y1={BOX.y}
+              x2={model.x(hover)}
+              y2={VOL.y + VOL.h}
+              stroke={CHART.text}
+              strokeWidth={1}
+              strokeDasharray="2 3"
+            />
+            <line
+              x1={BOX.x}
+              y1={model.yPrice(hovered.c)}
+              x2={BOX.x + BOX.w}
+              y2={model.yPrice(hovered.c)}
+              stroke={CHART.text}
+              strokeWidth={1}
+              strokeDasharray="2 3"
+            />
+            <rect
+              x={Math.min(model.x(hover) + 8, BOX.x + BOX.w - 150)}
+              y={BOX.y + 6}
+              width={142}
+              height={58}
+              rx={4}
+              fill={CHART.surface}
+              stroke={CHART.grid}
+              strokeWidth={1}
+            />
+            <text
+              x={Math.min(model.x(hover) + 16, BOX.x + BOX.w - 142)}
+              y={BOX.y + 20}
+              fill={CHART.strong}
+              fontSize={9}
+            >
+              O {hovered.o.toFixed(2)}  H {hovered.h.toFixed(2)}
+            </text>
+            <text
+              x={Math.min(model.x(hover) + 16, BOX.x + BOX.w - 142)}
+              y={BOX.y + 32}
+              fill={CHART.strong}
+              fontSize={9}
+            >
+              L {hovered.l.toFixed(2)}  C {hovered.c.toFixed(2)}
+            </text>
+            <text
+              x={Math.min(model.x(hover) + 16, BOX.x + BOX.w - 142)}
+              y={BOX.y + 44}
+              fill={CHART.text}
+              fontSize={9}
+            >
+              VOL {hovered.v.toLocaleString("en-US")}
+            </text>
+            <text
+              x={Math.min(model.x(hover) + 16, BOX.x + BOX.w - 142)}
+              y={BOX.y + 56}
+              fill={CHART.axis}
+              fontSize={9}
+            >
+              {String(hovered.t)}
+            </text>
           </g>
         ) : null}
+
+        <text x={BOX.x} y={296} fill={CHART.axis} fontSize={8.5}>
+          {String(bars[0]?.t ?? "")}
+        </text>
+        <text x={BOX.x + BOX.w} y={296} fill={CHART.axis} fontSize={8.5} textAnchor="end">
+          {String(bars[bars.length - 1]?.t ?? "")}
+        </text>
       </svg>
-
-      <div className="pointer-events-none absolute top-2 left-3 flex flex-wrap items-center gap-2.5">
-        {[
-          ["MA5", "#22d3ee"],
-          ["MA10", "#a78bfa"],
-          ["MA20", "#f59e0b"],
-          ["VWAP", "#94a3b8"],
-        ].map(([label, color]) => (
-          <span key={label} className="mono flex items-center gap-1 text-[9px] tracking-[0.08em] text-[var(--dim)]">
-            <span className="inline-block h-[2px] w-3 rounded" style={{ background: color }} />
-            {label}
-          </span>
-        ))}
-      </div>
-
-      {hovered && crosshair.index !== null ? (
-        <ChartTooltip x={crosshair.x}>
-          <p className="mono mb-1 text-[9px] tracking-[0.1em] text-[var(--dim)] uppercase">bar {crosshair.index + 1}</p>
-          <TooltipRow label="O" value={price(hovered.open)} />
-          <TooltipRow label="H" value={price(hovered.high)} tone="text-[var(--pos)]" />
-          <TooltipRow label="L" value={price(hovered.low)} tone="text-[var(--neg)]" />
-          <TooltipRow label="C" value={price(hovered.close)} />
-          <TooltipRow label="Vol" value={num(hovered.volume, 0)} />
-          {hoveredMa?.ma5 !== undefined ? <TooltipRow label="MA5" value={price(hoveredMa.ma5)} tone="text-[#22d3ee]" /> : null}
-          {hoveredMa?.vwap !== undefined ? <TooltipRow label="VWAP" value={price(hoveredMa.vwap)} tone="text-[#94a3b8]" /> : null}
-        </ChartTooltip>
-      ) : null}
+      <ChartLegend
+        items={[
+          { label: "MA5", color: CHART.accent },
+          { label: "MA10", color: CHART.text },
+          { label: "MA20", color: CHART.axis },
+          { label: "VWAP", color: CHART.bull, dashed: true },
+          { label: "Bull", color: CHART.bull },
+          { label: "Bear", color: CHART.bear },
+        ]}
+      />
     </div>
   );
 }

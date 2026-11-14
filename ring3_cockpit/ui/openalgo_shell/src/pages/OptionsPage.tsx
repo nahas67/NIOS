@@ -1,626 +1,249 @@
 /**
- * Options Chain & Strategy Lab (sec_018 Law 3).
+ * Options chain and multi-leg strategy lab.
  *
- * A symmetric strike ladder with calls left of the axis and puts mirrored to the
- * right, then a grounded multi-leg payoff builder. The chain and the payoff are
- * two separate ring 2 receipts, each sealed with a SHA-256 digest, so the screen
- * never mixes a re-priced curve with a stale chain.
+ * A symmetric strike ladder with Greeks on the left and a grounded payoff
+ * builder on the right. Every price comes from the Ring 2 Black-Scholes module,
+ * not from a browser-side approximation.
  */
 
 import { useState, type ReactNode } from "react";
 import { api } from "@/lib/api";
-import { useAction, useResource } from "@/lib/use-api";
-import { useLocation } from "@/lib/router";
-import { compact, int, isFiniteNumber, num, pct, price, ratioPct } from "@/lib/format";
-import type { OptionsChainReceipt, StrategyPayoffReceipt } from "@/lib/types";
+import { isRecord, num, rows, str } from "@/lib/format";
+import { useApi } from "@/lib/use-api";
+import { toast } from "@/lib/toast";
 import {
-  CopyHash,
+  Btn,
+  DataGrid,
   EmptyCleanSlate,
-  ErrorBlock,
-  GlassPanel,
-  LoadingBlock,
+  Field,
   MetricTile,
   SectionHeader,
-  StatusPill,
-  TabularValue,
-  type PillTone,
+  StatusBadge,
+  TerminalPanel,
 } from "@/design-system/primitives";
-import { PayoffCurveChart } from "@/charts/PayoffCurveChart";
-import { pushToast, toastError } from "@/lib/toast";
+import { PayoffCurveChart, type PayoffPoint } from "@/charts/PayoffCurveChart";
 
-function optionalNumber(value: string): number | undefined {
-  const trimmed = value.trim();
-  if (trimmed === "") return undefined;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : undefined;
+interface StrikeRow {
+  strike: number;
+  call_ltp: number;
+  call_delta: number;
+  put_ltp: number;
+  put_delta: number;
 }
 
-/** Implied volatility arrives as a fraction on some payloads and a percent on others. */
-function ivText(value: unknown): string {
-  if (!isFiniteNumber(value)) return "—";
-  return Math.abs(value) <= 1 ? ratioPct(value, 1) : pct(value, 1);
+function strikeFrom(row: Record<string, unknown>): StrikeRow {
+  return {
+    strike: num(row, "strike", 0),
+    call_ltp: num(row, "call_ltp", num(row, "call_mid", 0)),
+    call_delta: num(row, "call_delta", 0),
+    put_ltp: num(row, "put_ltp", num(row, "put_mid", 0)),
+    put_delta: num(row, "put_delta", 0),
+  };
 }
 
-function regimeTone(regime: string): PillTone {
-  if (regime === "BALANCED") return "ok";
-  if (regime === "PUT_HEAVY" || regime === "CALL_HEAVY") return "warn";
-  return "neutral";
-}
-
-function ChainTable({ receipt }: { receipt: OptionsChainReceipt }): ReactNode {
-  if (receipt.chain.length === 0) {
-    return (
-      <EmptyCleanSlate
-        title="No strikes returned"
-        body="The pricer returned an empty strike ladder. Reload the chain or widen the strike count."
-      />
-    );
+function payoffPoints(source: unknown): PayoffPoint[] {
+  const candidates = ["curve", "payoff", "points", "profile"];
+  for (const key of candidates) {
+    const list = rows(source, key);
+    if (list.length > 0) {
+      return list.map((row) => ({
+        spot: num(row, "spot", num(row, "underlying", 0)),
+        pnl: num(row, "pnl", num(row, "payoff", num(row, "value", 0))),
+      }));
+    }
   }
-  return (
-    <div className="max-h-[560px] overflow-auto">
-      <table className="table table-compact zebra">
-        <caption className="sr-only">
-          Symmetric option chain: calls left of the strike, puts mirrored to the right, each side with open interest,
-          last price, implied volatility and greeks
-        </caption>
-        <thead>
-          <tr>
-            <th scope="colgroup" colSpan={7} className="text-left">
-              Calls
-            </th>
-            <th scope="col" className="num">
-              Strike
-            </th>
-            <th scope="colgroup" colSpan={7} className="text-right">
-              Puts (mirrored)
-            </th>
-          </tr>
-          <tr>
-            <th scope="col" className="num">
-              OI
-            </th>
-            <th scope="col" className="num">
-              LTP
-            </th>
-            <th scope="col" className="num">
-              IV
-            </th>
-            <th scope="col" className="num">
-              Delta
-            </th>
-            <th scope="col" className="num">
-              Gamma
-            </th>
-            <th scope="col" className="num">
-              Theta
-            </th>
-            <th scope="col" className="num">
-              Vega
-            </th>
-            <th scope="col" className="num">
-              strike
-            </th>
-            <th scope="col" className="num">
-              Vega
-            </th>
-            <th scope="col" className="num">
-              Theta
-            </th>
-            <th scope="col" className="num">
-              Gamma
-            </th>
-            <th scope="col" className="num">
-              Delta
-            </th>
-            <th scope="col" className="num">
-              IV
-            </th>
-            <th scope="col" className="num">
-              LTP
-            </th>
-            <th scope="col" className="num">
-              OI
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {receipt.chain.map((row) => {
-            const atm = row.offset === 0;
-            return (
-              <tr key={row.strike} className={atm ? "bg-[var(--accent-soft)]" : undefined}>
-                <td className="num">
-                  <TabularValue value={row.call_oi} kind="int" />
-                </td>
-                <td className="num">
-                  <TabularValue value={row.call_ltp} kind="price" />
-                </td>
-                <td className="num">
-                  <span className="mono tnum">{ivText(row.call_iv)}</span>
-                </td>
-                <td className="num">
-                  <TabularValue value={row.call_delta} kind="num" digits={2} />
-                </td>
-                <td className="num">
-                  <TabularValue value={row.call_gamma} kind="num" digits={4} />
-                </td>
-                <td className="num">
-                  <TabularValue value={row.call_theta} kind="num" digits={2} />
-                </td>
-                <td className="num">
-                  <TabularValue value={row.call_vega} kind="num" digits={2} />
-                </td>
-                <th scope="row" className="num">
-                  <span className="flex items-center justify-end gap-1.5">
-                    <TabularValue value={row.strike} kind="price" />
-                    {atm ? <span className="pill pill-accent">ATM</span> : null}
-                  </span>
-                </th>
-                <td className="num">
-                  <TabularValue value={row.put_vega} kind="num" digits={2} />
-                </td>
-                <td className="num">
-                  <TabularValue value={row.put_theta} kind="num" digits={2} />
-                </td>
-                <td className="num">
-                  <TabularValue value={row.put_gamma} kind="num" digits={4} />
-                </td>
-                <td className="num">
-                  <TabularValue value={row.put_delta} kind="num" digits={2} />
-                </td>
-                <td className="num">
-                  <span className="mono tnum">{ivText(row.put_iv)}</span>
-                </td>
-                <td className="num">
-                  <TabularValue value={row.put_ltp} kind="price" />
-                </td>
-                <td className="num">
-                  <TabularValue value={row.put_oi} kind="int" />
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function PayoffPanel({ receipt }: { receipt: StrategyPayoffReceipt }): ReactNode {
-  const verified = receipt.grounding?.verified === true;
-  return (
-    <GlassPanel
-      title="Expiry payoff"
-      eyebrow={`${receipt.strategy} · ${int(receipt.curve_points)} points`}
-      actions={<StatusPill value={verified ? "GROUNDED" : "UNVERIFIED"} tone={verified ? "ok" : "warn"} />}
-    >
-      <div className="flex flex-col gap-3">
-        <PayoffCurveChart
-          points={receipt.payoff_curve}
-          breakevens={receipt.breakeven_points}
-          maxProfit={receipt.max_profit}
-          maxLoss={receipt.max_loss}
-          spot={receipt.underlying.spot}
-          unboundedUpside={receipt.unbounded_upside}
-          unboundedDownside={receipt.unbounded_downside}
-          height={240}
-        />
-
-        <div className="grid-auto-180">
-          <MetricTile
-            label="Net premium / unit"
-            value={<TabularValue value={receipt.net_premium_per_unit} kind="price" />}
-            hint={receipt.net_position || "net position"}
-          />
-          <MetricTile
-            label="Debit / credit"
-            value={<TabularValue value={receipt.net_debit_credit} kind="usd" signTone />}
-            hint={`${int(receipt.lot_size)} unit lot`}
-          />
-          <MetricTile
-            label="Breakevens"
-            value={
-              receipt.breakeven_points.length === 0
-                ? "—"
-                : receipt.breakeven_points.map((point) => price(point)).join(" · ")
-            }
-            hint="expiry spot"
-          />
-          <MetricTile
-            label="Max profit"
-            value={<TabularValue value={receipt.max_profit} kind="usd" />}
-            hint={receipt.unbounded_upside ? "unbounded upside" : "capped at expiry"}
-            tone="pos"
-          />
-          <MetricTile
-            label="Max loss"
-            value={<TabularValue value={receipt.max_loss} kind="usd" />}
-            hint={receipt.unbounded_downside ? "unbounded downside" : "capped at expiry"}
-            tone="neg"
-          />
-        </div>
-
-        <div className="max-h-[240px] overflow-auto">
-          <table className="table table-compact">
-            <caption className="sr-only">Strategy legs with strike, premium, implied volatility and delta</caption>
-            <thead>
-              <tr>
-                <th scope="col">Leg</th>
-                <th scope="col">Kind</th>
-                <th scope="col">Side</th>
-                <th scope="col" className="num">
-                  Strike
-                </th>
-                <th scope="col" className="num">
-                  Premium
-                </th>
-                <th scope="col" className="num">
-                  IV
-                </th>
-                <th scope="col" className="num">
-                  Delta
-                </th>
-                <th scope="col" className="num">
-                  Lot
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {receipt.legs.map((leg, index) => (
-                <tr key={`${leg.leg}-${index}`}>
-                  <td className="mono">{leg.leg}</td>
-                  <td>{leg.kind}</td>
-                  <td className={leg.direction > 0 ? "pos" : "neg"}>{leg.direction > 0 ? "LONG" : "SHORT"}</td>
-                  <td className="num">
-                    <TabularValue value={leg.strike} kind="price" />
-                  </td>
-                  <td className="num">
-                    <TabularValue value={leg.premium} kind="price" />
-                  </td>
-                  <td className="num">
-                    <span className="mono tnum">{ivText(leg.iv)}</span>
-                  </td>
-                  <td className="num">
-                    <TabularValue value={leg.delta} kind="num" digits={2} />
-                  </td>
-                  <td className="num">
-                    <TabularValue value={leg.lot_size} kind="int" />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        <div className="row-between flex-wrap gap-2 border-t border-[var(--line)] pt-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <CopyHash value={receipt.grounding?.sha256_digest} />
-            <StatusPill value={verified ? "VERIFIED" : "UNVERIFIED"} tone={verified ? "ok" : "warn"} />
-            {typeof receipt.grounding?.claims_checked === "number" ? (
-              <span className="mono text-[9.5px] text-[var(--dim)]">
-                {int(receipt.grounding.claims_checked)} claims checked
-              </span>
-            ) : null}
-          </div>
-          <span className="mono text-[9.5px] text-[var(--dim)]">
-            spot {price(receipt.underlying.spot)} · vol {ivText(receipt.underlying.volatility)} · dte{" "}
-            {int(receipt.underlying.days_to_expiry)}
-          </span>
-        </div>
-      </div>
-    </GlassPanel>
-  );
+  return [];
 }
 
 export function OptionsPage(): ReactNode {
-  const location = useLocation();
-  const page = useResource("options-page", () => api.options(), 0);
-  const chainAction = useAction<OptionsChainReceipt>();
-  const payoffAction = useAction<StrategyPayoffReceipt>();
-
-  const [chain, setChain] = useState<OptionsChainReceipt | null>(null);
+  const page = useApi(() => api.options(), []);
+  const [strategy, setStrategy] = useState("IRON_CONDOR");
   const [symbol, setSymbol] = useState("");
-  const [strategy, setStrategy] = useState("");
-  const [spot, setSpot] = useState<string | null>(null);
-  const [volatility, setVolatility] = useState<string | null>(null);
-  const [daysToExpiry, setDaysToExpiry] = useState<string | null>(null);
+  const [receipt, setReceipt] = useState<Record<string, unknown> | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  const underlyings = page.data?.underlyings ?? [];
-  const strategies = page.data?.strategies ?? [];
-  const activeChain = chain ?? page.data?.chain ?? null;
-  const activeSymbol = symbol || page.data?.default_symbol || activeChain?.symbol || "";
-  const selectedUnderlying = underlyings.find((row) => row.symbol === activeSymbol) ?? underlyings.at(0) ?? null;
-  const activeStrategy = strategy || strategies.at(0)?.id || "";
-  const template = strategies.find((row) => row.id === activeStrategy) ?? null;
+  const chain = isRecord(page.data?.chain) ? (page.data?.chain as Record<string, unknown>) : {};
+  const strikes = rows(chain, "strikes").map(strikeFrom);
+  const underlyings = rows(page.data, "underlyings");
+  const strategiesRaw = page.data?.strategies;
+  const strategies = Array.isArray(strategiesRaw)
+    ? strategiesRaw.map((item) =>
+        typeof item === "string" ? item : str(item, "name", "STRUCTURE"),
+      )
+    : [];
+  const activeSymbol = symbol || str(page.data, "default_symbol", str(chain, "symbol", "NIFTY"));
+  const points = payoffPoints(receipt);
+  const breakevensRaw = receipt?.breakevens;
+  const breakevens = Array.isArray(breakevensRaw) ? breakevensRaw.map((value) => Number(value) || 0) : [];
+  const maxProfit = num(receipt, "max_profit", 0);
+  const maxLoss = num(receipt, "max_loss", 0);
+  const pcr = num(chain, "pcr", num(chain, "put_call_ratio", 0));
+  const maxPain = num(chain, "max_pain", 0);
 
-  const spotInput = spot ?? (selectedUnderlying ? String(selectedUnderlying.spot) : "");
-  const volatilityInput = volatility ?? (selectedUnderlying ? String(selectedUnderlying.volatility) : "");
-  const daysInput = daysToExpiry ?? (selectedUnderlying ? String(selectedUnderlying.days_to_expiry) : "");
-
-  const summary = activeChain?.summary ?? null;
-  const atmIv = summary ? summary.atm_iv : null;
-  const pcr = summary ? summary.pcr : null;
-  const regime = summary ? summary.pcr_regime : "";
-  const totalCallOi = summary ? summary.total_call_oi : 0;
-  const totalPutOi = summary ? summary.total_put_oi : 0;
-  const strikeCount = activeChain ? activeChain.chain.length : 0;
-
-  const chooseUnderlying = (next: string): void => {
-    setSymbol(next);
-    const spec = underlyings.find((row) => row.symbol === next);
-    setSpot(spec ? String(spec.spot) : null);
-    setVolatility(spec ? String(spec.volatility) : null);
-    setDaysToExpiry(spec ? String(spec.days_to_expiry) : null);
-  };
-
-  const refreshChain = async (): Promise<void> => {
-    const next = await chainAction.run(() =>
-      api.optionsChain({
-        symbol: activeSymbol,
-        spot: optionalNumber(spotInput),
-        volatility: optionalNumber(volatilityInput),
-        days_to_expiry: optionalNumber(daysInput),
-      }),
-    );
-    if (next) {
-      setChain(next);
-      return;
+  const build = async () => {
+    setBusy(true);
+    try {
+      const next = await api.strategyPayoff({ symbol: activeSymbol, strategy });
+      setReceipt(next);
+      toast(`${strategy} payoff priced`, "success");
+    } catch (cause) {
+      toast(cause instanceof Error ? cause.message : "payoff rejected", "error");
+    } finally {
+      setBusy(false);
     }
-    if (chainAction.error) toastError("Chain request rejected", chainAction.error);
   };
-
-  const buildPayoff = async (): Promise<void> => {
-    if (!activeStrategy) {
-      pushToast("No strategy template", "The gateway returned no option templates", "warn");
-      return;
-    }
-    const next = await payoffAction.run(() =>
-      api.strategyPayoff({
-        symbol: activeSymbol,
-        strategy: activeStrategy,
-        spot: optionalNumber(spotInput),
-        volatility: optionalNumber(volatilityInput),
-        days_to_expiry: optionalNumber(daysInput),
-      }),
-    );
-    if (next) {
-      pushToast("Payoff receipt sealed", `${next.strategy} · ${int(next.curve_points)} points`, "ok");
-      return;
-    }
-    if (payoffAction.error) toastError("Payoff rejected", payoffAction.error);
-  };
-
-  const payoff = payoffAction.receipt;
-  const pcrHint = "put open interest / call open interest";
 
   return (
-    <>
+    <div className="nx-page">
       <SectionHeader
-        eyebrow={`ring2 · ${location.workspace} workspace · grounded greeks`}
-        title="Options Chain & Strategy Lab"
-        subtitle="A symmetric strike ladder with Black-Scholes greeks, PCR and Max Pain, beside a multi-leg payoff builder sealed with a SHA-256 digest."
+        kicker="RING 2 - DERIVATIVES"
+        title="Options chain and multi-leg strategy lab"
+        sub="Symmetric strike ladder with Greeks beside a grounded expiry payoff. No leg is priced in the browser."
         actions={
           <>
-            <StatusPill
-              value={activeChain ? `${int(strikeCount)} strikes` : "NO CHAIN"}
-              tone={activeChain ? "accent" : "neutral"}
-            />
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={page.reload}
-              disabled={page.loading}
-              aria-label="Reload the options landing payload"
-            >
-              {page.loading ? "Loading…" : "Reload"}
-            </button>
+            <StatusBadge tone="accent">{activeSymbol}</StatusBadge>
+            <Btn size="sm" tone="ghost" onClick={page.reload}>
+              Refresh chain
+            </Btn>
           </>
         }
       />
 
-      {page.error ? <ErrorBlock message={page.error} onRetry={page.reload} /> : null}
-
-      {page.data === null && page.loading ? <LoadingBlock rows={4} /> : null}
-
-      {!page.loading && !activeChain && !page.error ? (
-        <EmptyCleanSlate
-          title="No chain loaded"
-          body="The ring 2 pricer has not returned a strike ladder for this workspace."
-          action={
-            <button
-              type="button"
-              className="btn btn-sm btn-accent"
-              onClick={page.reload}
-              aria-label="Request the options landing payload"
-            >
-              Request chain
-            </button>
-          }
+      <div className="nx-grid nx-grid--4">
+        <MetricTile label="Strikes listed" value={String(strikes.length)} sub="symmetric ladder" />
+        <MetricTile
+          label="Put / call ratio"
+          value={pcr ? pcr.toFixed(2) : "-"}
+          sub="open interest weighted"
+          tone={pcr > 1 ? "bull" : "neutral"}
         />
-      ) : null}
+        <MetricTile label="Max pain" value={maxPain ? maxPain.toFixed(2) : "-"} sub="expiry pin estimate" />
+        <MetricTile
+          label="Structures"
+          value={String(strategies.length)}
+          sub="multi-leg builders available"
+          badge={<StatusBadge tone="muted">RING 2</StatusBadge>}
+        />
+      </div>
 
-      {activeChain ? (
-        <div className="flex flex-col gap-[14px]">
-          <GlassPanel title="Underlying & model inputs" eyebrow="ring2 · black-scholes with grounded metrics">
-            <div className="flex flex-col gap-3">
-              <div className="grid-auto-240">
-                <label className="field">
-                  <span className="field-label">Underlying</span>
-                  <select
-                    className="select"
-                    value={activeSymbol}
-                    onChange={(event) => chooseUnderlying(event.target.value)}
-                    aria-label="Options underlying"
-                  >
-                    {underlyings.length === 0 ? (
-                      <option value={activeSymbol}>{activeSymbol || "—"}</option>
-                    ) : (
-                      underlyings.map((row) => (
-                        <option key={row.symbol} value={row.symbol}>
-                          {`${row.symbol} · ${row.silo} · ${price(row.spot)}`}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </label>
+      <div className="nx-grid nx-grid--2">
+        <TerminalPanel title="Expiry payoff" subtitle="25 sampled spots, flat profit and loss zones">
+          <PayoffCurveChart points={points} breakevens={breakevens} strategy={strategy} />
+        </TerminalPanel>
 
-                <label className="field">
-                  <span className="field-label">Spot</span>
-                  <input
-                    className="input tnum"
-                    inputMode="decimal"
-                    value={spotInput}
-                    onChange={(event) => setSpot(event.target.value)}
-                    aria-label="Underlying spot"
-                  />
-                </label>
-
-                <label className="field">
-                  <span className="field-label">Volatility (annualised)</span>
-                  <input
-                    className="input tnum"
-                    inputMode="decimal"
-                    value={volatilityInput}
-                    onChange={(event) => setVolatility(event.target.value)}
-                    aria-label="Implied volatility assumption"
-                  />
-                </label>
-
-                <label className="field">
-                  <span className="field-label">Days to expiry</span>
-                  <input
-                    className="input tnum"
-                    inputMode="decimal"
-                    value={daysInput}
-                    onChange={(event) => setDaysToExpiry(event.target.value)}
-                    aria-label="Days to expiry"
-                  />
-                </label>
-
-                <div className="flex items-end">
-                  <button
-                    type="button"
-                    className="btn btn-accent w-full"
-                    onClick={() => void refreshChain()}
-                    disabled={chainAction.busy}
-                    aria-label="Refresh the option chain with the current model inputs"
-                  >
-                    {chainAction.busy ? "Pricing…" : "Refresh Chain"}
-                  </button>
-                </div>
-              </div>
-
-              {chainAction.error ? <ErrorBlock message={chainAction.error} /> : null}
-
-              <div className="kpi-strip">
-                <MetricTile
-                  label="ATM IV"
-                  value={ivText(atmIv ?? undefined)}
-                  hint={`atm strike ${price(summary ? summary.atm_strike : undefined)}`}
-                />
-                <MetricTile
-                  label="PCR"
-                  value={
-                    <span className="flex items-center gap-1.5">
-                      {num(pcr, 2)}
-                      <StatusPill value={regime || "—"} tone={regimeTone(regime)} dot={false} />
-                    </span>
-                  }
-                  hint={pcrHint}
-                />
-                <MetricTile
-                  label="Max pain"
-                  value={price(summary ? summary.max_pain_strike : undefined)}
-                  hint={`pain ${compact(summary ? summary.max_pain_value : undefined)}`}
-                />
-                <MetricTile
-                  label="Total OI"
-                  value={compact(totalCallOi + totalPutOi)}
-                  hint={`call ${compact(totalCallOi)} · put ${compact(totalPutOi)}`}
-                />
-              </div>
+        <TerminalPanel title="Strategy builder" subtitle="POST /api/v2/control/options/strategy-payoff">
+          <div className="nx-grid nx-grid--2">
+            <Field label="Underlying">
+              <input
+                className="nx-input"
+                value={activeSymbol}
+                onChange={(event) => setSymbol(event.target.value.toUpperCase())}
+              />
+            </Field>
+            <Field label="Structure">
+              <select
+                className="nx-select"
+                value={strategy}
+                onChange={(event) => setStrategy(event.target.value)}
+              >
+                {(strategies.length > 0 ? strategies : ["IRON_CONDOR", "VERTICAL_SPREAD", "STRADDLE"]).map(
+                  (name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ),
+                )}
+              </select>
+            </Field>
+          </div>
+          <div className="nx-row" style={{ marginTop: 8 }}>
+            <Btn tone="primary" onClick={build} disabled={busy}>
+              {busy ? "Pricing..." : "Price structure"}
+            </Btn>
+            <StatusBadge tone={maxProfit > 0 ? "bull" : "muted"}>
+              MAX PROFIT {maxProfit ? maxProfit.toFixed(2) : "-"}
+            </StatusBadge>
+            <StatusBadge tone={maxLoss < 0 ? "bear" : "muted"}>
+              MAX LOSS {maxLoss ? maxLoss.toFixed(2) : "-"}
+            </StatusBadge>
+          </div>
+          <div className="nx-hr" style={{ margin: "10px 0" }} />
+          <div className="nx-list nx-scroll nx-scroll--sm">
+            <div className="nx-list-item">
+              <span className="nx-badge nx-badge--muted">1</span>
+              <span className="nx-xs nx-dim">Legs are priced on the same latent volatility surface.</span>
             </div>
-          </GlassPanel>
-
-          <div className="split-2">
-            <GlassPanel
-              title={`Symmetric chain · ${int(strikeCount)} strikes`}
-              eyebrow={`${activeChain.symbol} · ${activeChain.silo} · ring2`}
-              footer={
-                <div className="row-between flex-wrap gap-2">
-                  <span className="mono text-[9.5px] tracking-[0.08em] text-[var(--dim)] uppercase">
-                    lot {int(activeChain.lot_size)} · step {price(activeChain.strike_step)} ·{" "}
-                    {activeChain.currency}
-                  </span>
-                  <span className="flex flex-wrap items-center gap-2">
-                    <CopyHash value={activeChain.grounding?.sha256_digest} />
-                    <StatusPill
-                      value={activeChain.grounding?.verified ? "VERIFIED" : "UNVERIFIED"}
-                      tone={activeChain.grounding?.verified ? "ok" : "warn"}
-                    />
-                  </span>
-                </div>
-              }
-            >
-              <ChainTable receipt={activeChain} />
-            </GlassPanel>
-
-            <div className="flex flex-col gap-3">
-              <GlassPanel title="Strategy builder" eyebrow="multi-leg · expiry pay-off">
-                <div className="flex flex-col gap-2">
-                  <label className="field">
-                    <span className="field-label">Template</span>
-                    <select
-                      className="select"
-                      value={activeStrategy}
-                      onChange={(event) => setStrategy(event.target.value)}
-                      aria-label="Options strategy template"
-                    >
-                      {strategies.length === 0 ? (
-                        <option value="">No templates</option>
-                      ) : (
-                        strategies.map((row) => (
-                          <option key={row.id} value={row.id}>
-                            {row.name || row.id}
-                          </option>
-                        ))
-                      )}
-                    </select>
-                  </label>
-
-                  {template ? (
-                    <p className="text-[11px] text-[var(--dim)]">
-                      {template.summary} · {template.bias} bias · legs {template.legs}
-                    </p>
-                  ) : null}
-
-                  <button
-                    type="button"
-                    className="btn btn-accent"
-                    onClick={() => void buildPayoff()}
-                    disabled={payoffAction.busy || activeStrategy === ""}
-                    aria-label="Build the expiry payoff for the selected strategy"
-                  >
-                    {payoffAction.busy ? "Pricing…" : "Build payoff"}
-                  </button>
-
-                  {payoffAction.error ? <ErrorBlock message={payoffAction.error} /> : null}
-                </div>
-              </GlassPanel>
-
-              {payoff ? (
-                <PayoffPanel receipt={payoff} />
-              ) : (
-                <GlassPanel title="Expiry payoff" eyebrow="grounded">
-                  <EmptyCleanSlate
-                    title="No payoff yet"
-                    body="Build a payoff to see the expiry curve, breakevens, the per-leg greeks and the SHA-256 receipt."
-                  />
-                </GlassPanel>
-              )}
+            <div className="nx-list-item">
+              <span className="nx-badge nx-badge--muted">2</span>
+              <span className="nx-xs nx-dim">Breakevens are solved from the expiry envelope, not eyeballed.</span>
+            </div>
+            <div className="nx-list-item">
+              <span className="nx-badge nx-badge--muted">3</span>
+              <span className="nx-xs nx-dim">Tax and fee floors are applied before the conformal gate.</span>
             </div>
           </div>
-        </div>
+        </TerminalPanel>
+      </div>
+
+      <TerminalPanel title="Chain ladder" subtitle="Calls left of the strike, puts right" flush>
+        <DataGrid<StrikeRow>
+          columns={[
+            { key: "cdelta", label: "Call delta", align: "right", render: (row) => (
+              <span className="nx-num nx-dim">{row.call_delta.toFixed(3)}</span>
+            ) },
+            { key: "cltp", label: "Call LTP", align: "right", render: (row) => (
+              <span className="nx-num nx-bull">{row.call_ltp.toFixed(2)}</span>
+            ) },
+            { key: "strike", label: "Strike", align: "right", render: (row) => (
+              <span className="nx-num nx-strong">{row.strike.toFixed(2)}</span>
+            ) },
+            { key: "pltp", label: "Put LTP", align: "right", render: (row) => (
+              <span className="nx-num nx-bear">{row.put_ltp.toFixed(2)}</span>
+            ) },
+            { key: "pdelta", label: "Put delta", align: "right", render: (row) => (
+              <span className="nx-num nx-dim">{row.put_delta.toFixed(3)}</span>
+            ) },
+          ]}
+          rows={strikes}
+          getKey={(row) => row.strike.toFixed(3)}
+          empty={
+            <EmptyCleanSlate
+              title="Chain not materialised"
+              body="Request a chain from the Ring 2 pricer to populate the ladder. Nothing is pre-seeded on a clean slate."
+              hint="POST /api/v2/control/options/chain"
+            />
+          }
+        />
+      </TerminalPanel>
+
+      {underlyings.length > 0 ? (
+        <TerminalPanel title="Underlying universe" subtitle="Silo-scoped derivative roots" flush>
+          <DataGrid
+            columns={[
+              {
+                key: "symbol",
+                label: "Root",
+                render: (row: Record<string, unknown>) => <span className="nx-strong">{str(row, "symbol", "-")}</span>,
+              },
+              {
+                key: "silo",
+                label: "Silo",
+                render: (row: Record<string, unknown>) => <span className="nx-dim">{str(row, "silo", "-")}</span>,
+              },
+              {
+                key: "lot",
+                label: "Lot",
+                align: "right",
+                render: (row: Record<string, unknown>) => (
+                  <span className="nx-num">{num(row, "lot_size", 0)}</span>
+                ),
+              },
+            ]}
+            rows={underlyings}
+            empty={<EmptyCleanSlate title="No root armed" />}
+          />
+        </TerminalPanel>
       ) : null}
-    </>
+    </div>
   );
 }

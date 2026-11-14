@@ -1,5 +1,5 @@
 /**
- * The fixed V1.4 page catalog.
+ * The fixed V1.5 page catalog.
  *
  * Fifteen production pages, five operational domains, one canonical route per
  * page plus the aliases the backend advertises in `/api/v2/cockpit/pages`.
@@ -62,7 +62,7 @@ export const PAGES: PageMeta[] = [
     aliases: ["/"],
     ring: "ring3",
     summary:
-      "Four-ring isolation heartbeat, total IBOR NAV, the 4×4 silo vault grid and the grounded proof stream.",
+      "Four-ring isolation heartbeat, total IBOR NAV, the 4x4 silo vault grid and the grounded proof stream.",
   },
   {
     key: "terminal",
@@ -110,14 +110,14 @@ export const PAGES: PageMeta[] = [
   },
   {
     key: "quant",
-    title: "490-Factor Quant Lab",
-    short: "490-Factor Quant Lab",
+    title: "480+ Factor Quant Lab",
+    short: "Factor Quant Lab",
     group: "quant",
     route: "/quant",
     aliases: [],
     ring: "ring2",
     summary:
-      "Ranked factor matrix, 47 loaders × 17 regional engines readiness and the grounded Black-Scholes pricer.",
+      "Ranked factor matrix, loader x regional-engine readiness and the grounded Black-Scholes pricer.",
   },
   {
     key: "agents",
@@ -128,7 +128,7 @@ export const PAGES: PageMeta[] = [
     aliases: [],
     ring: "ring2",
     summary:
-      "Six specialist agents, the token budget, grounded task assignment and the 0..100 decision dashboard.",
+      "Specialist agents, the token budget, grounded task assignment and the 0..100 decision dashboard.",
   },
   {
     key: "backtest",
@@ -172,7 +172,7 @@ export const PAGES: PageMeta[] = [
     aliases: [],
     ring: "ring0",
     summary:
-      "Debit/credit conservation, the 4 silos × 4 vaults micro-unit grid, ratchet preview and tax floors.",
+      "Debit/credit conservation, the 4 silos x 4 vaults micro-unit grid, ratchet preview and tax floors.",
   },
   {
     key: "logbook",
@@ -183,7 +183,7 @@ export const PAGES: PageMeta[] = [
     aliases: ["/journal"],
     ring: "ring3",
     summary:
-      "Gross → cost drag → net P&L attribution, R-multiples and the chronological execution journal.",
+      "Gross to cost drag to net P&L attribution, R-multiples and the chronological execution journal.",
   },
   {
     key: "verification",
@@ -205,7 +205,7 @@ export const PAGES: PageMeta[] = [
     aliases: ["/venues"],
     ring: "ring0",
     summary:
-      "Four silos × three venues, write-only credential masks, dual-vendor feeds and Ed25519 signing pings.",
+      "Four silos x three venues, write-only credential masks, dual-vendor feeds and Ed25519 signing pings.",
   },
   {
     key: "control",

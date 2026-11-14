@@ -1,156 +1,169 @@
 /**
- * MiroFish contagion flow.
+ * MiroFish contagion flow matrix.
  *
- * Five behavioural archetypes push a signed shock through three ticks. Edge
- * thickness encodes magnitude, colour encodes sign, and the fragility index is
- * drawn against its Ring 1 revocation threshold.
+ * Five archetypes down the rows, three cascade ticks across the columns. Each
+ * cell is a flat tile whose tint encodes the sign of the shock and whose label
+ * carries the exact cascade-fragility contribution, with directed arrows
+ * between ticks so the propagation order is unambiguous.
  */
 
 import type { ReactNode } from "react";
-import { num } from "@/lib/format";
-import { StatusPill } from "@/design-system/primitives";
+import { CHART, ChartLegend } from "./kit";
 
 export interface ContagionFlowGraphProps {
-  archetypes: string[];
-  tickFlows?: number[];
-  matrix?: number[][];
-  weights?: number[];
-  fragility?: number;
-  threshold?: number;
+  /** matrix[archetypeIndex][tickIndex], normalised to -1..1. */
+  matrix: number[][];
+  archetypes?: string[];
+  ticks?: string[];
   height?: number;
+  fragility?: number;
 }
 
-const PAD_X = 108;
-const NODE_R = 15;
-
-function normaliseMatrix(
-  rowCount: number,
-  columnCount: number,
-  matrix: number[][] | undefined,
-  tickFlows: number[] | undefined,
-  weights: number[] | undefined,
-): number[][] {
-  if (matrix && matrix.length === rowCount && matrix.every((row) => row.length >= columnCount)) {
-    return matrix.map((row) => row.slice(0, columnCount));
-  }
-  const weightTotal = weights && weights.length >= rowCount ? weights.slice(0, rowCount).reduce((sum, value) => sum + Math.abs(value), 0) : 0;
-  return Array.from({ length: rowCount }, (_, row) =>
-    Array.from({ length: columnCount }, (_, column) => {
-      const flow = tickFlows?.[column] ?? 0;
-      const share = weightTotal > 0 && weights ? Math.abs(weights[row] ?? 0) / weightTotal : 1 / rowCount;
-      return flow * share;
-    }),
-  );
-}
+const DEFAULT_ARCHETYPES = ["PANIC", "GREED", "HERD", "CONTRARIAN", "LIQUIDITY"];
+const DEFAULT_TICKS = ["T+0", "T+1", "T+2"];
+const TILE_W = 112;
+const TILE_H = 34;
+const GAP_X = 42;
+const GAP_Y = 9;
+const LEFT = 104;
 
 export function ContagionFlowGraph({
-  archetypes,
-  tickFlows = [],
   matrix,
-  weights,
+  archetypes = DEFAULT_ARCHETYPES,
+  ticks = DEFAULT_TICKS,
+  height,
   fragility = 0,
-  threshold = 0.75,
-  height = 300,
 }: ContagionFlowGraphProps): ReactNode {
-  const rows = Math.max(1, archetypes.length);
-  const columns = 3;
-  const width = 860;
-  const innerH = height - 70;
-  const stepY = innerH / rows;
-  const values = normaliseMatrix(rows, columns, matrix, tickFlows, weights);
-  const maxAbs = Math.max(0.0001, ...values.flat().map((value) => Math.abs(value)));
-  const columnX = Array.from({ length: columns }, (_, index) => PAD_X + ((width - PAD_X - 150) / columns) * (index + 1));
-  const rowY = (index: number) => 44 + stepY * index + stepY / 2;
-  const armed = fragility >= threshold;
+  const rows = archetypes.length;
+  const cols = ticks.length;
+  const width = LEFT + cols * TILE_W + (cols - 1) * GAP_X + 24;
+  const total = 22 + rows * TILE_H + (rows - 1) * GAP_Y + 16;
+
+  const value = (row: number, col: number): number => {
+    const line = matrix[row];
+    if (!Array.isArray(line)) return 0;
+    const cell = line[col];
+    return typeof cell === "number" && Number.isFinite(cell) ? cell : 0;
+  };
 
   return (
-    <div className="w-full">
+    <div className="nx-stack">
       <svg
-        viewBox={`0 0 ${width} ${height}`}
-        width="100%"
-        height={height}
+        className="nx-chart"
+        viewBox={`0 0 ${width} ${total}`}
+        style={{ height: height ?? total }}
         role="img"
-        aria-label={`Directed contagion flow across ${rows} archetypes and three ticks. Fragility index ${num(fragility, 3)} against a Ring 1 threshold of ${num(threshold, 2)}.`}
+        aria-label="MiroFish contagion flow matrix"
+        preserveAspectRatio="xMinYMin meet"
       >
-        <defs>
-          <marker id="contagion-out" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M0,0 L8,4 L0,8 z" fill="rgba(251,113,133,0.85)" />
-          </marker>
-          <marker id="contagion-in" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M0,0 L8,4 L0,8 z" fill="rgba(245,158,11,0.85)" />
-          </marker>
-        </defs>
+        <title>MiroFish five-archetype three-tick contagion matrix</title>
 
-        {Array.from({ length: columns }, (_, index) => (
-          <text key={`tick-${index}`} x={columnX[index]} y={24} textAnchor="middle" className="iso-ring-label" style={{ fontSize: 9 }}>
-            TICK {index + 1}
+        {ticks.map((tick, col) => (
+          <text
+            key={tick}
+            x={LEFT + col * (TILE_W + GAP_X) + TILE_W / 2}
+            y={12}
+            textAnchor="middle"
+            fill={CHART.axis}
+            fontSize={8.5}
+            letterSpacing="0.1em"
+          >
+            {tick}
           </text>
         ))}
 
-        {archetypes.map((archetype, row) => (
-          <g key={archetype}>
-            <text x={12} y={rowY(row) + 3} className="iso-ring-label" style={{ fontSize: 8.5 }}>
-              {archetype.replace(/_/g, " ").slice(0, 18)}
-            </text>
-            <text x={12} y={rowY(row) + 14} fill="rgba(148,163,184,0.55)" style={{ fontSize: 7.5, fontFamily: "var(--font-mono)" }}>
-              w {num(weights?.[row] ?? 0, 2)}
-            </text>
-            <circle cx={PAD_X - 40} cy={rowY(row)} r={4.5} fill={values[row].some((value) => value < 0) ? "rgba(251,113,133,0.8)" : "rgba(245,158,11,0.8)"} />
-          </g>
-        ))}
-
-        {values.map((row, rowIndex) =>
-          row.map((value, columnIndex) => {
-            const fromX = columnIndex === 0 ? PAD_X - 30 : columnX[columnIndex - 1] + NODE_R;
-            const toX = columnX[columnIndex] - NODE_R;
-            const fromY = columnIndex === 0 ? rowY(rowIndex) : rowY(rowIndex) + (value >= 0 ? -6 : 6);
-            const toY = rowY(rowIndex) + (value >= 0 ? -6 : 6);
-            const midX = (fromX + toX) / 2;
-            const lift = value >= 0 ? -10 - Math.abs(value) * 0.6 : 10 + Math.abs(value) * 0.6;
-            const strokeWidth = 0.6 + (Math.abs(value) / maxAbs) * 4.2;
-            return (
-              <path
-                key={`${rowIndex}-${columnIndex}`}
-                d={`M${fromX},${fromY} Q${midX},${rowY(rowIndex) + lift} ${toX},${toY}`}
-                fill="none"
-                stroke={value >= 0 ? "rgba(245,158,11,0.62)" : "rgba(251,113,133,0.62)"}
-                strokeWidth={strokeWidth}
-                markerEnd={`url(#${value >= 0 ? "contagion-in" : "contagion-out"})`}
-                opacity={0.35 + (Math.abs(value) / maxAbs) * 0.6}
-              >
-                <title>{`${archetypes[rowIndex]} · tick ${columnIndex + 1}: ${num(value, 3)}`}</title>
-              </path>
-            );
-          }),
-        )}
-
-        {columnX.map((x, index) => (
-          <g key={`node-${index}`}>
-            <circle cx={x} cy={height - 34} r={5} fill="rgba(148,163,184,0.5)" />
-            <text x={x} y={height - 18} textAnchor="middle" className="iso-ring-label" style={{ fontSize: 7.5 }}>
-              {num(tickFlows[index], 2)}
-            </text>
-          </g>
-        ))}
-
-        <text x={columnX[0]} y={height - 6} textAnchor="middle" fill="rgba(148,163,184,0.5)" style={{ fontSize: 7, fontFamily: "var(--font-mono)" }}>
-          net flow per tick
+        <text x={LEFT - 10} y={12} textAnchor="end" fill={CHART.axis} fontSize={8.5}>
+          FRAGILITY {fragility.toFixed(3)}
         </text>
-      </svg>
 
-      <div className="mt-1 flex flex-wrap items-center gap-3">
-        <span className="mono flex items-center gap-1.5 text-[9px] tracking-[0.08em] text-[var(--dim)]">
-          <span className="inline-block h-[2px] w-4 rounded bg-[rgba(245,158,11,0.8)]" /> POSITIVE FLOW
-        </span>
-        <span className="mono flex items-center gap-1.5 text-[9px] tracking-[0.08em] text-[var(--dim)]">
-          <span className="inline-block h-[2px] w-4 rounded bg-[rgba(251,113,133,0.8)]" /> NEGATIVE FLOW
-        </span>
-        <span className="ml-auto flex items-center gap-2">
-          <span className="eyebrow">fragility</span>
-          <span className="mono tnum text-[12px] text-[var(--ink)]">{num(fragility, 3)}</span>
-          <StatusPill value={armed ? "RING1 HALT" : "BELOW THRESHOLD"} tone={armed ? "bad" : "ok"} />
-        </span>
-      </div>
+        {archetypes.map((archetype, row) => {
+          const y = 22 + row * (TILE_H + GAP_Y);
+          return (
+            <g key={archetype}>
+              <text x={LEFT - 10} y={y + TILE_H / 2 + 3} textAnchor="end" fill={CHART.text} fontSize={9}>
+                {archetype}
+              </text>
+              {ticks.map((tick, col) => {
+                const cell = value(row, col);
+                const bullish = cell > 0.02;
+                const bearish = cell < -0.02;
+                const x = LEFT + col * (TILE_W + GAP_X);
+                return (
+                  <g key={`${archetype}-${tick}`}>
+                    <rect
+                      x={x}
+                      y={y}
+                      width={TILE_W}
+                      height={TILE_H}
+                      rx={4}
+                      fill={bullish ? CHART.bullFill : bearish ? CHART.bearFill : CHART.surface}
+                      stroke={bullish ? CHART.bullLine : bearish ? CHART.bearLine : CHART.grid}
+                      strokeWidth={1}
+                    />
+                    <text x={x + 8} y={y + 14} fill={CHART.axis} fontSize={7.5} letterSpacing="0.08em">
+                      {tick}
+                    </text>
+                    <text
+                      x={x + 8}
+                      y={y + 26}
+                      fill={bullish ? CHART.bull : bearish ? CHART.bear : CHART.text}
+                      fontSize={10}
+                      fontWeight={600}
+                    >
+                      {cell >= 0 ? "+" : ""}
+                      {cell.toFixed(2)}
+                    </text>
+                    <line
+                      x1={x + TILE_W - 46}
+                      y1={y + TILE_H - 12}
+                      x2={x + TILE_W - 10}
+                      y2={y + TILE_H - 12}
+                      stroke={CHART.grid}
+                      strokeWidth={1}
+                    />
+                    <rect
+                      x={x + TILE_W - 46}
+                      y={y + TILE_H - 13}
+                      width={Math.max(1, Math.min(36, Math.abs(cell) * 36))}
+                      height={3}
+                      fill={bullish ? CHART.bull : bearish ? CHART.bear : CHART.axis}
+                    />
+                  </g>
+                );
+              })}
+              {cols > 1
+                ? Array.from({ length: cols - 1 }).map((_, col) => {
+                    const arrowX = LEFT + col * (TILE_W + GAP_X) + TILE_W + 6;
+                    const arrowY = y + TILE_H / 2;
+                    return (
+                      <g key={`flow-${archetype}-${col}`}>
+                        <line
+                          x1={arrowX}
+                          y1={arrowY}
+                          x2={arrowX + GAP_X - 16}
+                          y2={arrowY}
+                          stroke={CHART.grid}
+                          strokeWidth={1.5}
+                        />
+                        <path
+                          d={`M${arrowX + GAP_X - 16} ${arrowY} l-4 -3 l0 6 Z`}
+                          fill={CHART.axis}
+                        />
+                      </g>
+                    );
+                  })
+                : null}
+            </g>
+          );
+        })}
+      </svg>
+      <ChartLegend
+        items={[
+          { label: "Adverse propagation", color: CHART.bearLine },
+          { label: "Stabilising flow", color: CHART.bullLine },
+          { label: "Neutral tick", color: CHART.grid },
+        ]}
+      />
     </div>
   );
 }

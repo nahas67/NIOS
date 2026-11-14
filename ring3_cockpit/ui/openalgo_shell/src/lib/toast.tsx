@@ -1,82 +1,70 @@
 /**
- * Tiny toast bus.
+ * Toast bus.
  *
- * Operator receipts are proof artefacts, so every action result can be pinned
- * into a stack without a modal. The bus is a module-level event so a page never
- * has to thread a callback through the shells.
+ * A module-level emitter plus one host mounted by the app root, so a page can
+ * report an order rejection or a reconcile result without prop-drilling a
+ * callback through the shells.
  */
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 
-export type ToastTone = "ok" | "warn" | "bad" | "info";
+export type ToastTone = "info" | "success" | "error";
 
-export interface Toast {
+export interface ToastMessage {
   id: number;
-  title: string;
-  detail?: string;
+  text: string;
   tone: ToastTone;
 }
 
-const TOAST_EVENT = "nios:toast";
-let nextId = 1;
+type Listener = (messages: ToastMessage[]) => void;
 
-export function pushToast(title: string, detail?: string, tone: ToastTone = "info"): void {
-  window.dispatchEvent(
-    new CustomEvent<Toast>(TOAST_EVENT, {
-      detail: { id: nextId++, title, detail, tone },
-    }),
-  );
+let messages: ToastMessage[] = [];
+let nextId = 1;
+const listeners = new Set<Listener>();
+
+function emit(): void {
+  const snapshot = [...messages];
+  for (const listener of listeners) listener(snapshot);
 }
 
-export function toastError(title: string, error: string | null): void {
-  pushToast(title, error ?? "unknown failure", "bad");
+export function toast(text: string, tone: ToastTone = "info"): void {
+  const id = nextId++;
+  messages = [...messages, { id, text, tone }].slice(-4);
+  emit();
+  window.setTimeout(() => {
+    messages = messages.filter((message) => message.id !== id);
+    emit();
+  }, 5200);
+}
+
+export function dismissToast(id: number): void {
+  messages = messages.filter((message) => message.id !== id);
+  emit();
 }
 
 export function ToastHost(): ReactNode {
-  const [items, setItems] = useState<Toast[]>([]);
+  const [current, setCurrent] = useState<ToastMessage[]>(messages);
 
   useEffect(() => {
-    const onToast = (event: Event) => {
-      const toast = (event as CustomEvent<Toast>).detail;
-      if (!toast) return;
-      setItems((prev) => [...prev.slice(-3), toast]);
-      window.setTimeout(() => {
-        setItems((prev) => prev.filter((item) => item.id !== toast.id));
-      }, 5200);
+    listeners.add(setCurrent);
+    setCurrent([...messages]);
+    return () => {
+      listeners.delete(setCurrent);
     };
-    window.addEventListener(TOAST_EVENT, onToast);
-    return () => window.removeEventListener(TOAST_EVENT, onToast);
   }, []);
 
-  if (items.length === 0) return null;
+  if (current.length === 0) return null;
 
   return (
-    <div
-      className="fixed right-4 bottom-4 z-[120] flex w-[min(420px,calc(100vw-2rem))] flex-col gap-2"
-      role="status"
-      aria-live="polite"
-    >
-      {items.map((item) => (
-        <div key={item.id} className="toast">
-          <div className="row-between">
-            <span className={`pill ${item.tone === "ok" ? "pill-ok" : item.tone === "bad" ? "pill-bad" : item.tone === "warn" ? "pill-warn" : "pill-info"}`}>
-              <span className="pill-dot" aria-hidden="true" />
-              {item.tone}
-            </span>
-            <button
-              type="button"
-              className="btn btn-ghost btn-sm"
-              onClick={() => setItems((prev) => prev.filter((row) => row.id !== item.id))}
-              aria-label="Dismiss notification"
-            >
-              Dismiss
-            </button>
-          </div>
-          <p className="mt-1.5 text-[12.5px] text-[var(--ink)]">{item.title}</p>
-          {item.detail ? (
-            <p className="mono mt-0.5 text-[10.5px] break-words text-[var(--dim)]">{item.detail}</p>
-          ) : null}
-        </div>
+    <div className="nx-toasts" aria-live="polite" aria-atomic="false">
+      {current.map((message) => (
+        <output key={message.id} className={`nx-toast nx-toast--${message.tone}`}>
+          <span className="nx-strong nx-xs">{message.tone.toUpperCase()}</span>
+          <span className="nx-truncate" style={{ whiteSpace: "normal" }}>
+            {message.text}
+          </span>
+        </output>
       ))}
     </div>
   );

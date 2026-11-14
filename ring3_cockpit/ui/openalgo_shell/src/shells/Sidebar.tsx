@@ -1,172 +1,97 @@
 /**
- * Shared navigation rail.
+ * Collapsible domain rail.
  *
- * Five operational domains, live counters, an active-route indicator and a
- * collapse state persisted per browser. The rail itself is mode-agnostic: the
- * shell root supplies the accent variables.
+ * Five operational domains, fifteen workstations, one accent left indicator on
+ * the active row. The collapsed state keeps every icon reachable and exposes
+ * the label as the accessible name, so the rail is usable in an 8-column grid.
  */
 
-import { useEffect, useState, type ReactNode } from "react";
-import {
-  Activity,
-  BookOpen,
-  Boxes,
-  Brain,
-  ChevronsLeft,
-  ChevronsRight,
-  Command,
-  FlaskConical,
-  Gauge,
-  Hammer,
-  Layers,
-  ListOrdered,
-  LogOut,
-  Network,
-  PenLine,
-  ShieldCheck,
-  SlidersHorizontal,
-  TrendingUp,
-  Users,
-} from "lucide-react";
-import { NAV_GROUPS, PAGE_BY_KEY, pagesByGroup, type PageKey } from "@/pages/registry";
-import { openPalette } from "@/design-system/primitives";
-import type { Tier, Workspace } from "@/lib/types";
+import type { ReactNode } from "react";
+import { NAV_GROUPS, PAGE_BY_KEY, type PageKey } from "@/pages/registry";
+import { Glyph } from "./icons";
+import type { NavProps } from "./types";
 
-const ICONS: Record<PageKey, typeof Gauge> = {
-  dashboard: Gauge,
-  terminal: Activity,
-  orders: ListOrdered,
-  options: Layers,
-  analyzer: FlaskConical,
-  quant: Boxes,
-  agents: Users,
-  backtest: TrendingUp,
-  brain: Brain,
-  forge: Hammer,
-  ledger: BookOpen,
-  logbook: PenLine,
-  verification: ShieldCheck,
-  brokers: Network,
-  control: SlidersHorizontal,
+/**
+ * The rail order is declared here, not derived, so a re-ordered registry can
+ * never silently reshuffle an operator's muscle memory. Every domain keeps the
+ * registry as the single source of truth for the route a key resolves to.
+ */
+const DOMAIN_KEYS: Record<string, PageKey[]> = {
+  core: ["dashboard", "terminal", "orders"],
+  quant: ["options", "analyzer", "quant"],
+  brain: ["agents", "backtest", "brain", "forge"],
+  audit: ["ledger", "logbook", "verification"],
+  sovereign: ["brokers", "control"],
 };
 
-const COLLAPSE_KEY = "nios.sidebar.collapsed";
-
-export interface SidebarProps {
-  workspace: Workspace;
-  active: PageKey;
-  onNavigate: (page: PageKey) => void;
-  badges?: Partial<Record<PageKey, string>>;
-  username: string | null;
-  tier: Tier;
-  onSignOut: () => void;
-}
-
-export function Sidebar({ workspace, active, onNavigate, badges, username, tier, onSignOut }: SidebarProps): ReactNode {
-  const [collapsed, setCollapsed] = useState(() => {
-    try {
-      return window.localStorage.getItem(COLLAPSE_KEY) === "1";
-    } catch {
-      return false;
-    }
-  });
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(COLLAPSE_KEY, collapsed ? "1" : "0");
-    } catch {
-      /* storage disabled */
-    }
-  }, [collapsed]);
-
-  const workspaceLabel = workspace === "paper" ? "PAPER SANDBOX" : workspace === "live" ? "LIVE VAULT" : "OPERATOR";
-
+export function Sidebar({ page, collapsed, onToggle, onNavigate }: NavProps): ReactNode {
   return (
-    <aside className="sidebar" aria-label="Primary navigation">
-      <div className="sidebar-brand">
-        <span className="brand-mark" aria-hidden="true">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <ellipse cx="12" cy="12" rx="10" ry="5.4" stroke="var(--accent)" strokeWidth="1.3" />
-            <ellipse cx="12" cy="12" rx="6.6" ry="3.4" stroke="var(--accent-2)" strokeWidth="1.1" />
-            <circle cx="12" cy="12" r="1.5" fill="var(--accent-2)" />
-          </svg>
+    <nav
+      className={collapsed ? "nx-sidebar nx-sidebar--rail" : "nx-sidebar"}
+      aria-label="Workstation domains"
+    >
+      <div className="nx-sidebar-brand">
+        <span className="nx-sidebar-brand-mark" aria-hidden="true">
+          <Glyph name="shield" size={13} />
         </span>
-        <div className="brand-text">
-          <p className="brand-title">NIOS</p>
-          <p className="brand-sub">{workspaceLabel}</p>
-        </div>
+        {collapsed ? null : (
+          <span className="nx-sidebar-brand-text">
+            <span className="nx-sidebar-brand-title">NIOS</span>
+            <span className="nx-sidebar-brand-sub">Sovereign Cockpit</span>
+          </span>
+        )}
       </div>
 
-      <div className="sidebar-scroll">
-        <button
-          type="button"
-          className="nav-item"
-          onClick={openPalette}
-          aria-label="Open quick jump command palette (Control or Command plus K)"
-          title="Quick jump · Ctrl/Cmd K"
-        >
-          <Command size={14} className="nav-icon" aria-hidden="true" />
-          <span className="nav-label">Quick jump</span>
-          <span className="nav-count">⌘K</span>
-        </button>
-
+      <div className="nx-nav">
         {NAV_GROUPS.map((group) => (
-          <nav className="nav-group" key={group.id} aria-label={group.label}>
-            <p className="nav-group-label">
-              {group.roman}. {group.label}
-            </p>
-            {pagesByGroup(group.id).map((page) => {
-              const Icon = ICONS[page.key];
-              const current = page.key === active;
+          <div className="nx-nav-group" key={group.id}>
+            <div className="nx-nav-grouphead">
+              {collapsed ? (
+                <span className="nx-nav-roman">{group.roman}</span>
+              ) : (
+                <>
+                  <span>{group.label}</span>
+                  <span className="nx-nav-roman">{group.roman}</span>
+                </>
+              )}
+            </div>
+            {(DOMAIN_KEYS[group.id] ?? []).map((key) => {
+              const entry = PAGE_BY_KEY[key];
+              const active = entry.key === page;
               return (
                 <button
-                  key={page.key}
+                  key={entry.key}
                   type="button"
-                  className="nav-item"
-                  aria-current={current ? "page" : undefined}
-                  aria-label={page.title}
-                  title={collapsed ? page.title : undefined}
-                  onClick={() => onNavigate(page.key)}
+                  className={active ? "nx-nav-item nx-nav-item--active" : "nx-nav-item"}
+                  onClick={() => onNavigate(entry.key)}
+                  aria-current={active ? "page" : undefined}
+                  title={collapsed ? entry.title : undefined}
                 >
-                  <Icon size={14} className="nav-icon" aria-hidden="true" />
-                  <span className="nav-label truncate">{PAGE_BY_KEY[page.key].short}</span>
-                  {badges?.[page.key] ? <span className="nav-count">{badges[page.key]}</span> : null}
+                  <Glyph name={entry.key} className="nx-nav-icon" />
+                  {collapsed ? (
+                    <span className="sr-only">{entry.title}</span>
+                  ) : (
+                    <span className="nx-nav-label">{entry.short}</span>
+                  )}
                 </button>
               );
             })}
-          </nav>
+          </div>
         ))}
       </div>
 
-      <div className="sidebar-foot">
-        <div className="min-w-0 sidebar-foot-text">
-          <p className="mono truncate text-[10.5px] text-[var(--ink-soft)]" title={username ?? "operator"}>
-            {username ?? "operator"}
-          </p>
-          <p className="mono text-[8.5px] tracking-[0.12em] text-[var(--dim)] uppercase">{tier} TIER</p>
-        </div>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            className="btn btn-ghost btn-icon"
-            onClick={onSignOut}
-            aria-label="Sign out of this workspace"
-            title="Sign out"
-          >
-            <LogOut size={13} />
-          </button>
-          <button
-            type="button"
-            className="btn btn-ghost btn-icon"
-            onClick={() => setCollapsed((value) => !value)}
-            aria-label={collapsed ? "Expand navigation rail" : "Collapse navigation rail"}
-            aria-expanded={!collapsed}
-            title={collapsed ? "Expand rail" : "Collapse rail"}
-          >
-            {collapsed ? <ChevronsRight size={13} /> : <ChevronsLeft size={13} />}
-          </button>
-        </div>
+      <div className="nx-sidebar-foot">
+        <button
+          type="button"
+          className="nx-rail-toggle"
+          onClick={onToggle}
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? "Expand the domain rail" : "Collapse the domain rail"}
+        >
+          <Glyph name={collapsed ? "expand" : "collapse"} size={14} />
+          {collapsed ? null : <span>Collapse rail</span>}
+        </button>
       </div>
-    </aside>
+    </nav>
   );
 }

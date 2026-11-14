@@ -3,8 +3,8 @@
  *
  * Holds the authenticated tier, the workspace the portal granted and the wall
  * clock expiry of the live 30-minute lease. The token itself never lands in
- * React state: it stays in `sessionStorage` (mirrored by the gateway's
- * HttpOnly cookie) and is attached by the API client.
+ * React state: it stays in `sessionStorage` (mirrored by the gateway's HttpOnly
+ * cookie) and is attached by the API client.
  */
 
 import {
@@ -17,7 +17,7 @@ import {
   type ReactNode,
 } from "react";
 import { authApi, setStoredToken, storedToken } from "./api";
-import type { AuthSession, AuthStatus, Tier } from "./types";
+import type { AuthSession, AuthStatus, Tier, Workspace } from "./types";
 
 const META_KEY = "nios.session.meta.v1";
 
@@ -25,6 +25,7 @@ interface SessionValue {
   status: AuthStatus | null;
   session: AuthSession | null;
   tier: Tier;
+  workspace: Workspace;
   username: string | null;
   loading: boolean;
   expiresAtMs: number | null;
@@ -87,7 +88,13 @@ export function SessionProvider({ children }: { children: ReactNode }): ReactNod
     setSession(next);
     setStatus((prev) =>
       prev
-        ? { ...prev, authenticated: true, username: next.username, tier: next.tier, workspace: next.workspace }
+        ? {
+            ...prev,
+            authenticated: true,
+            username: next.username,
+            tier: next.tier,
+            workspace: next.workspace ?? prev.workspace ?? null,
+          }
         : prev,
     );
   }, []);
@@ -108,10 +115,13 @@ export function SessionProvider({ children }: { children: ReactNode }): ReactNod
     const tier: Tier = session?.tier ?? status?.tier ?? "NONE";
     const expiresAtMs =
       session?.expires_ns != null ? Math.round(session.expires_ns / 1_000_000) : null;
+    const workspace: Workspace =
+      tier === "LIVE" ? "live" : tier === "PAPER" ? "paper" : "base";
     return {
       status,
       session,
       tier,
+      workspace,
       username: session?.username ?? status?.username ?? null,
       loading,
       expiresAtMs,

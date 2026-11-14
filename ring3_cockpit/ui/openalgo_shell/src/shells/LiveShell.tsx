@@ -1,185 +1,164 @@
 /**
- * Live production shell.
+ * Live sovereign vault shell.
  *
- * Matte carbon, crimson + amber, a hazard rail above the header and no
- * synthetic controls of any kind: the only write actions on this surface are
- * the two-step emergency kill switch and dropping the vault back to paper.
- * The 30-minute session lease is shown ticking at all times.
+ * Everything that can move real capital is here and nowhere else: the hazard
+ * ribbon, the 22-gate certificate chip, the 30-minute lease countdown, the
+ * two-step sub-millisecond kill switch and the vault lock. There is no deposit,
+ * no reset, no autopilot transport and no shadow burst in this file.
  */
 
-import { useMemo, useState, type ReactNode } from "react";
-import { ArrowLeftRight, Lock, ShieldAlert, Siren, Timer } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { api, authApi } from "@/lib/api";
+import { clock, num } from "@/lib/format";
+import { useSession } from "@/lib/session";
+import { toast } from "@/lib/toast";
+import { useApi } from "@/lib/use-api";
 import { PAGE_BY_KEY } from "@/pages/registry";
+import { Btn, ConfirmModal, StatusBadge } from "@/design-system/primitives";
+import { Glyph } from "./icons";
 import { Sidebar } from "./Sidebar";
 import type { ShellProps } from "./types";
-import { api, authApi } from "@/lib/api";
-import { useAction, useNow, useResource } from "@/lib/use-api";
-import { useSession } from "@/lib/session";
-import { pushToast, toastError } from "@/lib/toast";
-import { num } from "@/lib/format";
-import { ConfirmDangerModal, StatusPill } from "@/design-system/primitives";
 
-export function LiveShell({ page, children, onNavigate, onPortal }: ShellProps): ReactNode {
-  const meta = PAGE_BY_KEY[page];
-  const { username, signOut, expiresAtMs } = useSession();
-  const now = useNow(1000);
-  const preflight = useResource("live-preflight", () => authApi.preflight(), 30_000);
-  const liveState = useResource("live-workspace-state", () => authApi.liveState(), 12_000);
-  const kill = useAction<Record<string, unknown>>();
+const LEASE_MS = 30 * 60 * 1000;
+
+export function LiveShell({ page, onNavigate, onPortal, children }: ShellProps): ReactNode {
+  const [collapsed, setCollapsed] = useState(false);
+  const [remainingMs, setRemainingMs] = useState(LEASE_MS);
+  const [armed, setArmed] = useState(false);
   const [killOpen, setKillOpen] = useState(false);
-  const [dropping, setDropping] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const session = useSession();
+  const expiresAtMs = session.expiresAtMs;
+  const preflight = useApi(() => authApi.preflight(), []);
+  const meta = PAGE_BY_KEY[page];
 
-  const remainingS = useMemo(() => {
-    if (!expiresAtMs) return null;
-    return Math.max(0, Math.round((expiresAtMs - now) / 1000));
-  }, [expiresAtMs, now]);
+  const deadline = useMemo(() => expiresAtMs ?? Date.now() + LEASE_MS, [expiresAtMs]);
 
-  const expired = remainingS !== null && remainingS <= 0;
-  const ttl = remainingS === null ? "—" : `${String(Math.floor(remainingS / 60)).padStart(2, "0")}:${String(remainingS % 60).padStart(2, "0")}`;
+  useEffect(() => {
+    const tick = () => setRemainingMs(Math.max(0, deadline - Date.now()));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [deadline]);
 
-  const certificate = preflight.data;
-  const passed = certificate?.passed_gates ?? 0;
-  const total = certificate?.total_gates ?? 22;
-  const ready = certificate?.ready_for_live_cutover === true;
+  useEffect(() => {
+    if (!armed) return;
+    const timer = window.setTimeout(() => setArmed(false), 6000);
+    return () => window.clearTimeout(timer);
+  }, [armed]);
 
-  const liveFills = liveState.data?.live_fills ?? 0;
-  const brokersConfigured = Object.values(liveState.data?.silos ?? {}).filter((silo) => silo.configured).length;
+  const passedGates = num(preflight.data, "passed_gates", num(preflight.data, "certificate.passed_gates", 0));
+  const totalGates = num(preflight.data, "total_gates", num(preflight.data, "certificate.total_gates", 22));
 
-  const executeKill = async () => {
-    const receipt = await kill.run(() => api.killSwitch("operator emergency kill switch from the live vault"));
-    if (receipt) {
-      pushToast("Emergency kill switch executed", "Global halt latch armed; every lease disarmed", "bad");
-      setKillOpen(false);
-      preflight.reload();
-      liveState.reload();
-    } else if (kill.error) {
-      toastError("Kill switch rejected", kill.error);
-    }
-  };
-
-  const dropToPaper = async () => {
-    setDropping(true);
+  const fireKill = useCallback(async () => {
+    setBusy(true);
     try {
-      await signOut();
-      onPortal("paper-login");
+      const report = await api.killSwitch("cockpit two-step kill switch");
+      toast(
+        `Kill switch armed: ${String(report.leases_revoked ?? "all")} leases revoked, flatten dispatched`,
+        "success",
+      );
+      setKillOpen(false);
+    } catch (cause) {
+      toast(cause instanceof Error ? cause.message : "kill switch rejected", "error");
     } finally {
-      setDropping(false);
+      setBusy(false);
+      setArmed(false);
     }
-  };
+  }, []);
 
-  const leave = async () => {
-    await signOut();
-    onPortal("login");
-  };
+  const lock = useCallback(async () => {
+    await session.signOut();
+    onPortal("paper-login");
+  }, [session, onPortal]);
+
+  const ttlCritical = remainingMs < 5 * 60 * 1000;
 
   return (
-    <div className="shell nios-shell-live" data-collapsed={false}>
-      <Sidebar
-        workspace="live"
-        active={page}
-        onNavigate={onNavigate}
-        badges={{
-          control: `${passed}/${total}`,
-          brokers: `${brokersConfigured}/4`,
-          orders: num(liveFills, 0),
-        }}
-        username={username}
-        tier="LIVE"
-        onSignOut={() => void leave()}
-      />
+    <div className="nx-app nx-app--live nios-shell-live">
+      <Sidebar page={page} collapsed={collapsed} onToggle={() => setCollapsed(!collapsed)} onNavigate={onNavigate} />
 
-      <div className="main">
-        <div className="hazard-rail" role="presentation" />
+      <div className="nx-main">
+        <div className="nx-live-ribbon nios-hazard" role="alert">
+          <Glyph name="shield" size={12} />
+          <span>Live production - real capital - every order is signed by Ring 0</span>
+          <span style={{ marginLeft: "auto" }} className="nx-num">
+            LEASE {clock(remainingMs)}
+          </span>
+        </div>
 
-        <header className="topbar">
-          <div className="topbar-title">
-            <h1>{meta.title}</h1>
-            <span className="topbar-meta">
-              {meta.route} · {meta.ring} · real-capital execution
-            </span>
+        <header className="nx-topbar nx-topbar--live">
+          <span className="sr-only">Live vault control bar</span>
+          <div className="nx-topbar-title">
+            <strong>{meta.title}</strong>
+            <span>Live sovereign vault - signed execution only</span>
           </div>
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <span className="pill pill-bad">
-              <Lock size={10} aria-hidden="true" />
+
+          <div className="nx-topbar-spacer" />
+
+          <div className="nx-topbar-cluster">
+            <StatusBadge tone="bear" large dot title="Workspace tier">
               🔒 LIVE PRODUCTION — REAL CAPITAL
-            </span>
-            <span className="ttl" data-expired={expired} title="Live session lease (30 minute TTL)">
-              <Timer size={10} className="mr-1 inline" aria-hidden="true" />
-              LEASE {ttl}
-            </span>
-            <button
-              type="button"
-              className="btn btn-danger"
-              onClick={() => setKillOpen(true)}
-              aria-label="Arm the two-step emergency kill switch"
+            </StatusBadge>
+            <StatusBadge
+              tone={passedGates >= totalGates ? "bull" : "accent"}
+              title="22-gate go-live certificate"
             >
-              <Siren size={12} aria-hidden="true" />
-              EMERGENCY KILL SWITCH
-            </button>
+              22-GATE {passedGates}/{totalGates}
+            </StatusBadge>
+            <span className={ttlCritical ? "nx-live-ttl nx-live-ttl--warn" : "nx-live-ttl"} title="Session lease remaining">
+              <Glyph name="backtest" size={12} />
+              TTL {clock(remainingMs)}
+            </span>
+
+            <div className="nx-topbar-readout">
+              <span>Signed by</span>
+              <strong>{session.username ?? "unbound"}</strong>
+            </div>
+
+            <Btn
+              size="sm"
+              tone="danger"
+              armed={armed}
+              onClick={() => {
+                if (!armed) {
+                  setArmed(true);
+                  toast("Kill switch armed - confirm within 6s", "error");
+                  return;
+                }
+                setKillOpen(true);
+              }}
+            >
+              {armed ? "CONFIRM <1ms KILL" : "EMERGENCY KILL SWITCH"}
+            </Btn>
+            <Btn size="sm" tone="ghost" onClick={lock}>
+              <Glyph name="logout" size={12} />
+              Lock Live Vault (Drop to Paper)
+            </Btn>
           </div>
         </header>
 
-        <div className="ribbon ribbon-live" role="status">
-          <ShieldAlert size={12} aria-hidden="true" />
-          LIVE VAULT — EVERY ORDER IS SIGNED BY RING 0 AND SETTLES REAL CAPITAL
-          <span className="dim">·</span>
-          <span className="tnum">fills {num(liveFills, 0)}</span>
-          <span className="dim">·</span>
-          <span className="tnum">
-            22-gate pre-flight {passed}/{total}
-          </span>
-          <div className="ml-auto flex flex-wrap items-center gap-1.5">
-            <StatusPill value={ready ? "PRE-FLIGHT GREEN" : certificate ? "PRE-FLIGHT ATTENTION" : "PRE-FLIGHT PENDING"} tone={ready ? "ok" : certificate ? "warn" : "neutral"} />
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => void dropToPaper()}
-              disabled={dropping}
-              aria-label="Lock the live vault and drop back to the paper sandbox"
-            >
-              <ArrowLeftRight size={12} aria-hidden="true" />
-              Lock Live Vault (Drop to Paper)
-            </button>
-          </div>
-        </div>
-
-        {expired ? (
-          <div className="border-b border-[rgba(244,63,94,0.4)] bg-[rgba(244,63,94,0.12)] px-5 py-2">
-            <div className="row-between mx-auto max-w-[1680px]">
-              <p className="text-[12px] text-[#fecdd3]">
-                The 30-minute live lease has expired. Ring 1 will not accept a new intent until the vault door is re-opened.
-              </p>
-              <button type="button" className="btn btn-sm btn-danger" onClick={() => onPortal("live-login")}>
-                Re-open vault door
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        <main className="content" id="main-content">
-          <div className="content-inner">{children}</div>
-        </main>
+        <main className="nx-content">{children}</main>
       </div>
 
-      <ConfirmDangerModal
+      <ConfirmModal
         open={killOpen}
-        title="Two-step emergency kill switch"
-        body={
-          <span>
-            This arms the global halt latch (<span className="mono">&lt;1 ms</span>), disarms every Ring 1 lease, cancels all
-            working orders and flattens every silo. The vault stays reduce-only until a human re-arms it. Type KILL to fire.
-          </span>
-        }
-        requireText="KILL"
-        confirmLabel="Fire kill switch"
-        busy={kill.busy}
-        onCancel={() => setKillOpen(false)}
-        onConfirm={() => void executeKill()}
-      />
-
-      <div className="sr-only" aria-live="polite">
-        Live session lease {ttl}, pre-flight {passed} of {total} gates passed.
-      </div>
+        title="Emergency kill switch"
+        description="Global halt: every active lease is revoked, the kill latch is set and a flatten is dispatched. This is not a pause."
+        confirmLabel="Execute global halt"
+        tone="danger"
+        busy={busy}
+        onConfirm={fireKill}
+        onClose={() => {
+          setKillOpen(false);
+          setArmed(false);
+        }}
+      >
+        <p className="nx-portal-note">
+          The latch is read from shared memory on the Ring 1 hot path, so the halt lands in under one
+          millisecond. Re-arming requires an explicit operator action from the control room.
+        </p>
+      </ConfirmModal>
     </div>
   );
 }

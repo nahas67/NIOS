@@ -1,136 +1,129 @@
 /**
- * Strategy NAV versus benchmark with an underwater drawdown pane.
- * Both series share one value domain so the spread is honest; the drawdown pane
- * is always zero-anchored so the deepest trough is proportional.
+ * Strategy NAV versus benchmark, with the drawdown row underneath.
+ *
+ * Both NAV series are re-based to 100 so a freshly funded silo and a matured
+ * silo share one axis. Drawdown is drawn as flat burgundy bars, never an area
+ * gradient.
  */
 
 import type { ReactNode } from "react";
-import { num, price } from "@/lib/format";
-import { ChartTooltip, GridLines, TooltipRow, VB_W, domainOf, linePath, scale, useCrosshair } from "./kit";
+import { CHART, ChartLegend, extent, linePath, plotGrid, scale } from "./kit";
 
 export interface EquityDrawdownChartProps {
-  equity: number[];
+  /** Rebased or raw NAV samples; the chart re-bases to 100 internally. */
+  strategy: number[];
   benchmark?: number[];
   drawdownPct?: number[];
   height?: number;
-  currency?: string;
 }
 
-const MARGIN = { left: 62, right: 16, top: 16, bottom: 20 };
+const NAV = { x: 52, y: 12, w: 648, h: 176 };
+const DD = { x: 52, y: 206, w: 648, h: 48 };
+
+function rebase(series: number[]): number[] {
+  const base = series.find((value) => Number.isFinite(value) && value !== 0);
+  if (!base) return series.map(() => 100);
+  return series.map((value) => (value / base) * 100);
+}
 
 export function EquityDrawdownChart({
-  equity,
-  benchmark,
-  drawdownPct,
-  height = 320,
-  currency = "$",
+  strategy,
+  benchmark = [],
+  drawdownPct = [],
+  height = 280,
 }: EquityDrawdownChartProps): ReactNode {
-  const navH = Math.round((height - MARGIN.top - MARGIN.bottom) * 0.68);
-  const ddH = Math.round((height - MARGIN.top - MARGIN.bottom) * 0.26);
-  const gap = Math.round((height - MARGIN.top - MARGIN.bottom) * 0.06);
-  const plotW = VB_W - MARGIN.left - MARGIN.right;
-  const count = equity.length;
-  const crosshair = useCrosshair(count);
+  const navSeries = rebase(strategy);
+  const benchSeries = rebase(benchmark);
 
-  if (count === 0) {
+  if (navSeries.length < 2) {
     return (
-      <div className="empty" style={{ minHeight: height }}>
-        <p className="text-[12px] text-[var(--dim)]">Run a backtest to plot the equity and drawdown curves.</p>
+      <div className="nx-stack">
+        <svg className="nx-chart" viewBox="0 0 720 280" style={{ height }} role="img" aria-label="Equity curve empty">
+          <title>Equity and drawdown - no observations</title>
+          {plotGrid(NAV)}
+          {plotGrid(DD, 2, 6)}
+          <text x={NAV.x + NAV.w / 2} y={NAV.y + NAV.h / 2} textAnchor="middle" fill={CHART.axis} fontSize={11}>
+            NO NAV HISTORY - the first settled mark will seed this curve
+          </text>
+        </svg>
+        <ChartLegend
+          items={[
+            { label: "Strategy NAV", color: CHART.accent },
+            { label: "Benchmark", color: CHART.text, dashed: true },
+            { label: "Drawdown", color: CHART.bearFill },
+          ]}
+        />
       </div>
     );
   }
 
-  const benchmarkClean = benchmark && benchmark.length > 0 ? benchmark : [];
-  const navDomain = domainOf([...equity, ...benchmarkClean], 0.05);
-  const ddSeries = drawdownPct && drawdownPct.length > 0 ? drawdownPct : [];
-  const ddMin = ddSeries.length > 0 ? Math.min(0, ...ddSeries) : -1;
-  const ddDomain = { min: ddMin * 1.08, max: 0.6 };
+  const all = [...navSeries, ...benchSeries];
+  const [lo, hi] = extent(all, [95, 105]);
+  const pad = (hi - lo) * 0.1 || 1;
+  const y = scale(lo - pad, hi + pad, NAV.h);
+  const xFor = (index: number, length: number) => NAV.x + (NAV.w / Math.max(1, length - 1)) * index;
+  const toPoints = (series: number[]) =>
+    series.map((value, index) => [xFor(index, series.length), NAV.y + NAV.h - y(value)] as [number, number]);
 
-  const xAt = (index: number) => MARGIN.left + (count === 1 ? plotW / 2 : (index / (count - 1)) * plotW);
-  const navY = (value: number) => MARGIN.top + navH - scale(value, navDomain, navH);
-  const ddTop = MARGIN.top + navH + gap;
-  const ddY = (value: number) => ddTop + ddH - scale(value, ddDomain, ddH);
-
-  const equityPath = linePath(equity.map((value, index) => [xAt(index), navY(value)]));
-  const benchmarkPath = linePath(benchmarkClean.map((value, index) => [xAt(index), navY(value)]));
-  const ddPath =
-    ddSeries.length > 0
-      ? `M${xAt(0)},${ddTop} ${ddSeries.map((value, index) => `L${xAt(index)},${ddY(value)}`).join(" ")} L${xAt(ddSeries.length - 1)},${ddTop} Z`
-      : "";
-
-  const hoveredEquity = crosshair.index !== null ? equity[crosshair.index] : null;
-  const hoveredBenchmark = crosshair.index !== null ? benchmarkClean[crosshair.index] : undefined;
-  const hoveredDrawdown = crosshair.index !== null && ddSeries.length > 0 ? ddSeries[crosshair.index] : undefined;
+  const ddValues = drawdownPct.length > 0 ? drawdownPct : navSeries.map(() => 0);
+  const ddMax = Math.max(...ddValues.map((value) => Math.abs(value)), 1);
+  const barW = Math.max(1, (DD.w / Math.max(1, ddValues.length)) * 0.7);
 
   return (
-    <div className="relative w-full">
-      <svg
-        viewBox={`0 0 ${VB_W} ${height}`}
-        width="100%"
-        height={height}
-        role="img"
-        aria-label={`Strategy NAV curve over ${count} bars compared with the benchmark, plus the underwater drawdown`}
-        {...crosshair.bind}
-        style={{ touchAction: "none" }}
-      >
-        <GridLines
-          domain={navDomain}
-          plotH={navH}
-          plotW={plotW}
-          left={MARGIN.left}
-          top={MARGIN.top}
-          count={4}
-          format={(value) => `${currency}${num(value, 0)}`}
-        />
+    <div className="nx-stack">
+      <svg className="nx-chart" viewBox="0 0 720 280" style={{ height }} role="img" aria-label="Strategy equity and drawdown">
+        <title>Strategy equity versus benchmark with drawdown</title>
+        {plotGrid(NAV)}
+        {plotGrid(DD, 2, 6)}
+        <line x1={NAV.x} y1={NAV.y + NAV.h} x2={NAV.x + NAV.w} y2={NAV.y + NAV.h} stroke={CHART.grid} strokeWidth={1} />
 
-        {benchmarkPath ? <path d={benchmarkPath} fill="none" stroke="rgba(148,163,184,0.7)" strokeWidth={1.3} strokeDasharray="5 4" /> : null}
-        <path d={equityPath} fill="none" stroke="var(--accent)" strokeWidth={2} style={{ filter: "drop-shadow(0 0 5px var(--accent))" }} />
+        {[0, 0.5, 1].map((fraction) => (
+          <text
+            key={fraction}
+            x={NAV.x - 7}
+            y={NAV.y + NAV.h * fraction + 3}
+            textAnchor="end"
+            fill={CHART.axis}
+            fontSize={8.5}
+          >
+            {(hi - (hi - lo) * fraction).toFixed(1)}
+          </text>
+        ))}
 
-        <line x1={MARGIN.left} x2={VB_W - MARGIN.right} y1={ddTop - 6} y2={ddTop - 6} stroke="rgba(148,163,184,0.14)" />
-        <text x={MARGIN.left - 6} y={ddTop + 8} textAnchor="end" className="iso-ring-label" style={{ fontSize: 8 }}>
-          DD
-        </text>
-        <text x={MARGIN.left + 4} y={ddTop + 9} fill="rgba(251,113,133,0.7)" style={{ fontSize: 8, fontFamily: "var(--font-mono)" }}>
-          {num(ddMin, 2)}% worst
-        </text>
-
-        <line x1={MARGIN.left} x2={VB_W - MARGIN.right} y1={ddTop} y2={ddTop} stroke="rgba(148,163,184,0.2)" />
-        {ddPath ? <path d={ddPath} fill="rgba(251,113,133,0.22)" stroke="rgba(251,113,133,0.65)" strokeWidth={1} /> : null}
-
-        <text x={MARGIN.left} y={height - 5} className="iso-ring-label" style={{ fontSize: 8 }}>
-          bar 0
-        </text>
-        <text x={VB_W - MARGIN.right} y={height - 5} textAnchor="end" className="iso-ring-label" style={{ fontSize: 8 }}>
-          bar {count - 1}
-        </text>
-
-        {crosshair.index !== null ? (
-          <g>
-            <line x1={crosshair.x} x2={crosshair.x} y1={MARGIN.top} y2={ddTop + ddH} stroke="rgba(226,232,240,0.26)" strokeDasharray="3 3" />
-            {hoveredEquity !== null ? <circle cx={crosshair.x} cy={navY(hoveredEquity)} r={3} fill="var(--accent)" /> : null}
-          </g>
+        {benchSeries.length > 1 ? (
+          <path d={linePath(toPoints(benchSeries))} fill="none" stroke={CHART.text} strokeWidth={1} strokeDasharray="4 3" />
         ) : null}
+        <path d={linePath(toPoints(navSeries))} fill="none" stroke={CHART.accent} strokeWidth={1.5} />
+
+        {ddValues.map((value, index) => {
+          const h = (Math.abs(value) / ddMax) * DD.h;
+          return (
+            <rect
+              key={`dd-${index}`}
+              x={DD.x + (DD.w / Math.max(1, ddValues.length)) * index}
+              y={DD.y + DD.h - h}
+              width={barW}
+              height={Math.max(1, h)}
+              fill={CHART.bearFill}
+              stroke={CHART.bearLine}
+              strokeWidth={0.5}
+            />
+          );
+        })}
+        <text x={DD.x} y={DD.y - 4} fill={CHART.bear} fontSize={8.5}>
+          DRAWDOWN max {ddMax.toFixed(2)}%
+        </text>
+        <text x={NAV.x + NAV.w} y={274} textAnchor="end" fill={CHART.axis} fontSize={8.5}>
+          {navSeries.length} observations
+        </text>
       </svg>
-
-      <div className="pointer-events-none absolute top-2 left-3 flex items-center gap-3">
-        <span className="mono flex items-center gap-1 text-[9px] tracking-[0.08em] text-[var(--dim)]">
-          <span className="inline-block h-[2px] w-3 rounded bg-[var(--accent)]" /> STRATEGY
-        </span>
-        <span className="mono flex items-center gap-1 text-[9px] tracking-[0.08em] text-[var(--dim)]">
-          <span className="inline-block h-[2px] w-3 rounded bg-[rgba(148,163,184,0.7)]" /> BENCHMARK
-        </span>
-      </div>
-
-      {hoveredEquity !== null && crosshair.index !== null ? (
-        <ChartTooltip x={crosshair.x}>
-          <p className="mono mb-1 text-[9px] tracking-[0.1em] text-[var(--dim)] uppercase">bar {crosshair.index}</p>
-          <TooltipRow label="strategy" value={`${currency}${price(hoveredEquity)}`} />
-          {typeof hoveredBenchmark === "number" ? <TooltipRow label="benchmark" value={`${currency}${price(hoveredBenchmark)}`} /> : null}
-          {typeof hoveredDrawdown === "number" ? (
-            <TooltipRow label="drawdown" value={`${num(hoveredDrawdown, 2)}%`} tone="text-[var(--neg)]" />
-          ) : null}
-        </ChartTooltip>
-      ) : null}
+      <ChartLegend
+        items={[
+          { label: "Strategy NAV", color: CHART.accent },
+          { label: "Benchmark", color: CHART.text, dashed: true },
+          { label: "Drawdown", color: CHART.bearLine },
+        ]}
+      />
     </div>
   );
 }
