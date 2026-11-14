@@ -1,4 +1,4 @@
-"""Phase 4 -- final closure certification.
+﻿"""Phase 4 -- final closure certification.
 
 Four gates close the Main Core (Phases 1-3):
 
@@ -10,7 +10,7 @@ Four gates close the Main Core (Phases 1-3):
 * Gate 3 -- ``scripts/preflight_golive.py --json`` certifies the release with
   ``ready_for_live_cutover == True``, ``failed_gates == 0`` and a 64-character
   SHA-256 certificate digest.
-* Gate 4 -- the regression inventory grew from 18 to 23 suites while every
+* Gate 4 -- the regression inventory grew to 24 suites while every
   pre-existing Phase 1-3 suite stayed intact.
 
 Phase 4 Step 2 wires those organs into the Ring 3 control plane and cockpit:
@@ -22,9 +22,8 @@ Phase 4 Step 2 wires those organs into the Ring 3 control plane and cockpit:
   + tail-hedge cycle and returns a verified Ring 0 Ed25519 receipt.
 * ``POST /api/v2/control/brokers`` refuses ``mode="LIVE"`` unless the
   certificate reports ``failed_gates == 0``.
-* The compiled ``dist/`` bundle served at ``GET /`` carries both controls.
-* ``npx biome lint src/`` in the cockpit workspace exits ``0`` with zero
-  diagnostics, and ``GET /`` serves that rebuilt bundle asset-for-asset.
+* ``GET /`` serves one deterministic, zero-JavaScript headless status document.
+* There is no React/Vite/Biome toolchain in the tree (V1.6).
 
 Nothing in this module places a live order, unlocks a silo, or reads a secret.
 The Ring 0 leg only ever produces an *unsigned* proposal signature over a
@@ -341,25 +340,7 @@ LIVE_SILO = "FX_MT5"
 FRONTEND = ROOT / "ring3_cockpit" / "ui" / "openalgo_shell"
 
 
-def _run_frontend(
-    args: list[str], *, timeout_s: float
-) -> subprocess.CompletedProcess:
-    """Run a Node toolchain command in the cockpit workspace.
 
-    ``npx`` is a ``.cmd`` shim on Windows, so route it through ``cmd.exe``;
-    POSIX shells resolve the binary directly.
-    """
-    command = ["cmd.exe", "/c", "npx", *args] if os.name == "nt" else ["npx", *args]
-    return subprocess.run(
-        command,
-        cwd=str(FRONTEND),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout_s,
-        check=False,
-    )
 
 
 @pytest.fixture(scope="module")
@@ -892,7 +873,7 @@ def test_all_11_cockpit_pages_and_spa_routes_are_served_and_hydrated(
         "/backtest",
     )
     index_bytes = (FRONTEND / "dist" / "index.html").read_bytes()
-    assert index_bytes, "compiled cockpit bundle is missing dist/index.html"
+    assert index_bytes, "headless status document is missing"
 
     for route in spa_routes:
         response = cockpit.get(route)
@@ -968,7 +949,7 @@ def test_interactive_workstation_actions_across_pages_on_v1(cockpit: Any) -> Non
     The cockpit is no longer telemetry-only. An operator can submit a grounded
     PAPER order, cancel it, drive shadow fills to the 30-fill graduation line,
     price a grounded option, re-scan the 490-factor zoo, read a full SKILL.md on
-    demand and reconcile all four IBOR silos — without any of those actions able
+    demand and reconcile all four IBOR silos â€” without any of those actions able
     to sign a live order from Ring 3.
     """
     silo = "CRYPTO_BINANCE"

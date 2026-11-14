@@ -9,7 +9,7 @@ Four gates:
 3. Market terminal (60-bar OHLCV + MA/VWAP, 10-level L2 ladder, Lee-Ready
    tape), the cost-adjusted trade logbook and the 12-venue broker hub.
 4. Fifteen pages across ``/``, ``/paper/*`` and ``/live/*``, the distinct
-   Paper/Live shells and the Biome lint gate on the React 19 cockpit.
+   Paper/Live API boundaries and the headless zero-JavaScript document.
 
 Nothing here signs an order, reads a broker secret, or writes the IBOR: the
 new surfaces are read-only telemetry plus the operator's own journal

@@ -13,10 +13,10 @@ Gates
 3. **Skills & plugins.**  The four core ``SKILL.md`` files load progressively
    (frontmatter first, body on demand).  A registered factor pack starts in the
    shadow nursery at 0/30 and is a Forge challenger.
-4. **Unified production server.**  ``GET /`` serves the compiled React 19
-   ``index.html`` from ``dist/`` while ``/api/v2/*`` stays live;
-   ``python scripts/run_nios.py --smoke-test`` exits 0; ``npm run build``
-   succeeds.
+4. **Unified production server.**  ``GET /`` serves one deterministic,
+   zero-JavaScript headless status document while ``/api/v2/*`` stays live;
+   ``python scripts/run_nios.py --smoke-test`` exits 0. There is no frontend
+   build step in V1.6.
 5. Full regression is the complete pytest run (all Step 2-8 files).
 """
 

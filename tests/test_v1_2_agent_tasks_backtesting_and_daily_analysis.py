@@ -7,7 +7,7 @@ Four gates:
 2. Agent task assignment lifecycle and clean-slate reset.
 3. Tax-net walk-forward backtester and the 30-fill nursery promotion gate.
 4. SPA routes (``/agents`` and ``/backtest`` in all three workspaces) plus the
-   Biome lint gate on the React 19 cockpit.
+   Headless document + backend contract (no React/Vite toolchain in V1.6).
 
 The suite never signs an order, never reads a broker key, and never writes the
 IBOR: Ring 2 emits grounded research only (Law 2 + Law 3, ``sec_004``/``sec_018``).
@@ -875,20 +875,16 @@ def test_gate4_page_aliases_are_declared_in_the_backend() -> None:
     assert "<script" not in document.lower()
 
 
-def test_gate4_biome_lint_is_clean() -> None:
-    npx = shutil.which("npx")
-    if npx is None:
-        pytest.skip("npx is not available on this host")
-
-    completed = subprocess.run(
-        [npx, "biome", "lint", "src/"],
-        cwd=str(UI_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=600,
-        check=False,
-    )
-    assert completed.returncode == 0, (completed.stdout + completed.stderr)[-4000:]
+def test_gate4_no_frontend_toolchain_remains() -> None:
+    """V1.6 removed React/Vite/Biome: there is nothing to build or lint."""
+    assert not (UI_ROOT / "package.json").exists()
+    assert not (UI_ROOT / "vite.config.ts").exists()
+    assert not (UI_ROOT / "biome.json").exists()
+    assert not (UI_ROOT / "src").exists()
+    assert not (UI_ROOT / "node_modules").exists()
+    document = (UI_ROOT / "dist" / "index.html").read_text(encoding="utf-8")
+    assert "HEADLESS_API" in document
+    assert "<script" not in document.lower()
 
 
 def test_gate4_headless_document_is_built() -> None:
