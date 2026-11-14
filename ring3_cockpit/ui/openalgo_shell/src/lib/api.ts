@@ -1,9 +1,15 @@
 import type {
   AgentAssignPayload,
   AgentAssignReceipt,
+  AgentBatchWatchlistPayload,
+  AgentBatchWatchlistReceipt,
   AgentCancelReceipt,
+  AgentFollowupPayload,
+  AgentFollowupReceipt,
   AgentsPageData,
   AnalyzerPageData,
+  BacktestComparePayload,
+  BacktestComparisonReceipt,
   BacktestPageData,
   BacktestReceipt,
   BacktestRunPayload,
@@ -627,6 +633,36 @@ export function postCancelAgentTasks(taskId = 'ALL'): Promise<AgentCancelReceipt
   })
 }
 
+/**
+ * Run the decision dashboard across a whole watchlist in one batch.
+ *
+ * The backend ranks every symbol by `signal_score` and `operation_advice`
+ * and seals the entire ranking into one SHA-256 `GroundedFactPacket`.
+ */
+export function postAgentBatchWatchlist(
+  payload: AgentBatchWatchlistPayload,
+): Promise<AgentBatchWatchlistReceipt> {
+  return request<AgentBatchWatchlistReceipt>(
+    '/api/v2/control/agents/batch-watchlist',
+    { method: 'POST', body: JSON.stringify({ ...payload }) },
+  )
+}
+
+/**
+ * Ask a grounded follow-up against a completed agent task.
+ *
+ * The answer may only cite metrics already committed in that task's
+ * `GroundedFactPacket`; the server rejects an ungrounded answer.
+ */
+export function postAgentFollowup(
+  payload: AgentFollowupPayload,
+): Promise<AgentFollowupReceipt> {
+  return request<AgentFollowupReceipt>('/api/v2/control/agents/followup', {
+    method: 'POST',
+    body: JSON.stringify({ ...payload }),
+  })
+}
+
 // ---------------------------------------------------------------------------
 // V1.2 - walk-forward backtesting workstation (/backtest)
 // ---------------------------------------------------------------------------
@@ -647,6 +683,22 @@ export function postRunBacktest(payload: BacktestRunPayload): Promise<BacktestRe
     method: 'POST',
     body: JSON.stringify({ ...payload }),
   })
+}
+
+/**
+ * Run all eight harvested strategies on the exact same bar series.
+ *
+ * Every row is already tax-net: the silo floor (India 8.50 bps including
+ * 5.50 bps STT, crypto 16.00, US 2.80, FX 1.60) is deducted per trade before
+ * the Deflated Sharpe gate is evaluated.
+ */
+export function postCompareStrategies(
+  payload: BacktestComparePayload,
+): Promise<BacktestComparisonReceipt> {
+  return request<BacktestComparisonReceipt>(
+    '/api/v2/control/backtest/compare-strategies',
+    { method: 'POST', body: JSON.stringify({ ...payload }) },
+  )
 }
 
 /**

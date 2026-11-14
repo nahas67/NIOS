@@ -58,11 +58,14 @@ from ring2_brain.truth.grounding_gate import NumericalGroundingVerifier
 
 __all__ = [
     "CHAMPION_NET_EDGE_FLOOR_BPS",
+    "DEFAULT_TIMEFRAME",
     "DSR_GATE",
     "EMBARGO_PCT",
     "PURGED_K_FOLDS",
     "REPORT_TOLERANCE",
     "SILO_COST_FLOORS_BPS",
+    "TIMEFRAMES",
+    "TIMEFRAME_PROFILES",
     "BacktestGateError",
     "NurseryGateError",
     "WalkForwardBacktestEngine",
@@ -82,6 +85,39 @@ REPORT_TOLERANCE: float = 0.02
 _TRADING_BARS_PER_YEAR: int = 252
 #: Risk-free rate used for Sharpe/Sortino (0.0 keeps the receipt auditable).
 _RISK_FREE_RATE: float = 0.0
+
+#: Selectable bar frequencies.  A shorter bar carries proportionally less
+#: volatility and needs a proportionally larger annualisation factor, so both
+#: are derived from the same profile instead of being guessed per call site.
+TIMEFRAMES: tuple[str, ...] = ("1m", "5m", "15m", "1h", "1d")
+DEFAULT_TIMEFRAME: str = "1d"
+TIMEFRAME_PROFILES: dict[str, dict[str, float]] = {
+    "1m": {
+        "bars_per_year": float(252 * 390),
+        "bar_interval_ns": float(60_000_000_000),
+        "volatility_scale": 1.0 / math.sqrt(390.0),
+    },
+    "5m": {
+        "bars_per_year": float(252 * 78),
+        "bar_interval_ns": float(300_000_000_000),
+        "volatility_scale": 1.0 / math.sqrt(78.0),
+    },
+    "15m": {
+        "bars_per_year": float(252 * 26),
+        "bar_interval_ns": float(900_000_000_000),
+        "volatility_scale": 1.0 / math.sqrt(26.0),
+    },
+    "1h": {
+        "bars_per_year": float(252 * 6 + 126),
+        "bar_interval_ns": float(3_600_000_000_000),
+        "volatility_scale": 1.0 / math.sqrt(6.5),
+    },
+    "1d": {
+        "bars_per_year": float(_TRADING_BARS_PER_YEAR),
+        "bar_interval_ns": float(86_400_000_000_000),
+        "volatility_scale": 1.0,
+    },
+}
 
 #: Statutory round-trip cost floors, mirrored from
 #: ``ring1_spinal.silo_worker.SILO_CONFIGS[*].cost_floor``.  Kept as a literal
@@ -303,6 +339,73 @@ def _silo_cost_floor_bps(silo: str) -> float:
 silo_cost_floor_bps = _silo_cost_floor_bps
 
 
+def _timeframe_profile(timeframe: Any) -> dict[str, float]:
+    """Return the validated bar profile for ``timeframe``."""
+
+    key = str(timeframe or DEFAULT_TIMEFRAME).strip().lower()
+    profile = TIMEFRAME_PROFILES.get(key)
+    if profile is None:
+        raise BacktestGateError(
+            f"unknown timeframe {timeframe!r}; expected one of {list(TIMEFRAMES)}"
+        )
+    return profile
+
+
+def _timeframe_tape(
+    symbol: str,
+    silo: str,
+    *,
+    bars: int,
+    timeframe: str,
+) -> tuple[tuple[PriceBar, ...], dict[str, float]]:
+    """Build one deterministic tape at the requested bar frequency.
+
+    The synthetic generator produces a daily-shaped random path.  For a shorter
+    bar the per-bar log return, the wick and the annualisation factor are all
+    scaled by ``sqrt(bars_per_day)`` so a minute bar is not handed a daily-sized
+    shock (which would manufacture an implausible Sharpe ratio).
+    """
+
+    profile = _timeframe_profile(timeframe)
+    interval_ns = int(profile["bar_interval_ns"])
+    raw = synthetic_bars(
+        symbol,
+        silo,
+        bars=int(bars),
+        bar_interval_ns=interval_ns,
+    )
+    scale = float(profile["volatility_scale"])
+    if abs(scale - 1.0) <= 1e-12:
+        return raw, profile
+
+    out: list[PriceBar] = []
+    price = float(raw[0].open)
+    for index, bar in enumerate(raw):
+        open_price = price
+        if float(bar.open) > 0.0:
+            raw_return = math.log(float(bar.close) / float(bar.open))
+        else:  # pragma: no cover - synthetic bars are strictly positive
+            raw_return = 0.0
+        close_price = max(0.0001, open_price * math.exp(raw_return * scale))
+        high_move = max(0.0, math.log(float(bar.high) / float(bar.open))) if bar.open > 0 else 0.0
+        low_move = max(0.0, math.log(float(bar.open) / float(bar.low))) if bar.low > 0 else 0.0
+        high_price = max(open_price, close_price) * math.exp(high_move * scale)
+        low_price = min(open_price, close_price) / math.exp(low_move * scale)
+        out.append(
+            PriceBar(
+                index=index,
+                open=round(open_price, 6),
+                high=round(high_price, 6),
+                low=round(low_price, 6),
+                close=round(close_price, 6),
+                volume=round(float(bar.volume), 2),
+                ts_ns=int(bar.ts_ns),
+            )
+        )
+        price = close_price
+    return tuple(out), profile
+
+
 # --------------------------------------------------------------------------- #
 # Receipt model
 # --------------------------------------------------------------------------- #
@@ -334,6 +437,8 @@ def _summarise(receipt: Mapping[str, Any]) -> dict[str, Any]:
         "strategy_id": receipt.get("strategy_id"),
         "strategy_name": receipt.get("strategy_name"),
         "bars": receipt.get("bars"),
+        "timeframe": receipt.get("timeframe"),
+        "bars_per_year": receipt.get("bars_per_year"),
         "cost_floor_bps": receipt.get("cost_floor_bps"),
         "net_edge_bps": receipt.get("net_edge_bps"),
         "deflated_sharpe_ratio": metrics.get("deflated_sharpe_ratio"),
@@ -460,6 +565,15 @@ class WalkForwardBacktestEngine:
             "strategies": self.strategy_catalog(),
             "strategy_count": len(STRATEGY_IDS),
             "silos": list(KNOWN_SILOS),
+            "timeframes": list(TIMEFRAMES),
+            "default_timeframe": DEFAULT_TIMEFRAME,
+            "timeframe_profiles": {
+                key: {
+                    "bars_per_year": int(profile["bars_per_year"]),
+                    "bar_interval_ns": int(profile["bar_interval_ns"]),
+                }
+                for key, profile in TIMEFRAME_PROFILES.items()
+            },
             "cost_floors": {
                 silo: _silo_cost_floor_bps(silo) for silo in KNOWN_SILOS
             },
@@ -511,11 +625,13 @@ class WalkForwardBacktestEngine:
         symbol: str = "SPY",
         strategy_id: str = "ma_golden_cross",
         bars: int = _DEFAULT_BARS,
+        timeframe: str = DEFAULT_TIMEFRAME,
         initial_capital_units: float = _DEFAULT_INITIAL_CAPITAL_UNITS,
         fast_window: int | None = None,
         slow_window: int | None = None,
         stop_loss_bps: float | None = None,
         take_profit_bps: float | None = None,
+        tape: Sequence[PriceBar] | None = None,
     ) -> dict[str, Any]:
         """Run one deterministic walk-forward backtest and seal the receipt."""
 
@@ -538,6 +654,8 @@ class WalkForwardBacktestEngine:
             raise ValueError(
                 f"bars must be within [{_MIN_BARS}, {_MAX_BARS}], got {bar_count}"
             )
+        timeframe_key = str(timeframe or DEFAULT_TIMEFRAME).strip().lower()
+        profile = _timeframe_profile(timeframe_key)
         capital = _finite_float(initial_capital_units)
         if capital is None or capital <= 0.0:
             raise ValueError("initial_capital_units must be a positive number")
@@ -564,7 +682,17 @@ class WalkForwardBacktestEngine:
             raise ValueError("fast_window must be >= 2 and slow_window >= 3")
 
         created_at_ns = int(self._clock())
-        tape = synthetic_bars(symbol_id, silo_id, bars=bar_count)
+        if tape is None:
+            tape, profile = _timeframe_tape(
+                symbol_id, silo_id, bars=bar_count, timeframe=timeframe_key
+            )
+        else:
+            tape = tuple(tape)
+            if len(tape) < _MIN_BARS:
+                raise ValueError(
+                    f"a supplied tape needs at least {_MIN_BARS} bars"
+                )
+        bar_count = len(tape)
         spec = get_strategy(strategy_key)
         cost_floor = _silo_cost_floor_bps(silo_id)
 
@@ -594,6 +722,7 @@ class WalkForwardBacktestEngine:
             cost_floor_bps=cost_floor,
             cost_floors_all={s: _silo_cost_floor_bps(s) for s in KNOWN_SILOS},
             bar_count=bar_count,
+            bars_per_year=int(profile["bars_per_year"]),
         )
         kfold = _purged_kfold(
             simulation["trades"],
@@ -638,6 +767,10 @@ class WalkForwardBacktestEngine:
         packet_metrics["stop_loss_bps"] = float(stop_bps)
         packet_metrics["take_profit_bps"] = float(target_bps)
         packet_metrics["run_bars"] = float(bar_count)
+        packet_metrics["bars_per_year"] = float(profile["bars_per_year"])
+        packet_metrics["timeframe_seconds"] = float(
+            profile["bar_interval_ns"] / 1_000_000_000.0
+        )
         packet_metrics["dsr_gate"] = float(DSR_GATE)
         packet_metrics["champion_net_edge_floor_bps"] = float(
             CHAMPION_NET_EDGE_FLOOR_BPS
@@ -672,7 +805,7 @@ class WalkForwardBacktestEngine:
         self._counter += 1
         backtest_id = (
             f"bt_{created_at_ns:x}_{self._counter:04x}_"
-            f"{_sha256_hex(f'{symbol_id}|{silo_id}|{label}|{bar_count}')[:8]}"
+            f"{_sha256_hex(f'{symbol_id}|{silo_id}|{label}|{timeframe_key}|{bar_count}')[:8]}"
         )
         receipt: dict[str, Any] = {
             "backtest_id": backtest_id,
@@ -683,6 +816,9 @@ class WalkForwardBacktestEngine:
             "strategy_label": label,
             "custom_ma": bool(custom_ma),
             "bars": bar_count,
+            "timeframe": timeframe_key,
+            "bars_per_year": int(profile["bars_per_year"]),
+            "bar_interval_ns": int(profile["bar_interval_ns"]),
             "params": {
                 "fast_window": int(fast) if custom_ma else None,
                 "slow_window": int(slow) if custom_ma else None,
@@ -726,6 +862,113 @@ class WalkForwardBacktestEngine:
         self._runs[backtest_id] = BacktestRun(receipt=receipt, created_at_ns=created_at_ns)
         self._order.append(backtest_id)
         return dict(receipt)
+
+    # -- comparison ------------------------------------------------------- #
+    def compare_strategies(
+        self,
+        *,
+        silo: str = "US_IBKR",
+        symbol: str = "SPY",
+        timeframe: str = DEFAULT_TIMEFRAME,
+        bars: int = _DEFAULT_BARS,
+    ) -> dict[str, Any]:
+        """Run all eight harvested strategies on one identical bar series."""
+
+        silo_id = str(silo).strip().upper()
+        if silo_id not in _SILO_SET:
+            raise ValueError(
+                f"unknown silo {silo!r}; expected one of {sorted(_SILO_SET)}"
+            )
+        symbol_id = str(symbol or "").strip().upper()
+        if not symbol_id:
+            raise ValueError("symbol must be a non-empty ticker")
+        bar_count = int(bars)
+        if bar_count < _MIN_BARS or bar_count > _MAX_BARS:
+            raise ValueError(
+                f"bars must be within [{_MIN_BARS}, {_MAX_BARS}], got {bar_count}"
+            )
+        timeframe_key = str(timeframe or DEFAULT_TIMEFRAME).strip().lower()
+        profile = _timeframe_profile(timeframe_key)
+
+        tape, profile = _timeframe_tape(
+            symbol_id, silo_id, bars=bar_count, timeframe=timeframe_key
+        )
+        bar_count = len(tape)
+        cost_floor = _silo_cost_floor_bps(silo_id)
+
+        rows: list[dict[str, Any]] = []
+        for strategy_id in STRATEGY_IDS:
+            receipt = self.run(
+                silo=silo_id,
+                symbol=symbol_id,
+                strategy_id=strategy_id,
+                bars=bar_count,
+                timeframe=timeframe_key,
+                tape=tape,
+            )
+            metrics = dict(receipt.get("metrics") or {})
+            rows.append(
+                {
+                    "strategy_id": strategy_id,
+                    "strategy_name": receipt.get("strategy_name"),
+                    "backtest_id": receipt.get("backtest_id"),
+                    "total_return_pct": round(
+                        _sane(metrics.get("total_return_pct")), 6
+                    ),
+                    "sharpe_ratio": round(_sane(metrics.get("sharpe_ratio")), 6),
+                    "deflated_sharpe_ratio": round(
+                        _sane(metrics.get("deflated_sharpe_ratio")), 6
+                    ),
+                    "passes_dsr_gate": bool(receipt.get("passes_dsr_gate")),
+                    "net_edge_bps": round(_sane(metrics.get("net_edge_bps")), 6),
+                    "win_rate_pct": round(_sane(metrics.get("win_rate_pct")), 6),
+                    "total_trades": int(_sane(metrics.get("total_trades"))),
+                    "max_drawdown_pct": round(
+                        _sane(metrics.get("max_drawdown_pct")), 6
+                    ),
+                    "cost_floor_bps": float(cost_floor),
+                    "grounding_sha256": receipt.get("grounding_sha256"),
+                    "verified": bool(receipt.get("verified")),
+                }
+            )
+
+        rows.sort(
+            key=lambda row: (
+                -float(row["deflated_sharpe_ratio"]),
+                -float(row["net_edge_bps"]),
+                str(row["strategy_id"]),
+            )
+        )
+        for index, row in enumerate(rows, start=1):
+            row["rank"] = index
+
+        digest_material = "|".join(
+            f"{row['strategy_id']}:{row['deflated_sharpe_ratio']}:{row['net_edge_bps']}"
+            for row in rows
+        )
+        return {
+            "silo": silo_id,
+            "symbol": symbol_id,
+            "timeframe": timeframe_key,
+            "bars": bar_count,
+            "bars_per_year": int(profile["bars_per_year"]),
+            "bar_interval_ns": int(profile["bar_interval_ns"]),
+            "cost_floor_bps": float(cost_floor),
+            "statutory_tax_bps": 5.50 if silo_id == "INDIA_ZERODHA_DHAN" else 0.0,
+            "dsr_gate": float(DSR_GATE),
+            "strategy_count": len(rows),
+            "leaderboard": rows,
+            "ranked": rows,
+            "best_strategy": rows[0] if rows else None,
+            "comparison_sha256": _sha256_hex(digest_material),
+            "synthetic_tape": True,
+            "air_gap": {
+                "ring2_only": True,
+                "signs_orders": False,
+                "reads_broker_keys": False,
+            },
+            "generated_at_ns": int(self._clock()),
+        }
 
     # -- nursery ----------------------------------------------------------- #
     def promote_to_nursery(self, backtest_id: str) -> dict[str, Any]:
@@ -1025,7 +1268,9 @@ def _simulate(
 # --------------------------------------------------------------------------- #
 # Metric computation
 # --------------------------------------------------------------------------- #
-def _annualised_sharpe(returns: Sequence[float]) -> float:
+def _annualised_sharpe(
+    returns: Sequence[float], bars_per_year: int = _TRADING_BARS_PER_YEAR
+) -> float:
     if len(returns) < 2:
         return 0.0
     mean = sum(returns) / len(returns)
@@ -1033,11 +1278,13 @@ def _annualised_sharpe(returns: Sequence[float]) -> float:
     std = math.sqrt(variance)
     if std <= 1e-12:
         return 0.0
-    excess = mean - (_RISK_FREE_RATE / _TRADING_BARS_PER_YEAR)
-    return (excess / std) * math.sqrt(_TRADING_BARS_PER_YEAR)
+    excess = mean - (_RISK_FREE_RATE / bars_per_year)
+    return (excess / std) * math.sqrt(bars_per_year)
 
 
-def _annualised_sortino(returns: Sequence[float]) -> float:
+def _annualised_sortino(
+    returns: Sequence[float], bars_per_year: int = _TRADING_BARS_PER_YEAR
+) -> float:
     if len(returns) < 2:
         return 0.0
     mean = sum(returns) / len(returns)
@@ -1046,7 +1293,7 @@ def _annualised_sortino(returns: Sequence[float]) -> float:
     deviation = math.sqrt(variance)
     if deviation <= 1e-12:
         return 0.0
-    return (mean / deviation) * math.sqrt(_TRADING_BARS_PER_YEAR)
+    return (mean / deviation) * math.sqrt(bars_per_year)
 
 
 def _moments(returns: Sequence[float]) -> tuple[float, float]:
@@ -1066,7 +1313,9 @@ def _moments(returns: Sequence[float]) -> tuple[float, float]:
 
 
 def _deflated_sharpe_units(
-    returns: Sequence[float], num_trials: int
+    returns: Sequence[float],
+    num_trials: int,
+    bars_per_year: int = _TRADING_BARS_PER_YEAR,
 ) -> float:
     """Deflated Sharpe **in Sharpe units** (observed minus expected max).
 
@@ -1078,7 +1327,7 @@ def _deflated_sharpe_units(
     budget.
     """
 
-    sharpe = _annualised_sharpe(returns)
+    sharpe = _annualised_sharpe(returns, bars_per_year)
     trials = max(2, int(num_trials))
     normal = NormalDist()
     euler = 0.5772156649015329
@@ -1096,6 +1345,7 @@ def _compute_metrics(
     cost_floor_bps: float,
     cost_floors_all: Mapping[str, float],
     bar_count: int,
+    bars_per_year: int = _TRADING_BARS_PER_YEAR,
 ) -> dict[str, float]:
     closes = _closes(tape)
     trades: list[dict[str, Any]] = list(simulation["trades"])
@@ -1105,7 +1355,7 @@ def _compute_metrics(
     total_return_pct = (final_nav / initial_capital_units - 1.0) * 100.0
     benchmark_return_pct = (benchmark_final / initial_capital_units - 1.0) * 100.0
     alpha_pct = total_return_pct - benchmark_return_pct
-    years = max(bar_count / _TRADING_BARS_PER_YEAR, 1.0 / _TRADING_BARS_PER_YEAR)
+    years = max(bar_count / bars_per_year, 1.0 / bars_per_year)
     growth = final_nav / initial_capital_units
     cagr_pct = ((growth ** (1.0 / years)) - 1.0) * 100.0 if growth > 0 else -100.0
 
@@ -1117,10 +1367,10 @@ def _compute_metrics(
         for index in range(1, len(equity))
         if equity[index - 1] > 0.0
     ]
-    sharpe = _annualised_sharpe(bar_returns)
-    sortino = _annualised_sortino(bar_returns)
+    sharpe = _annualised_sharpe(bar_returns, bars_per_year)
+    sortino = _annualised_sortino(bar_returns, bars_per_year)
     skew, excess_kurt = _moments(bar_returns)
-    dsr = _deflated_sharpe_units(bar_returns, len(STRATEGY_IDS))
+    dsr = _deflated_sharpe_units(bar_returns, len(STRATEGY_IDS), bars_per_year)
 
     peak = 0.0
     max_drawdown_pct = 0.0
@@ -1177,7 +1427,7 @@ def _compute_metrics(
         "exposure_pct": exposure,
         "avg_bars_held": avg_held,
         "bar_count": float(bar_count),
-        "bars_per_year": float(_TRADING_BARS_PER_YEAR),
+        "bars_per_year": float(bars_per_year),
         "return_skew": skew,
         "return_excess_kurtosis": excess_kurt,
         "first_close": float(closes[0]) if closes else 0.0,

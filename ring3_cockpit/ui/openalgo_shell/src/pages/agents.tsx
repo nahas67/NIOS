@@ -1,4 +1,4 @@
-import { Bot, ClipboardList, Cpu, Gauge, Trash2, Waves } from 'lucide-react';
+import { Bot, ClipboardList, Cpu, Gauge, MessageSquare, Search, Trash2, Waves } from 'lucide-react';
 import { useState } from 'react';
 import { ActionFeedback, ActionPanel, ProofRow } from '@/components/operator-action';
 import { DataState, PageShell, StatTile } from '@/components/page-shell';
@@ -17,9 +17,15 @@ import {
 import { Textarea } from '@/components/ui/textarea';
 import { useAction } from '@/hooks/use-action';
 import { usePageData } from '@/hooks/use-page-data';
-import { fetchAgentsPage, postAgentTask, postCancelAgentTasks } from '@/lib/api';
+import { fetchAgentsPage, postAgentBatchWatchlist, postAgentFollowup, postAgentTask, postCancelAgentTasks } from '@/lib/api';
 import { cell, num, rowKey } from '@/lib/rows';
-import type { AgentAssignReceipt, AgentCancelReceipt, AgentsPageData } from '@/types';
+import type {
+  AgentAssignReceipt,
+  AgentBatchWatchlistReceipt,
+  AgentCancelReceipt,
+  AgentFollowupReceipt,
+  AgentsPageData,
+} from '@/types';
 
 const SILO_IDS = ['CRYPTO_BINANCE', 'INDIA_ZERODHA_DHAN', 'US_IBKR', 'FX_MT5'] as const;
 const PRIORITIES = ['LOW', 'NORMAL', 'HIGH', 'CRITICAL'] as const;
@@ -83,9 +89,19 @@ export function AgentsPage() {
     'Summarise the decision dashboard and flag the single largest risk.',
   );
   const [receipt, setReceipt] = useState<AgentAssignReceipt | null>(null);
+  const [batchSymbols, setBatchSymbols] = useState<string>('SPY, QQQ, IWM');
+  const [batchStrategy, setBatchStrategy] = useState<string>('ma_golden_cross');
+  const [batchReceipt, setBatchReceipt] = useState<AgentBatchWatchlistReceipt | null>(null);
+  const [followupTaskId, setFollowupTaskId] = useState<string>('');
+  const [followupQuestion, setFollowupQuestion] = useState<string>(
+    'What are the target and stop levels, and the main risk?',
+  );
+  const [followupReceipt, setFollowupReceipt] = useState<AgentFollowupReceipt | null>(null);
 
   const assign = useAction<AgentAssignReceipt>();
   const cancel = useAction<AgentCancelReceipt>();
+  const batch = useAction<AgentBatchWatchlistReceipt>();
+  const followup = useAction<AgentFollowupReceipt>();
 
   const agents = data?.agents ?? [];
   const strategies = data?.strategies ?? [];
@@ -97,6 +113,8 @@ export function AgentsPage() {
   const signalScore = typeof report?.signal_score === 'number' ? report.signal_score : null;
   const advice = typeof report?.operation_advice === 'string' ? report.operation_advice : null;
   const gaugePct = signalScore === null ? 0 : Math.max(0, Math.min(100, signalScore));
+  const batchRows = asRows(batchReceipt?.structured_result?.ranking ?? []);
+  const conversation = followupReceipt?.conversation_history ?? [];
 
   async function submitTask() {
     const parsed = symbols
@@ -124,6 +142,38 @@ export function AgentsPage() {
     if (result) {
       setReceipt(null);
       page.reload();
+    }
+  }
+
+  async function submitBatch() {
+    const parsed = batchSymbols
+      .split(/[,\s;|]+/)
+      .map((entry) => entry.trim().toUpperCase())
+      .filter((entry) => entry.length > 0);
+    if (parsed.length === 0) return;
+    const result = await batch.run(() =>
+      postAgentBatchWatchlist({
+        silo,
+        symbols: parsed,
+        strategy_id: batchStrategy.trim() || null,
+      }),
+    );
+    if (result) {
+      setBatchReceipt(result);
+      setFollowupTaskId(result.task_id);
+      setFollowupReceipt(null);
+      page.reload();
+    }
+  }
+
+  async function askFollowup() {
+    const taskId = followupTaskId.trim();
+    if (taskId.length === 0 || followupQuestion.trim().length === 0) return;
+    const result = await followup.run(() =>
+      postAgentFollowup({ task_id: taskId, question: followupQuestion }),
+    );
+    if (result) {
+      setFollowupReceipt(result);
     }
   }
 
@@ -177,6 +227,142 @@ export function AgentsPage() {
           icon={Waves}
         />
       </div>
+
+      <ActionPanel
+        title="Run Watchlist Batch Scan"
+        description="Runs the harvested decision dashboard across the whole watchlist, ranks every symbol by signal score and operation advice, and seals the batch ranking into one SHA-256 grounded packet."
+      >
+        <div className="grid gap-3 md:grid-cols-[minmax(0,18rem)_minmax(0,14rem)_minmax(0,1fr)_auto]">
+          <div className="grid gap-1.5">
+            <Label htmlFor="batch-silo">Silo</Label>
+            <Select value={silo} onValueChange={setSilo}>
+              <SelectTrigger id="batch-silo" className="h-8 font-mono text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SILO_IDS.map((entry) => (
+                  <SelectItem key={entry} value={entry} className="font-mono text-xs">
+                    {entry}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="batch-strategy">Strategy Focus</Label>
+            <Select value={batchStrategy} onValueChange={setBatchStrategy}>
+              <SelectTrigger id="batch-strategy" className="h-8 font-mono text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(strategies.length > 0
+                  ? strategies.map((entry) => entry.strategy_id)
+                  : [...Array(0)].map(() => '')
+                ).map((entry) => (
+                  <SelectItem key={entry} value={entry} className="font-mono text-xs">
+                    {entry}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="batch-symbols">Comma-separated symbols</Label>
+            <Input
+              id="batch-symbols"
+              className="h-8 font-mono text-xs"
+              value={batchSymbols}
+              onChange={(event) => setBatchSymbols(event.target.value)}
+              placeholder="SPY, QQQ, IWM"
+            />
+          </div>
+          <div className="flex items-end">
+            <Button type="button" size="sm" disabled={batch.pending} onClick={submitBatch}>
+              <Search className="mr-1 size-3.5" />
+              {batch.pending ? 'Scanning…' : 'Run Watchlist Batch Scan'}
+            </Button>
+          </div>
+        </div>
+        <ActionFeedback pending={batch.pending} error={batch.error} />
+        {batchReceipt ? (
+          <div className="grid gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge
+                variant="outline"
+                className={`font-mono text-[10px] ${
+                  batchReceipt.verified
+                    ? 'border-emerald-500/40 text-emerald-300'
+                    : 'border-rose-500/40 text-rose-300'
+                }`}
+              >
+                {batchReceipt.verified ? 'BATCH GROUNDED' : 'BATCH UNGROUNDED'}
+              </Badge>
+              <span className="text-[11px] text-muted-foreground">
+                {cell(batchReceipt, 'task_id')} · {batchRows.length} symbols ranked · top{' '}
+                {String(batchReceipt.structured_result?.top_symbol ?? '—')}
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[46rem] border-collapse text-left font-mono text-[11px]">
+                <thead>
+                  <tr className="border-b border-border/60 text-muted-foreground">
+                    <th className="py-1.5 pr-3 text-right font-normal">rank</th>
+                    <th className="py-1.5 pr-3 font-normal">symbol</th>
+                    <th className="py-1.5 pr-3 text-right font-normal">signal_score</th>
+                    <th className="py-1.5 pr-3 font-normal">operation_advice</th>
+                    <th className="py-1.5 pr-3 text-right font-normal">close</th>
+                    <th className="py-1.5 pr-3 text-right font-normal">target</th>
+                    <th className="py-1.5 pr-3 text-right font-normal">stop</th>
+                    <th className="py-1.5 pr-3 text-right font-normal">reward_risk</th>
+                    <th className="py-1.5 font-normal">grounding</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {batchRows.length === 0 ? (
+                    <tr>
+                      <td className="py-3 text-muted-foreground" colSpan={9}>
+                        No batch ranking returned.
+                      </td>
+                    </tr>
+                  ) : (
+                    batchRows.map((row, index) => (
+                      <tr key={rowKey(row, index)} className="border-b border-border/30">
+                        <td className="py-1.5 pr-3 text-right">{fmt(num(row, 'rank'), 0)}</td>
+                        <td className="py-1.5 pr-3">{cell(row, 'symbol')}</td>
+                        <td className="py-1.5 pr-3 text-right">
+                          {fmt(num(row, 'signal_score'))}
+                        </td>
+                        <td className="py-1.5 pr-3">
+                          <Badge
+                            variant="outline"
+                            className={`font-mono text-[10px] ${
+                              ADVICE_ACCENT[cell(row, 'operation_advice')] ??
+                              'border-border text-muted-foreground'
+                            }`}
+                          >
+                            {cell(row, 'operation_advice')}
+                          </Badge>
+                        </td>
+                        <td className="py-1.5 pr-3 text-right">{fmt(num(row, 'close_price'))}</td>
+                        <td className="py-1.5 pr-3 text-right">{fmt(num(row, 'target_price'))}</td>
+                        <td className="py-1.5 pr-3 text-right">{fmt(num(row, 'stop_loss'))}</td>
+                        <td className="py-1.5 pr-3 text-right">{fmt(num(row, 'reward_risk'))}</td>
+                        <td className="py-1.5">
+                          {cell(row, 'grounding_sha256').slice(0, 12) || '—'}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <ProofRow
+              label="batch_grounding_sha256"
+              value={batchReceipt.grounding_sha256 || '—'}
+            />
+          </div>
+        ) : null}
+      </ActionPanel>
 
       <DataState loading={page.loading} error={page.error}>
         <div className="grid gap-4 xl:grid-cols-[minmax(0,26rem)_minmax(0,1fr)]">
@@ -443,13 +629,14 @@ export function AgentsPage() {
                   <th className="py-1.5 pr-3 font-normal">status</th>
                   <th className="py-1.5 pr-3 text-right font-normal">latency_ms</th>
                   <th className="py-1.5 pr-3 text-right font-normal">token_usd</th>
+                  <th className="py-1.5 pr-3 font-normal">follow-up</th>
                   <th className="py-1.5 font-normal">grounding</th>
                 </tr>
               </thead>
               <tbody>
                 {tasks.length === 0 ? (
                   <tr>
-                    <td className="py-3 text-muted-foreground" colSpan={9}>
+                    <td className="py-3 text-muted-foreground" colSpan={10}>
                       Clean slate — no agent tasks have been assigned in this workspace.
                     </td>
                   </tr>
@@ -480,6 +667,22 @@ export function AgentsPage() {
                       <td className="py-1.5 pr-3 text-right">
                         {fmt(num(row, 'token_cost_usd'), 6)}
                       </td>
+                      <td className="py-1.5 pr-3">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-6 px-2 text-[10px]"
+                          disabled={row.status !== 'COMPLETED'}
+                          onClick={() => {
+                            setFollowupTaskId(String(row.task_id));
+                            setFollowupReceipt(null);
+                          }}
+                        >
+                          <MessageSquare className="mr-1 size-3" />
+                          Ask
+                        </Button>
+                      </td>
                       <td className="py-1.5">
                         {cell(row, 'grounding_sha256').slice(0, 12) || '—'}
                       </td>
@@ -489,6 +692,111 @@ export function AgentsPage() {
               </tbody>
             </table>
             <ActionFeedback pending={cancel.pending} error={cancel.error} />
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <CardTitle className="text-sm">Ask Follow-Up Question</CardTitle>
+              <Badge
+                variant="outline"
+                className={`font-mono text-[10px] ${
+                  followupReceipt?.verified
+                    ? 'border-emerald-500/40 text-emerald-300'
+                    : 'border-border text-muted-foreground'
+                }`}
+              >
+                {followupReceipt?.verified ? 'GROUNDED Q&A' : 'AWAITING QUESTION'}
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            <div className="grid gap-3 md:grid-cols-[minmax(0,16rem)_minmax(0,1fr)_auto]">
+              <div className="grid gap-1.5">
+                <Label htmlFor="followup-task">Completed task_id</Label>
+                <Input
+                  id="followup-task"
+                  className="h-8 font-mono text-xs"
+                  value={followupTaskId}
+                  onChange={(event) => setFollowupTaskId(event.target.value)}
+                  placeholder="task_…"
+                />
+              </div>
+              <div className="grid gap-1.5">
+                <Label htmlFor="followup-question">Question</Label>
+                <Input
+                  id="followup-question"
+                  className="h-8 font-mono text-xs"
+                  value={followupQuestion}
+                  onChange={(event) => setFollowupQuestion(event.target.value)}
+                  placeholder="What is the target and stop, and the main risk?"
+                />
+              </div>
+              <div className="flex items-end">
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={
+                    followup.pending ||
+                    followupTaskId.trim().length === 0 ||
+                    followupQuestion.trim().length === 0
+                  }
+                  onClick={askFollowup}
+                >
+                  <MessageSquare className="mr-1 size-3.5" />
+                  {followup.pending ? 'Answering…' : 'Ask Follow-Up'}
+                </Button>
+              </div>
+            </div>
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              The answer may only cite indicators, entry/target/stop levels and risk factors
+              already committed in that task's GroundedFactPacket.
+            </p>
+            <ActionFeedback pending={followup.pending} error={followup.error} />
+            {conversation.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                Pick a completed task with the Ask button, or paste its task_id, then ask a
+                question. Every answer is re-verified before it is returned.
+              </p>
+            ) : (
+              <div className="grid gap-2">
+                {conversation.map((turn, index) => (
+                  <div
+                    key={rowKey(turn, index)}
+                    className={`rounded-md border p-2 ${
+                      turn.role === 'operator'
+                        ? 'border-sky-500/30 bg-sky-500/5'
+                        : 'border-border/60 bg-muted/20'
+                    }`}
+                  >
+                    <div className="mb-1 flex flex-wrap items-center gap-2">
+                      <Badge variant="outline" className="font-mono text-[10px]">
+                        {turn.role}
+                      </Badge>
+                      {turn.grounding_sha256 ? (
+                        <span className="font-mono text-[10px] text-muted-foreground">
+                          {turn.grounding_sha256.slice(0, 12)}
+                        </span>
+                      ) : null}
+                    </div>
+                    <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed">
+                      {turn.text}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            )}
+            {followupReceipt ? (
+              <div className="grid gap-1 rounded-md border border-border/60 p-2">
+                <ProofRow label="task_id" value={followupReceipt.task_id} />
+                <ProofRow label="turn_index" value={String(followupReceipt.turn_index)} />
+                <ProofRow
+                  label="grounding_sha256"
+                  value={followupReceipt.grounding_sha256}
+                />
+              </div>
+            ) : null}
           </CardContent>
         </Card>
       </DataState>

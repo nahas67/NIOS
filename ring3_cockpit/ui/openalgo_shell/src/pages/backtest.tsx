@@ -18,17 +18,21 @@ import { useAction } from '@/hooks/use-action';
 import { usePageData } from '@/hooks/use-page-data';
 import {
   fetchBacktestPage,
+  postCompareStrategies,
   postPromoteToNursery,
   postRunBacktest,
 } from '@/lib/api';
 import { cell, num, rowKey } from '@/lib/rows';
 import type {
+  BacktestComparisonReceipt,
   BacktestPageData,
   BacktestReceipt,
+  BacktestTimeframe,
   NurseryPromotionReceipt,
 } from '@/types';
 
 const SILO_IDS = ['CRYPTO_BINANCE', 'INDIA_ZERODHA_DHAN', 'US_IBKR', 'FX_MT5'] as const;
+const TIMEFRAMES: BacktestTimeframe[] = ['1m', '5m', '15m', '1h', '1d'];
 const HORIZONS = ['t_plus_1', 't_plus_5', 't_plus_20'] as const;
 
 const HORIZON_LABELS: Record<string, string> = {
@@ -72,6 +76,7 @@ export function BacktestPage() {
   const [silo, setSilo] = useState<string>('INDIA_ZERODHA_DHAN');
   const [symbol, setSymbol] = useState<string>('RELIANCE');
   const [strategyId, setStrategyId] = useState<string>('ma_golden_cross');
+  const [timeframe, setTimeframe] = useState<BacktestTimeframe>('1d');
   const [bars, setBars] = useState<string>('252');
   const [capital, setCapital] = useState<string>('100000');
   const [fastWindow, setFastWindow] = useState<string>('6');
@@ -81,9 +86,11 @@ export function BacktestPage() {
 
   const [receipt, setReceipt] = useState<BacktestReceipt | null>(null);
   const [promotion, setPromotion] = useState<NurseryPromotionReceipt | null>(null);
+  const [comparison, setComparison] = useState<BacktestComparisonReceipt | null>(null);
 
   const run = useAction<BacktestReceipt>();
   const promote = useAction<NurseryPromotionReceipt>();
+  const compare = useAction<BacktestComparisonReceipt>();
 
   const strategies = data?.strategies ?? [];
   const runs = data?.runs ?? [];
@@ -106,6 +113,7 @@ export function BacktestPage() {
       symbol: symbol.trim().toUpperCase(),
       strategy_id: strategyId,
       bars: Number.isFinite(parsedBars) ? parsedBars : 252,
+      timeframe,
       initial_capital_units: Number.parseFloat(capital) || 100000,
       fast_window: Number.parseInt(fastWindow, 10) || null,
       slow_window: Number.parseInt(slowWindow, 10) || null,
@@ -125,6 +133,22 @@ export function BacktestPage() {
     const result = await promote.run(() => postPromoteToNursery(receipt.backtest_id));
     if (result) {
       setPromotion(result);
+      page.reload();
+    }
+  }
+
+  async function compareStrategies() {
+    const parsedBars = Number.parseInt(bars, 10);
+    const result = await compare.run(() =>
+      postCompareStrategies({
+        silo,
+        symbol: symbol.trim().toUpperCase(),
+        timeframe,
+        bars: Number.isFinite(parsedBars) ? parsedBars : 252,
+      }),
+    );
+    if (result) {
+      setComparison(result);
       page.reload();
     }
   }
@@ -203,6 +227,25 @@ export function BacktestPage() {
                 value={symbol}
                 onChange={(event) => setSymbol(event.target.value)}
               />
+            </div>
+
+            <div className="grid gap-1.5">
+              <Label htmlFor="bt-timeframe">Timeframe</Label>
+              <Select
+                value={timeframe}
+                onValueChange={(value) => setTimeframe(value as BacktestTimeframe)}
+              >
+                <SelectTrigger id="bt-timeframe" className="h-8 font-mono text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {TIMEFRAMES.map((entry) => (
+                    <SelectItem key={entry} value={entry} className="font-mono text-xs">
+                      {entry}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
 
             <div className="grid gap-1.5">
@@ -294,6 +337,132 @@ export function BacktestPage() {
           <ActionFeedback pending={run.pending} error={run.error} />
         </ActionPanel>
 
+        <ActionPanel
+          title="Strategy Comparison Matrix"
+          description="Runs all eight harvested strategies on the exact same bar series with the silo's statutory tax-net cost floor deducted from every trade."
+        >
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor="bt-compare-timeframe">Timeframe</Label>
+              <Select
+                value={timeframe}
+                onValueChange={(value) => setTimeframe(value as BacktestTimeframe)}
+              >
+                <SelectTrigger
+                  id="bt-compare-timeframe"
+                  className="h-8 w-28 font-mono text-xs"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {TIMEFRAMES.map((entry) => (
+                    <SelectItem key={entry} value={entry} className="font-mono text-xs">
+                      {entry}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button type="button" size="sm" disabled={compare.pending} onClick={compareStrategies}>
+              <BarChart3 className="mr-1 size-3.5" />
+              {compare.pending
+                ? 'Comparing…'
+                : `Compare All 8 Strategies on ${symbol.trim().toUpperCase() || 'SYMBOL'}`}
+            </Button>
+            <span className="text-[11px] text-muted-foreground">
+              Tax-net floor {fmt(data?.cost_floors?.[silo])} bps · {bars} bars
+            </span>
+          </div>
+          <ActionFeedback pending={compare.pending} error={compare.error} />
+          {comparison ? (
+            <div className="grid gap-2">
+              <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                <Badge variant="outline" className="font-mono text-[10px]">
+                  {comparison.timeframe} · {comparison.bars_per_year} bars/yr
+                </Badge>
+                <Badge variant="outline" className="font-mono text-[10px]">
+                  FLOOR {fmt(comparison.cost_floor_bps)} bps
+                </Badge>
+                <span>
+                  {comparison.symbol} · best {comparison.best_strategy?.strategy_id ?? '—'}
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[64rem] border-collapse text-left font-mono text-[11px]">
+                  <thead>
+                    <tr className="border-b border-border/60 text-muted-foreground">
+                      <th className="py-1.5 pr-3 text-right font-normal">rank</th>
+                      <th className="py-1.5 pr-3 font-normal">strategy_id</th>
+                      <th className="py-1.5 pr-3 text-right font-normal">total_return_pct</th>
+                      <th className="py-1.5 pr-3 text-right font-normal">sharpe_ratio</th>
+                      <th className="py-1.5 pr-3 text-right font-normal">deflated_sharpe</th>
+                      <th className="py-1.5 pr-3 font-normal">dsr_gate</th>
+                      <th className="py-1.5 pr-3 text-right font-normal">net_edge_bps</th>
+                      <th className="py-1.5 pr-3 text-right font-normal">win_rate_pct</th>
+                      <th className="py-1.5 font-normal">grounding</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {comparison.leaderboard.length === 0 ? (
+                      <tr>
+                        <td className="py-3 text-muted-foreground" colSpan={9}>
+                          No strategies returned.
+                        </td>
+                      </tr>
+                    ) : (
+                      comparison.leaderboard.map((row, index) => (
+                        <tr key={rowKey(row, index)} className="border-b border-border/30">
+                          <td className="py-1.5 pr-3 text-right">{fmt(num(row, 'rank'), 0)}</td>
+                          <td className="py-1.5 pr-3">{cell(row, 'strategy_id')}</td>
+                          <td
+                            className={`py-1.5 pr-3 text-right ${
+                              num(row, 'total_return_pct') >= 0
+                                ? 'text-emerald-300'
+                                : 'text-rose-300'
+                            }`}
+                          >
+                            {fmt(num(row, 'total_return_pct'))}
+                          </td>
+                          <td className="py-1.5 pr-3 text-right">
+                            {fmt(num(row, 'sharpe_ratio'))}
+                          </td>
+                          <td className="py-1.5 pr-3 text-right">
+                            {fmt(num(row, 'deflated_sharpe_ratio'))}
+                          </td>
+                          <td className="py-1.5 pr-3">
+                            <span
+                              className={
+                                row.passes_dsr_gate ? 'text-emerald-300' : 'text-rose-300'
+                              }
+                            >
+                              {row.passes_dsr_gate ? 'PASS' : 'FAIL'}
+                            </span>
+                          </td>
+                          <td className="py-1.5 pr-3 text-right">
+                            {fmt(num(row, 'net_edge_bps'))}
+                          </td>
+                          <td className="py-1.5 pr-3 text-right">
+                            {fmt(num(row, 'win_rate_pct'))}
+                          </td>
+                          <td className="py-1.5">
+                            {cell(row, 'grounding_sha256').slice(0, 12) || '—'}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <ProofRow label="comparison_sha256" value={comparison.comparison_sha256} />
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Compare every template on one shared tape to see which strategy actually clears the
+              tax-net Deflated Sharpe gate on this symbol and timeframe.
+            </p>
+          )}
+        </ActionPanel>
+
         {receipt ? (
           <>
             <Card>
@@ -363,6 +532,8 @@ export function BacktestPage() {
                   />
                   <ProofRow label="net_edge_bps" value={fmt(metrics.net_edge_bps)} />
                   <ProofRow label="cost_floor_bps" value={fmt(receipt.cost_floor_bps)} />
+                  <ProofRow label="timeframe" value={receipt.timeframe} />
+                  <ProofRow label="bars_per_year" value={fmt(receipt.bars_per_year, 0)} />
                 </div>
 
                 {kfold ? (

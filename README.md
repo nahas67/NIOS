@@ -52,9 +52,10 @@ python scripts/run_nios.py --host 127.0.0.1 --port 8000
 ```
 
 The cockpit is served at `http://127.0.0.1:8000/`; REST, SSE and the MCP bridge share the same
-origin. The SPA exposes **nine pages** — `/dashboard`, `/orders`, `/analyzer`, `/quant`,
-`/brain`, `/forge`, `/ledger`, `/verification`, `/control` — plus the aliases `/` (dashboard),
-`/positions` (orders), `/xray` (brain) and `/mcp` (control). Interpreter discovery order:
+origin. The SPA exposes **eleven pages** — `/dashboard`, `/orders`, `/analyzer`, `/quant`,
+`/brain`, `/forge`, `/ledger`, `/verification`, `/control`, `/agents`, `/backtest` — plus the
+aliases `/` (dashboard), `/positions` (orders), `/xray` (brain) and `/mcp` (control).
+Interpreter discovery order:
 `NIOS_PYTHON` → `NIOS_VENV` → `.venv` → `venv` → pre-provisioned dev venv → `py -3.12` /
 `python3.12`.
 
@@ -67,7 +68,7 @@ origin. The SPA exposes **nine pages** — `/dashboard`, `/orders`, `/analyzer`,
 | **0 — Sovereign Vault** | `ring0_vault/` | Verifies SHA-256 digests, enforces whitelists and notional caps, runs the 98% split-conformal gate and the cross-silo tail-copula shield, stages two-phase TigerBeetle transfers, signs orders, reconciles every 60 s, enforces ADR-009 loss stops. | The only ring holding broker credentials or signing power. |
 | **1 — Spinal Reflex** | `ring1_spinal/` | Deterministic zero-GC hot path. Dual-vendor feed normalization, executed-OFI gate, cancel-to-fill gate, 0.1 ms volatility breaker. | Holds short-TTL leases only. Cannot sign, settle or write the IBOR. |
 | **2 — Bicameral Brain** | `ring2_brain/` | 490-factor zoo and valuation lab, SHA-256 grounding ledger, SEC EDGAR point-in-time guard, MiroFish contagion cascade, System 1 lease writer and the System 2 investment committee. | No broker keys, no exchange sockets, no order signing. |
-| **3 — Glass Cockpit** | `ring3_cockpit/` | FastAPI REST/SSE control plane, global kill switch, the React 19 nine-page cockpit, and a read-only MCP bridge. | Read-only for market state; may only write the explicit control endpoints. |
+| **3 — Glass Cockpit** | `ring3_cockpit/` | FastAPI REST/SSE control plane, global kill switch, the React 19 eleven-page cockpit, and a read-only MCP bridge. | Read-only for market state; may only write the explicit control endpoints. |
 | **Core substrate** | `core/` | POSIX shared-memory SeqLock, NATS JetStream bus, DuckDB/Parquet bitemporal lake, orchestrator. | Tier 0/1/2 contracts only. |
 
 ### The five non-negotiable laws
@@ -158,7 +159,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**312 tests · 20 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**313 tests · 20 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -192,6 +193,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 17 | `test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS/socket auditor, zero-downtime Fernet + Ed25519 rotation, runbook completeness |
 | 18 | `test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight certificate, supervisor forge/tail-hedge, Phase 4 release seal |
 | 19 | `test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard |
+| 20 | `test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** 8 harvested strategies, grounded decision dashboard, 6 agent tasks, watchlist batch ranking, grounded Q&A follow-up, 5-timeframe backtester, 8-way comparison, 30-fill nursery gate |
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
 independent of whatever happens to be installed in the interpreter.
@@ -264,9 +266,44 @@ preserved exactly.
 
 ---
 
-## The nine-page cockpit workstation
+## V1.2 — agent task hub, grounded Q&A, multi-timeframe backtester
 
-The Ring 3 cockpit is a React 19 SPA with nine pages. `GET /api/v2/cockpit/pages` is the
+`V1.2` harvests `ZhuLinsen/daily_stock_analysis` into Ring 2 and exposes it through two new
+cockpit pages. Everything stays research-only: no agent signs an order, reads a broker key, or
+writes the IBOR.
+
+### `/agents` — specialist agents, watchlist batch, grounded Q&A
+
+| Endpoint | Effect |
+|---|---|
+| `POST /api/v2/control/agents/assign` | Dispatch one of 6 specialist agents (decision dashboard, technical, valuation, contagion, forge, backtest audit) |
+| `POST /api/v2/control/agents/batch-watchlist` | One decision-dashboard batch across a symbol watchlist; ranks by `signal_score` (`0..100`) and `operation_advice` (`STRONG_BUY → AVOID`), then seals the whole ranking into one SHA-256 `GroundedFactPacket` |
+| `POST /api/v2/control/agents/followup` | Multi-turn grounded strategy Q&A against a completed `task_id`; cites only verified indicators, entry/target/stop levels and risk factors, appends to `conversation_history`, and re-verifies with `NumericalGroundingVerifier` |
+| `GET /api/v2/control/agents/tasks/{task_id}` | Full report plus the Q&A thread |
+| `POST /api/v2/control/agents/cancel` | Cancel one task or clear the queue |
+
+A follow-up on a task that is missing (`404`), not completed, or whose answer cannot be grounded
+is refused — the answer is never returned unverified.
+
+### `/backtest` — five timeframes and an eight-strategy comparison
+
+`POST /api/v2/control/backtest/run` accepts `timeframe: "1m" | "5m" | "15m" | "1h" | "1d"`
+(default `1d`). Shorter bars scale both per-bar volatility (`1/sqrt(bars_per_day)`) and the
+annualisation factor, so a minute bar cannot inherit a daily-sized shock. Bars per year:
+`1m 98,280 · 5m 19,656 · 15m 6,552 · 1h 1,638 · 1d 252`.
+
+`POST /api/v2/control/backtest/compare-strategies` runs all **8 harvested strategies** on the
+exact same bar series and returns a ranked leaderboard (`rank`, `strategy_id`,
+`total_return_pct`, `sharpe_ratio`, `deflated_sharpe_ratio`, `passes_dsr_gate`, `net_edge_bps`,
+`win_rate_pct`, `grounding_sha256`). Every trade is charged the silo's statutory round-trip
+floor before the gate is evaluated: `INDIA 8.50 bps` (incl. 5.50 bps STT), `CRYPTO 16.00 bps`,
+`US 2.80 bps`, `FX 1.60 bps`.
+
+---
+
+## The eleven-page cockpit workstation
+
+The Ring 3 cockpit is a React 19 SPA with eleven pages. `GET /api/v2/cockpit/pages` is the
 authoritative catalogue; the SPA catch-all serves any route (and alias) on direct navigation or
 refresh, while `/api/*` and `/metrics` still return a real `404`.
 
@@ -281,6 +318,8 @@ refresh, while `/api/*` and `/metrics` still return a real `404`.
 | 7 | IBOR Ledger & Tax | `/ledger` | — | Ring 0 | Double-entry journal, 35/15 ratchet, TigerBeetle + PG16 |
 | 8 | Proofs, Chaos & Telemetry | `/verification` | — | Ring 0 | TLA+ BFS proofs, VOPR campaign, OS tuning, metrics |
 | 9 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | 22-gate pre-flight, credential vault, LLM switchboard, MCP |
+| 10 | Agent Task Hub | `/agents` | — | Ring 2 | 6 specialist agents, watchlist batch ranking, grounded Q&A, token ledger |
+| 11 | Walk-Forward Backtester | `/backtest` | — | Ring 2 | 5 timeframes, 8-strategy tax-net comparison, Purged K-Fold, DSR gate |
 
 ---
 
@@ -293,12 +332,14 @@ side-effect-free; the only writes are the explicit control surfaces below (`sec_
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/v2/cockpit/pages` | 9-page catalogue, alias map, platform counts |
+| `GET` | `/api/v2/cockpit/pages` | 11-page catalogue, alias map, platform counts |
 | `GET` | `/api/v2/cockpit/orders` | SmartOMS blotter, slicers, outbox pending |
 | `GET` | `/api/v2/cockpit/analyzer` | Shadow nursery and adverse-selection telemetry |
 | `GET` | `/api/v2/cockpit/quant` | 490-factor scan, valuation, loader readiness |
 | `GET` | `/api/v2/cockpit/forge` | Forge leaderboard, plugins, SKILL.md catalog |
 | `GET` | `/api/v2/cockpit/ledger` | Double-entry journal, ratchet, TigerBeetle + PG16 |
+| `GET` | `/api/v2/cockpit/agents` | Agent catalog, task queue, token ledger |
+| `GET` | `/api/v2/cockpit/backtest` | Strategy catalog, timeframes, cost floors, saved runs |
 | `GET` | `/api/v2/cockpit/mcp` | Read-only MCP catalogue + air-gap audit |
 | `GET` | `/api/v2/cockpit/skills/{skill_name}` | One SKILL.md document as structured Markdown |
 
@@ -348,6 +389,16 @@ opens a venue socket or unlocks a silo.
 | `POST` | `/api/v2/control/brain/committee-debate` | One grounded System 2 debate turn; `symbol=AUTO` debates the top candidate. |
 | `POST` | `/api/v2/control/forge/evaluate-challenger` | Nursery gate: Deflated Sharpe `>= 1.50` **and** `shadow_fills >= 30`, read from the forge. |
 
+### V1.2 agent and backtest controls (5)
+
+| Method | Path | Effect |
+|---|---|---|
+| `POST` | `/api/v2/control/agents/assign` | One grounded specialist-agent task |
+| `POST` | `/api/v2/control/agents/batch-watchlist` | Ranked decision-dashboard batch sealed into one SHA-256 packet |
+| `POST` | `/api/v2/control/agents/followup` | Grounded multi-turn Q&A against a completed task |
+| `POST` | `/api/v2/control/backtest/run` | Tax-net walk-forward run at `1m`/`5m`/`15m`/`1h`/`1d` |
+| `POST` | `/api/v2/control/backtest/compare-strategies` | All 8 strategies on one tape, ranked, tax-net |
+
 A rejected challenger, a drill that reports a violation, or a `NO_TRADE` committee verdict is
 data, not an error. Never widen a threshold or bypass Ring 0 to make a red row green.
 
@@ -362,7 +413,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     312 tests across 20 suites
+tests/                     313 tests across 20 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 22-gate go-live readiness certificate (--strict / --fast)
@@ -376,18 +427,18 @@ start_nios.bat / .sh       1-click launch
 
 ---
 
-## Release seal — `v3.2.0-V1.1`
+## Release seal — `v3.3.0-V1.2`
 
 | Gate | Command | Required result |
 |---|---|---|
-| Unit / integration | `pytest tests -q` | **312 passed**, 0 failed, 0 warnings |
+| Unit / integration | `pytest tests -q` | **313 passed**, 0 failed, 0 warnings |
 | Smoke suite | `python scripts/run_nios.py --smoke-test` | **22/22 rows**, `EXIT=0` |
 | Go-live certificate | `python scripts/preflight_golive.py --fast` | **22/22 PASS**, `EXIT=0` |
-| Live `V1.1` burn-in | boot on `:8001`, `setup → login → paper state → fund-paper → live state (403) → elevate-live → live state (200) → logout`, shut down | **clean slate on boot**, **`403` before elevation**, **`200` after**, then empty `git status --porcelain` |
+| Live `V1.2` burn-in | boot on `:8001`, clean slate (`tasks == []`, `backtests == []`, `vaults == 0`, `autopilot == false`), then `setup → login → cockpit/agents → agents/assign → agents/followup → agents/batch-watchlist → backtest/run → backtest/compare-strategies → /paper/agents → /paper/backtest → elevate-live → /live/agents → /live/backtest → auth/reset`, shut down | **11/11 routes at 200**, clean-slate on boot, port `8001` free afterwards, empty `git status --porcelain` |
 
 The seal asserts nothing new about live capital: every silo still boots `PAPER`, the 22-gate
-certificate still governs a LIVE cutover, and `main` (`9a8ac5f` / `v3.0.0-PROD`) and `V1`
-(`ff67b5c` / `v3.1.0-V1`) are untouched.
+certificate still governs a LIVE cutover, and `main` (`9a8ac5f` / `v3.0.0-PROD`), `V1`
+(`ff67b5c` / `v3.1.0-V1`) and `V1.1` (`99ea43a` / `v3.2.0-V1.1`) are untouched.
 
 ---
 

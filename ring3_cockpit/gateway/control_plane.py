@@ -53,7 +53,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Literal, Mapping
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -874,6 +874,22 @@ class AgentCancelRequest(BaseModel):
     task_id: str = "ALL"
 
 
+class AgentBatchWatchlistRequest(BaseModel):
+    """``POST /api/v2/control/agents/batch-watchlist`` -- ranked batch scan."""
+
+    silo: str = "US_IBKR"
+    symbols: list[str] = Field(default_factory=list)
+    strategy_id: str | None = None
+    priority: str = "NORMAL"
+
+
+class AgentFollowupRequest(BaseModel):
+    """``POST /api/v2/control/agents/followup`` -- grounded strategy Q&A."""
+
+    task_id: str = Field(..., min_length=1, max_length=64)
+    question: str = Field(..., min_length=1, max_length=2000)
+
+
 class BacktestRunRequest(BaseModel):
     """``POST /api/v2/control/backtest/run`` -- tax-net walk-forward run."""
 
@@ -881,11 +897,21 @@ class BacktestRunRequest(BaseModel):
     symbol: str = "SPY"
     strategy_id: str = "ma_golden_cross"
     bars: int = 252
+    timeframe: Literal["1m", "5m", "15m", "1h", "1d"] = "1d"
     initial_capital_units: float = 100_000.0
     fast_window: int | None = None
     slow_window: int | None = None
     stop_loss_bps: float | None = None
     take_profit_bps: float | None = None
+
+
+class BacktestCompareRequest(BaseModel):
+    """``POST /api/v2/control/backtest/compare-strategies`` -- 8-way matrix."""
+
+    silo: str = "US_IBKR"
+    symbol: str = "SPY"
+    timeframe: Literal["1m", "5m", "15m", "1h", "1d"] = "1d"
+    bars: int = 252
 
 
 class NurseryPromoteRequest(BaseModel):
@@ -4145,6 +4171,8 @@ class ControlPlane:
             "routes": {
                 "agents": "/api/v2/cockpit/agents",
                 "assign": "/api/v2/control/agents/assign",
+                "batch_watchlist": "/api/v2/control/agents/batch-watchlist",
+                "followup": "/api/v2/control/agents/followup",
                 "task": "/api/v2/control/agents/tasks/{task_id}",
                 "cancel": "/api/v2/control/agents/cancel",
             },
@@ -4162,6 +4190,24 @@ class ControlPlane:
         )
         task["token"] = self.task_dispatcher.token_usage()
         return task
+
+    def batch_watchlist(self, request: AgentBatchWatchlistRequest) -> dict[str, Any]:
+        """Rank a whole symbol watchlist and seal one grounded batch packet."""
+        task = self.task_dispatcher.batch_watchlist(
+            silo=request.silo,
+            symbols=list(request.symbols or []),
+            strategy_id=request.strategy_id,
+            priority=request.priority,
+        )
+        task["token"] = self.task_dispatcher.token_usage()
+        return task
+
+    def agent_followup(self, request: AgentFollowupRequest) -> dict[str, Any]:
+        """Answer one grounded follow-up against a completed task."""
+        return self.task_dispatcher.followup(
+            task_id=request.task_id,
+            question=request.question,
+        )
 
     def agent_task(self, task_id: str) -> dict[str, Any]:
         """``GET /api/v2/control/agents/tasks/{task_id}`` -- full report."""
@@ -4187,6 +4233,7 @@ class ControlPlane:
             "routes": {
                 "backtest": "/api/v2/cockpit/backtest",
                 "run": "/api/v2/control/backtest/run",
+                "compare": "/api/v2/control/backtest/compare-strategies",
                 "promote": "/api/v2/control/backtest/promote-to-nursery",
             },
         }
@@ -4198,6 +4245,7 @@ class ControlPlane:
             symbol=request.symbol,
             strategy_id=request.strategy_id,
             bars=int(request.bars),
+            timeframe=request.timeframe,
             initial_capital_units=float(request.initial_capital_units),
             fast_window=request.fast_window,
             slow_window=request.slow_window,
@@ -4206,6 +4254,17 @@ class ControlPlane:
         )
         receipt["run_count"] = self.backtest_engine.run_count
         return receipt
+
+    def compare_backtest_strategies(
+        self, request: BacktestCompareRequest
+    ) -> dict[str, Any]:
+        """``POST /api/v2/control/backtest/compare-strategies`` -- 8-way matrix."""
+        return self.backtest_engine.compare_strategies(
+            silo=request.silo,
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            bars=int(request.bars),
+        )
 
     def promote_backtest(self, request: NurseryPromoteRequest) -> dict[str, Any]:
         """``POST /api/v2/control/backtest/promote-to-nursery`` -- DSR gated."""
@@ -6109,10 +6168,39 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
                 status_code=404, detail=f"UNKNOWN_TASK: {exc.args[0]}"
             ) from exc
 
+    @app.post("/api/v2/control/agents/batch-watchlist")
+    def control_agents_batch_watchlist(
+        request: AgentBatchWatchlistRequest,
+    ) -> dict[str, Any]:
+        try:
+            return control.batch_watchlist(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v2/control/agents/followup")
+    def control_agents_followup(request: AgentFollowupRequest) -> dict[str, Any]:
+        try:
+            return control.agent_followup(request)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"UNKNOWN_TASK: {exc.args[0]}"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/api/v2/control/backtest/run")
     def control_backtest_run(request: BacktestRunRequest) -> dict[str, Any]:
         try:
             return control.run_backtest(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v2/control/backtest/compare-strategies")
+    def control_backtest_compare(
+        request: BacktestCompareRequest,
+    ) -> dict[str, Any]:
+        try:
+            return control.compare_backtest_strategies(request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

@@ -76,6 +76,18 @@ MAX_SYMBOLS = 8
 DSR_GATE = 1.50
 CHAMPION_NET_EDGE_FLOOR_BPS = 0.50
 REPORT_TOLERANCE = 0.02
+FOLLOWUP_TOKEN_COST_USD = 0.000092
+FOLLOWUP_PROMPT_TOKENS = 180
+FOLLOWUP_COMPLETION_TOKENS = 120
+
+#: Advice ordering used to break a signal-score tie in a watchlist ranking.
+ADVICE_RANK: dict[str, int] = {
+    "STRONG_BUY": 0,
+    "BUY": 1,
+    "HOLD": 2,
+    "WAIT": 3,
+    "AVOID": 4,
+}
 
 AGENT_IDS: tuple[str, ...] = (
     "daily_decision_agent",
@@ -267,8 +279,83 @@ def _normalise_symbols(symbols: Any) -> list[str]:
 
 
 def _prefixed(symbol: str, metrics: Mapping[str, float]) -> dict[str, float]:
-    prefix = re.sub(r"[^A-Za-z0-9_]", "_", str(symbol))
+    prefix = _metric_prefix(symbol)
     return {f"{prefix}__{key}": float(value) for key, value in metrics.items()}
+
+
+def _metric_prefix(symbol: str) -> str:
+    """Return the deterministic metric namespace for one symbol."""
+
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(symbol).upper())
+
+
+def _question_intent(question: str) -> frozenset[str]:
+    """Classify a follow-up question into the grounded metric groups to cite."""
+
+    text = str(question or "").lower()
+    intents: set[str] = set()
+    if any(
+        token in text
+        for token in ("target", "stop", "entry", "level", "price", "buy", "sell")
+    ):
+        intents.add("levels")
+    if any(
+        token in text
+        for token in (
+            "indicator",
+            "rsi",
+            "macd",
+            "moving average",
+            "ma5",
+            "ma10",
+            "ma20",
+            "trend",
+            "momentum",
+            "volatility",
+        )
+    ):
+        intents.add("indicators")
+    if any(
+        token in text
+        for token in ("risk", "drawdown", "downside", "danger", "caution")
+    ):
+        intents.add("risk")
+    if any(
+        token in text
+        for token in ("score", "rank", "advice", "recommend", "signal", "rating")
+    ):
+        intents.add("score")
+    if not intents:
+        intents.update({"levels", "score"})
+    return frozenset(intents)
+
+
+_LEVEL_METRICS: tuple[str, ...] = (
+    "close_price",
+    "entry_price",
+    "target_price",
+    "target_distance_pct",
+    "stop_loss",
+    "stop_distance_pct",
+    "reward_risk",
+)
+_INDICATOR_METRICS: tuple[str, ...] = (
+    "ma5",
+    "ma10",
+    "ma20",
+    "bias_ma5_pct",
+    "rsi_14",
+    "macd_value",
+    "macd_signal_value",
+    "atr_14",
+)
+_RISK_METRICS: tuple[str, ...] = (
+    "max_drawdown_pct",
+    "volatility_20d_pct",
+    "stop_distance_pct",
+    "reward_risk",
+)
+_SCORE_METRICS: tuple[str, ...] = ("signal_score", "rank")
 
 
 # --------------------------------------------------------------------------
@@ -517,6 +604,8 @@ class AgentTask:
     verification: dict[str, Any] = field(default_factory=dict)
     verified: bool = False
     error: str | None = None
+    conversation_history: list[dict[str, Any]] = field(default_factory=list)
+    fact_packet: dict[str, Any] = field(default_factory=dict)
 
     @property
     def terminal(self) -> bool:
@@ -542,12 +631,17 @@ class AgentTask:
             "verified": bool(self.verified),
             "verification": dict(self.verification),
             "error": self.error,
+            "conversation_turns": len(self.conversation_history),
+            "fact_count": len(self.fact_packet.get("metrics") or {}),
         }
 
     def to_full_dict(self) -> dict[str, Any]:
         payload = self.to_dict()
         payload["structured_result"] = self.structured_result
         payload["markdown_report"] = self.markdown_report
+        payload["conversation_history"] = [
+            dict(turn) for turn in self.conversation_history
+        ]
         return payload
 
 
@@ -810,6 +904,399 @@ class AgentTaskDispatcher:
                     self._failed += 1
         return task.to_full_dict()
 
+    def batch_watchlist(
+        self,
+        *,
+        silo: Any = DEFAULT_SILO,
+        symbols: Any = None,
+        strategy_id: Any = None,
+        priority: Any = "NORMAL",
+    ) -> dict[str, Any]:
+        """Run the decision dashboard across a watchlist and seal one ranking packet."""
+
+        silo_key = str(silo or DEFAULT_SILO).strip().upper()
+        if silo_key not in KNOWN_SILOS:
+            raise ValueError(
+                "unknown silo; expected one of " + ", ".join(KNOWN_SILOS)
+            )
+        watchlist = _normalise_symbols(symbols)
+        if not watchlist:
+            raise ValueError("at least one symbol is required")
+
+        strategy_value: str | None = None
+        if strategy_id is not None and str(strategy_id).strip():
+            candidate = str(strategy_id).strip().lower()
+            if candidate not in STRATEGY_IDS:
+                raise ValueError(
+                    "unknown strategy_id; expected one of " + ", ".join(STRATEGY_IDS)
+                )
+            strategy_value = candidate
+
+        priority_key = str(priority or "NORMAL").strip().upper()
+        if priority_key not in TASK_PRIORITIES:
+            raise ValueError(
+                "unknown priority; expected one of " + ", ".join(TASK_PRIORITIES)
+            )
+
+        spec = _get_agent("daily_decision_agent")
+        now_ns = int(self._clock())
+        task = AgentTask(
+            task_id=f"task_{uuid.uuid4().hex[:12]}",
+            agent_id=spec.agent_id,
+            task_type="WATCHLIST_BATCH",
+            silo=silo_key,
+            symbols=watchlist,
+            strategy_id=strategy_value,
+            prompt="",
+            priority=priority_key,
+            status="PENDING",
+            progress_pct=0,
+            created_at_ns=now_ns,
+        )
+        with self._lock:
+            self._tasks[task.task_id] = task
+            self._order.append(task.task_id)
+            self._counter += 1
+
+        start_ns = now_ns
+        task.status = "PROCESSING"
+        task.progress_pct = 10
+        try:
+            self._budget_check(spec)
+            reports = [
+                self._dashboard.evaluate(
+                    symbol,
+                    silo_key,
+                    bar_count=DEFAULT_BAR_COUNT,
+                    as_of_ns=now_ns,
+                )
+                for symbol in watchlist
+            ]
+            focus = get_strategy(strategy_value) if strategy_value else None
+            rows: list[dict[str, Any]] = []
+            for report in reports:
+                focus_score = (
+                    float(report.strategy_scores.get(strategy_value, 0.0))
+                    if strategy_value
+                    else 0.0
+                )
+                rows.append(
+                    {
+                        "symbol": report.symbol,
+                        "signal_score": round(float(report.signal_score), 4),
+                        "operation_advice": report.operation_advice,
+                        "close_price": round(float(report.close_price), 6),
+                        "target_price": round(float(report.target_price), 6),
+                        "stop_loss": round(float(report.stop_loss), 6),
+                        "target_distance_pct": round(float(report.target_distance_pct), 6),
+                        "stop_distance_pct": round(float(report.stop_distance_pct), 6),
+                        "reward_risk": round(float(report.reward_risk), 6),
+                        "rsi_14": round(float(report.rsi_14), 6),
+                        "atr_14": round(float(report.atr_14), 6),
+                        "return_20d_pct": round(float(report.return_20d_pct), 6),
+                        "max_drawdown_pct": round(float(report.max_drawdown_pct), 6),
+                        "macd_status": report.macd_status,
+                        "rsi_status": report.rsi_status,
+                        "signal_reasons": list(report.signal_reasons),
+                        "risk_factors": list(report.risk_factors),
+                        "best_strategy_id": report.best_strategy_id,
+                        "grounding_sha256": report.grounding_sha256,
+                        "verified": bool(report.verified),
+                        "strategy_focus_score": round(focus_score, 4),
+                    }
+                )
+            rows.sort(
+                key=lambda row: (
+                    -float(row["signal_score"]),
+                    -float(row["strategy_focus_score"]),
+                    ADVICE_RANK.get(str(row["operation_advice"]), 9),
+                    str(row["symbol"]),
+                )
+            )
+            for index, row in enumerate(rows, start=1):
+                row["rank"] = index
+
+            metrics: dict[str, float] = {
+                "watchlist_size": float(len(rows)),
+            }
+            for row in rows:
+                block = {
+                    "rank": float(row["rank"]),
+                    "signal_score": float(row["signal_score"]),
+                    "close_price": float(row["close_price"]),
+                    "target_price": float(row["target_price"]),
+                    "stop_loss": float(row["stop_loss"]),
+                    "target_distance_pct": float(row["target_distance_pct"]),
+                    "stop_distance_pct": float(row["stop_distance_pct"]),
+                    "reward_risk": float(row["reward_risk"]),
+                    "rsi_14": float(row["rsi_14"]),
+                    "atr_14": float(row["atr_14"]),
+                    "return_20d_pct": float(row["return_20d_pct"]),
+                    "max_drawdown_pct": float(row["max_drawdown_pct"]),
+                }
+                if strategy_value:
+                    block["strategy_score"] = float(row["strategy_focus_score"])
+                metrics.update(_prefixed(str(row["symbol"]), block))
+
+            knowledge_ts = max(
+                (int(report.knowledge_ts_ns) for report in reports), default=now_ns
+            )
+            packet = GroundedFactPacket(
+                symbol="WATCHLIST",
+                valid_time_ns=knowledge_ts,
+                knowledge_ts_ns=knowledge_ts,
+                as_of_ns=now_ns,
+                metrics=metrics,
+            )
+
+            doc = _Doc("Watchlist Batch Ranking")
+            doc.para(
+                f"Daily decision batch on silo {silo_key} covering "
+                f"{_spell(len(rows))} watchlist symbols."
+            )
+            if focus is not None:
+                doc.note("Strategy focus", focus.name)
+            doc.head("Ranked watchlist")
+            doc.text("| Rank | Symbol | Score | Advice |")
+            doc.text("| --- | --- | --- | --- |")
+            for row in rows:
+                doc.text(
+                    f"| {_spell(int(row['rank']))} | {_digitless(row['symbol'])} | "
+                    f"{_fmt(row['signal_score'])} | {row['operation_advice']} |"
+                )
+            doc.text("")
+            for row in rows:
+                doc.head(f"{row['symbol']} watchlist card")
+                doc.note("Operation advice", str(row["operation_advice"]))
+                doc.note("Macd status", str(row["macd_status"]))
+                doc.note("Rsi status", str(row["rsi_status"]))
+                doc.kv("Signal score", row["signal_score"])
+                doc.kv("Close price", row["close_price"])
+                doc.kv("Target price", row["target_price"])
+                doc.kv("Stop loss", row["stop_loss"])
+                doc.kv("Reward risk", row["reward_risk"])
+                if strategy_value:
+                    doc.kv("Strategy focus score", row["strategy_focus_score"])
+            risk_union: list[str] = []
+            for row in rows:
+                for risk in row["risk_factors"]:
+                    if risk not in risk_union:
+                        risk_union.append(str(risk))
+            doc.bullets("Batch risk factors", risk_union)
+
+            markdown = doc.build()
+            verdict = self._verify(packet, markdown)
+            task.markdown_report = markdown
+            task.grounding_sha256 = packet.sha256_digest
+            task.fact_packet = packet.to_dict()
+            task.verification = verdict
+            task.verified = bool(verdict.get("verified"))
+            task.structured_result = {
+                "batch": True,
+                "agent_id": spec.agent_id,
+                "task_type": "WATCHLIST_BATCH",
+                "silo": silo_key,
+                "symbols": list(watchlist),
+                "strategy_id": strategy_value,
+                "watchlist_size": len(rows),
+                "ranking": rows,
+                "advice_by_symbol": {
+                    str(row["symbol"]): str(row["operation_advice"]) for row in rows
+                },
+                "score_by_symbol": {
+                    str(row["symbol"]): float(row["signal_score"]) for row in rows
+                },
+                "top_symbol": rows[0]["symbol"] if rows else None,
+                "grounding_sha256": packet.sha256_digest,
+                "verified": task.verified,
+                "fact_count": len(metrics),
+            }
+            task.token_cost_usd = self._record_spend(spec)
+            task.completed_at_ns = int(self._clock())
+            task.latency_ms = max(0.0, (task.completed_at_ns - start_ns) / 1_000_000.0)
+            if task.verified:
+                task.status = "COMPLETED"
+                task.progress_pct = 100
+            else:
+                task.status = "FAILED"
+                task.progress_pct = 100
+                task.error = str(verdict.get("error") or "UNGROUNDED-BATCH")
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
+            task.status = "FAILED"
+            task.progress_pct = 100
+            task.error = f"{type(exc).__name__}: {exc}"
+            task.completed_at_ns = int(self._clock())
+            task.latency_ms = max(0.0, (task.completed_at_ns - start_ns) / 1_000_000.0)
+            task.structured_result = {"batch": True, "error": task.error}
+        finally:
+            with self._lock:
+                if task.status == "COMPLETED":
+                    self._completed += 1
+                elif task.status == "FAILED":
+                    self._failed += 1
+        return task.to_full_dict()
+
+    def followup(self, *, task_id: Any, question: Any) -> dict[str, Any]:
+        """Answer one grounded multi-turn question against a completed task."""
+
+        key = str(task_id or "").strip()
+        if not key:
+            raise ValueError("task_id is required")
+        text = str(question or "").strip()
+        if not text:
+            raise ValueError("question must be a non-empty string")
+
+        with self._lock:
+            task = self._tasks.get(key)
+        if task is None:
+            raise KeyError(key)
+        if task.status != "COMPLETED" or not task.fact_packet:
+            raise ValueError("follow-up requires a completed grounded task")
+
+        packet = GroundedFactPacket(**task.fact_packet)
+        intents = _question_intent(text)
+        now_ns = int(self._clock())
+
+        doc = _Doc("Strategy Q&A Follow-Up")
+        doc.para(
+            f"Follow-up on task {task.task_id} for "
+            f"{', '.join(task.symbols)} on silo {task.silo}."
+        )
+        doc.para(f"Operator question: {text}")
+
+        metric_names: dict[str, list[str]] = {}
+        if "levels" in intents:
+            metric_names["levels"] = list(_LEVEL_METRICS)
+        if "indicators" in intents:
+            metric_names["indicators"] = list(_INDICATOR_METRICS)
+        if "risk" in intents:
+            metric_names["risk"] = list(_RISK_METRICS)
+        if "score" in intents:
+            metric_names["score"] = list(_SCORE_METRICS)
+
+        for symbol in task.symbols:
+            prefix = _metric_prefix(symbol)
+            doc.head(f"{symbol} grounded answer")
+            advice = self._advice_for_symbol(task, symbol)
+            if advice:
+                doc.note("Operation advice", advice)
+            ranked = packet.metrics.get(f"{prefix}__rank")
+            if ranked is not None:
+                doc.kv("Watchlist rank", ranked)
+            for group, names in metric_names.items():
+                for name in names:
+                    value = packet.metrics.get(f"{prefix}__{name}")
+                    if value is not None and name != "rank":
+                        doc.kv(f"{group} {name}", value)
+            risks = self._risk_factors_for_symbol(task, symbol)
+            if risks and "risk" in intents:
+                doc.bullets("Risk factors", risks)
+            elif risks:
+                doc.bullets("Recorded risk factors", risks)
+
+        markdown = doc.build()
+        verdict = self._verify(packet, markdown)
+        if not verdict.get("verified"):
+            raise ValueError(
+                f"UNGROUNDED-FOLLOWUP: {verdict.get('error') or 'verification failed'}"
+            )
+
+        cost = 0.0
+        try:
+            report = self._token_ledger.record(
+                system=2,
+                provider="deterministic",
+                model="strategy_qa_followup",
+                prompt_tokens=FOLLOWUP_PROMPT_TOKENS,
+                completion_tokens=FOLLOWUP_COMPLETION_TOKENS,
+                usd_cost=FOLLOWUP_TOKEN_COST_USD,
+            )
+            cost = float(report.get("usd_cost", FOLLOWUP_TOKEN_COST_USD))
+        except Exception:
+            cost = FOLLOWUP_TOKEN_COST_USD
+
+        operator_turn = {
+            "role": "operator",
+            "text": text,
+            "at_ns": now_ns,
+        }
+        agent_turn = {
+            "role": "agent",
+            "text": markdown,
+            "at_ns": int(self._clock()),
+            "grounding_sha256": packet.sha256_digest,
+            "verified": True,
+            "claims_checked": int(verdict.get("claims_checked") or 0),
+            "token_cost_usd": round(cost, 6),
+        }
+        with self._lock:
+            task.conversation_history.extend([operator_turn, agent_turn])
+            history = [dict(turn) for turn in task.conversation_history]
+
+        return {
+            "task_id": task.task_id,
+            "agent_id": task.agent_id,
+            "silo": task.silo,
+            "symbols": list(task.symbols),
+            "question": text,
+            "answer": markdown,
+            "intents": sorted(intents),
+            "conversation_history": history,
+            "turn_index": len(history) // 2,
+            "grounding_sha256": packet.sha256_digest,
+            "verified": True,
+            "verification": verdict,
+            "token": self.token_usage(),
+            "generated_at_ns": now_ns,
+        }
+
+    @staticmethod
+    def _advice_for_symbol(task: AgentTask, symbol: str) -> str | None:
+        """Extract the recorded operation advice for one symbol, if any."""
+
+        found: list[str] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, Mapping):
+                if (
+                    str(node.get("symbol") or "") == str(symbol)
+                    and node.get("operation_advice") is not None
+                ):
+                    found.append(str(node["operation_advice"]))
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, (list, tuple)):
+                for value in node:
+                    walk(value)
+
+        walk(task.structured_result)
+        return found[0] if found else None
+
+    @staticmethod
+    def _risk_factors_for_symbol(task: AgentTask, symbol: str) -> list[str]:
+        """Extract the recorded risk factors for one symbol, deduplicated."""
+
+        found: list[str] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, Mapping):
+                risks = node.get("risk_factors")
+                if str(node.get("symbol") or "") == str(symbol) and isinstance(
+                    risks, (list, tuple)
+                ):
+                    for risk in risks:
+                        text = str(risk).strip()
+                        if text and text not in found:
+                            found.append(text)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, (list, tuple)):
+                for value in node:
+                    walk(value)
+
+        walk(task.structured_result)
+        return found
+
     def _budget_check(self, spec: AgentSpec) -> None:
         ledger = self._token_ledger
         spend = float(getattr(ledger, "spend_usd", 0.0) or 0.0)
@@ -874,6 +1361,7 @@ class AgentTaskDispatcher:
 
         task.markdown_report = markdown
         task.grounding_sha256 = packet.sha256_digest
+        task.fact_packet = packet.to_dict()
         task.verification = verdict
         task.verified = bool(verdict.get("verified"))
         task.structured_result = {

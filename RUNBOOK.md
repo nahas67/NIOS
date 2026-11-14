@@ -1,8 +1,8 @@
 # NIOS Production Operator Runbook
 
 **Document ID:** NIOS-OPS-2026-V3
-**Release tag:** `v3.2.0-V1.1` (supersedes `v3.1.0-V1` and `v3.0.0-PROD`, both frozen)
-**Branch:** `V1.1`
+**Release tag:** `v3.3.0-V1.2` (supersedes `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
+**Branch:** `V1.2`
 **Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
 **Operating constitution:** `AGENTS.md`
@@ -117,8 +117,8 @@ scrypt-hashed, the PIN is PBKDF2-derived, and sessions are HMAC-signed files und
 
 | Workspace | SPA routes | State endpoint |
 |---|---|---|
-| Paper sandbox | `/paper`, `/paper/dashboard`, `/paper/orders`, `/paper/analyzer`, `/paper/quant`, `/paper/brain`, `/paper/forge`, `/paper/ledger`, `/paper/verification`, `/paper/control` | `GET /api/v2/workspace/paper/state` |
-| Live production | `/live`, `/live/dashboard`, `/live/orders`, `/live/positions`, `/live/quant`, `/live/brain`, `/live/ledger`, `/live/control` | `GET /api/v2/workspace/live/state` |
+| Paper sandbox | `/paper`, `/paper/dashboard`, `/paper/orders`, `/paper/analyzer`, `/paper/quant`, `/paper/brain`, `/paper/forge`, `/paper/ledger`, `/paper/verification`, `/paper/control`, `/paper/agents`, `/paper/backtest` | `GET /api/v2/workspace/paper/state` |
+| Live production | `/live`, `/live/dashboard`, `/live/orders`, `/live/positions`, `/live/quant`, `/live/brain`, `/live/ledger`, `/live/control`, `/live/agents`, `/live/backtest` | `GET /api/v2/workspace/live/state` |
 
 The two trees are separate React entry points with separate state contracts. The Live tree
 is sealed: `GET /api/v2/workspace/live/state` answers `401 AUTH_REQUIRED` with no session and
@@ -332,11 +332,11 @@ python scripts/preflight_golive.py --strict      # go-live readiness certificate
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.3.0-V1.2`: `pytest tests -q` must report **312 passed, 0 failed, 0 warnings**
+Release seal for `v3.3.0-V1.2`: `pytest tests -q` must report **313 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 19-suite / 285-test inventory
+### 3.2a The 20-suite / 313-test inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -535,7 +535,7 @@ read-only and the only writes are the explicit control surfaces in this table.
 | `GET` | `/api/v2/cockpit/stream` | SSE cockpit frames at 60 FPS |
 | `GET` | `/api/v2/cockpit/formal-proofs?refresh=` | TLA+ / VOPR / backend telemetry |
 
-#### 5.3.2 Page telemetry — 7 read-only endpoints
+#### 5.3.2 Page telemetry — 9 read-only endpoints
 
 One endpoint per non-dashboard page. Each returns the page header, ring ownership, live organ
 counts and the row set the SPA renders. None of them mutates state, opens a socket, or reads a
@@ -543,12 +543,14 @@ credential.
 
 | Method | Path | Backing surface |
 |---|---|---|
-| `GET` | `/api/v2/cockpit/pages` | 9-page catalogue, alias map, platform-wide counts |
+| `GET` | `/api/v2/cockpit/pages` | 11-page catalogue, alias map, platform-wide counts |
 | `GET` | `/api/v2/cockpit/orders` | SmartOMS blotter, Maker-Peg/TWAP slicers, outbox |
 | `GET` | `/api/v2/cockpit/analyzer` | 30-fill L2 shadow nursery, adverse selection |
 | `GET` | `/api/v2/cockpit/quant` | 490-factor scan, DCF / Black-Scholes, loaders |
 | `GET` | `/api/v2/cockpit/forge` | Alpha Forge leaderboard, plugins, SKILL.md catalog |
 | `GET` | `/api/v2/cockpit/ledger` | Double-entry journal, 35/15 ratchet, TigerBeetle + PG16 |
+| `GET` | `/api/v2/cockpit/agents` | 6 specialist agents, 8 strategies, task queue, token ledger |
+| `GET` | `/api/v2/cockpit/backtest` | 8-strategy catalog, 5 timeframes, silo cost floors, saved runs |
 | `GET` | `/api/v2/cockpit/mcp` | Read-only MCP catalogue + air-gap audit |
 | `GET` | `/api/v2/cockpit/skills/{skill_name}` | One SKILL.md document as structured Markdown |
 
@@ -629,11 +631,28 @@ and verdicts only — Ring 0 alone signs.
 | `GET` | `/api/v2/metrics/json` | JSON telemetry |
 | `GET` | `/metrics` | Prometheus scrape alias |
 
+#### 5.3.7 V1.2 agent task hub and timeframe backtester
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v2/control/agents/assign` | Dispatch one grounded specialist-agent task |
+| `POST` | `/api/v2/control/agents/batch-watchlist` | One decision-dashboard batch over a watchlist; ranks by `signal_score` + `operation_advice`; seals the batch ranking into one SHA-256 packet |
+| `POST` | `/api/v2/control/agents/followup` | Grounded multi-turn strategy Q&A against a completed task; appends to `conversation_history`; re-verified by `NumericalGroundingVerifier` |
+| `GET` | `/api/v2/control/agents/tasks/{task_id}` | Full grounded report plus the Q&A conversation |
+| `POST` | `/api/v2/control/agents/cancel` | Cancel one task or clear the queue |
+| `POST` | `/api/v2/control/backtest/run` | Tax-net walk-forward run; `timeframe` is `1m`/`5m`/`15m`/`1h`/`1d` |
+| `POST` | `/api/v2/control/backtest/compare-strategies` | All 8 harvested strategies on one shared bar series, ranked, with the silo tax-net floor deducted |
+| `POST` | `/api/v2/control/backtest/promote-to-nursery` | DSR-gated entry into the 30-fill L2 shadow nursery |
+
+Cost floors applied by both backtest routes: `INDIA_ZERODHA_DHAN` 8.50 bps (includes 5.50 bps
+STT), `CRYPTO_BINANCE` 16.00 bps, `US_IBKR` 2.80 bps, `FX_MT5` 1.60 bps. An unknown
+`timeframe`, silo or strategy is rejected with `422`; an unknown task is `404 UNKNOWN_TASK`.
+
 ---
 
-## SOP 6 — Nine-Page Cockpit Workstation
+## SOP 6 — Eleven-Page Cockpit Workstation
 
-### 6.1 The nine pages
+### 6.1 The eleven pages
 
 The cockpit is a single React 19 SPA with eleven production pages. `GET /api/v2/cockpit/pages`
 returns the authoritative catalogue, including the alias map; a direct navigation or browser
@@ -650,6 +669,8 @@ refresh on any route is served by the SPA catch-all and never 404s.
 | 7 | IBOR Ledger & Tax | `/ledger` | — | Ring 0 | Double-entry journal, 35/15 ratchet, TigerBeetle + PG16 |
 | 8 | Proofs, Chaos & Telemetry | `/verification` | — | Ring 0 | TLA+ BFS proofs, VOPR campaign, OS tuning, metrics |
 | 9 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | 22-gate pre-flight, credential vault, LLM switchboard, MCP |
+| 10 | Agent Task Hub | `/agents` | — | Ring 2 | 6 specialist agents, watchlist batch ranking, grounded Q&A, token ledger |
+| 11 | Walk-Forward Backtester | `/backtest` | — | Ring 2 | 5 timeframes, 8-strategy tax-net comparison, Purged K-Fold, DSR gate |
 
 `/api` and `/metrics` are excluded from the catch-all, so an unknown API path still returns a
 real `404` instead of the SPA shell.
@@ -667,8 +688,10 @@ real `404` instead of the SPA shell.
 | `/ledger` | `cockpit/ledger` | `ledger/reconcile` |
 | `/verification` | `formal-proofs` | `verification/chaos-drill`, `/vopr`, `/os-tune` |
 | `/control` | `cockpit/mcp`, `control/preflight` | `brokers`, `llms`, `killswitch`, `vault/*` |
+| `/agents` | `cockpit/agents` | `agents/assign`, `agents/batch-watchlist`, `agents/followup`, `agents/cancel` |
+| `/backtest` | `cockpit/backtest` | `backtest/run`, `backtest/compare-strategies`, `backtest/promote-to-nursery` |
 
-### 6.3 Non-destructive 9-page burn-in sweep
+### 6.3 Non-destructive 11-page burn-in sweep
 
 Run this before declaring a documentation or UI release sealed. It never places a live order
 and never mutates a credential.
@@ -680,21 +703,25 @@ python scripts/nios_port_check.py --scan 8000 8010
 # 2. Boot the unified server on the port it printed
 python scripts/run_nios.py --host 127.0.0.1 --port <PORT>
 
-# 3. Sweep all 9 SPA routes + 4 aliases (expect 200 + index.html on every one)
-#    /dashboard /orders /analyzer /quant /brain /forge /ledger /verification /control
+# 3. Sweep all 11 SPA routes + 4 aliases (expect 200 + index.html on every one)
+#    /dashboard /orders /analyzer /quant /brain /forge /ledger /verification
+#    /control /agents /backtest
 #    / /positions /xray /mcp
 
-# 4. Sweep the 7 page-telemetry endpoints + skills document
+# 4. Sweep the 9 page-telemetry endpoints + skills document
 #    /api/v2/cockpit/pages /orders /analyzer /quant /forge /ledger /mcp
+#    /api/v2/cockpit/agents /api/v2/cockpit/backtest
 #    /api/v2/cockpit/skills/<skill_name>
 
 # 5. Sweep the 12 workstation controls with their documented payloads (expect 200)
+#    plus the V1.2 agent/backtest controls: agents/assign, agents/batch-watchlist,
+#    agents/followup, backtest/run, backtest/compare-strategies
 
 # 6. Shut down cleanly; `git status --porcelain` must be empty afterwards.
 ```
 
-Acceptance: **9/9 routes**, **7/7 page endpoints**, **12/12 controls** at `200 OK`, then a clean
-`Ctrl+C` and an empty `git status --porcelain`. Any non-200 is a release blocker — do not retry
+Acceptance: **11/11 routes**, **9/9 page endpoints**, **12/12 controls**, **5/5 V1.2 controls**
+at `200 OK`, then a clean `Ctrl+C` and an empty `git status --porcelain`. Any non-200 is a release blocker — do not retry
 around it, read the response body.
 
 ### 6.4 Reference payloads
@@ -720,6 +747,15 @@ POST /api/v2/control/brain/mirofish-shock
 POST /api/v2/control/brain/committee-debate {"silo":"US_IBKR","symbol":"AUTO","spread_bps":3.0}
 POST /api/v2/control/forge/evaluate-challenger
 {"plugin_name":"challenger_alpha_7","candidate_sharpe":1.85,"shadow_fills":30,"silo":"US_IBKR"}
+
+POST /api/v2/control/agents/batch-watchlist
+{"silo":"US_IBKR","symbols":["SPY","QQQ","IWM","DIA"],"strategy_id":"ma_golden_cross"}
+POST /api/v2/control/agents/followup
+{"task_id":"task_<id>","question":"What are the target and stop levels, and the main risk?"}
+POST /api/v2/control/backtest/run
+{"silo":"US_IBKR","symbol":"SPY","strategy_id":"ma_golden_cross","bars":252,"timeframe":"5m"}
+POST /api/v2/control/backtest/compare-strategies
+{"silo":"INDIA_ZERODHA_DHAN","symbol":"RELIANCE","timeframe":"1d","bars":252}
 ```
 
 `committee-debate` (and `orders/paper`) reject an unknown `silo` with `422`; use a real silo id

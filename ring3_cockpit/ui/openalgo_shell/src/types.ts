@@ -1879,6 +1879,74 @@ export interface AgentCancelReceipt {
   [key: string]: unknown
 }
 
+export interface AgentWatchlistRankRow {
+  symbol: string
+  rank: number
+  signal_score: number
+  operation_advice: string
+  close_price: number
+  target_price: number
+  stop_loss: number
+  reward_risk: number
+  rsi_14: number
+  risk_factors: string[]
+  best_strategy_id: string
+  grounding_sha256: string
+  verified: boolean
+  [key: string]: unknown
+}
+
+export interface AgentBatchWatchlistPayload {
+  silo: string
+  symbols: string[]
+  strategy_id?: string | null
+}
+
+export interface AgentBatchWatchlistReceipt extends AgentAssignReceipt {
+  structured_result: {
+    batch?: boolean
+    watchlist_size?: number
+    ranking?: AgentWatchlistRankRow[]
+    top_symbol?: string | null
+    advice_by_symbol?: Record<string, string>
+    score_by_symbol?: Record<string, number>
+    [key: string]: unknown
+  }
+}
+
+export interface AgentConversationTurn {
+  role: string
+  text: string
+  at_ns: number
+  grounding_sha256?: string
+  verified?: boolean
+  claims_checked?: number
+  token_cost_usd?: number
+  [key: string]: unknown
+}
+
+export interface AgentFollowupPayload {
+  task_id: string
+  question: string
+}
+
+export interface AgentFollowupReceipt {
+  task_id: string
+  agent_id: string
+  silo: string
+  symbols: string[]
+  question: string
+  answer: string
+  intents: string[]
+  conversation_history: AgentConversationTurn[]
+  turn_index: number
+  grounding_sha256: string
+  verified: boolean
+  verification: Record<string, unknown>
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
 export interface AgentsPageData {
   page: string
   route: string
@@ -1907,6 +1975,9 @@ export interface AgentsPageData {
 // ---------------------------------------------------------------------------
 // V1.2 - walk-forward backtesting workstation (/backtest)
 // ---------------------------------------------------------------------------
+
+/** Selectable bar frequencies for the walk-forward backtester. */
+export type BacktestTimeframe = '1m' | '5m' | '15m' | '1h' | '1d'
 
 export interface CostFloorRow {
   silo: string
@@ -1951,6 +2022,8 @@ export interface BacktestPageData {
   strategy_count: number
   strategies: StrategyTemplate[]
   silos: string[]
+  timeframes: BacktestTimeframe[]
+  default_timeframe: BacktestTimeframe
   cost_floors: Record<string, number>
   cost_floor_table: CostFloorRow[]
   k_folds: number
@@ -2008,6 +2081,7 @@ export interface BacktestRunPayload {
   symbol: string
   strategy_id: string
   bars: number
+  timeframe: BacktestTimeframe
   initial_capital_units: number
   fast_window?: number | null
   slow_window?: number | null
@@ -2022,6 +2096,9 @@ export interface BacktestReceipt {
   strategy_id: string
   strategy_name: string
   bars: number
+  timeframe: BacktestTimeframe
+  bars_per_year: number
+  bar_interval_ns: number
   cost_floor_bps: number
   statutory_tax_bps: number
   initial_capital_units: number
@@ -2072,6 +2149,50 @@ export interface NurseryPromotionReceipt {
   nursery_bypassed: boolean
   grounding_sha256: string
   next: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface BacktestComparePayload {
+  silo: string
+  symbol: string
+  timeframe: BacktestTimeframe
+  bars: number
+}
+
+export interface BacktestComparisonRow {
+  rank: number
+  strategy_id: string
+  strategy_name: string
+  backtest_id: string
+  total_return_pct: number
+  sharpe_ratio: number
+  deflated_sharpe_ratio: number
+  passes_dsr_gate: boolean
+  net_edge_bps: number
+  win_rate_pct: number
+  total_trades: number
+  max_drawdown_pct: number
+  cost_floor_bps: number
+  grounding_sha256: string
+  verified: boolean
+  [key: string]: unknown
+}
+
+export interface BacktestComparisonReceipt {
+  silo: string
+  symbol: string
+  timeframe: BacktestTimeframe
+  bars: number
+  bars_per_year: number
+  bar_interval_ns: number
+  cost_floor_bps: number
+  statutory_tax_bps: number
+  dsr_gate: number
+  strategy_count: number
+  leaderboard: BacktestComparisonRow[]
+  best_strategy: BacktestComparisonRow | null
+  comparison_sha256: string
   generated_at_ns: number
   [key: string]: unknown
 }

@@ -909,3 +909,247 @@ def test_gate4_cockpit_bundle_is_built() -> None:
     assert "assets/" in text
     assets = list((UI_ROOT / "dist" / "assets").glob("*.js"))
     assert assets, "dist/assets has no JavaScript bundle"
+
+def test_gate5_watchlist_batch_qa_followup_and_8_strategy_comparison(
+    client,
+    session_token,
+) -> None:
+    """V1.2 Step 2: batch watchlist, grounded Q&A, timeframes, 8-way compare."""
+
+    from ring2_brain.quant.daily_analysis_donor import OPERATION_ADVICE
+
+    headers = _headers(session_token)
+
+    reset = client.post("/api/v2/control/workspace/reset", headers=headers)
+    assert reset.status_code == 200, reset.text
+
+    # -- 1. Multi-symbol watchlist batch ranking --------------------------
+    batch = client.post(
+        "/api/v2/control/agents/batch-watchlist",
+        headers=headers,
+        json={
+            "silo": "US_IBKR",
+            "symbols": ["SPY", "QQQ", "IWM", "DIA"],
+            "strategy_id": "ma_golden_cross",
+        },
+    )
+    assert batch.status_code == 200, batch.text
+    body = batch.json()
+    assert body["status"] == "COMPLETED"
+    assert body["verified"] is True
+    assert body["task_id"].startswith("task_")
+    assert _is_sha256(body["grounding_sha256"])
+    assert body["fact_count"] > 0
+
+    structured = body["structured_result"]
+    ranking = structured["ranking"]
+    assert structured["batch"] is True
+    assert structured["watchlist_size"] == 4
+    assert structured["strategy_id"] == "ma_golden_cross"
+    assert [row["rank"] for row in ranking] == [1, 2, 3, 4]
+    assert [row["symbol"] for row in ranking] == sorted(
+        (row["symbol"] for row in ranking),
+        key=lambda symbol: -next(
+            row["signal_score"] for row in ranking if row["symbol"] == symbol
+        ),
+    )
+    for row in ranking:
+        assert 0.0 <= row["signal_score"] <= 100.0
+        assert row["operation_advice"] in OPERATION_ADVICE
+        assert _is_sha256(row["grounding_sha256"])
+        assert row["target_price"] > 0.0
+        assert row["stop_loss"] > 0.0
+        assert row["reward_risk"] >= 0.0
+    scores = [row["signal_score"] for row in ranking]
+    assert scores == sorted(scores, reverse=True)
+    assert structured["top_symbol"] == ranking[0]["symbol"]
+
+    stored = client.get(
+        f"/api/v2/control/agents/tasks/{body['task_id']}", headers=headers
+    )
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["conversation_history"] == []
+
+    # -- 2. Grounded multi-turn strategy Q&A follow-up --------------------
+    first = client.post(
+        "/api/v2/control/agents/followup",
+        headers=headers,
+        json={
+            "task_id": body["task_id"],
+            "question": "What are the target and stop levels and the main risk?",
+        },
+    )
+    assert first.status_code == 200, first.text
+    turn = first.json()
+    assert turn["verified"] is True
+    assert turn["task_id"] == body["task_id"]
+    assert turn["turn_index"] == 1
+    assert len(turn["conversation_history"]) == 2
+    assert turn["conversation_history"][0]["role"] == "operator"
+    assert turn["conversation_history"][1]["role"] == "agent"
+    assert _is_sha256(turn["grounding_sha256"])
+    assert "levels stop_loss" in turn["answer"]
+    assert "Risk factors" in turn["answer"]
+    verification = turn["verification"]
+    assert verification["verified"] is True
+    assert verification["claims_checked"] >= 1
+    assert verification["digest"] == turn["grounding_sha256"]
+
+    second = client.post(
+        "/api/v2/control/agents/followup",
+        headers=headers,
+        json={
+            "task_id": body["task_id"],
+            "question": "How do the RSI and moving-average indicators look?",
+        },
+    )
+    assert second.status_code == 200, second.text
+    second_turn = second.json()
+    assert second_turn["turn_index"] == 2
+    assert len(second_turn["conversation_history"]) == 4
+    assert "indicators rsi_fourteen" in second_turn["answer"]
+    assert "indicators atr_fourteen" in second_turn["answer"]
+    assert second_turn["verified"] is True
+
+    missing = client.post(
+        "/api/v2/control/agents/followup",
+        headers=headers,
+        json={"task_id": "task_missing", "question": "What is the target?"},
+    )
+    assert missing.status_code == 404
+
+    # -- 3. Timeframe selection scales annualisation and volatility -------
+    daily = client.post(
+        "/api/v2/control/backtest/run",
+        headers=headers,
+        json={
+            "silo": "US_IBKR",
+            "symbol": "SPY",
+            "strategy_id": "ma_golden_cross",
+            "bars": 120,
+            "timeframe": "1d",
+        },
+    )
+    assert daily.status_code == 200, daily.text
+    daily_body = daily.json()
+    assert daily_body["timeframe"] == "1d"
+    assert daily_body["bars_per_year"] == 252
+    assert daily_body["metrics"]["bars_per_year"] == 252.0
+    assert daily_body["bar_interval_ns"] == 86_400_000_000_000
+
+    five_minute = client.post(
+        "/api/v2/control/backtest/run",
+        headers=headers,
+        json={
+            "silo": "US_IBKR",
+            "symbol": "SPY",
+            "strategy_id": "ma_golden_cross",
+            "bars": 120,
+            "timeframe": "5m",
+        },
+    )
+    assert five_minute.status_code == 200, five_minute.text
+    five_body = five_minute.json()
+    assert five_body["timeframe"] == "5m"
+    assert five_body["bars_per_year"] == 19656
+    assert five_body["metrics"]["bars_per_year"] == 19656.0
+    assert five_body["bar_interval_ns"] == 300_000_000_000
+    assert five_body["metrics"]["sharpe_ratio"] != daily_body["metrics"]["sharpe_ratio"]
+
+    minute = client.post(
+        "/api/v2/control/backtest/run",
+        headers=headers,
+        json={
+            "silo": "US_IBKR",
+            "symbol": "SPY",
+            "strategy_id": "ma_golden_cross",
+            "bars": 90,
+            "timeframe": "1m",
+        },
+    )
+    assert minute.status_code == 200, minute.text
+    assert minute.json()["metrics"]["bars_per_year"] == 98280.0
+
+    bad_timeframe = client.post(
+        "/api/v2/control/backtest/run",
+        headers=headers,
+        json={
+            "silo": "US_IBKR",
+            "symbol": "SPY",
+            "strategy_id": "ma_golden_cross",
+            "bars": 120,
+            "timeframe": "4h",
+        },
+    )
+    assert bad_timeframe.status_code == 422
+
+    # -- 4. Eight-strategy tax-net comparison matrix ----------------------
+    compare = client.post(
+        "/api/v2/control/backtest/compare-strategies",
+        headers=headers,
+        json={
+            "silo": "INDIA_ZERODHA_DHAN",
+            "symbol": "RELIANCE",
+            "timeframe": "1d",
+            "bars": 180,
+        },
+    )
+    assert compare.status_code == 200, compare.text
+    matrix = compare.json()
+    assert matrix["strategy_count"] == 8
+    assert matrix["timeframe"] == "1d"
+    assert matrix["bars_per_year"] == 252
+    assert matrix["cost_floor_bps"] == 8.5
+    assert matrix["statutory_tax_bps"] == 5.5
+    assert _is_sha256(matrix["comparison_sha256"])
+    leaderboard = matrix["leaderboard"]
+    assert len(leaderboard) == 8
+    assert {row["strategy_id"] for row in leaderboard} == set(EXPECTED_STRATEGIES)
+    assert [row["rank"] for row in leaderboard] == list(range(1, 9))
+    assert [row["deflated_sharpe_ratio"] for row in leaderboard] == sorted(
+        (row["deflated_sharpe_ratio"] for row in leaderboard), reverse=True
+    )
+    for row in leaderboard:
+        assert row["cost_floor_bps"] == 8.5
+        assert isinstance(row["passes_dsr_gate"], bool)
+        assert row["max_drawdown_pct"] >= 0.0
+        assert 0.0 <= row["win_rate_pct"] <= 100.0
+        assert _is_sha256(row["grounding_sha256"])
+        assert row["backtest_id"].startswith("bt_")
+    assert matrix["best_strategy"]["strategy_id"] == leaderboard[0]["strategy_id"]
+
+    us_compare = client.post(
+        "/api/v2/control/backtest/compare-strategies",
+        headers=headers,
+        json={"silo": "US_IBKR", "symbol": "SPY", "timeframe": "1h", "bars": 120},
+    )
+    assert us_compare.status_code == 200, us_compare.text
+    us_body = us_compare.json()
+    assert us_body["cost_floor_bps"] == 2.8
+    assert us_body["statutory_tax_bps"] == 0.0
+    assert us_body["bars_per_year"] == 1638
+    assert len(us_body["leaderboard"]) == 8
+
+    crypto_compare = client.post(
+        "/api/v2/control/backtest/compare-strategies",
+        headers=headers,
+        json={"silo": "CRYPTO_BINANCE", "symbol": "BTC-USDT", "bars": 90},
+    )
+    assert crypto_compare.status_code == 200, crypto_compare.text
+    assert crypto_compare.json()["cost_floor_bps"] == 16.0
+
+    # -- 5. Page contracts advertise the new controls ---------------------
+    agents_page = client.get("/api/v2/cockpit/agents", headers=headers).json()
+    assert agents_page["routes"]["batch_watchlist"] == (
+        "/api/v2/control/agents/batch-watchlist"
+    )
+    assert agents_page["routes"]["followup"] == "/api/v2/control/agents/followup"
+    backtest_page = client.get("/api/v2/cockpit/backtest", headers=headers).json()
+    assert backtest_page["routes"]["compare"] == (
+        "/api/v2/control/backtest/compare-strategies"
+    )
+    assert "1m" in backtest_page["timeframes"]
+    assert "1d" in backtest_page["timeframes"]
+
+    purge = client.post("/api/v2/control/workspace/reset", headers=headers)
+    assert purge.status_code == 200, purge.text
