@@ -809,26 +809,30 @@ def test_gate3_backtest_history_survives_until_reset_purges_it(
 # ---------------------------------------------------------------------------
 
 
-def test_gate4_pages_index_advertises_eleven_pages(client, session_token) -> None:
+def test_gate4_pages_index_advertises_fifteen_pages(client, session_token) -> None:
     headers = _headers(session_token)
     response = client.get("/api/v2/cockpit/pages", headers=headers)
     assert response.status_code == 200, response.text
     body = response.json()
 
-    assert body["page_count"] == 11
+    assert body["page_count"] == 15
     keys = [page["key"] for page in body["pages"]]
     assert keys == [
         "dashboard",
+        "terminal",
         "orders",
+        "options",
         "analyzer",
         "quant",
+        "agents",
+        "backtest",
         "brain",
         "forge",
         "ledger",
+        "logbook",
         "verification",
+        "brokers",
         "control",
-        "agents",
-        "backtest",
     ]
 
     for key, route in (("agents", "/agents"), ("backtest", "/backtest")):
@@ -875,7 +879,7 @@ def test_gate4_spa_route_aliases_are_declared() -> None:
     app_source = (SRC_ROOT / "App.tsx").read_text(encoding="utf-8")
     assert "case 'agents':" in app_source
     assert "case 'backtest':" in app_source
-    assert "11 production pages" in app_source
+    assert "15 production pages" in app_source
 
     workspace_source = (SRC_ROOT / "pages" / "workspace.tsx").read_text(
         encoding="utf-8"

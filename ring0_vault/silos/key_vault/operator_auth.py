@@ -8,10 +8,18 @@ KDF digests; the plaintext never touches disk, a log line, or a response body.
 Two credential factors are deliberately separate:
 
 * ``password``     -- authenticates the operator into the **PAPER** sandbox.
-* ``live_pin``     -- the second factor that elevates an existing PAPER
-  session to **LIVE**.  It is never accepted on its own: elevation requires a
-  valid PAPER session token *and* the PIN, so a stolen PIN is useless without a
-  login.
+* ``live_pin``     -- the second factor for **LIVE**.  It is never accepted on
+  its own: either a valid PAPER session token *and* the PIN (legacy
+  ``/api/v2/auth/elevate-live``), or the password and the PIN in one atomic
+  request (``/api/v2/auth/login/live``).  A stolen PIN is useless without the
+  password, and a stolen password is useless without the PIN.
+
+V1.3 adds the two explicit portals without touching the legacy contract:
+
+* :meth:`OperatorAuth.login_paper` -- ``POST /api/v2/auth/login/paper``.
+* :meth:`OperatorAuth.login_live`  -- ``POST /api/v2/auth/login/live``: a single
+  three-factor request (username + password + PIN) that mints a LIVE session
+  directly, so a live operator never has to hold a PAPER token first.
 
 Session tokens are stateless HMAC-SHA256 bearer tokens signed with a per-vault
 random key.  A token carries ``username``, ``tier`` and ``exp``; ``revoke_session``
@@ -50,7 +58,6 @@ __all__ = [
     "default_operator_auth",
     "reset_operator_auth_singleton",
 ]
-
 NONE_TIER = "NONE"
 PAPER_TIER = "PAPER"
 LIVE_TIER = "LIVE"
@@ -121,12 +128,15 @@ class OperatorSession:
     tier: str
     issued_ns: int
     expires_ns: int
+    #: The workspace this session was minted for: ``PAPER`` or ``LIVE``.
+    workspace: str = PAPER_TIER
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "token": self.token,
             "username": self.username,
             "tier": self.tier,
+            "workspace": self.workspace,
             "issued_ns": int(self.issued_ns),
             "expires_ns": int(self.expires_ns),
         }
@@ -286,34 +296,85 @@ class OperatorAuth:
             return self._issue(record, PAPER_TIER)
 
     # -- login -------------------------------------------------------------
+    def _verify_password(self, record: Mapping[str, Any], username: str, password: str) -> bool:
+        """Constant-time check of the ``scrypt`` password digest.
+
+        Both the operator handle and the digest are always compared, so a wrong
+        username cannot be told apart from a wrong password.
+        """
+        stored = record.get("password") or {}
+        salt = _b64d(str(stored.get("salt", "")))
+        expected = _b64d(str(stored.get("hash", "")))
+        supplied = _derive_scrypt(str(password or ""), salt)
+        user_ok = hmac.compare_digest(str(username or "").strip(), str(record.get("username", "")))
+        secret_ok = hmac.compare_digest(supplied, expected)
+        return bool(user_ok and secret_ok)
+
+    def _verify_pin(self, record: Mapping[str, Any], live_pin: str) -> bool:
+        """Constant-time check of the ``pbkdf2_hmac`` live-PIN digest."""
+        pin = str(live_pin or "").strip()
+        stored = record.get("live_pin") or {}
+        salt = _b64d(str(stored.get("salt", "")))
+        expected = _b64d(str(stored.get("hash", "")))
+        return bool(hmac.compare_digest(_derive_pbkdf2(pin, salt), expected))
+
     def login_operator(self, username: str, password: str) -> OperatorSession:
         with self._lock:
             record = self._load()
             if record is None:
                 raise OperatorAuthFailed("no operator registered")
-            user = str(username or "").strip()
-            stored = record.get("password") or {}
-            salt = _b64d(str(stored.get("salt", "")))
-            expected = _b64d(str(stored.get("hash", "")))
-            supplied = _derive_scrypt(str(password or ""), salt)
-            user_ok = hmac.compare_digest(user, str(record.get("username", "")))
-            secret_ok = hmac.compare_digest(supplied, expected)
-            if not (user_ok and secret_ok):
+            if not self._verify_password(record, username, password):
                 raise OperatorAuthFailed("invalid credentials")
             return self._issue(record, PAPER_TIER)
+
+    def login_paper(self, username: str, password: str) -> OperatorSession:
+        """``POST /api/v2/auth/login/paper`` -- a 12 h PAPER session."""
+        session = self.login_operator(username, password)
+        if session.tier != PAPER_TIER:  # pragma: no cover - defensive
+            raise OperatorAuthFailed("invalid tier")
+        return session
+
+    def login_live(
+        self, username: str, password: str, live_pin: str
+    ) -> OperatorSession:
+        """``POST /api/v2/auth/login/live`` -- one atomic three-factor login.
+
+        The password is verified against the ``scrypt`` digest and the PIN
+        against the ``pbkdf2_hmac`` digest, both in constant time.  A missing or
+        non-numeric PIN is rejected before either KDF runs, so the two failure
+        classes stay distinguishable to the gateway without leaking *which*
+        factor was wrong:
+
+        * bad username/password  -> :class:`OperatorAuthFailed` (``401``)
+        * missing/invalid PIN    -> :class:`LivePinRejected`  (``403``)
+
+        The resulting token is a 30 min LIVE session, single-purpose: it never
+        downgrades to PAPER and it is not minted from a PAPER token, so the
+        live portal is a first-class entry point rather than an elevation.
+        """
+        pin = str(live_pin or "").strip()
+        if not pin or not pin.isdigit():
+            raise LivePinRejected("live PIN rejected")
+        with self._lock:
+            record = self._load()
+            if record is None:
+                raise OperatorAuthFailed("no operator registered")
+            password_ok = self._verify_password(record, username, password)
+            pin_ok = self._verify_pin(record, pin)
+            if not password_ok:
+                raise OperatorAuthFailed("invalid credentials")
+            if not pin_ok:
+                raise LivePinRejected("live PIN rejected")
+            return self._issue(record, LIVE_TIER)
 
     # -- elevation ---------------------------------------------------------
     def elevate_to_live(self, session_token: str, live_pin: str) -> OperatorSession:
         with self._lock:
-            current = self.decode_session(session_token)
+            self.decode_session(session_token)
             record = self._load()
             if record is None:  # pragma: no cover - token implies a record
                 raise OperatorAuthFailed("no operator registered")
-            pin = str(live_pin or "").strip()
-            stored = record.get("live_pin") or {}
-            salt = _b64d(str(stored.get("salt", "")))
-            expected = _b64d(str(stored.get("hash", "")))
-            if not hmac.compare_digest(_derive_pbkdf2(pin, salt), expected):
+            if not self._verify_pin(record, live_pin):
                 raise LivePinRejected("live PIN rejected")
             # The PAPER token is single-use for elevation: revoke it so a
             # replayed cookie can never mint a second LIVE session.
@@ -335,6 +396,7 @@ class OperatorAuth:
         claims = {
             "u": str(record.get("username", "")),
             "t": str(tier),
+            "w": str(tier),
             "iat": now,
             "exp": now + int(ttl_s) * 1_000_000_000,
             "n": secrets.token_hex(8),
@@ -348,6 +410,7 @@ class OperatorAuth:
             tier=str(tier),
             issued_ns=int(claims["iat"]),
             expires_ns=int(claims["exp"]),
+            workspace=str(claims["w"]),
         )
 
     def decode_session(self, session_token: str | None) -> dict[str, Any]:
@@ -390,6 +453,7 @@ class OperatorAuth:
         return {
             "username": str(claims.get("u", "")),
             "tier": str(claims.get("t", NONE_TIER)),
+            "workspace": str(claims.get("w", claims.get("t", NONE_TIER))),
             "issued_ns": int(claims.get("iat", 0)),
             "expires_ns": int(claims.get("exp", 0)),
         }
@@ -405,6 +469,9 @@ class OperatorAuth:
                 "username": (claims or {}).get("username")
                 or (str(record.get("username")) if record else None),
                 "tier": (claims or {}).get("tier", NONE_TIER),
+                "workspace": (claims or {}).get("workspace", NONE_TIER),
+                "issued_ns": int((claims or {}).get("issued_ns", 0) or 0),
+                "expires_ns": int((claims or {}).get("expires_ns", 0) or 0),
                 "clean_slate_active": False,
             }
 

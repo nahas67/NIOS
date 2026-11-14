@@ -981,3 +981,143 @@
      be invalid under half of them. The editor already sets its own colour. */
   color: inherit;
 }
+
+
+/* ==========================================================================
+   V1.3 design system - dark SaaS glassmorphism, isometric ring cards and the
+   two physically distinct workspace shells.
+   These are plain classes (not utilities) so the shells own their look even
+   when a page renders its own Tailwind palette.
+   ========================================================================== */
+
+/* The base glass surface: a 1px specular top edge over a blurred card.
+   Used by every panel that sits directly on the obsidian background. */
+.nios-glass {
+  position: relative;
+  border-radius: 0.9rem;
+  border: 1px solid rgb(148 163 184 / 0.16);
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 0.045), rgb(255 255 255 / 0.012)),
+    rgb(9 9 14 / 0.72);
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.06),
+    0 18px 40px -24px rgb(0 0 0 / 0.9);
+}
+
+/* The brighter specular border used for the hero / login cards. */
+.nios-glass-strong {
+  border-color: rgb(148 163 184 / 0.26);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.12),
+    0 30px 80px -30px rgb(0 0 0 / 0.95);
+}
+
+/* Isometric architecture card: three stacked translucent planes suggest the
+   four-ring topology without shipping a raster asset. */
+.nios-iso-plane {
+  transform: skewY(-4deg) rotateX(6deg);
+  border-radius: 0.85rem;
+  border: 1px solid rgb(148 163 184 / 0.20);
+  background: linear-gradient(135deg, rgb(255 255 255 / 0.05), transparent 65%);
+  transition: transform 220ms ease, border-color 220ms ease;
+}
+.nios-iso-plane:hover {
+  transform: skewY(-2deg) rotateX(3deg) translateY(-2px);
+  border-color: rgb(148 163 184 / 0.38);
+}
+
+/* Crisp tabular numerals: prices, Greeks, bps. Never let a digit jitter. */
+.nios-tabular {
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: 'tnum' 1, 'lnum' 1;
+  letter-spacing: -0.01em;
+}
+
+/* Accent rail for a grouped sidebar section. */
+.nios-group-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: rgb(148 163 184 / 0.85);
+}
+
+/* Paper sandbox shell: deep obsidian with lavender + cyan accents. */
+.nios-shell-paper {
+  --nios-accent: #a78bfa;
+  --nios-accent-2: #22d3ee;
+  background:
+    radial-gradient(70rem 34rem at 8% -10%, rgb(167 139 250 / 0.14), transparent 65%),
+    radial-gradient(60rem 30rem at 96% 4%, rgb(34 211 238 / 0.12), transparent 65%),
+    #06060a;
+}
+
+/* Live production shell: matte carbon with crimson + amber hazard accents. */
+.nios-shell-live {
+  --nios-accent: #f43f5e;
+  --nios-accent-2: #f59e0b;
+  background:
+    radial-gradient(70rem 34rem at 10% -10%, rgb(244 63 94 / 0.16), transparent 62%),
+    radial-gradient(60rem 30rem at 92% 6%, rgb(245 158 11 / 0.12), transparent 62%),
+    #080607;
+}
+
+/* Hazard-striped ribbon for the live vault: no page in /live/* may look calm. */
+.nios-hazard {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgb(244 63 94 / 0.22) 0px,
+    rgb(244 63 94 / 0.22) 10px,
+    rgb(245 158 11 / 0.16) 10px,
+    rgb(245 158 11 / 0.16) 20px
+  );
+}
+
+/* Armoured left rail used by the LIVE sidebar. */
+.nios-armored-rail {
+  border-left: 3px solid rgb(244 63 94 / 0.75);
+  box-shadow: inset 3px 0 0 rgb(245 158 11 / 0.35);
+}
+
+/* Soft glow used for a live session TTL / kill-switch chip. */
+.nios-live-chip {
+  border: 1px solid rgb(244 63 94 / 0.45);
+  background: rgb(244 63 94 / 0.12);
+  color: rgb(254 205 211);
+  box-shadow: 0 0 18px -6px rgb(244 63 94 / 0.75);
+}
+
+/* Soft glow used for a paper sandbox chip. */
+.nios-paper-chip {
+  border: 1px solid rgb(34 211 238 / 0.45);
+  background: rgb(34 211 238 / 0.12);
+  color: rgb(165 243 252);
+  box-shadow: 0 0 18px -6px rgb(34 211 238 / 0.7);
+}
+
+/* The dual-portal gateway split: two cards side by side on desktop. */
+.nios-portal-grid {
+  display: grid;
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+@media (min-width: 1024px) {
+  .nios-portal-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Redacted credential chip: the only representation of a venue secret. */
+.nios-masked-secret {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.16em;
+  color: rgb(148 163 184 / 0.9);
+}
+
+/* A strike row that is at the money keeps a visible anchor in the chain. */
+.nios-atm-row {
+  background: linear-gradient(90deg, rgb(34 211 238 / 0.10), transparent 70%);
+  box-shadow: inset 2px 0 0 rgb(34 211 238 / 0.8);
+}

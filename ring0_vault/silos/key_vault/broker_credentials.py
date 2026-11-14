@@ -43,7 +43,9 @@ __all__ = [
     "BrokerCredentialVault",
     "BROKER_VAULT_ENV",
     "default_broker_vault",
+    "digest_payload",
     "mask_secret",
+    "signing_self_test",
 ]
 
 #: Override the vault root (tests point this at ``tmp_path``).
@@ -334,3 +336,50 @@ def digest_payload(payload: Any) -> bytes:
 
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).digest()
+
+
+def signing_self_test(
+    vault: BrokerCredentialVault | None = None,
+    *,
+    venue: str = "self_test",
+) -> dict[str, Any]:
+    """Prove the Ring 0 Ed25519 signer round-trips without exposing key material.
+
+    The broker hub needs to show an operator that "dry-run signing is READY" for
+    every venue.  It must never show the key, the seed, or a signature that
+    could be replayed as an order, so this probe signs a digest that is derived
+    from the venue name and the current key fingerprint, verifies it in the same
+    call, and returns only boolean/digest evidence (``sec_011``).
+
+    Returns a dict with ``algorithm``, ``verified``, ``public_fingerprint``,
+    ``message_sha256`` and ``signature_length``.  No raw key is present in the
+    returned mapping by construction.
+    """
+
+    resolved = vault if vault is not None else default_broker_vault()
+    message = digest_payload(
+        {
+            "probe": "nios.ring0.signing_self_test.v1",
+            "venue": str(venue),
+            "fingerprint": resolved.ed25519_public_fingerprint,
+        }
+    )
+    try:
+        signature = resolved.sign(message)
+        verified = bool(resolved.verify(message, signature))
+    except Exception as exc:  # noqa: BLE001 - a broken signer is a red row
+        return {
+            "algorithm": "Ed25519",
+            "verified": False,
+            "public_fingerprint": "",
+            "message_sha256": hashlib.sha256(message).hexdigest(),
+            "signature_length": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "algorithm": "Ed25519",
+        "verified": verified,
+        "public_fingerprint": resolved.ed25519_public_fingerprint,
+        "message_sha256": hashlib.sha256(message).hexdigest(),
+        "signature_length": len(signature),
+    }

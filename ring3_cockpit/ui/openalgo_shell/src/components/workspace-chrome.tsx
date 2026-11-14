@@ -9,7 +9,13 @@ interface WorkspaceSwitcherProps {
   onNavigate: (path: string) => void
 }
 
-/** Top-bar `[ PAPER SANDBOX ]` vs `[ 🔒 LIVE PRODUCTION ]` switcher. */
+/**
+ * `[ PAPER SANDBOX ]` vs `[ 🔒 LIVE PRODUCTION ]`.
+ *
+ * A locked live vault routes to `/live/login` — the dedicated portal — rather
+ * than the legacy two-step `/live-unlock`, because V1.3 mints LIVE sessions from
+ * one three-factor request.
+ */
 export function WorkspaceSwitcher({ mode, tier, onNavigate }: WorkspaceSwitcherProps) {
   const liveUnlocked = tier === 'LIVE'
   return (
@@ -37,9 +43,7 @@ export function WorkspaceSwitcher({ mode, tier, onNavigate }: WorkspaceSwitcherP
         type="button"
         role="tab"
         aria-selected={mode === 'live'}
-        onClick={() =>
-          onNavigate(liveUnlocked ? '/live/dashboard' : '/live-unlock')
-        }
+        onClick={() => onNavigate(liveUnlocked ? '/live/dashboard' : '/live/login')}
         className={cn(
           'flex items-center gap-1.5 rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] transition',
           mode === 'live'
@@ -54,55 +58,76 @@ export function WorkspaceSwitcher({ mode, tier, onNavigate }: WorkspaceSwitcherP
   )
 }
 
-/** Prominent mode banner: cyan/emerald for Paper, crimson/amber for Live. */
-export function WorkspaceBanner({
-  mode,
-  cleanSlate,
-  navUnits,
-  shadowFills,
-  autopilot,
-  tier,
+/** One compact, mode-tinted chip used across both shell ribbons. */
+export function ShellChip({
+  tone,
+  children,
+  className,
 }: {
-  mode: WorkspaceMode
-  cleanSlate?: boolean
-  navUnits?: number
-  shadowFills?: number
-  autopilot?: boolean
-  tier?: AuthTier
+  tone: 'paper' | 'live' | 'neutral'
+  children: React.ReactNode
+  className?: string
 }) {
-  if (mode === 'live') {
-    return (
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-rose-500/40 bg-gradient-to-r from-rose-950/60 via-rose-900/30 to-amber-900/20 px-4 py-2 text-[11px] text-rose-100 lg:px-6">
-        <span className="flex items-center gap-2 font-semibold uppercase tracking-[0.18em]">
-          <Lock className="size-3.5" />
-          Live Production — Authenticated
-        </span>
-        <span className="flex items-center gap-3 text-rose-200/80">
-          <span>tier {tier ?? 'NONE'}</span>
-          <span className="text-rose-300/60">·</span>
-          <span>no paper orders · no paper balances</span>
-        </span>
-      </div>
-    )
-  }
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-cyan-500/40 bg-gradient-to-r from-cyan-950/60 via-emerald-950/40 to-teal-900/20 px-4 py-2 text-[11px] text-cyan-100 lg:px-6">
-      <span className="flex items-center gap-2 font-semibold uppercase tracking-[0.18em]">
-        <ShieldCheck className="size-3.5" />
-        Paper Sandbox
-        {cleanSlate ? (
-          <span className="rounded-full border border-emerald-400/50 bg-emerald-500/10 px-2 py-0.5 text-[9px] text-emerald-200">
-            clean slate · all values 0
-          </span>
-        ) : null}
-      </span>
-      <span className="flex items-center gap-3 text-cyan-200/90">
-        <span>NAV {(navUnits ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-        <span className="text-cyan-300/50">·</span>
-        <span>shadow {shadowFills ?? 0}/30</span>
-        <span className="text-cyan-300/50">·</span>
-        <span>{autopilot ? 'autopilot ON' : 'autopilot OFF'}</span>
-      </span>
-    </div>
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em]',
+        tone === 'live'
+          ? 'nios-live-chip'
+          : tone === 'paper'
+            ? 'nios-paper-chip'
+            : 'border-border/60 bg-card/50 text-muted-foreground',
+        className,
+      )}
+    >
+      {children}
+    </span>
+  )
+}
+
+/**
+ * Horizontal page strip used inside a shell.
+ *
+ * The sidebar owns navigation on desktop; this strip keeps every page one tap
+ * away in the workspace header and on narrow screens.
+ */
+export function ShellRouteStrip({
+  routes,
+  path,
+  mode,
+  onNavigate,
+}: {
+  routes: { path: string; label: string }[]
+  path: string
+  mode: WorkspaceMode
+  onNavigate: (path: string) => void
+}) {
+  return (
+    <nav
+      aria-label={`${mode} workspace pages`}
+      className="flex flex-wrap items-center gap-1"
+    >
+      {routes.map((entry) => {
+        const active = path === entry.path
+        return (
+          <button
+            key={entry.path}
+            type="button"
+            aria-current={active ? 'page' : undefined}
+            onClick={() => onNavigate(entry.path)}
+            className={cn(
+              'rounded-md px-2.5 py-1 text-[11px] transition',
+              active
+                ? mode === 'live'
+                  ? 'bg-rose-500/20 text-rose-100'
+                  : 'bg-cyan-500/20 text-cyan-100'
+                : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
+            )}
+          >
+            {entry.label}
+          </button>
+        )
+      })}
+    </nav>
   )
 }

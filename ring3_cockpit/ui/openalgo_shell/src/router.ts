@@ -1,37 +1,70 @@
 import { useCallback, useEffect, useState } from 'react'
 
-/** The eleven production cockpit pages. */
+/** The fifteen production cockpit pages. */
 export type PageKey =
   | 'dashboard'
+  | 'terminal'
   | 'orders'
+  | 'options'
   | 'analyzer'
   | 'quant'
+  | 'agents'
+  | 'backtest'
   | 'brain'
   | 'forge'
   | 'ledger'
+  | 'logbook'
   | 'verification'
+  | 'brokers'
   | 'control'
-  | 'agents'
-  | 'backtest'
 
-/** V1.1: physically separate workspaces + the three auth screens. */
+/** V1.1: physically separate workspaces.  V1.3 adds the two login portals. */
 export type WorkspaceKey = 'paper' | 'live' | 'legacy'
-export type AuthScreen = 'setup' | 'login' | 'live-unlock' | null
+export type AuthScreen =
+  | 'setup'
+  | 'login'
+  | 'live-unlock'
+  | 'paper-login'
+  | 'live-login'
+  | null
 
 /** Canonical URL path per page (legacy, workspace-less aliases). */
 export const PAGE_PATHS: Record<PageKey, string> = {
   dashboard: '/dashboard',
+  terminal: '/terminal',
   orders: '/orders',
+  options: '/options',
   analyzer: '/analyzer',
   quant: '/quant',
+  agents: '/agents',
+  backtest: '/backtest',
   brain: '/brain',
   forge: '/forge',
   ledger: '/ledger',
+  logbook: '/logbook',
   verification: '/verification',
+  brokers: '/brokers',
   control: '/control',
-  agents: '/agents',
-  backtest: '/backtest',
 }
+
+/** Page order used by the sidebar, the router and the tests. */
+export const PAGE_ORDER: PageKey[] = [
+  'dashboard',
+  'terminal',
+  'orders',
+  'options',
+  'analyzer',
+  'quant',
+  'agents',
+  'backtest',
+  'brain',
+  'forge',
+  'ledger',
+  'logbook',
+  'verification',
+  'brokers',
+  'control',
+]
 
 /** Workspace-qualified path for a page. */
 export function workspacePath(page: PageKey, workspace: 'paper' | 'live'): string {
@@ -41,19 +74,26 @@ export function workspacePath(page: PageKey, workspace: 'paper' | 'live'): strin
 const PATH_TO_PAGE: Record<string, PageKey> = {
   '/': 'dashboard',
   '/dashboard': 'dashboard',
+  '/terminal': 'terminal',
   '/orders': 'orders',
   '/positions': 'orders',
+  '/options': 'options',
+  '/chain': 'options',
   '/analyzer': 'analyzer',
   '/quant': 'quant',
+  '/agents': 'agents',
+  '/backtest': 'backtest',
   '/brain': 'brain',
   '/xray': 'brain',
   '/forge': 'forge',
   '/ledger': 'ledger',
+  '/logbook': 'logbook',
+  '/journal': 'logbook',
   '/verification': 'verification',
+  '/brokers': 'brokers',
+  '/venues': 'brokers',
   '/control': 'control',
   '/mcp': 'control',
-  '/agents': 'agents',
-  '/backtest': 'backtest',
 }
 
 /** Legacy tab id each page maps onto, used for backward compatibility. */
@@ -72,6 +112,13 @@ export function pathForLegacyTab(tab: LegacyTab): string {
   return PAGE_PATHS.dashboard
 }
 
+/** The two dedicated login portals plus the gateway selector. */
+export const LOGIN_PORTALS = {
+  paper: '/paper/login',
+  live: '/live/login',
+  gateway: '/login',
+} as const
+
 function normalize(pathname: string): string {
   if (!pathname) return '/'
   const trimmed = pathname.replace(/\/+$/, '')
@@ -85,7 +132,19 @@ export function parseRoute(pathname: string): {
   authPage: AuthScreen
 } {
   const path = normalize(pathname)
-  if (path === '/setup' || path === '/login' || path === '/live-unlock') {
+  // The dedicated portals are checked first: `/paper/login` and `/live/login`
+  // are auth screens, never workspace pages.
+  if (path === '/paper/login') {
+    return { workspace: 'legacy', page: 'dashboard', authPage: 'paper-login' }
+  }
+  if (path === '/live/login') {
+    return { workspace: 'legacy', page: 'dashboard', authPage: 'live-login' }
+  }
+  if (
+    path === '/setup' ||
+    path === '/login' ||
+    path === '/live-unlock'
+  ) {
     return { workspace: 'legacy', page: 'dashboard', authPage: path.slice(1) as AuthScreen }
   }
   const match = /^\/(paper|live)(\/.*)?$/.exec(path)

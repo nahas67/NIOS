@@ -5,16 +5,19 @@ import {
   Banknote,
   Flame,
   Lock,
+  LogOut,
   Play,
   RotateCcw,
   ShieldCheck,
   Square,
+  Timer,
+  Zap,
 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { WorkspaceBanner, WorkspaceSwitcher } from '@/components/workspace-chrome'
+import { ShellChip, ShellRouteStrip, WorkspaceSwitcher } from '@/components/workspace-chrome'
 import {
   authApi,
   type AuthTier,
@@ -22,79 +25,60 @@ import {
   type PaperWorkspaceState,
   type WorkspaceMode,
 } from '@/lib/auth'
-import { cn } from '@/lib/utils'
 
+/** The fifteen pages, workspace-qualified, in sidebar order. */
 export const PAPER_ROUTES: { path: string; label: string }[] = [
   { path: '/paper/dashboard', label: 'Dashboard' },
+  { path: '/paper/terminal', label: 'Terminal' },
   { path: '/paper/orders', label: 'Orders' },
+  { path: '/paper/options', label: 'Options' },
   { path: '/paper/analyzer', label: 'Analyzer' },
   { path: '/paper/quant', label: 'Quant' },
+  { path: '/paper/agents', label: 'Agents' },
+  { path: '/paper/backtest', label: 'Backtest' },
   { path: '/paper/brain', label: 'Brain' },
   { path: '/paper/forge', label: 'Forge' },
   { path: '/paper/ledger', label: 'Ledger' },
+  { path: '/paper/logbook', label: 'Logbook' },
   { path: '/paper/verification', label: 'Verification' },
+  { path: '/paper/brokers', label: 'Brokers' },
   { path: '/paper/control', label: 'Control' },
-  { path: '/paper/agents', label: 'Agents' },
-  { path: '/paper/backtest', label: 'Backtest' },
 ]
 
 export const LIVE_ROUTES: { path: string; label: string }[] = [
   { path: '/live/dashboard', label: 'Dashboard' },
+  { path: '/live/terminal', label: 'Terminal' },
   { path: '/live/orders', label: 'Orders' },
-  { path: '/live/positions', label: 'Positions' },
+  { path: '/live/options', label: 'Options' },
+  { path: '/live/analyzer', label: 'Analyzer' },
   { path: '/live/quant', label: 'Quant' },
-  { path: '/live/brain', label: 'Brain' },
-  { path: '/live/ledger', label: 'Ledger' },
-  { path: '/live/control', label: 'Control' },
   { path: '/live/agents', label: 'Agents' },
   { path: '/live/backtest', label: 'Backtest' },
+  { path: '/live/brain', label: 'Brain' },
+  { path: '/live/forge', label: 'Forge' },
+  { path: '/live/ledger', label: 'Ledger' },
+  { path: '/live/logbook', label: 'Logbook' },
+  { path: '/live/verification', label: 'Verification' },
+  { path: '/live/brokers', label: 'Brokers' },
+  { path: '/live/control', label: 'Control' },
 ]
-
-function WorkspaceNav({
-  routes,
-  path,
-  mode,
-  onNavigate,
-}: {
-  routes: { path: string; label: string }[]
-  path: string
-  mode: WorkspaceMode
-  onNavigate: (path: string) => void
-}) {
-  return (
-    <nav
-      aria-label={`${mode} workspace pages`}
-      className="flex flex-wrap items-center gap-1"
-    >
-      {routes.map((entry) => {
-        const active = path === entry.path
-        return (
-          <button
-            key={entry.path}
-            type="button"
-            onClick={() => onNavigate(entry.path)}
-            className={cn(
-              'rounded-md px-2.5 py-1 text-[11px] transition',
-              active
-                ? mode === 'live'
-                  ? 'bg-rose-500/20 text-rose-100'
-                  : 'bg-cyan-500/20 text-cyan-100'
-                : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
-            )}
-          >
-            {entry.label}
-          </button>
-        )
-      })}
-    </nav>
-  )
-}
 
 function toUnits(micros: number | undefined): number {
   return (micros ?? 0) / 1_000_000
 }
 
-export function PaperWorkspacePage({
+function formatUnits(value: number): string {
+  return value.toLocaleString(undefined, { maximumFractionDigits: 2 })
+}
+
+/**
+ * PAPER SANDBOX shell — deep obsidian with lavender/cyan accents.
+ *
+ * This is the only shell allowed to render deposit controls, the clean-slate
+ * onboarding panel and the play/pause tape button, because every figure it
+ * shows is either zero or the operator's own simulated capital.
+ */
+export function PaperShell({
   path,
   tier,
   onNavigate,
@@ -135,10 +119,7 @@ export function PaperWorkspacePage({
     )
   }, [state])
 
-  const siloIds = useMemo(
-    () => (state ? Object.keys(state.silos).sort() : []),
-    [state],
-  )
+  const siloIds = useMemo(() => (state ? Object.keys(state.silos).sort() : []), [state])
 
   async function deposit() {
     setBusy(true)
@@ -189,30 +170,29 @@ export function PaperWorkspacePage({
   }
 
   const cleanSlate = state?.clean_slate_active ?? false
-  const showOnboarding =
-    cleanSlate && (page === 'dashboard' || page === 'ledger')
+  const showOnboarding = cleanSlate && (page === 'dashboard' || page === 'ledger')
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <WorkspaceBanner
-        mode="paper"
-        cleanSlate={cleanSlate}
-        navUnits={navUnits}
-        shadowFills={state?.shadow.shadow_fills ?? 0}
-        autopilot={state?.autopilot.enabled ?? false}
-        tier={tier}
-      />
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 px-4 py-2 lg:px-6">
-        <div className="flex items-center gap-3">
-          <WorkspaceSwitcher mode="paper" tier={tier} onNavigate={onNavigate} />
-          <WorkspaceNav
-            routes={PAPER_ROUTES}
-            path={path}
-            mode="paper"
-            onNavigate={onNavigate}
-          />
+    <div className="nios-shell-paper flex min-h-0 flex-1 flex-col">
+      {/* ---- top ribbon: sandbox identity, simulated NAV, tape + capital ---- */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-cyan-500/30 bg-gradient-to-r from-cyan-950/50 via-violet-950/40 to-transparent px-4 py-2 lg:px-6">
+        <div className="flex flex-wrap items-center gap-2">
+          <ShellChip tone="paper">
+            <ShieldCheck className="size-3" />
+            PAPER SANDBOX
+          </ShellChip>
+          <ShellChip tone="neutral">
+            SIMULATED NAV <span className="nios-tabular ml-1">{formatUnits(navUnits)}</span>
+          </ShellChip>
+          <ShellChip tone="neutral">
+            SHADOW {state?.shadow.shadow_fills ?? 0}/{state?.shadow.required_fills ?? 30}
+          </ShellChip>
+          <ShellChip tone={cleanSlate ? 'paper' : 'neutral'}>
+            {cleanSlate ? 'CLEAN SLATE · ALL VALUES 0' : 'FUNDED'}
+          </ShellChip>
         </div>
-        <div className="flex items-center gap-2">
+
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             size="sm"
             variant={state?.autopilot.enabled ? 'secondary' : 'default'}
@@ -221,11 +201,11 @@ export function PaperWorkspacePage({
           >
             {state?.autopilot.enabled ? (
               <>
-                <Square className="mr-1 size-3" /> Pause autopilot
+                <Square className="mr-1 size-3" /> Autopilot: pause
               </>
             ) : (
               <>
-                <Play className="mr-1 size-3" /> Start paper autopilot
+                <Play className="mr-1 size-3" /> Autopilot: play
               </>
             )}
           </Button>
@@ -236,7 +216,57 @@ export function PaperWorkspacePage({
             disabled={busy}
           >
             <RotateCcw className="mr-1 size-3" />
-            {confirmReset ? 'Confirm reset to zero' : 'Reset all values to zero'}
+            {confirmReset ? 'Confirm reset to zero' : 'Reset to zero'}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="border-rose-500/50 text-rose-200 hover:bg-rose-500/10"
+            onClick={() => onNavigate('/live/login')}
+          >
+            <Lock className="mr-1 size-3" /> Switch to live vault
+          </Button>
+        </div>
+      </div>
+
+      {/* ---- second row: workspace switcher + the simulated-capital deposit ---- */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 px-4 py-2 lg:px-6">
+        <div className="flex flex-wrap items-center gap-3">
+          <WorkspaceSwitcher mode="paper" tier={tier} onNavigate={onNavigate} />
+          <ShellRouteStrip routes={PAPER_ROUTES} path={path} mode="paper" onNavigate={onNavigate} />
+        </div>
+        <div className="flex flex-wrap items-end gap-2">
+          <div className="space-y-1">
+            <Label htmlFor="paper-fund-silo" className="text-[9px] uppercase tracking-wide">
+              Silo
+            </Label>
+            <select
+              id="paper-fund-silo"
+              value={silo}
+              onChange={(event) => setSilo(event.target.value)}
+              className="h-8 rounded-md border border-input bg-transparent px-2 text-[11px]"
+            >
+              {(siloIds.length ? siloIds : ['US_IBKR']).map((id) => (
+                <option key={id} value={id}>
+                  {id}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="paper-fund-amount" className="text-[9px] uppercase tracking-wide">
+              Amount
+            </Label>
+            <Input
+              id="paper-fund-amount"
+              className="h-8 w-28"
+              inputMode="decimal"
+              value={amount}
+              onChange={(event) => setAmount(event.target.value)}
+            />
+          </div>
+          <Button size="sm" onClick={deposit} disabled={busy}>
+            <Banknote className="mr-1 size-3" /> Deposit paper capital
           </Button>
         </div>
       </div>
@@ -249,72 +279,33 @@ export function PaperWorkspacePage({
       ) : null}
 
       {showOnboarding ? (
-        <section className="mx-4 mt-3 rounded-xl border border-cyan-500/30 bg-cyan-500/5 px-4 py-3 lg:mx-6">
+        <section className="nios-glass mx-4 mt-3 px-4 py-3 lg:mx-6">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <h2 className="flex items-center gap-2 text-sm font-semibold text-cyan-100">
                 <Banknote className="size-4" />
-                Clean slate — nothing pre-funded
+                PAPER SANDBOX — simulated execution only (all values start at 0)
               </h2>
               <p className="mt-1 max-w-xl text-[11px] leading-relaxed text-muted-foreground">
                 Every silo and vault reads <span className="text-cyan-200">0</span>. Deposit
                 your own Paper capital to open a balanced double-entry
                 <span className="text-cyan-200"> EQUITY_CAPITAL → VAULTS </span>
-                genesis entry. The autopilot stays OFF until you press start.
+                genesis entry. The autopilot stays OFF until you press play.
               </p>
             </div>
-            <div className="flex flex-wrap items-end gap-2">
-              <div className="space-y-1">
-                <Label htmlFor="fund-silo" className="text-[10px] uppercase tracking-wide">
-                  Silo
-                </Label>
-                <select
-                  id="fund-silo"
-                  value={silo}
-                  onChange={(event) => setSilo(event.target.value)}
-                  className="h-8 rounded-md border border-input bg-transparent px-2 text-[11px]"
-                >
-                  {(siloIds.length ? siloIds : ['US_IBKR']).map((id) => (
-                    <option key={id} value={id}>
-                      {id}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="fund-amount" className="text-[10px] uppercase tracking-wide">
-                  Amount
-                </Label>
-                <Input
-                  id="fund-amount"
-                  className="h-8 w-32"
-                  inputMode="decimal"
-                  value={amount}
-                  onChange={(event) => setAmount(event.target.value)}
-                />
-              </div>
-              <Button size="sm" onClick={deposit} disabled={busy}>
-                <ArrowRight className="mr-1 size-3" /> Deposit starting capital
-              </Button>
-            </div>
+            <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {Object.entries(state?.silos ?? {}).map(([id, entry]) => (
+                <div key={id} className="rounded-lg border border-border/50 bg-card/40 px-2.5 py-1.5">
+                  <dt className="text-[9px] uppercase tracking-wide text-muted-foreground">
+                    {id}
+                  </dt>
+                  <dd className="nios-tabular font-mono text-xs text-foreground">
+                    {formatUnits(toUnits(entry.nav_micros))}
+                  </dd>
+                </div>
+              ))}
+            </dl>
           </div>
-          <dl className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {Object.entries(state?.silos ?? {}).map(([id, entry]) => (
-              <div
-                key={id}
-                className="rounded-lg border border-border/50 bg-card/40 px-2.5 py-1.5"
-              >
-                <dt className="text-[9px] uppercase tracking-wide text-muted-foreground">
-                  {id}
-                </dt>
-                <dd className="font-mono text-xs text-foreground">
-                  {toUnits(entry.nav_micros).toLocaleString(undefined, {
-                    maximumFractionDigits: 2,
-                  })}
-                </dd>
-              </div>
-            ))}
-          </dl>
         </section>
       ) : null}
 
@@ -323,20 +314,31 @@ export function PaperWorkspacePage({
   )
 }
 
-export function LiveWorkspacePage({
+/**
+ * LIVE PRODUCTION shell — matte carbon with crimson/amber hazard accents.
+ *
+ * A LIVE session is required to render anything past the sealed door. Inside,
+ * this shell deliberately has **no** deposit button, **no** shadow-burst button
+ * and **no** paper balance: those are Paper-only affordances and their absence
+ * is part of the safety contract, not an oversight.
+ */
+export function LiveShell({
   path,
   tier,
+  expiresNs,
   onNavigate,
   children,
 }: {
   path: string
   tier: AuthTier
+  expiresNs?: number | null
   onNavigate: (path: string) => void
   children: React.ReactNode
 }) {
   const [state, setState] = useState<LiveWorkspaceState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [nowNs, setNowNs] = useState(() => Date.now() * 1_000_000)
 
   const unlocked = tier === 'LIVE'
 
@@ -355,21 +357,33 @@ export function LiveWorkspacePage({
     void refresh()
   }, [refresh])
 
+  // A live session is 30 minutes. The countdown is the operator's only clock.
+  useEffect(() => {
+    if (!unlocked) return
+    const timer = window.setInterval(() => setNowNs(Date.now() * 1_000_000), 1_000)
+    return () => window.clearInterval(timer)
+  }, [unlocked])
+
   if (!unlocked) {
     return (
-      <div className="flex min-h-0 flex-1 flex-col">
-        <WorkspaceBanner mode="live" tier={tier} />
+      <div className="nios-shell-live flex min-h-0 flex-1 flex-col">
+        <div className="nios-hazard flex flex-wrap items-center gap-2 border-b border-rose-500/50 px-4 py-2 text-[11px] text-rose-100 lg:px-6">
+          <Lock className="size-3.5" />
+          <span className="font-semibold uppercase tracking-[0.18em]">
+            LIVE PRODUCTION — VAULT SEALED
+          </span>
+        </div>
         <div className="mx-auto mt-16 max-w-lg rounded-2xl border border-rose-500/40 bg-rose-500/5 p-6 text-center">
           <Lock className="mx-auto size-6 text-rose-300" />
           <h2 className="mt-3 text-sm font-semibold text-rose-100">
             Live Production is sealed
           </h2>
           <p className="mt-1 text-[11px] text-muted-foreground">
-            A LIVE-tier session is required. Paper sessions never see live balances,
-            broker credentials or the go-live certificate.
+            A LIVE-tier session is required. Paper sessions never see live balances, broker
+            credentials or the go-live certificate.
           </p>
-          <Button className="mt-4" onClick={() => onNavigate('/live-unlock')}>
-            Enter live PIN
+          <Button className="mt-4" onClick={() => onNavigate('/live/login')}>
+            Enter the live vault
           </Button>
         </div>
       </div>
@@ -377,22 +391,19 @@ export function LiveWorkspacePage({
   }
 
   const preflight = (state?.preflight ?? {}) as Record<string, unknown>
-  const credentialSilos = ((state?.broker_credentials as { silos?: Record<string, { configured?: number }> })
-    ?.silos ?? {}) as Record<string, { configured?: number }>
-  const feed = (state?.feed ?? {}) as Record<string, unknown>
-  const feedRows = (feed.rows ?? feed.vendors ?? []) as unknown[]
-
-  async function arm(mode: 'LIVE' | 'PAPER') {
-    setBusy(true)
-    try {
-      await authApi.armSilo({ silo: 'US_IBKR', mode, confirm_live: true })
-      await refresh()
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'mode change failed')
-    } finally {
-      setBusy(false)
-    }
-  }
+  const gatesPassed = Number(preflight.gates_passed ?? preflight.passed ?? 0)
+  const gatesTotal = Number(preflight.gates_total ?? 22)
+  const certificateReady = Boolean(preflight.ready_for_live_cutover ?? false)
+  const remainingSeconds =
+    typeof expiresNs === 'number' && expiresNs > 0
+      ? Math.max(0, Math.floor((expiresNs - nowNs) / 1_000_000_000))
+      : null
+  const ttlLabel =
+    remainingSeconds === null
+      ? '30:00'
+      : `${String(Math.floor(remainingSeconds / 60)).padStart(2, '0')}:${String(
+          remainingSeconds % 60,
+        ).padStart(2, '0')}`
 
   async function flatten() {
     setBusy(true)
@@ -406,22 +417,66 @@ export function LiveWorkspacePage({
     }
   }
 
+  async function lockVault() {
+    setBusy(true)
+    try {
+      await authApi.logout()
+    } catch {
+      // The cookie is dropped locally either way; the operator lands on paper.
+    } finally {
+      setBusy(false)
+      onNavigate('/paper/login')
+    }
+  }
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <WorkspaceBanner mode="live" tier={tier} />
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 px-4 py-2 lg:px-6">
-        <div className="flex items-center gap-3">
-          <WorkspaceSwitcher mode="live" tier={tier} onNavigate={onNavigate} />
-          <WorkspaceNav
-            routes={LIVE_ROUTES}
-            path={path}
-            mode="live"
-            onNavigate={onNavigate}
-          />
+    <div className="nios-shell-live flex min-h-0 flex-1 flex-col">
+      {/* ---- hazard ribbon: real-capital identity, certificate, TTL, kill ---- */}
+      <div className="nios-hazard flex flex-wrap items-center justify-between gap-2 border-b border-rose-500/50 px-4 py-2 text-[11px] text-rose-50 lg:px-6">
+        <div className="flex flex-wrap items-center gap-2">
+          <ShellChip tone="live">
+            <Lock className="size-3" />
+            🔒 LIVE PRODUCTION — REAL CAPITAL
+          </ShellChip>
+          <ShellChip tone="neutral" className="border-amber-500/50 text-amber-100">
+            <ShieldCheck className="mr-1 size-3" />
+            22-GATE {certificateReady ? 'CERTIFIED' : 'PENDING'} · {gatesPassed}/{gatesTotal}
+          </ShellChip>
+          <ShellChip tone="neutral" className="border-rose-500/50 text-rose-100">
+            <Timer className="mr-1 size-3" />
+            LIVE SESSION TTL {ttlLabel}
+          </ShellChip>
         </div>
-        <Button size="sm" variant="destructive" onClick={flatten} disabled={busy}>
-          <Flame className="mr-1 size-3" /> Emergency flatten (&lt;1 ms)
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="destructive" onClick={flatten} disabled={busy}>
+            <Flame className="mr-1 size-3" /> &lt;1ms emergency kill switch
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="border-amber-500/50 text-amber-100 hover:bg-amber-500/10"
+            onClick={lockVault}
+            disabled={busy}
+          >
+            <LogOut className="mr-1 size-3" /> Lock live vault (drop to paper)
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 px-4 py-2 lg:px-6">
+        <div className="flex flex-wrap items-center gap-3">
+          <WorkspaceSwitcher mode="live" tier={tier} onNavigate={onNavigate} />
+          <ShellRouteStrip routes={LIVE_ROUTES} path={path} mode="live" onNavigate={onNavigate} />
+        </div>
+        <div className="flex items-center gap-2">
+          {state?.silos
+            ? Object.entries(state.silos).map(([id, entry]) => (
+                <ShellChip key={id} tone="neutral">
+                  {id} {String(entry.mode ?? 'PAPER')}
+                </ShellChip>
+              ))
+            : null}
+        </div>
       </div>
 
       {error ? (
@@ -431,59 +486,71 @@ export function LiveWorkspacePage({
       ) : null}
 
       <section className="mx-4 mt-3 grid gap-3 lg:mx-6 lg:grid-cols-3">
-        <div className="rounded-xl border border-rose-500/30 bg-card/40 p-3">
+        <div className="nios-glass border-rose-500/30 p-3">
           <h2 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-rose-100">
             <ShieldCheck className="size-3.5" /> 22-Gate Go-Live Certificate
           </h2>
-          <p className="mt-2 font-mono text-[11px] text-muted-foreground">
-            status: {String(preflight.status ?? preflight.ready ?? 'UNKNOWN')}
+          <p className="nios-tabular mt-2 font-mono text-[11px] text-muted-foreground">
+            status: {String(preflight.status ?? (certificateReady ? 'READY' : 'PENDING'))}
           </p>
-          <p className="font-mono text-[11px] text-muted-foreground">
-            gates: {String(preflight.gates_passed ?? preflight.passed ?? '—')} /{' '}
-            {String(preflight.gates_total ?? 22)}
+          <p className="nios-tabular font-mono text-[11px] text-muted-foreground">
+            gates: {gatesPassed} / {gatesTotal}
+          </p>
+          <p className="nios-tabular font-mono text-[11px] text-muted-foreground">
+            failed: {String(preflight.failed_gates ?? 0)}
           </p>
         </div>
 
-        <div className="rounded-xl border border-amber-500/30 bg-card/40 p-3">
+        <div className="nios-glass border-amber-500/30 p-3">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-amber-100">
-            12-Venue Write-Only Credential Vault
+            Write-Only Venue Credentials
           </h2>
           <ul className="mt-2 space-y-1 text-[11px] text-muted-foreground">
-            {Object.entries(credentialSilos).length ? (
-              Object.entries(credentialSilos)
-                .slice(0, 12)
-                .map(([id, entry]) => (
-                  <li key={id} className="flex items-center justify-between gap-2">
-                    <span className="font-mono">{id}</span>
-                    <span className={entry.configured ? 'text-emerald-300' : 'text-muted-foreground'}>
-                      {entry.configured ? 'configured · ********' : 'unset'}
-                    </span>
-                  </li>
-                ))
-            ) : (
+            {Object.entries(
+              ((state?.broker_credentials as { silos?: Record<string, { configured?: number }> })
+                ?.silos ?? {}) as Record<string, { configured?: number }>,
+            )
+              .slice(0, 12)
+              .map(([id, entry]) => (
+                <li key={id} className="flex items-center justify-between gap-2">
+                  <span className="font-mono">{id}</span>
+                  <span
+                    className={entry.configured ? 'text-emerald-300' : 'text-muted-foreground'}
+                  >
+                    {entry.configured ? 'configured · ********' : 'unset'}
+                  </span>
+                </li>
+              ))}
+            {Object.keys(
+              ((state?.broker_credentials as { silos?: Record<string, unknown> })?.silos ?? {}) as
+                Record<string, unknown>,
+            ).length === 0 ? (
               <li>no credential handshake recorded</li>
-            )}
+            ) : null}
           </ul>
         </div>
 
-        <div className="rounded-xl border border-border/40 bg-card/40 p-3">
+        <div className="nios-glass p-3">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-foreground">
-            Dual-Vendor Feed
+            Dual-Vendor Feed &amp; Arming
           </h2>
-          <p className="mt-2 font-mono text-[11px] text-muted-foreground">
-            mode: {String(feed.feed_mode ?? 'UNKNOWN')}
+          <p className="nios-tabular mt-2 font-mono text-[11px] text-muted-foreground">
+            feed mode: {String((state?.feed as { feed_mode?: string })?.feed_mode ?? 'UNKNOWN')}
           </p>
-          <p className="font-mono text-[11px] text-muted-foreground">
-            vendors tracked: {feedRows.length}
+          <p className="nios-tabular font-mono text-[11px] text-muted-foreground">
+            live fills: {state?.live_fills ?? 0}
           </p>
-          <div className="mt-2 flex gap-2">
-            <Button size="sm" variant="destructive" onClick={() => arm('LIVE')} disabled={busy}>
-              Arm LIVE
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => arm('PAPER')} disabled={busy}>
-              Disarm to PAPER
-            </Button>
-          </div>
+          <p className="mt-2 flex items-center gap-1 text-[10px] text-rose-200/80">
+            <Zap className="size-3" /> Every entry still passes the 98% conformal gate.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            className="mt-2 border-rose-500/40 text-rose-100"
+            onClick={() => onNavigate('/live/brokers')}
+          >
+            <ArrowRight className="mr-1 size-3" /> Open the broker hub
+          </Button>
         </div>
       </section>
 
@@ -491,3 +558,9 @@ export function LiveWorkspacePage({
     </div>
   )
 }
+
+/** Backwards-compatible aliases used by the App router. */
+export const PaperWorkspacePage = PaperShell
+export const LiveWorkspacePage = LiveShell
+
+export type { WorkspaceMode }

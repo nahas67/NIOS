@@ -16,6 +16,8 @@ import type {
   BrokerControlPayload,
   BrokerCredentialPayload,
   BrokerCredentialReport,
+  BrokerPingReceipt,
+  BrokersPageData,
   CancelOrdersPayload,
   CancelOrdersReceipt,
   ChallengerEvalReceipt,
@@ -36,12 +38,17 @@ import type {
   LedgerReconcileReceipt,
   LLMControlPayload,
   LLMProbeReport,
+  LogbookEntryPayload,
+  LogbookEntryReceipt,
+  LogbookPageData,
   McpPageData,
   MetricsSnapshot,
   MiroFishShockReceipt,
   NurseryPromotionReceipt,
   OptionPricePayload,
   OptionPriceReceipt,
+  OptionsChainReceipt,
+  OptionsPageData,
   OrdersPageData,
   OsTuneReceipt,
   PagesIndex,
@@ -54,7 +61,10 @@ import type {
   ShadowBurstPayload,
   ShadowBurstReceipt,
   SkillMarkdownReceipt,
+  StrategyPayoffReceipt,
   SupervisorControlResponse,
+  TerminalFrame,
+  TerminalPageData,
   VaultRotationReport,
   VaultStatus,
   VoprCampaignReceipt,
@@ -712,4 +722,98 @@ export function postPromoteToNursery(backtestId: string): Promise<NurseryPromoti
     '/api/v2/control/backtest/promote-to-nursery',
     { method: 'POST', body: JSON.stringify({ backtest_id: backtestId }) },
   )
+}
+
+
+// ---------------------------------------------------------------------------
+// V1.3 - options chain, market terminal, trade logbook and the broker hub
+// ---------------------------------------------------------------------------
+
+/** Read the optionable underlyings, the six strategy templates and a live NIFTY chain. */
+export function fetchOptionsPage(): Promise<OptionsPageData> {
+  return request<OptionsPageData>('/api/v2/cockpit/options')
+}
+
+/** Build one grounded Call/Put chain with Greeks, PCR and Max Pain. */
+export function postOptionsChain(payload: {
+  symbol?: string
+  spot?: number
+  volatility?: number
+  days_to_expiry?: number
+  strike_count?: number
+  risk_free_rate?: number
+}): Promise<OptionsChainReceipt> {
+  return request<OptionsChainReceipt>('/api/v2/control/options/chain', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+/** Price one multi-leg template and return its 25-point expiry payoff curve. */
+export function postStrategyPayoff(payload: {
+  symbol?: string
+  strategy: string
+  spot?: number
+  volatility?: number
+  days_to_expiry?: number
+  width_steps?: number
+  risk_free_rate?: number
+}): Promise<StrategyPayoffReceipt> {
+  return request<StrategyPayoffReceipt>('/api/v2/control/options/strategy-payoff', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+/** Read the multi-silo watchlist plus a live BTC terminal frame. */
+export function fetchTerminalPage(): Promise<TerminalPageData> {
+  return request<TerminalPageData>('/api/v2/cockpit/terminal')
+}
+
+/** Re-frame one symbol: quotes, candles, L2 ladder and the Lee-Ready tape. */
+export function postTerminalQuote(payload: {
+  symbol?: string
+  silo?: string
+  bars?: number
+  depth?: number
+}): Promise<TerminalFrame> {
+  return request<TerminalFrame>('/api/v2/control/terminal/quote', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+/** Read the trade logbook, its aggregates and the silo cost floors. */
+export function fetchLogbookPage(): Promise<LogbookPageData> {
+  return request<LogbookPageData>('/api/v2/cockpit/logbook')
+}
+
+/** Record one structured trade: gross/net P&L, cost drag bps and R-multiple. */
+export function postLogbookEntry(
+  payload: LogbookEntryPayload,
+): Promise<LogbookEntryReceipt> {
+  return request<LogbookEntryReceipt>('/api/v2/control/logbook/entry', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+/** Zero the journal (used by the clean-slate workflow). */
+export function postLogbookClear(): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>('/api/v2/control/logbook/clear', {
+    method: 'POST',
+  })
+}
+
+/** Read the 12-venue adapter matrix across all four silos. */
+export function fetchBrokersPage(): Promise<BrokersPageData> {
+  return request<BrokersPageData>('/api/v2/cockpit/brokers')
+}
+
+/** Ping one venue adapter and prove the Ring 0 Ed25519 signer round-trips. */
+export function postBrokerPing(venue: string): Promise<BrokerPingReceipt> {
+  return request<BrokerPingReceipt>('/api/v2/control/brokers/ping', {
+    method: 'POST',
+    body: JSON.stringify({ venue, operator: 'ring3.cockpit' }),
+  })
 }

@@ -6,17 +6,22 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAuth } from '@/hooks/use-auth'
 import { useCockpit } from '@/hooks/use-cockpit'
-import { AnalyzerPage } from '@/pages/analyzer'
 import { AgentsPage } from '@/pages/agents'
-import { LoginPage, LiveUnlockPage, SetupPage } from '@/pages/auth'
+import { AnalyzerPage } from '@/pages/analyzer'
+import { SetupPage, LiveUnlockPage } from '@/pages/auth'
+import { LiveLoginPage, LoginGatewayPage, PaperLoginPage } from '@/pages/auth-views'
 import { BacktestPage } from '@/pages/backtest'
 import { BrainPage } from '@/pages/brain'
+import { BrokersPage } from '@/pages/brokers'
 import { ControlPage } from '@/pages/control'
 import { DashboardPage } from '@/pages/dashboard'
 import { ForgePage } from '@/pages/forge'
 import { LedgerPage } from '@/pages/ledger'
+import { LogbookPage } from '@/pages/logbook'
+import { OptionsPage } from '@/pages/options'
 import { OrdersPage } from '@/pages/orders'
 import { QuantPage } from '@/pages/quant'
+import { TerminalPage } from '@/pages/terminal'
 import { VerificationPage } from '@/pages/verification'
 import { LiveWorkspacePage, PaperWorkspacePage } from '@/pages/workspace'
 import { legacyTabFor, pathForLegacyTab, useRoute } from '@/router'
@@ -44,83 +49,88 @@ export function App() {
 
   function renderPage() {
     switch (route.page) {
+      case 'dashboard':
+        return <DashboardPage state={state} cards={cards} />
+      case 'terminal':
+        return <TerminalPage />
       case 'orders':
         return <OrdersPage />
+      case 'options':
+        return <OptionsPage />
       case 'analyzer':
         return <AnalyzerPage />
       case 'quant':
         return <QuantPage />
+      case 'agents':
+        return <AgentsPage />
+      case 'backtest':
+        return <BacktestPage />
       case 'brain':
         return <BrainPage state={state} />
       case 'forge':
         return <ForgePage />
       case 'ledger':
         return <LedgerPage />
+      case 'logbook':
+        return <LogbookPage />
       case 'verification':
         return <VerificationPage state={state} />
+      case 'brokers':
+        return <BrokersPage />
       case 'control':
         return <ControlPage state={state} onSaved={refresh} />
-      case 'agents':
-        return <AgentsPage />
-      case 'backtest':
-        return <BacktestPage />
       default:
         return <DashboardPage state={state} cards={cards} />
     }
   }
 
-  // ---- V1.1 auth screens (first run, sign in, live elevation) ----------
+  // ---- V1.3 auth screens: gateway, two portals, setup and legacy unlock ----
   if (route.authPage === 'setup') {
     return (
-      <SetupPage
-        status={auth.status}
-        onAuthenticated={auth.applySession}
-        onDone={route.go}
-      />
+      <SetupPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
     )
   }
   if (route.authPage === 'login') {
+    return <LoginGatewayPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
+  }
+  if (route.authPage === 'paper-login') {
     return (
-      <LoginPage
-        status={auth.status}
-        onAuthenticated={auth.applySession}
-        onDone={route.go}
-      />
+      <PaperLoginPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
+    )
+  }
+  if (route.authPage === 'live-login') {
+    return (
+      <LiveLoginPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
     )
   }
   if (route.authPage === 'live-unlock') {
     return (
-      <LiveUnlockPage
-        status={auth.status}
-        onAuthenticated={auth.applySession}
-        onDone={route.go}
-      />
+      <LiveUnlockPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
     )
   }
 
   // First-time entry: an uninitialised install lands on the operator setup.
-  if (auth.status && !auth.status.initialized && route.workspace === 'legacy' && route.path === '/') {
+  if (
+    auth.status &&
+    !auth.status.initialized &&
+    route.workspace === 'legacy' &&
+    route.path === '/'
+  ) {
     return (
-      <SetupPage
-        status={auth.status}
-        onAuthenticated={auth.applySession}
-        onDone={route.go}
-      />
+      <SetupPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
     )
   }
 
-  // A workspace route requires a PAPER (or LIVE) session.
+  // A workspace route requires the matching portal session.
   const needsLogin =
     (route.workspace === 'paper' || route.workspace === 'live') &&
     auth.status !== null &&
     !auth.status.authenticated
   if (needsLogin) {
-    return (
-      <LoginPage
-        status={auth.status}
-        onAuthenticated={auth.applySession}
-        onDone={route.go}
-      />
+    return route.workspace === 'live' ? (
+      <LiveLoginPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
+    ) : (
+      <PaperLoginPage status={auth.status} onAuthenticated={auth.applySession} onDone={route.go} />
     )
   }
 
@@ -130,7 +140,12 @@ export function App() {
         {renderPage()}
       </PaperWorkspacePage>
     ) : route.workspace === 'live' ? (
-      <LiveWorkspacePage path={route.path} tier={tier} onNavigate={route.go}>
+      <LiveWorkspacePage
+        path={route.path}
+        tier={tier}
+        expiresNs={auth.status?.expires_ns ?? null}
+        onNavigate={route.go}
+      >
         {renderPage()}
       </LiveWorkspacePage>
     ) : legacyTab ? (
@@ -150,12 +165,25 @@ export function App() {
       renderPage()
     )
 
+  const shellMode =
+    route.workspace === 'live' ? 'live' : route.workspace === 'paper' ? 'paper' : 'legacy'
+
   return (
     <div className="dark">
-      <div className="relative min-h-screen overflow-hidden bg-background text-foreground">
+      <div
+        className={
+          route.workspace === 'legacy'
+            ? 'relative min-h-screen overflow-hidden bg-background text-foreground'
+            : 'relative min-h-screen overflow-hidden bg-[#06060a] text-foreground'
+        }
+      >
         <div
           aria-hidden
-          className="pointer-events-none absolute inset-0 opacity-70"
+          className={
+            route.workspace === 'legacy'
+              ? 'pointer-events-none absolute inset-0 opacity-70'
+              : 'pointer-events-none absolute inset-0 opacity-30'
+          }
           style={{
             backgroundImage:
               'radial-gradient(60rem 30rem at 12% 0%, rgba(56,189,248,0.10), transparent 70%), radial-gradient(50rem 26rem at 88% 8%, rgba(168,85,247,0.10), transparent 70%), linear-gradient(rgba(148,163,184,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,0.05) 1px, transparent 1px)',
@@ -169,6 +197,7 @@ export function App() {
             onNavigate={route.go}
             state={state}
             connected={connected}
+            mode={shellMode}
           />
 
           <div className="flex min-w-0 flex-1 flex-col">
@@ -215,7 +244,7 @@ export function App() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span>
                   NIOS-ARC-2026-V3 · v{state?.version ?? '3.0.0-PROD'} · Ring 3 is read-only for
-                  market state · 11 production pages
+                  market state · 15 production pages
                 </span>
                 <span>
                   99.1% noise abstention · 98% split-conformal · 35/15 in-silo ratchet

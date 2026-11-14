@@ -18,7 +18,13 @@ export interface AuthStatus {
   authenticated: boolean
   username: string | null
   tier: AuthTier
+  workspace?: AuthTier
   clean_slate_active: boolean
+  /** V1.3: the two dedicated portals plus the gateway selector. */
+  login_portals?: { paper: string; live: string; gateway: string }
+  active_workspace?: AuthTier
+  issued_ns?: number
+  expires_ns?: number
 }
 
 export interface AuthSession {
@@ -26,8 +32,11 @@ export interface AuthSession {
   token: string
   username: string
   tier: AuthTier
+  workspace?: AuthTier
+  portal?: string
   issued_ns: number
   expires_ns: number
+  session_ttl_s?: number
   clean_slate?: boolean
   preflight_ok?: boolean
   warnings?: string[]
@@ -154,6 +163,28 @@ export const authApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  /** V1.3 paper portal: username + password -> 12 h PAPER session. */
+  loginPaper: (payload: { username: string; password: string }) =>
+    request<AuthSession>('/api/v2/auth/login/paper', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  /**
+   * V1.3 live portal: one atomic three-factor request.
+   *
+   * The PIN is sent with the password so the vault door never has to hold a
+   * PAPER token first.  A wrong or missing PIN is `403 LIVE_PIN_REJECTED`.
+   */
+  loginLive: (payload: { username: string; password: string; live_pin: string }) =>
+    request<AuthSession>('/api/v2/auth/login/live', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  /** The 22-gate go-live certificate rendered on the live vault door. */
+  preflight: () => request<Record<string, unknown>>('/api/v2/control/preflight'),
 
   elevate: (live_pin: string) =>
     request<AuthSession>('/api/v2/auth/elevate-live', {

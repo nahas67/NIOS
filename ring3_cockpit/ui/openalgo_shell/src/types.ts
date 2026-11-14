@@ -2196,3 +2196,407 @@ export interface BacktestComparisonReceipt {
   generated_at_ns: number
   [key: string]: unknown
 }
+
+
+// ---------------------------------------------------------------------------
+// V1.3 - options chain, market terminal, trade logbook and 12-venue broker hub
+// ---------------------------------------------------------------------------
+
+export interface GroundedPacketEnvelope {
+  sha256_digest: string
+  verified: boolean
+  claims_checked: number
+  derived_expressions: number
+  tolerance: number
+  packet: Record<string, unknown>
+  report: Record<string, unknown>
+  ledger: { packets: number; digest: string } | null
+}
+
+export interface OptionsUnderlying {
+  symbol: string
+  silo: string
+  currency: string
+  spot: number
+  volatility: number
+  days_to_expiry: number
+  strike_step: number
+  lot_size: number
+}
+
+export interface OptionsStrategyTemplate {
+  id: string
+  name: string
+  bias: string
+  legs: string
+  summary: string
+}
+
+export interface OptionsChainRow {
+  strike: number
+  moneyness: number
+  offset: number
+  call_ltp: number
+  call_iv: number
+  call_delta: number
+  call_gamma: number
+  call_theta: number
+  call_vega: number
+  call_oi: number
+  put_ltp: number
+  put_iv: number
+  put_delta: number
+  put_gamma: number
+  put_theta: number
+  put_vega: number
+  put_oi: number
+  [key: string]: unknown
+}
+
+export interface OptionsChainSummary {
+  atm_strike: number
+  atm_iv: number
+  pcr: number
+  pcr_regime: string
+  max_pain_strike: number
+  max_pain_value: number
+  total_call_oi: number
+  total_put_oi: number
+  strike_count: number
+}
+
+export interface OptionsChainReceipt {
+  status: string
+  page: string
+  symbol: string
+  silo: string
+  currency: string
+  lot_size: number
+  strike_step: number
+  underlying: {
+    spot: number
+    volatility: number
+    days_to_expiry: number
+    years_to_expiry: number
+    risk_free_rate: number
+  }
+  chain: OptionsChainRow[]
+  summary: OptionsChainSummary
+  grounding: GroundedPacketEnvelope
+  packet: Record<string, unknown>
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface OptionsPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  underlyings: OptionsUnderlying[]
+  strategies: OptionsStrategyTemplate[]
+  default_symbol: string
+  chain: OptionsChainReceipt
+  counts: { underlyings: number; strategies: number; strikes: number }
+  law: string
+  generated_at_ns: number
+}
+
+export interface OptionLeg {
+  leg: string
+  kind: string
+  direction: number
+  strike: number
+  strike_offset_steps: number
+  iv: number
+  premium: number
+  delta: number
+  gamma: number
+  theta: number
+  vega: number
+  lot_size: number
+}
+
+export interface PayoffPoint {
+  expiry_spot: number
+  pnl: number
+  return_bps: number
+}
+
+export interface StrategyPayoffReceipt {
+  status: string
+  page: string
+  symbol: string
+  silo: string
+  currency: string
+  strategy: string
+  strategy_meta: Partial<OptionsStrategyTemplate>
+  underlying: {
+    spot: number
+    volatility: number
+    days_to_expiry: number
+    years_to_expiry: number
+    risk_free_rate: number
+  }
+  atm_strike: number
+  lot_size: number
+  legs: OptionLeg[]
+  net_premium_per_unit: number
+  net_debit_credit: number
+  net_position: string
+  max_profit: number
+  max_loss: number
+  unbounded_upside: boolean
+  unbounded_downside: boolean
+  breakeven_points: number[]
+  payoff_curve: PayoffPoint[]
+  curve_points: number
+  grounding: GroundedPacketEnvelope
+  packet: Record<string, unknown>
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface TerminalCandle {
+  index: number
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+}
+
+export interface TerminalQuoteRow {
+  symbol: string
+  silo: string
+  asset_class: string
+  last: number
+  change_bps: number
+  bid: number
+  ask: number
+  spread_bps: number
+}
+
+export interface TerminalDepthLevel {
+  level: number
+  price: number
+  quantity: number
+}
+
+export interface TerminalTapePrint {
+  sequence: number
+  price: number
+  quantity: number
+  side: string
+  classification: string
+}
+
+export interface TerminalFrame {
+  status: string
+  page: string
+  symbol: string
+  silo: string
+  asset_class: string
+  quote: {
+    last: number
+    mid: number
+    reference: number
+    session_change_bps: number
+    spread_bps: number
+  }
+  quotes: TerminalQuoteRow[]
+  candles: TerminalCandle[]
+  series: {
+    close: number[]
+    ma5: number[]
+    ma10: number[]
+    ma20: number[]
+    vwap: number[]
+    volume: number[]
+  }
+  depth: {
+    level_count: number
+    bids: TerminalDepthLevel[]
+    asks: TerminalDepthLevel[]
+    bid_quantity_total: number
+    ask_quantity_total: number
+    imbalance_ratio: number
+    imbalance_regime: string
+  }
+  tape: TerminalTapePrint[]
+  tape_summary: {
+    prints: number
+    buy_initiated: number
+    sell_initiated: number
+    buy_ratio: number
+  }
+  grounding: GroundedPacketEnvelope
+  packet: Record<string, unknown>
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface TerminalWatchRow {
+  symbol: string
+  silo: string
+  asset_class: string
+  reference: number
+}
+
+export interface TerminalPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  watchlist: TerminalWatchRow[]
+  default_symbol: string
+  frame: TerminalFrame
+  counts: { watchlist: number; silos: number; bars: number; depth_levels: number }
+  law: string
+  generated_at_ns: number
+}
+
+export interface LogbookEntryRecord {
+  entry_id: string
+  sequence: number
+  silo: string
+  symbol: string
+  side: string
+  setup_strategy: string
+  entry_price: number
+  exit_price: number
+  quantity: number
+  stop_loss: number
+  notional: number
+  gross_pnl: number
+  cost_bps: number
+  cost_drag: number
+  net_pnl: number
+  net_bps: number
+  r_multiple: number
+  outcome: string
+  workspace: string
+  thesis: string
+  lessons_learned: string
+  recorded_at_ns: number
+  [key: string]: unknown
+}
+
+export interface LogbookPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  entries: LogbookEntryRecord[]
+  counts: {
+    entries: number
+    wins: number
+    losses: number
+    flat: number
+    paper: number
+    live: number
+  }
+  aggregate: {
+    gross_pnl: number
+    cost_drag: number
+    net_pnl: number
+    win_rate: number
+    avg_r_multiple: number
+    total_r_multiple: number
+    avg_cost_bps: number
+  }
+  cost_floor_bps: Record<string, number>
+  clean_slate: boolean
+  law: string
+  generated_at_ns: number
+}
+
+export interface LogbookEntryPayload {
+  silo: string
+  symbol: string
+  side: 'LONG' | 'SHORT' | 'BUY' | 'SELL'
+  setup_strategy?: string
+  entry_price: number
+  exit_price: number
+  quantity: number
+  stop_loss?: number
+  thesis?: string
+  lessons_learned?: string
+  workspace?: 'PAPER' | 'LIVE'
+}
+
+export interface LogbookEntryReceipt {
+  ok: boolean
+  page: string
+  workspace: string
+  entry: LogbookEntryRecord
+  counts: LogbookPageData['counts']
+  aggregate: LogbookPageData['aggregate']
+  law: string
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface BrokerVenueRow {
+  venue: string
+  silo: string
+  market: string
+  adapter_module: string
+  adapter_importable: boolean
+  adapter_reason: string
+  credential_status: string
+  api_key_masked: string | null
+  api_secret_masked: string | null
+  environment: string | null
+  dry_run_verified: boolean
+  signing: { algorithm: string; dry_run_verified: boolean; public_fingerprint: string }
+  feed: { mode: string; dual_vendor: boolean; health: string }
+  settlement: Record<string, unknown>
+  [key: string]: unknown
+}
+
+export interface BrokersPageData {
+  page: string
+  title: string
+  ring: string
+  read_only: boolean
+  venues_supported: string[]
+  venues: BrokerVenueRow[]
+  silos: Array<{ silo: string; market: string; venues: string[]; configured: number }>
+  vault: {
+    write_only: boolean
+    path: string
+    key_version: number | null
+    ed25519_public_fingerprint: string | null
+    raw_secrets_exposed: boolean
+  }
+  signing_dry_run: Record<string, unknown>
+  feed: Record<string, unknown>
+  counts: {
+    venues: number
+    silos: number
+    configured: number
+    unset: number
+    adapters_importable: number
+  }
+  air_gap: { raw_keys_exposed: number; order_signing_tools: number; ring3_read_only: boolean }
+  law: string
+  generated_at_ns: number
+}
+
+export interface BrokerPingReceipt {
+  ok: boolean
+  page: string
+  venue: string
+  silo: string
+  adapter: { module: string; importable: boolean; reason: string }
+  signing: Record<string, unknown>
+  credential: { status: string; api_key_masked: string | null; raw_secret_returned: boolean }
+  latency_budget_ms: number
+  operator: string
+  generated_at_ns: number
+  [key: string]: unknown
+}

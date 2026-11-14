@@ -1,8 +1,8 @@
 # NIOS Production Operator Runbook
 
 **Document ID:** NIOS-OPS-2026-V3
-**Release tag:** `v3.3.0-V1.2` (supersedes `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
-**Branch:** `V1.2`
+**Release tag:** `v3.4.0-V1.3` (supersedes `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
+**Branch:** `V1.3`
 **Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
 **Operating constitution:** `AGENTS.md`
@@ -117,8 +117,8 @@ scrypt-hashed, the PIN is PBKDF2-derived, and sessions are HMAC-signed files und
 
 | Workspace | SPA routes | State endpoint |
 |---|---|---|
-| Paper sandbox | `/paper`, `/paper/dashboard`, `/paper/orders`, `/paper/analyzer`, `/paper/quant`, `/paper/brain`, `/paper/forge`, `/paper/ledger`, `/paper/verification`, `/paper/control`, `/paper/agents`, `/paper/backtest` | `GET /api/v2/workspace/paper/state` |
-| Live production | `/live`, `/live/dashboard`, `/live/orders`, `/live/positions`, `/live/quant`, `/live/brain`, `/live/ledger`, `/live/control`, `/live/agents`, `/live/backtest` | `GET /api/v2/workspace/live/state` |
+| Paper sandbox | `/paper`, `/paper/dashboard`, `/paper/terminal`, `/paper/orders`, `/paper/options`, `/paper/analyzer`, `/paper/quant`, `/paper/agents`, `/paper/backtest`, `/paper/brain`, `/paper/forge`, `/paper/ledger`, `/paper/logbook`, `/paper/verification`, `/paper/brokers`, `/paper/control` | `GET /api/v2/workspace/paper/state` |
+| Live production | `/live`, `/live/dashboard`, `/live/terminal`, `/live/orders`, `/live/positions`, `/live/options`, `/live/analyzer`, `/live/quant`, `/live/agents`, `/live/backtest`, `/live/brain`, `/live/forge`, `/live/ledger`, `/live/logbook`, `/live/verification`, `/live/brokers`, `/live/control` | `GET /api/v2/workspace/live/state` |
 
 The two trees are separate React entry points with separate state contracts. The Live tree
 is sealed: `GET /api/v2/workspace/live/state` answers `401 AUTH_REQUIRED` with no session and
@@ -231,6 +231,68 @@ way to zero values while keeping the operator.
 
 ---
 
+## SOP 1C — V1.3 Separate Paper and Live Login Portals
+
+`V1.3` gives the two workspaces their own login doors. The legacy
+`/api/v2/auth/login` + `/api/v2/auth/elevate-live` pair still works and is kept for
+backward compatibility, but an operator no longer has to hold a PAPER token in order to enter
+the live vault.
+
+### 1C.1 The two portals
+
+| Portal | Route | Request | Session | Reach |
+|---|---|---|---|---|
+| Paper | `/paper/login` | `{username, password}` | `PAPER`, 12 h | `/paper/*`, paper orders, paper funding |
+| Live | `/live/login` | `{username, password, live_pin}` | `LIVE`, 30 min | everything PAPER can reach **plus** every live-mutating route |
+| Gateway | `/login` | — (selector only) | — | renders both portal cards |
+
+| Endpoint | Method | Success | Failure |
+|---|---|---|---|
+| `/api/v2/auth/login/paper` | `POST` | `200`, `tier=PAPER`, `workspace=PAPER`, `session_ttl_s=43200` | `401 INVALID_CREDENTIALS` |
+| `/api/v2/auth/login/live` | `POST` | `200`, `tier=LIVE`, `workspace=LIVE`, `session_ttl_s=1800`, `preflight_ok` | `403 LIVE_PIN_REJECTED` (missing/non-numeric/wrong PIN), `401 INVALID_CREDENTIALS` (bad password) |
+
+Both routes set the `HttpOnly; SameSite=Strict` `nios_session` cookie with the matching
+`max_age` (43,200 s vs 1,800 s), so the browser and the `X-NIOS-Session` header always agree.
+
+### 1C.2 What each portal can and cannot do
+
+* A PAPER token answers `403 LIVE_ELEVATION_REQUIRED` on
+  `GET /api/v2/workspace/live/state` — by design, not by accident.
+* The LIVE portal verifies the `scrypt` password digest **and** the `pbkdf2_hmac` PIN digest
+  in constant time inside Ring 0; both KDFs always run, so a wrong password cannot be told
+  apart from a wrong PIN by latency.
+* A missing PIN is rejected before either KDF runs and is always `403 LIVE_PIN_REJECTED`
+  (an authorization verdict), never a `422` schema error.
+* `GET /api/v2/auth/status` now returns `login_portals`
+  (`{"paper": "/paper/login", "live": "/live/login", "gateway": "/login"}`) and
+  `active_workspace` (`PAPER` | `LIVE` | `NONE`), plus `expires_ns` for the live TTL chip.
+
+```bash
+# Paper portal
+curl.exe -X POST http://127.0.0.1:8000/api/v2/auth/login/paper \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"sovereign\",\"password\":\"<operator password>\"}"
+
+# Live portal: three factors in one request
+curl.exe -X POST http://127.0.0.1:8000/api/v2/auth/login/live \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"sovereign\",\"password\":\"<operator password>\",\"live_pin\":\"<pin>\"}"
+```
+
+### 1C.3 The two shells look nothing alike
+
+| | Paper sandbox | Live production |
+|---|---|---|
+| Palette | deep obsidian, lavender `#a78bfa` + cyan `#22d3ee` | matte carbon, crimson `#f43f5e` + amber `#f59e0b` |
+| Ribbon | `PAPER SANDBOX`, `SIMULATED NAV`, autopilot play/pause, deposit, reset-to-zero, *switch to live vault* | hazard stripes, `🔒 LIVE PRODUCTION — REAL CAPITAL`, 22-gate status, live TTL countdown, `<1ms emergency kill switch`, *lock live vault (drop to paper)* |
+| Affordances | deposit paper capital, reset to zero, shadow metrics | **no** deposit control, **no** shadow-burst control; the live journal is separate |
+
+A page under `/live/*` never renders a paper deposit button or a synthetic shadow-burst
+button. That absence is part of the safety contract (`sec_018` Law 2: the human, not the
+model, owns the live gate).
+
+---
+
 ## SOP 2 — Emergency Incident Response
 
 ### 2.1 Global kill switch (`<1.0 ms` budget)
@@ -327,16 +389,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 20 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 21 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.3.0-V1.2`: `pytest tests -q` must report **313 passed, 0 failed, 0 warnings**
+Release seal for `v3.4.0-V1.3`: `pytest tests -q` must report **396 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 20-suite / 313-test inventory
+### 3.2a The 21-suite / 396-test inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -360,6 +422,7 @@ prerequisites for re-tagging; neither may be waived.
 | 18 | `tests/test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight, forge |
 | 19 | `tests/test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard, credential-gated factory reset |
 | 20 | `tests/test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** `daily_stock_analysis` harvest (8 strategies, grounded decision dashboard), 6 specialist agent tasks, tax-net walk-forward backtester, 30-fill nursery gate, 11-page SPA |
+| 21 | `tests/test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.3** separate `/paper/login` + `/live/login` portals, options chain with Greeks/PCR/Max Pain, six multi-leg payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15 pages across all three route trees |
 
 ### 3.3 Chaos / crash injection
 
@@ -543,14 +606,18 @@ credential.
 
 | Method | Path | Backing surface |
 |---|---|---|
-| `GET` | `/api/v2/cockpit/pages` | 11-page catalogue, alias map, platform-wide counts |
+| `GET` | `/api/v2/cockpit/pages` | 15-page catalogue, alias map, platform-wide counts |
+| `GET` | `/api/v2/cockpit/terminal` | Market terminal watchlist + a grounded 60-bar / L2 / tape frame |
 | `GET` | `/api/v2/cockpit/orders` | SmartOMS blotter, Maker-Peg/TWAP slicers, outbox |
+| `GET` | `/api/v2/cockpit/options` | Optionable underlyings, six payoff templates, live NIFTY chain |
 | `GET` | `/api/v2/cockpit/analyzer` | 30-fill L2 shadow nursery, adverse selection |
 | `GET` | `/api/v2/cockpit/quant` | 490-factor scan, DCF / Black-Scholes, loaders |
 | `GET` | `/api/v2/cockpit/forge` | Alpha Forge leaderboard, plugins, SKILL.md catalog |
 | `GET` | `/api/v2/cockpit/ledger` | Double-entry journal, 35/15 ratchet, TigerBeetle + PG16 |
+| `GET` | `/api/v2/cockpit/logbook` | Trade journal, cost-drag aggregates, silo cost floors |
 | `GET` | `/api/v2/cockpit/agents` | 6 specialist agents, 8 strategies, task queue, token ledger |
 | `GET` | `/api/v2/cockpit/backtest` | 8-strategy catalog, 5 timeframes, silo cost floors, saved runs |
+| `GET` | `/api/v2/cockpit/brokers` | 12-venue adapter matrix, credential status, Ed25519 dry-run, feed health |
 | `GET` | `/api/v2/cockpit/mcp` | Read-only MCP catalogue + air-gap audit |
 | `GET` | `/api/v2/cockpit/skills/{skill_name}` | One SKILL.md document as structured Markdown |
 
@@ -602,20 +669,22 @@ shared-memory segment so a drill never disarms the live Ring 1 lease table, and 
 campaign is a pure simulator. `/brain/*` and `/forge/*` are Ring 2 surfaces that emit proposals
 and verdicts only — Ring 0 alone signs.
 
-#### 5.3.5 V1.1 operator auth, dual workspaces and clean slate
+#### 5.3.5 V1.1 operator auth, V1.3 dual portals and clean slate
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/v2/auth/status` | `initialized`, `authenticated`, `username`, `tier`, `clean_slate_active` |
+| `GET` | `/api/v2/auth/status` | `initialized`, `authenticated`, `username`, `tier`, `workspace`, `clean_slate_active`, `login_portals`, `active_workspace`, `expires_ns` |
 | `POST` | `/api/v2/auth/setup` | First-run operator registration → PAPER session |
-| `POST` | `/api/v2/auth/login` | PAPER session |
-| `POST` | `/api/v2/auth/elevate-live` | LIVE PIN → LIVE session (30 min, single-use) |
+| `POST` | `/api/v2/auth/login` | Legacy PAPER session |
+| `POST` | `/api/v2/auth/login/paper` | **V1.3** dedicated paper portal → PAPER (12 h) |
+| `POST` | `/api/v2/auth/login/live` | **V1.3** dedicated live portal, three factors → LIVE (30 min) |
+| `POST` | `/api/v2/auth/elevate-live` | Legacy PAPER→LIVE PIN elevation (30 min, single-use) |
 | `POST` | `/api/v2/auth/logout` | Revoke the presented session |
 | `POST` | `/api/v2/auth/reset` | Delete the operator credential and zero the workspace (`{password, live_pin}` required once initialized) |
 | `GET` | `/api/v2/workspace/paper/state` | Mode-scoped Paper telemetry |
 | `GET` | `/api/v2/workspace/live/state` | Mode-scoped Live telemetry (`tier=LIVE` only) |
 | `POST` | `/api/v2/control/ledger/fund-paper` | Operator-chosen paper capital, double entry |
-| `POST` | `/api/v2/control/workspace/reset` | Zero the workspace, keep the credential |
+| `POST` | `/api/v2/control/workspace/reset` | Zero the workspace (including the logbook), keep the credential |
 | `POST` | `/api/v2/control/workspace/autopilot` | Play / pause the paper tape (default OFF) |
 
 `/api/v2/control/brokers` (`mode=LIVE`), `/brokers/credentials`, `/brokers/testnet-order` and
@@ -648,29 +717,59 @@ Cost floors applied by both backtest routes: `INDIA_ZERODHA_DHAN` 8.50 bps (incl
 STT), `CRYPTO_BINANCE` 16.00 bps, `US_IBKR` 2.80 bps, `FX_MT5` 1.60 bps. An unknown
 `timeframe`, silo or strategy is rejected with `422`; an unknown task is `404 UNKNOWN_TASK`.
 
+#### 5.3.7 V1.3 options, terminal, logbook and broker hub
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v2/cockpit/options` | Underlyings, six payoff templates and a grounded NIFTY chain |
+| `POST` | `/api/v2/control/options/chain` | Deterministic Call/Put chain with Greeks, PCR, Max Pain, ATM IV (11 strikes by default) |
+| `POST` | `/api/v2/control/options/strategy-payoff` | Multi-leg payoff: legs, net debit/credit, max profit/loss, breakevens, 25-point curve |
+| `GET` | `/api/v2/cockpit/terminal` | Watchlist + a live 60-bar / 10-level / Lee-Ready frame |
+| `POST` | `/api/v2/control/terminal/quote` | Re-frame one symbol (quotes, OHLCV, MA5/10/20, VWAP, L2 ladder, tape) |
+| `GET` | `/api/v2/cockpit/logbook` | Journal entries, gross/net P&L, win rate, avg R, cost floors |
+| `POST` | `/api/v2/control/logbook/entry` | Record one cost-adjusted trade (gross → cost drag → net → R-multiple) |
+| `POST` | `/api/v2/control/logbook/clear` | Zero the journal |
+| `GET` | `/api/v2/cockpit/brokers` | 12-venue matrix, `CONFIGURED`/`UNSET`, masked keys, Ed25519 dry-run, settlement |
+| `POST` | `/api/v2/control/brokers/ping` | Import one adapter and prove the Ring 0 Ed25519 signer round-trips |
+
+The chain supports `NIFTY`, `BANKNIFTY`, `BTCUSDT`, `ETHUSDT`, `SPY` and `EURUSD`, with an
+optional `spot`, `volatility`, `days_to_expiry`, `risk_free_rate` and `strike_count`
+(default `11`, forced odd so the chain stays symmetric). Every response is sealed with a
+verified SHA-256 `GroundedFactPacket`.
+
+The logbook applies the statutory cost floor per silo before attribution: `INDIA_ZERODHA_DHAN`
+8.50 bps, `CRYPTO_BINANCE` 16.00 bps, `US_IBKR` 2.80 bps, `FX_MT5` 1.60 bps. A clean-slate
+boot starts with `entries == []`, and `POST /api/v2/control/workspace/reset` clears it back to
+`[]` along with every other workspace value.
+
 ---
 
-## SOP 6 — Eleven-Page Cockpit Workstation
+## SOP 6 — Fifteen-Page Cockpit Workstation
 
-### 6.1 The eleven pages
+### 6.1 The fifteen pages
 
-The cockpit is a single React 19 SPA with eleven production pages. `GET /api/v2/cockpit/pages`
-returns the authoritative catalogue, including the alias map; a direct navigation or browser
-refresh on any route is served by the SPA catch-all and never 404s.
+The cockpit is a single React 19 SPA with fifteen production pages. `GET /api/v2/cockpit/pages`
+returns the authoritative catalogue, including the alias map and the five sidebar groups; a
+direct navigation or browser refresh on any route is served by the SPA catch-all and never
+404s.
 
-| # | Page | Route | Aliases | Ring | Summary |
-|---|---|---|---|---|---|
-| 1 | Dashboard | `/dashboard` | `/` | Ring 3 | 4-silo IBOR vault cards, SSE proof stream, 60 s leases |
-| 2 | Orders & Positions | `/orders` | `/positions` | Ring 0 | SmartOMS blotter, Maker-Peg/TWAP slicers, atomic outbox |
-| 3 | Shadow Analyzer | `/analyzer` | — | Ring 1 | 30-fill L2 shadow nursery, adverse-selection telemetry |
-| 4 | Quant & Valuation Lab | `/quant` | — | Ring 2 | 490-factor scanner, DCF/Black-Scholes, loader readiness |
-| 5 | Brain & Contagion X-Ray | `/brain` | `/xray` | Ring 2 | Ring isolation, MiroFish cascade, committee, SHA-256 proofs |
-| 6 | Alpha Forge & Plugins | `/forge` | — | Ring 2 | Nocturnal Forge leaderboard, plugins, SKILL.md catalog |
-| 7 | IBOR Ledger & Tax | `/ledger` | — | Ring 0 | Double-entry journal, 35/15 ratchet, TigerBeetle + PG16 |
-| 8 | Proofs, Chaos & Telemetry | `/verification` | — | Ring 0 | TLA+ BFS proofs, VOPR campaign, OS tuning, metrics |
-| 9 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | 22-gate pre-flight, credential vault, LLM switchboard, MCP |
-| 10 | Agent Task Hub | `/agents` | — | Ring 2 | 6 specialist agents, watchlist batch ranking, grounded Q&A, token ledger |
-| 11 | Walk-Forward Backtester | `/backtest` | — | Ring 2 | 5 timeframes, 8-strategy tax-net comparison, Purged K-Fold, DSR gate |
+| # | Page | Route | Aliases | Ring | Group | Summary |
+|---|---|---|---|---|---|---|
+| 1 | Dashboard | `/dashboard` | `/` | Ring 3 | Core Execution | 4-silo IBOR vault cards, SSE proof stream, 60 s leases |
+| 2 | Market Terminal | `/terminal` | — | Ring 1 | Core Execution | Multi-silo watchlist, 60 bars + MA/VWAP, 10-level L2, Lee-Ready tape |
+| 3 | Orders & Positions | `/orders` | `/positions` | Ring 0 | Core Execution | SmartOMS blotter, Maker-Peg/TWAP slicers, atomic outbox |
+| 4 | Options & Strategy Lab | `/options` | `/chain` | Ring 2 | Quant & Options | Call/Put chain with Greeks, PCR, Max Pain, six payoff templates |
+| 5 | Shadow Analyzer | `/analyzer` | — | Ring 1 | Quant & Options | 30-fill L2 shadow nursery, adverse-selection telemetry |
+| 6 | Quant & Valuation Lab | `/quant` | — | Ring 2 | Quant & Options | 490-factor scanner, DCF/Black-Scholes, loader readiness |
+| 7 | Agent Task Hub | `/agents` | — | Ring 2 | Bicameral Brain & Agents | 6 specialist agents, watchlist batch ranking, grounded Q&A, token ledger |
+| 8 | Walk-Forward Backtester | `/backtest` | — | Ring 2 | Bicameral Brain & Agents | 5 timeframes, 8-strategy tax-net comparison, Purged K-Fold, DSR gate |
+| 9 | Brain & Contagion X-Ray | `/brain` | `/xray` | Ring 2 | Bicameral Brain & Agents | Ring isolation, MiroFish cascade, committee, SHA-256 proofs |
+| 10 | Alpha Forge & Plugins | `/forge` | — | Ring 2 | Bicameral Brain & Agents | Nocturnal Forge leaderboard, plugins, SKILL.md catalog |
+| 11 | IBOR Ledger & Tax | `/ledger` | — | Ring 0 | Ledger & Verification | Double-entry journal, 35/15 ratchet, TigerBeetle + PG16 |
+| 12 | Trade Logbook | `/logbook` | `/journal` | Ring 0 | Ledger & Verification | Cost-adjusted journal, net P&L, R-multiple, win/loss attribution |
+| 13 | Proofs, Chaos & Telemetry | `/verification` | — | Ring 0 | Ledger & Verification | TLA+ BFS proofs, VOPR campaign, OS tuning, metrics |
+| 14 | Broker Hub & Feeds | `/brokers` | `/venues` | Ring 0 | Sovereign Control | 12-venue matrix, masked credentials, Ed25519 dry-run, feed health |
+| 15 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | Sovereign Control | 22-gate pre-flight, credential vault, LLM switchboard, MCP |
 
 `/api` and `/metrics` are excluded from the catch-all, so an unknown API path still returns a
 real `404` instead of the SPA shell.
@@ -680,18 +779,22 @@ real `404` instead of the SPA shell.
 | Page | Read path | Write path |
 |---|---|---|
 | `/dashboard` | `state`, `stream` | — |
+| `/terminal` | `cockpit/terminal` | `terminal/quote` |
 | `/orders` | `cockpit/orders` | `orders/paper`, `orders/cancel` |
+| `/options` | `cockpit/options` | `options/chain`, `options/strategy-payoff` |
 | `/analyzer` | `cockpit/analyzer` | `analyzer/shadow-burst` |
 | `/quant` | `cockpit/quant` | `quant/price-option`, `quant/scan` |
+| `/agents` | `cockpit/agents` | `agents/assign`, `agents/batch-watchlist`, `agents/followup`, `agents/cancel` |
+| `/backtest` | `cockpit/backtest` | `backtest/run`, `backtest/compare-strategies`, `backtest/promote-to-nursery` |
 | `/brain` | `state`, `formal-proofs` | `brain/mirofish-shock`, `brain/committee-debate` |
 | `/forge` | `cockpit/forge`, `skills/{name}` | `forge/evaluate-challenger` |
 | `/ledger` | `cockpit/ledger` | `ledger/reconcile` |
+| `/logbook` | `cockpit/logbook` | `logbook/entry`, `logbook/clear` |
 | `/verification` | `formal-proofs` | `verification/chaos-drill`, `/vopr`, `/os-tune` |
+| `/brokers` | `cockpit/brokers`, `control/preflight` | `brokers/ping` |
 | `/control` | `cockpit/mcp`, `control/preflight` | `brokers`, `llms`, `killswitch`, `vault/*` |
-| `/agents` | `cockpit/agents` | `agents/assign`, `agents/batch-watchlist`, `agents/followup`, `agents/cancel` |
-| `/backtest` | `cockpit/backtest` | `backtest/run`, `backtest/compare-strategies`, `backtest/promote-to-nursery` |
 
-### 6.3 Non-destructive 11-page burn-in sweep
+### 6.3 Non-destructive 15-page burn-in sweep
 
 Run this before declaring a documentation or UI release sealed. It never places a live order
 and never mutates a credential.
@@ -703,25 +806,27 @@ python scripts/nios_port_check.py --scan 8000 8010
 # 2. Boot the unified server on the port it printed
 python scripts/run_nios.py --host 127.0.0.1 --port <PORT>
 
-# 3. Sweep all 11 SPA routes + 4 aliases (expect 200 + index.html on every one)
-#    /dashboard /orders /analyzer /quant /brain /forge /ledger /verification
-#    /control /agents /backtest
-#    / /positions /xray /mcp
+# 3. Sweep all 15 SPA routes x 3 trees (base, /paper/*, /live/*) = 45 routes
+#    /dashboard /terminal /orders /options /analyzer /quant /agents /backtest
+#    /brain /forge /ledger /logbook /verification /brokers /control
+#    / /positions /xray /mcp /chain /journal /venues
+#    /login /paper/login /live/login /setup /live-unlock
 
-# 4. Sweep the 9 page-telemetry endpoints + skills document
-#    /api/v2/cockpit/pages /orders /analyzer /quant /forge /ledger /mcp
-#    /api/v2/cockpit/agents /api/v2/cockpit/backtest
+# 4. Sweep the page-telemetry endpoints + skills document
+#    /api/v2/cockpit/pages /terminal /orders /options /analyzer /quant /forge
+#    /ledger /logbook /agents /backtest /brokers /mcp
 #    /api/v2/cockpit/skills/<skill_name>
 
-# 5. Sweep the 12 workstation controls with their documented payloads (expect 200)
-#    plus the V1.2 agent/backtest controls: agents/assign, agents/batch-watchlist,
-#    agents/followup, backtest/run, backtest/compare-strategies
+# 5. Sweep the workstation controls with their documented payloads (expect 200)
+#    plus the V1.3 controls: options/chain, options/strategy-payoff,
+#    terminal/quote, logbook/entry, logbook/clear, brokers/ping
 
 # 6. Shut down cleanly; `git status --porcelain` must be empty afterwards.
 ```
 
-Acceptance: **11/11 routes**, **9/9 page endpoints**, **12/12 controls**, **5/5 V1.2 controls**
-at `200 OK`, then a clean `Ctrl+C` and an empty `git status --porcelain`. Any non-200 is a release blocker — do not retry
+Acceptance: **45/45 routes**, **13/13 page endpoints**, **12/12 controls**, **5/5 V1.2
+controls** and **6/6 V1.3 controls** at `200 OK`, then a clean `Ctrl+C` and an empty
+`git status --porcelain`. Any non-200 is a release blocker — do not retry
 around it, read the response body.
 
 ### 6.4 Reference payloads
