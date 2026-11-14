@@ -34,6 +34,8 @@ export const PAPER_ROUTES: { path: string; label: string }[] = [
   { path: '/paper/ledger', label: 'Ledger' },
   { path: '/paper/verification', label: 'Verification' },
   { path: '/paper/control', label: 'Control' },
+  { path: '/paper/agents', label: 'Agents' },
+  { path: '/paper/backtest', label: 'Backtest' },
 ]
 
 export const LIVE_ROUTES: { path: string; label: string }[] = [
@@ -44,6 +46,8 @@ export const LIVE_ROUTES: { path: string; label: string }[] = [
   { path: '/live/brain', label: 'Brain' },
   { path: '/live/ledger', label: 'Ledger' },
   { path: '/live/control', label: 'Control' },
+  { path: '/live/agents', label: 'Agents' },
+  { path: '/live/backtest', label: 'Backtest' },
 ]
 
 function WorkspaceNav({

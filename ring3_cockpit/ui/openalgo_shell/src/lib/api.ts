@@ -1,5 +1,12 @@
 import type {
+  AgentAssignPayload,
+  AgentAssignReceipt,
+  AgentCancelReceipt,
+  AgentsPageData,
   AnalyzerPageData,
+  BacktestPageData,
+  BacktestReceipt,
+  BacktestRunPayload,
   BrokerControlPayload,
   BrokerCredentialPayload,
   BrokerCredentialReport,
@@ -26,6 +33,7 @@ import type {
   McpPageData,
   MetricsSnapshot,
   MiroFishShockReceipt,
+  NurseryPromotionReceipt,
   OptionPricePayload,
   OptionPriceReceipt,
   OrdersPageData,
@@ -322,7 +330,7 @@ export function postSupervisorForgeHedge(): Promise<ForgeHedgeReceipt> {
  * Step 4 — read-only multi-page cockpit telemetry
  * ------------------------------------------------------------------ */
 
-/** Page catalog: nine production pages, their routes and live counts. */
+/** Page catalog: eleven production pages, their routes and live counts. */
 export function fetchPages(): Promise<PagesIndex> {
   return request<PagesIndex>('/api/v2/cockpit/pages')
 }
@@ -580,4 +588,76 @@ export function postEvaluateChallenger(payload: {
     method: 'POST',
     body: JSON.stringify({ operator: 'ring3.cockpit', ...payload }),
   })
+}
+
+// ---------------------------------------------------------------------------
+// V1.2 - agent task assignment workstation (/agents)
+// ---------------------------------------------------------------------------
+
+/** Read the six specialist agents, eight strategies and the task queue. */
+export function fetchAgentsPage(): Promise<AgentsPageData> {
+  return request<AgentsPageData>('/api/v2/cockpit/agents')
+}
+
+/**
+ * Assign one grounded task to a Ring 2 specialist agent.
+ *
+ * Ring 2 emits research only: the receipt carries a SHA-256 `grounding_sha256`
+ * and never an order, a broker key, or an IBOR write.
+ */
+export function postAgentTask(payload: AgentAssignPayload): Promise<AgentAssignReceipt> {
+  return request<AgentAssignReceipt>('/api/v2/control/agents/assign', {
+    method: 'POST',
+    body: JSON.stringify({ ...payload }),
+  })
+}
+
+/** Read one task together with its full grounded markdown report. */
+export function fetchAgentTask(taskId: string): Promise<AgentAssignReceipt> {
+  return request<AgentAssignReceipt>(
+    `/api/v2/control/agents/tasks/${encodeURIComponent(taskId)}`,
+  )
+}
+
+/** Cancel one task, or pass `ALL` to clear the whole queue. */
+export function postCancelAgentTasks(taskId = 'ALL'): Promise<AgentCancelReceipt> {
+  return request<AgentCancelReceipt>('/api/v2/control/agents/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ task_id: taskId }),
+  })
+}
+
+// ---------------------------------------------------------------------------
+// V1.2 - walk-forward backtesting workstation (/backtest)
+// ---------------------------------------------------------------------------
+
+/** Read the strategy catalog, silo cost-floor table and saved runs. */
+export function fetchBacktestPage(): Promise<BacktestPageData> {
+  return request<BacktestPageData>('/api/v2/cockpit/backtest')
+}
+
+/**
+ * Run a deterministic tax-net walk-forward backtest.
+ *
+ * Every trade is charged the silo's statutory floor (India STT is 5.50 bps of
+ * the 8.50 bps total) before the Deflated Sharpe gate is computed.
+ */
+export function postRunBacktest(payload: BacktestRunPayload): Promise<BacktestReceipt> {
+  return request<BacktestReceipt>('/api/v2/control/backtest/run', {
+    method: 'POST',
+    body: JSON.stringify({ ...payload }),
+  })
+}
+
+/**
+ * Promote a passing run into the 30-fill shadow nursery.
+ *
+ * Rejected with HTTP 409 unless the Deflated Sharpe clears 1.50 and the tax-net
+ * edge clears +0.50 bps. The nursery never starts above 0/30 fills.
+ */
+export function postPromoteToNursery(backtestId: string): Promise<NurseryPromotionReceipt> {
+  return request<NurseryPromotionReceipt>(
+    '/api/v2/control/backtest/promote-to-nursery',
+    { method: 'POST', body: JSON.stringify({ backtest_id: backtestId }) },
+  )
 }

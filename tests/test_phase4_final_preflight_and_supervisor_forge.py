@@ -10,7 +10,7 @@ Four gates close the Main Core (Phases 1-3):
 * Gate 3 -- ``scripts/preflight_golive.py --json`` certifies the release with
   ``ready_for_live_cutover == True``, ``failed_gates == 0`` and a 64-character
   SHA-256 certificate digest.
-* Gate 4 -- the regression inventory grew from 18 to 19 suites while every
+* Gate 4 -- the regression inventory grew from 18 to 20 suites while every
   pre-existing Phase 1-3 suite stayed intact.
 
 Phase 4 Step 2 wires those organs into the Ring 3 control plane and cockpit:
@@ -311,7 +311,7 @@ def test_gate4_regression_inventory_is_eighteen_suites() -> None:
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 19, suites
+    assert len(suites) == 20, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"
@@ -904,7 +904,7 @@ def test_step2_mirofish_sub_1_8ms_ring1_sub_140us_and_deterministic_cert_hash(
         runtime.close()
 
 
-def test_all_9_cockpit_pages_and_spa_routes_are_served_and_hydrated(
+def test_all_11_cockpit_pages_and_spa_routes_are_served_and_hydrated(
     cockpit: Any,
 ) -> None:
     """Every production cockpit page is served, hydrated and grounded by Ring 3."""
@@ -919,6 +919,8 @@ def test_all_9_cockpit_pages_and_spa_routes_are_served_and_hydrated(
         "/ledger",
         "/verification",
         "/control",
+        "/agents",
+        "/backtest",
     )
     index_bytes = (FRONTEND / "dist" / "index.html").read_bytes()
     assert index_bytes, "compiled cockpit bundle is missing dist/index.html"
@@ -933,7 +935,7 @@ def test_all_9_cockpit_pages_and_spa_routes_are_served_and_hydrated(
     index = cockpit.get("/api/v2/cockpit/pages")
     assert index.status_code == 200
     payload = index.json()
-    assert payload["page_count"] == 9
+    assert payload["page_count"] == 11
     assert {page["key"] for page in payload["pages"]} == {
         "dashboard",
         "orders",
@@ -944,6 +946,8 @@ def test_all_9_cockpit_pages_and_spa_routes_are_served_and_hydrated(
         "ledger",
         "verification",
         "control",
+        "agents",
+        "backtest",
     }
     assert payload["air_gap"]["ring3_read_only"] is True
     assert payload["air_gap"]["order_signing_tools"] == 0
@@ -1310,7 +1314,7 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
     * ``POST /api/v2/control/forge/evaluate-challenger`` -- the nursery gates
       (``DSR >= 1.50`` and ``>= 30`` shadow fills) on both sides of the line.
 
-    The rebuilt ``dist/`` bundle must carry every control, so all nine cockpit
+    The rebuilt ``dist/`` bundle must carry every control, so all eleven cockpit
     pages ship with a live workstation action.
     """
 

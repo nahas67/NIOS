@@ -1786,3 +1786,292 @@ export interface ChallengerEvalReceipt {
   generated_at_ns: number
   [key: string]: unknown
 }
+
+// ---------------------------------------------------------------------------
+// V1.2 - agent task assignment workstation (/agents)
+// ---------------------------------------------------------------------------
+
+export interface StrategyTemplate {
+  strategy_id: string
+  name: string
+  family: string
+  summary: string
+  timeframe: string
+  required_bars: number
+  donor_source: string
+  donor_file: string
+  silos: string[]
+  parameters: Record<string, number>
+  [key: string]: unknown
+}
+
+export interface AgentSpec {
+  agent_id: string
+  title: string
+  task_type: string
+  description: string
+  capabilities: string[]
+  requires_strategy: boolean
+  token_prompt: number
+  token_completion: number
+  token_cost_usd: number
+  ring: string
+  signs_orders: boolean
+  reads_broker_keys: boolean
+  [key: string]: unknown
+}
+
+export interface TokenUsage {
+  spend_usd: number
+  cap_usd: number
+  remaining_usd: number
+  utilization_pct: number
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  locked: boolean
+  [key: string]: unknown
+}
+
+export interface AgentTaskRow {
+  task_id: string
+  agent_id: string
+  task_type: string
+  silo: string
+  symbols: string[]
+  strategy_id: string | null
+  prompt: string
+  priority: string
+  status: string
+  progress_pct: number
+  created_at_ns: number
+  completed_at_ns: number
+  latency_ms: number
+  token_cost_usd: number
+  grounding_sha256: string
+  verified: boolean
+  error: string | null
+  [key: string]: unknown
+}
+
+export interface AgentAssignPayload {
+  agent_id: string
+  silo: string
+  symbols: string[]
+  strategy_id: string | null
+  prompt: string
+  priority: string
+}
+
+export interface AgentAssignReceipt extends AgentTaskRow {
+  structured_result: Record<string, unknown>
+  markdown_report: string
+  verification: Record<string, unknown>
+  token?: TokenUsage
+}
+
+export interface AgentCancelReceipt {
+  cancelled: number
+  scope: string
+  remaining_tasks: number
+  tasks: AgentTaskRow[]
+  token?: TokenUsage
+  [key: string]: unknown
+}
+
+export interface AgentsPageData {
+  page: string
+  route: string
+  workspaces: string[]
+  routes: Record<string, string>
+  agent_count: number
+  agents: AgentSpec[]
+  strategy_count: number
+  strategies: StrategyTemplate[]
+  silos: string[]
+  priorities: string[]
+  task_count: number
+  tasks: AgentTaskRow[]
+  counts: Record<string, number>
+  active_tasks: number
+  completed_tasks: number
+  failed_tasks: number
+  cancelled_tasks: number
+  token: TokenUsage
+  clean_slate: boolean
+  air_gap: Record<string, unknown>
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+// ---------------------------------------------------------------------------
+// V1.2 - walk-forward backtesting workstation (/backtest)
+// ---------------------------------------------------------------------------
+
+export interface CostFloorRow {
+  silo: string
+  cost_floor_bps: number
+  statutory_tax_bps: number
+  [key: string]: unknown
+}
+
+export interface BacktestSummaryRow {
+  backtest_id: string
+  silo: string
+  symbol: string
+  strategy_id: string
+  strategy_name: string
+  bars: number
+  cost_floor_bps: number
+  net_edge_bps: number
+  deflated_sharpe_ratio: number
+  passes_dsr_gate: boolean
+  passes_champion_floor: boolean
+  promotable: boolean
+  grounding_sha256: string
+  verified: boolean
+  created_at_ns: number
+  initial_capital_units: number
+  final_nav_units: number
+  total_return_pct: number
+  max_drawdown_pct: number
+  total_trades: number
+  win_rate_pct: number
+  params: Record<string, unknown>
+  [key: string]: unknown
+}
+
+export interface BacktestPageData {
+  page: string
+  route: string
+  workspaces: string[]
+  routes: Record<string, string>
+  run_count: number
+  runs: BacktestSummaryRow[]
+  strategy_count: number
+  strategies: StrategyTemplate[]
+  silos: string[]
+  cost_floors: Record<string, number>
+  cost_floor_table: CostFloorRow[]
+  k_folds: number
+  embargo_pct: number
+  dsr_gate: number
+  champion_net_edge_floor_bps: number
+  report_tolerance: number
+  clean_slate: boolean
+  air_gap: Record<string, unknown>
+  generated_at_ns: number
+  [key: string]: unknown
+}
+
+export interface BacktestTradeRow {
+  trade_id: string
+  entry_bar: number
+  exit_bar: number
+  side: string
+  entry_price: number
+  exit_price: number
+  gross_bps: number
+  cost_bps: number
+  net_bps: number
+  bars_held: number
+  reason: string
+  [key: string]: unknown
+}
+
+export interface HorizonRow {
+  horizon_bars: number
+  samples: number
+  wins: number
+  win_rate_pct: number
+  net_edge_bps: number
+  cost_bps: number
+  [key: string]: unknown
+}
+
+export interface PurgedKFoldReport {
+  k: number
+  embargo_pct: number
+  embargo_bars: number
+  fold_count: number
+  folds: Array<Record<string, unknown>>
+  trades_in_folds: number
+  out_of_sample_net_bps: number
+  purged: number
+  embargoed: number
+  leakage_free: boolean
+  [key: string]: unknown
+}
+
+export interface BacktestRunPayload {
+  silo: string
+  symbol: string
+  strategy_id: string
+  bars: number
+  initial_capital_units: number
+  fast_window?: number | null
+  slow_window?: number | null
+  stop_loss_bps?: number | null
+  take_profit_bps?: number | null
+}
+
+export interface BacktestReceipt {
+  backtest_id: string
+  silo: string
+  symbol: string
+  strategy_id: string
+  strategy_name: string
+  bars: number
+  cost_floor_bps: number
+  statutory_tax_bps: number
+  initial_capital_units: number
+  final_nav_units: number
+  benchmark_final_units: number
+  equity_curve: number[]
+  drawdown_curve_pct: number[]
+  benchmark_curve_units: number[]
+  trades: BacktestTradeRow[]
+  trade_count: number
+  signal_bars: number
+  metrics: Record<string, number>
+  horizon_matrix: Record<string, HorizonRow>
+  purged_kfold: PurgedKFoldReport
+  deflated_sharpe_ratio: number
+  dsr_gate: number
+  passes_dsr_gate: boolean
+  net_edge_bps: number
+  champion_net_edge_floor_bps: number
+  passes_champion_floor: boolean
+  promotable: boolean
+  grounding_sha256: string
+  fact_count: number
+  markdown_report: string
+  verification: Record<string, unknown>
+  verified: boolean
+  created_at_ns: number
+  run_count?: number
+  [key: string]: unknown
+}
+
+export interface NurseryPromotionReceipt {
+  promoted: boolean
+  already_registered: boolean
+  backtest_id: string
+  strategy_id: string
+  silo: string
+  symbol: string
+  deflated_sharpe_ratio: number
+  dsr_gate: number
+  net_edge_bps: number
+  champion_net_edge_floor_bps: number
+  plugin_name: string
+  shadow_fills: number
+  required_fills: number
+  remaining_fills: number
+  graduated: boolean
+  nursery_bypassed: boolean
+  grounding_sha256: string
+  next: string
+  generated_at_ns: number
+  [key: string]: unknown
+}

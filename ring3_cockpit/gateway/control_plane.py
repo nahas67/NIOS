@@ -857,6 +857,43 @@ class AutopilotControlRequest(BaseModel):
     enabled: bool = False
 
 
+class AgentAssignRequest(BaseModel):
+    """``POST /api/v2/control/agents/assign`` -- dispatch a Ring 2 agent task."""
+
+    agent_id: str
+    silo: str = "US_IBKR"
+    symbols: list[str] = Field(default_factory=list)
+    strategy_id: str | None = None
+    prompt: str = ""
+    priority: str = "NORMAL"
+
+
+class AgentCancelRequest(BaseModel):
+    """``POST /api/v2/control/agents/cancel`` -- cancel one task or clear all."""
+
+    task_id: str = "ALL"
+
+
+class BacktestRunRequest(BaseModel):
+    """``POST /api/v2/control/backtest/run`` -- tax-net walk-forward run."""
+
+    silo: str = "US_IBKR"
+    symbol: str = "SPY"
+    strategy_id: str = "ma_golden_cross"
+    bars: int = 252
+    initial_capital_units: float = 100_000.0
+    fast_window: int | None = None
+    slow_window: int | None = None
+    stop_loss_bps: float | None = None
+    take_profit_bps: float | None = None
+
+
+class NurseryPromoteRequest(BaseModel):
+    """``POST /api/v2/control/backtest/promote-to-nursery`` -- DSR-gated."""
+
+    backtest_id: str
+
+
 # ---------------------------------------------------------------------------
 # Mutable control state
 # ---------------------------------------------------------------------------
@@ -1138,6 +1175,25 @@ class ControlPlane:
         # pool, so rebuilding it on every debate would be pure overhead.
         self._committee_cache: dict[str, Any] = {}
         self._committee_lock = threading.Lock()
+        # ---- V1.2: Ring 2 agent task assignment + walk-forward backtester --
+        # Both engines are constructed here, after every collaborator they
+        # depend on exists, and both start empty (clean-slate boot).
+        from ring2_brain.agents.task_dispatcher import AgentTaskDispatcher
+        from ring2_brain.backtest.engine import WalkForwardBacktestEngine
+        from ring2_brain.quant.scanner import ValuationLab
+
+        self.backtest_engine = WalkForwardBacktestEngine(
+            plugins=self.plugins,
+            shadow_twin=self.shadow_twin,
+        )
+        self._valuation_lab = ValuationLab()
+        self.task_dispatcher = AgentTaskDispatcher(
+            valuation=self._valuation_lab,
+            forge=self.forge,
+            backtest_engine=self.backtest_engine,
+            token_ledger=self.token_ledger,
+        )
+        self.task_dispatcher.attach(contagion_factory=self._contagion_engine_for)
 
     # -- reads ------------------------------------------------------------
     def broker_state(self, key: str) -> dict[str, Any]:
@@ -4077,9 +4133,87 @@ class ControlPlane:
             slot2.updated_at_ns = int(report["probed_at_ns"])
         return report
 
+    # -- V1.2: agent task hub + walk-forward backtester --------------------
+    def agents_page(self) -> dict[str, Any]:
+        """``GET /api/v2/cockpit/agents`` -- specialist agents and task queue."""
+        snapshot = self.task_dispatcher.snapshot()
+        return {
+            **snapshot,
+            "page": "agents",
+            "route": "/agents",
+            "workspaces": ["/paper/agents", "/live/agents"],
+            "routes": {
+                "agents": "/api/v2/cockpit/agents",
+                "assign": "/api/v2/control/agents/assign",
+                "task": "/api/v2/control/agents/tasks/{task_id}",
+                "cancel": "/api/v2/control/agents/cancel",
+            },
+        }
+
+    def assign_agent_task(self, request: AgentAssignRequest) -> dict[str, Any]:
+        """Dispatch one grounded Ring 2 agent task and return its report."""
+        task = self.task_dispatcher.assign(
+            agent_id=request.agent_id,
+            silo=request.silo,
+            symbols=list(request.symbols or []),
+            strategy_id=request.strategy_id,
+            prompt=request.prompt,
+            priority=request.priority,
+        )
+        task["token"] = self.task_dispatcher.token_usage()
+        return task
+
+    def agent_task(self, task_id: str) -> dict[str, Any]:
+        """``GET /api/v2/control/agents/tasks/{task_id}`` -- full report."""
+        task = self.task_dispatcher.task_dict(str(task_id))
+        if task is None:
+            raise KeyError(f"UNKNOWN_TASK: {task_id}")
+        return task
+
+    def cancel_agent_tasks(self, request: AgentCancelRequest) -> dict[str, Any]:
+        """``POST /api/v2/control/agents/cancel`` -- cancel one or clear all."""
+        result = self.task_dispatcher.cancel(str(request.task_id))
+        result["token"] = self.task_dispatcher.token_usage()
+        return result
+
+    def backtest_page(self) -> dict[str, Any]:
+        """``GET /api/v2/cockpit/backtest`` -- catalog, floors, saved runs."""
+        snapshot = self.backtest_engine.snapshot()
+        return {
+            **snapshot,
+            "page": "backtest",
+            "route": "/backtest",
+            "workspaces": ["/paper/backtest", "/live/backtest"],
+            "routes": {
+                "backtest": "/api/v2/cockpit/backtest",
+                "run": "/api/v2/control/backtest/run",
+                "promote": "/api/v2/control/backtest/promote-to-nursery",
+            },
+        }
+
+    def run_backtest(self, request: BacktestRunRequest) -> dict[str, Any]:
+        """``POST /api/v2/control/backtest/run`` -- grounded walk-forward run."""
+        receipt = self.backtest_engine.run(
+            silo=request.silo,
+            symbol=request.symbol,
+            strategy_id=request.strategy_id,
+            bars=int(request.bars),
+            initial_capital_units=float(request.initial_capital_units),
+            fast_window=request.fast_window,
+            slow_window=request.slow_window,
+            stop_loss_bps=request.stop_loss_bps,
+            take_profit_bps=request.take_profit_bps,
+        )
+        receipt["run_count"] = self.backtest_engine.run_count
+        return receipt
+
+    def promote_backtest(self, request: NurseryPromoteRequest) -> dict[str, Any]:
+        """``POST /api/v2/control/backtest/promote-to-nursery`` -- DSR gated."""
+        return self.backtest_engine.promote_to_nursery(str(request.backtest_id))
+
     # -- multi-page read-only telemetry (Step 4: full cockpit) ------------
     def _page_specs(self) -> list[dict[str, Any]]:
-        """The nine production Cockpit pages, in sidebar order."""
+        """The eleven production Cockpit pages, in sidebar order."""
         return [
             {
                 "key": "dashboard",
@@ -4161,6 +4295,30 @@ class ControlPlane:
                 "ring": "RING 3",
                 "read_only": True,
                 "summary": "22-gate pre-flight, credential vault, LLM switchboard, MCP.",
+            },
+            {
+                "key": "agents",
+                "title": "Agent Task Hub",
+                "route": "/agents",
+                "aliases": [],
+                "ring": "RING 2",
+                "read_only": True,
+                "summary": (
+                    "6 specialist Ring 2 agents, 8 harvested strategies, grounded "
+                    "decision dashboard, token-budget ledger."
+                ),
+            },
+            {
+                "key": "backtest",
+                "title": "Walk-Forward Backtester",
+                "route": "/backtest",
+                "aliases": [],
+                "ring": "RING 2",
+                "read_only": True,
+                "summary": (
+                    "Tax-net walk-forward CV, Purged K-Fold + embargo, Deflated "
+                    "Sharpe gate, 30-fill nursery promotion."
+                ),
             },
         ]
 
@@ -4815,6 +4973,8 @@ class ControlPlane:
             "clean_slate": True,
             "clean_slate_active": True,
             "workspace": "paper",
+            "agents": self.task_dispatcher.reset_to_clean_slate(),
+            "backtest": self.backtest_engine.reset_to_clean_slate(),
             **report,
         }
 
@@ -5910,6 +6070,66 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.get("/api/v2/cockpit/mcp")
     def cockpit_mcp() -> dict[str, Any]:
         return control.mcp_page()
+
+    # ---- V1.2: agent task hub + walk-forward backtester ------------------
+    @app.get("/api/v2/cockpit/agents")
+    def cockpit_agents() -> dict[str, Any]:
+        return control.agents_page()
+
+    @app.get("/api/v2/cockpit/backtest")
+    def cockpit_backtest() -> dict[str, Any]:
+        return control.backtest_page()
+
+    @app.post("/api/v2/control/agents/assign")
+    def control_agents_assign(request: AgentAssignRequest) -> dict[str, Any]:
+        try:
+            return control.assign_agent_task(request)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"UNKNOWN_TASK: {exc.args[0]}"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v2/control/agents/tasks/{task_id}")
+    def control_agents_task(task_id: str) -> dict[str, Any]:
+        try:
+            return control.agent_task(task_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"UNKNOWN_TASK: {task_id}"
+            ) from exc
+
+    @app.post("/api/v2/control/agents/cancel")
+    def control_agents_cancel(request: AgentCancelRequest) -> dict[str, Any]:
+        try:
+            return control.cancel_agent_tasks(request)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"UNKNOWN_TASK: {exc.args[0]}"
+            ) from exc
+
+    @app.post("/api/v2/control/backtest/run")
+    def control_backtest_run(request: BacktestRunRequest) -> dict[str, Any]:
+        try:
+            return control.run_backtest(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v2/control/backtest/promote-to-nursery")
+    def control_backtest_promote(request: NurseryPromoteRequest) -> dict[str, Any]:
+        from ring2_brain.backtest.engine import NurseryGateError
+
+        try:
+            return control.promote_backtest(request)
+        except NurseryGateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"UNKNOWN_BACKTEST: {request.backtest_id}"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # ---- Phase 4 Step 5: interactive operator actions --------------------
     @app.post("/api/v2/control/orders/paper")

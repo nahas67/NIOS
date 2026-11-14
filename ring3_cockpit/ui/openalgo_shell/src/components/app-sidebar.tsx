@@ -1,10 +1,12 @@
 import {
   BookOpen,
+  Bot,
   BrainCircuit,
   Calculator,
   Flame,
   FlaskConical,
   LayoutDashboard,
+  LineChart,
   ListOrdered,
   ShieldCheck,
   SlidersHorizontal,
@@ -32,6 +34,8 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'ledger', label: 'IBOR Ledger', hint: 'double entry', icon: BookOpen },
   { key: 'verification', label: 'Proofs & Chaos', hint: 'TLA+ · VOPR', icon: ShieldCheck },
   { key: 'control', label: 'Control & MCP', hint: '22 gates', icon: SlidersHorizontal },
+  { key: 'agents', label: 'Agent Tasks', hint: '6 agents · 8 strategies', icon: Bot },
+  { key: 'backtest', label: 'Backtester', hint: 'walk-forward · DSR', icon: LineChart },
 ]
 
 interface AppSidebarProps {

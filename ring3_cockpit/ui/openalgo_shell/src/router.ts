@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 
-/** The nine production cockpit pages. */
+/** The eleven production cockpit pages. */
 export type PageKey =
   | 'dashboard'
   | 'orders'
@@ -11,6 +11,8 @@ export type PageKey =
   | 'ledger'
   | 'verification'
   | 'control'
+  | 'agents'
+  | 'backtest'
 
 /** V1.1: physically separate workspaces + the three auth screens. */
 export type WorkspaceKey = 'paper' | 'live' | 'legacy'
@@ -27,6 +29,8 @@ export const PAGE_PATHS: Record<PageKey, string> = {
   ledger: '/ledger',
   verification: '/verification',
   control: '/control',
+  agents: '/agents',
+  backtest: '/backtest',
 }
 
 /** Workspace-qualified path for a page. */
@@ -48,6 +52,8 @@ const PATH_TO_PAGE: Record<string, PageKey> = {
   '/verification': 'verification',
   '/control': 'control',
   '/mcp': 'control',
+  '/agents': 'agents',
+  '/backtest': 'backtest',
 }
 
 /** Legacy tab id each page maps onto, used for backward compatibility. */

@@ -7,7 +7,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAuth } from '@/hooks/use-auth'
 import { useCockpit } from '@/hooks/use-cockpit'
 import { AnalyzerPage } from '@/pages/analyzer'
+import { AgentsPage } from '@/pages/agents'
 import { LoginPage, LiveUnlockPage, SetupPage } from '@/pages/auth'
+import { BacktestPage } from '@/pages/backtest'
 import { BrainPage } from '@/pages/brain'
 import { ControlPage } from '@/pages/control'
 import { DashboardPage } from '@/pages/dashboard'
@@ -58,6 +60,10 @@ export function App() {
         return <VerificationPage state={state} />
       case 'control':
         return <ControlPage state={state} onSaved={refresh} />
+      case 'agents':
+        return <AgentsPage />
+      case 'backtest':
+        return <BacktestPage />
       default:
         return <DashboardPage state={state} cards={cards} />
     }
@@ -209,7 +215,7 @@ export function App() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span>
                   NIOS-ARC-2026-V3 · v{state?.version ?? '3.0.0-PROD'} · Ring 3 is read-only for
-                  market state · 9 production pages
+                  market state · 11 production pages
                 </span>
                 <span>
                   99.1% noise abstention · 98% split-conformal · 35/15 in-silo ratchet

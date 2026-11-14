@@ -310,7 +310,7 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
 
 def test_gate5_full_test_inventory_is_eighteen_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 19, [path.name for path in test_files]
+    assert len(test_files) == 20, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
     assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
     # Phase 3 Step 1 adds process isolation, the live TigerBeetle replica and the

@@ -591,7 +591,29 @@ class NIOSCoreOrchestrator:
             "token_spend_usd": float(getattr(self.token_ledger, "spend_usd", 0.0) or 0.0),
             "autopilot": False,
             "orders": [],
+            "agents": self._reset_agent_tasks(),
+            "backtest": self._reset_backtest_runs(),
         }
+
+    def _reset_agent_tasks(self) -> dict[str, Any]:
+        control = getattr(self, "control", None)
+        dispatcher = getattr(control, "task_dispatcher", None)
+        if dispatcher is None:
+            return {"cleared": 0, "task_count": 0}
+        try:
+            return dict(dispatcher.reset_to_clean_slate())
+        except Exception:  # pragma: no cover - defensive clean-slate sweep
+            return {"cleared": 0, "task_count": 0}
+
+    def _reset_backtest_runs(self) -> dict[str, Any]:
+        control = getattr(self, "control", None)
+        engine = getattr(control, "backtest_engine", None)
+        if engine is None:
+            return {"cleared": 0, "run_count": 0}
+        try:
+            return dict(engine.reset_to_clean_slate())
+        except Exception:  # pragma: no cover - defensive clean-slate sweep
+            return {"cleared": 0, "run_count": 0}
 
     def set_autopilot(self, enabled: bool) -> dict[str, Any]:
         """Operator PLAY/PAUSE for the paper tape (never starts live trading)."""

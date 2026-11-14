@@ -327,12 +327,12 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 285 tests / 19 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 20 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.2.0-V1.1`: `pytest tests -q` must report **285 passed, 0 failed, 0 warnings**
+Release seal for `v3.3.0-V1.2`: `pytest tests -q` must report **312 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
@@ -359,6 +359,7 @@ prerequisites for re-tagging; neither may be waived.
 | 17 | `tests/test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS tuning, key rotation, runbook |
 | 18 | `tests/test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight, forge |
 | 19 | `tests/test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard, credential-gated factory reset |
+| 20 | `tests/test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** `daily_stock_analysis` harvest (8 strategies, grounded decision dashboard), 6 specialist agent tasks, tax-net walk-forward backtester, 30-fill nursery gate, 11-page SPA |
 
 ### 3.3 Chaos / crash injection
 
@@ -634,7 +635,7 @@ and verdicts only — Ring 0 alone signs.
 
 ### 6.1 The nine pages
 
-The cockpit is a single React 19 SPA with nine production pages. `GET /api/v2/cockpit/pages`
+The cockpit is a single React 19 SPA with eleven production pages. `GET /api/v2/cockpit/pages`
 returns the authoritative catalogue, including the alias map; a direct navigation or browser
 refresh on any route is served by the SPA catch-all and never 404s.
 
