@@ -1,7 +1,7 @@
 # NIOS Production Operator Runbook
 
 **Document ID:** NIOS-OPS-2026-V3
-**Release tag:** `v3.7.0-V1.6` (supersedes `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
+**Release tag:** `v3.7.0-V1.6` (supersedes `v3.6.0-V1.5`, `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
 **Branch:** `V1.6`
 **Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
@@ -293,6 +293,79 @@ model, owns the live gate).
 
 ---
 
+## SOP 1D — V1.6 Headless Backend Mode
+
+`v3.7.0-V1.6` ships **no frontend**. The React/Vite tree
+(`ring3_cockpit/ui/openalgo_shell/src`, `public`, `node_modules`, the Vite/Biome
+toolchain and the compiled JavaScript bundle) was removed. Ring 3 is a headless
+REST/SSE backend plus one deterministic status document.
+
+### 1D.1 What a browser sees
+
+`GET /`, `/dashboard`, `/orders`, `/paper/*`, `/live/*` and every other client
+route answer `200 text/html` with
+`ring3_cockpit/ui/openalgo_shell/dist/index.html`: a zero-JavaScript manifest
+that names the API root, the envelope keys and the risk-telemetry keys. There is
+no `<script>` tag, no `/assets/` bundle and no CSS framework. `GET /api/v2/*` is
+never swallowed by the catch-all; an unknown API path is a real `404`.
+
+If `dist/index.html` is absent, `create_app()` generates the same manifest
+in-process, so a bare checkout never 404s on a client route.
+
+### 1D.2 The response envelope
+
+Every `/api/v2/cockpit/*` and `/api/v2/workspace/*` payload carries:
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | `v1.6.headless-backend` |
+| `generated_at_ns` | UTC nanosecond stamp of the response |
+| `clean_slate_active` | workspace is still demo-free |
+| `workspace_mode` | `PAPER` / `LIVE` / `NONE` |
+| `payload_sha256` | SHA-256 over the canonical JSON (envelope excluded) |
+| `risk` | per-silo `gross_exposure_micros`, `net_exposure_micros`, `margin_used_micros`, `free_margin_micros`, `var_99_bps`, `cvar_99_bps`, `max_drawdown_bps`, `realized_pnl_micros`, `unrealized_pnl_micros`, `total_tax_paid_micros` |
+
+To verify a payload: remove `payload_sha256`, serialise with sorted keys and
+`separators=(",", ":")`, SHA-256 the UTF-8 bytes and compare.
+
+### 1D.3 Instrument and statutory data completeness
+
+`core/instrument_registry.py` holds 48 canonical instruments across the four
+silos with exact `lot_size`, `tick_size_micros`, `freeze_quantity`,
+`circuit_limit_pct`, initial/maintenance margin, settlement cycle, UTC session
+and option strike step. `SmartOMS` rejects an off-lot or over-freeze quantity
+with `422 INSTRUMENT_REJECTED` and snaps an off-tick limit price onto the exact
+tick grid before the outbox is touched.
+
+`ring0_vault/ibor/tax_and_cost_engine.py` itemizes every fill's statutory drag in
+integer micros and bps: India `STT / exchange / SEBI / stamp duty / GST 18% /
+brokerage / modeled slippage` (`8.50 bps`), crypto `maker-taker / funding 8h /
+liquidation insurance / modeled slippage` (`16.00 bps`), US `SEC 31 / FINRA TAF /
+OCC / commission / modeled slippage` (`2.80 bps`) and FX `raw spread / ECN /
+TOM-NEXT / modeled slippage` (`1.60 bps`). The components always sum to the
+floor to the last micro-unit and are exposed on `cockpit/orders`,
+`cockpit/ledger`, `cockpit/logbook`, `orders/paper` and `backtest/run`.
+
+`ring2_brain/quant/catalog.py` exposes the 490-factor catalogue (six taxonomies,
+per-factor IC / decay half-life / z-score / contribution weight), the 47 data
+loaders and the 17 regional engines on `GET /api/v2/cockpit/quant`.
+
+### 1D.4 Security hardening
+
+* `POST /auth/login`, `/auth/login/paper`, `/auth/login/live`,
+  `/auth/elevate-live` and `/auth/reset` persist a brute-force counter: five
+  consecutive failures inside 15 minutes lock the door for 60 s, doubling per
+  further failure to a 1 h ceiling. A locked attempt is `429
+  TOO_MANY_ATTEMPTS` with `Retry-After`.
+* Every request model rejects `NaN`, `±Inf` and `|x| > 1e18` at the schema
+  boundary; identifier fields reject `/`, `\`, NUL and `..`.
+* `IBORLedger`, `CrashAtomicOutbox`, `SmartOMS`, `WalkForwardBacktestEngine`,
+  `AgentTaskDispatcher` and the control plane serialize mutations behind
+  re-entrant locks. `POST /control/orders/paper` accepts `idempotency_key`: a
+  duplicate replays the original receipt and never double-debits the vault.
+
+---
+
 ## SOP 2 — Emergency Incident Response
 
 ### 2.1 Global kill switch (`<1.0 ms` budget)
@@ -394,7 +467,7 @@ python scripts/preflight_golive.py --strict      # go-live readiness certificate
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.6.0-V1.5`: `pytest tests -q` must report **430 passed, 0 failed, 0 warnings**
+Release seal for `v3.7.0-V1.6`: `pytest tests -q` must report **462 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 

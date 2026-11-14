@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**430 tests · 24 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**462 tests · 24 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -188,7 +188,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 9 | `test_phase2_step1_donor_activation.py` | Donor activation, ring isolation |
 | 10 | `test_phase2_step2_silo_adapters.py` | Four silos, PAPER→LIVE toggle |
 | 11 | `test_phase2_step3_feeds_and_llm_pool.py` | Dual-vendor feed, LLM pool budgets |
-| 12 | `test_phase2_step4_formal_vopr_and_hedger.py` | TLA+/VOPR, tail hedger, Phase 2 certification gate (compiled `dist/` served at `/`) |
+| 12 | `test_phase2_step4_formal_vopr_and_hedger.py` | TLA+/VOPR, tail hedger, Phase 2 certification gate (headless document served at `/`) |
 | 13 | `test_phase3_step1_multiprocess_and_live_daemons.py` | 4-ring OS supervisor |
 | 14 | `test_phase3_step2_live_cutover_and_cockpit.py` | Live cutover, masked credentials |
 | 15 | `test_phase3_step3_testnet_supervisor_and_security.py` | Testnet bridge, supervisor, security |
@@ -197,13 +197,43 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 18 | `test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight certificate, supervisor forge/tail-hedge, Phase 4 release seal |
 | 19 | `test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard |
 | 20 | `test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** 8 harvested strategies, grounded decision dashboard, 6 agent tasks, watchlist batch ranking, grounded Q&A follow-up, 5-timeframe backtester, 8-way comparison, 30-fill nursery gate |
-| 21 | `test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.3** separate `/paper/login` + `/live/login` portals, options chain (Greeks/PCR/Max Pain), six multi-leg payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15 pages × 3 route trees |
-| 22 | `test_v1_4_clean_room_masterpiece_ui.py` | **V1.4** clean-room rebuild: 15 bespoke workstations, dual-shell separation, four auth portals, six zero-dependency SVG charts, five-domain navigation, clean-slate rendering, biome-clean source |
+| 21 | `test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.6** separate `/paper/login` + `/live/login` portals, options chain (Greeks/PCR/Max Pain), six payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15-page catalogue across all three route trees, headless document |
+| 22 | `test_v1_4_clean_room_masterpiece_ui.py` | **V1.6** headless backend contract: no frontend tree, 55-route zero-JavaScript document, envelope + risk telemetry on 13 page endpoints, dual workspace boundary, clean-slate rendering |
 | 23 | `test_v1_5_institutional_terminal_ui.py` | **V1.6** headless institutional contract: 50-route status document, integer micro money, exact itemized statutory floors, 15-page catalogue, dual workspace boundary, reproducible payload digest |
 | 24 | `test_v1_6_backend_bug_hunt_security_and_data_completeness.py` | **V1.6** master instrument registry + lot/tick/freeze enforcement, itemized statutory cost engine, adversarial numerical/boundary fuzzing, 32-thread idempotency + double-entry conservation, auth brute-force lockout + secret non-leakage |
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
 independent of whatever happens to be installed in the interpreter.
+
+---
+
+## V1.6 — headless backend, complete data and security hardening
+
+`v3.7.0-V1.6` removes the React/Vite frontend and turns Ring 3 into a headless
+REST/SSE backend:
+
+* **No frontend ships.** `ring3_cockpit/ui/openalgo_shell/src`, `public`,
+  `node_modules`, the Vite/Biome toolchain and the compiled JavaScript bundle are
+  gone. Client routes answer `200 text/html` with a deterministic,
+  zero-JavaScript status manifest.
+* **Deterministic envelope.** Every cockpit/workspace payload carries
+  `schema_version`, `generated_at_ns`, `clean_slate_active`, `workspace_mode`,
+  `payload_sha256` and a per-silo `risk` block of integer micro-units
+  (`gross_exposure_micros`, `margin_used_micros`, `var_99_bps`, …).
+* **Master instrument registry.** 48 canonical instruments across the four silos
+  with exact lot, tick, freeze, circuit, margin, settlement and session specs;
+  `SmartOMS` enforces lot/tick/freeze before the outbox.
+* **Itemized statutory cost engine.** Every fill, backtest and logbook row
+  records STT / exchange / SEBI / stamp / GST / brokerage / slippage (and the
+  crypto, US and FX equivalents) in integer micros and bps, reconciling exactly
+  to `8.50 / 16.00 / 2.80 / 1.60` bps.
+* **Complete quant telemetry.** 490 factors across six taxonomies with IC,
+  decay half-life, z-score and weight; 47 loaders and 17 regional engines with
+  full schema metadata.
+* **Security hardening.** Schema-level `NaN`/`Inf` rejection, traversal-safe
+  identifiers, re-entrant locks across every mutating engine, `idempotency_key`
+  replay on paper orders, and a persisted exponential brute-force lockout
+  (`429 TOO_MANY_ATTEMPTS`) on every auth surface.
 
 ---
 
@@ -465,7 +495,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     430 tests across 24 suites
+tests/                     462 tests across 24 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 22-gate go-live readiness certificate (--strict / --fast)
@@ -483,7 +513,7 @@ start_nios.bat / .sh       1-click launch
 
 | Gate | Command | Required result |
 |---|---|---|
-| Unit / integration | `pytest tests -q` | **430 passed**, 0 failed, 0 warnings |
+| Unit / integration | `pytest tests -q` | **462 passed**, 0 failed, 0 warnings |
 | Smoke suite | `python scripts/run_nios.py --smoke-test` | **22/22 rows**, `EXIT=0` |
 | Go-live certificate | `python scripts/preflight_golive.py --fast` | **22/22 PASS**, `EXIT=0` |
 | Live `V1.5` burn-in | boot on `:8001` with the flat terminal bundle, walk `/setup`, `/paper/login`, `/live/login` and all 45 page routes, then shut down | **50/50 routes at 200**, clean slate on boot, port `8001` free afterwards, empty `git status --porcelain` |
