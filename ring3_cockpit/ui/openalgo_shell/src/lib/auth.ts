@@ -163,8 +163,11 @@ export const authApi = {
 
   logout: () => request<{ ok: boolean; revoked: boolean }>('/api/v2/auth/logout', { method: 'POST' }),
 
-  resetEverything: () =>
-    request<Record<string, unknown>>('/api/v2/auth/reset', { method: 'POST' }),
+  resetEverything: (payload: { password: string; live_pin: string }) =>
+    request<Record<string, unknown>>('/api/v2/auth/reset', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   resetWorkspace: () =>
     request<Record<string, unknown>>('/api/v2/control/workspace/reset', { method: 'POST' }),

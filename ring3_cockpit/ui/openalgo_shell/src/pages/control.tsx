@@ -1,5 +1,13 @@
 import { useState } from 'react'
-import { Lock, Play, ShieldCheck, Terminal } from 'lucide-react'
+import {
+  AlertTriangle,
+  KeyRound,
+  Lock,
+  Play,
+  RotateCcw,
+  ShieldCheck,
+  Terminal,
+} from 'lucide-react'
 
 import { ControlRoomTab } from '@/components/control-room-tab'
 import { PageShell, StatTile } from '@/components/page-shell'
@@ -10,6 +18,7 @@ import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { usePageData } from '@/hooks/use-page-data'
 import { callMcpTool, fetchMcpPage } from '@/lib/api'
+import { authApi } from '@/lib/auth'
 import { cell, num } from '@/lib/rows'
 import type { CockpitState } from '@/types'
 
@@ -26,6 +35,44 @@ export function ControlPage({ state, onSaved }: ControlPageProps) {
   const [output, setOutput] = useState<string>('')
   const [running, setRunning] = useState(false)
   const activeTool = selected || String(tools[0]?.name ?? '')
+  const [resetPassword, setResetPassword] = useState('')
+  const [resetPin, setResetPin] = useState('')
+  const [confirmReset, setConfirmReset] = useState(false)
+  const [resetting, setResetting] = useState(false)
+  const [resetError, setResetError] = useState<string | null>(null)
+
+  async function factoryReset() {
+    if (!confirmReset) {
+      setConfirmReset(true)
+      setResetError(null)
+      return
+    }
+    if (!resetPassword || !resetPin) {
+      setResetError('Password and live PIN are both required.')
+      return
+    }
+    setResetting(true)
+    setResetError(null)
+    try {
+      await authApi.resetEverything({ password: resetPassword, live_pin: resetPin })
+      setResetPassword('')
+      setResetPin('')
+      setConfirmReset(false)
+      if (typeof window !== 'undefined') window.location.assign('/setup')
+    } catch (cause) {
+      setConfirmReset(false)
+      setResetError(cause instanceof Error ? cause.message : 'factory reset failed')
+    } finally {
+      setResetting(false)
+    }
+  }
+
+  function cancelFactoryReset() {
+    setConfirmReset(false)
+    setResetPassword('')
+    setResetPin('')
+    setResetError(null)
+  }
 
   async function runTool() {
     if (!activeTool) return
@@ -155,6 +202,92 @@ export function ControlPage({ state, onSaved }: ControlPageProps) {
             <span>ring3_read_only={cell({ value: data?.air_gap?.ring3_read_only ?? true }, 'value')}</span>
             <span>venues_tradable={num(data?.invariants ?? {}, 'venues_tradable')}</span>
             <span>key_reading_tools={num(data?.invariants ?? {}, 'key_reading_tools')}</span>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-destructive/40 bg-destructive/5 shadow-none">
+        <CardHeader className="px-4">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <KeyRound className="size-3.5" />
+            Sovereign factory reset
+          </CardTitle>
+          <p className="text-[11px] text-muted-foreground">
+            POST <span className="font-mono">/api/v2/auth/reset</span> — deletes the operator
+            credential and zeroes every value. Once an operator exists the Ring 0 vault refuses
+            the reset unless the password and the live PIN both match their stored digests.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-3 px-4">
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="space-y-1">
+              <label
+                className="font-mono text-[10px] text-muted-foreground"
+                htmlFor="factory-reset-password"
+              >
+                password
+              </label>
+              <Input
+                id="factory-reset-password"
+                type="password"
+                value={resetPassword}
+                onChange={(event) => setResetPassword(event.target.value)}
+                className="h-8 font-mono text-[11px]"
+                placeholder="operator password"
+                autoComplete="current-password"
+                disabled={resetting}
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="font-mono text-[10px] text-muted-foreground" htmlFor="factory-reset-pin">
+                live_pin
+              </label>
+              <Input
+                id="factory-reset-pin"
+                type="password"
+                inputMode="numeric"
+                value={resetPin}
+                onChange={(event) => setResetPin(event.target.value)}
+                className="h-8 font-mono text-[11px]"
+                placeholder="4-12 digits"
+                autoComplete="off"
+                disabled={resetting}
+              />
+            </div>
+          </div>
+          {resetError ? (
+            <p className="flex items-center gap-1.5 text-[11px] text-amber-300">
+              <AlertTriangle className="size-3 shrink-0" />
+              {resetError}
+            </p>
+          ) : null}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant={confirmReset ? 'destructive' : 'outline'}
+              className="h-8 text-[10px]"
+              disabled={resetting}
+              onClick={() => void factoryReset()}
+            >
+              <RotateCcw className="mr-1.5 size-3" />
+              {confirmReset ? 'CONFIRM FACTORY RESET' : 'REQUEST FACTORY RESET'}
+            </Button>
+            {confirmReset ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-8 text-[10px]"
+                disabled={resetting}
+                onClick={cancelFactoryReset}
+              >
+                CANCEL
+              </Button>
+            ) : null}
+            <span className="font-mono text-[10px] text-muted-foreground">
+              401 AUTH_REQUIRED · 403 INVALID_CREDENTIALS · 200 clean slate
+            </span>
           </div>
         </CardContent>
       </Card>

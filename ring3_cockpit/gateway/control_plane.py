@@ -830,6 +830,19 @@ class AuthElevateRequest(BaseModel):
     live_pin: str = Field(..., min_length=4, max_length=12, pattern=r"^[0-9]+$")
 
 
+class AuthResetRequest(BaseModel):
+    """``POST /api/v2/auth/reset`` -- credential-gated factory reset.
+
+    Both factors default to empty so a *clean-slate* install (no operator on
+    disk) can still be reset with no body.  Once a vault exists Ring 0 refuses
+    the reset unless ``password`` and ``live_pin`` both match the stored
+    ``scrypt`` and ``pbkdf2_hmac`` digests.
+    """
+
+    password: str = Field(default="", max_length=256)
+    live_pin: str = Field(default="", max_length=12)
+
+
 class PaperFundingRequest(BaseModel):
     """``POST /api/v2/control/ledger/fund-paper`` -- user-chosen capital."""
 
@@ -4738,6 +4751,47 @@ class ControlPlane:
         revoked = bool(self.operator_auth().revoke_session(session_token))
         return {"ok": True, "revoked": revoked}
 
+    def auth_reset(self, request: AuthResetRequest | None = None) -> dict[str, Any]:
+        """Factory reset: delete the operator credential **and** zero the workspace.
+
+        A reset erases the credential file, the HMAC session key and every
+        outstanding token, so it is the one Ring 3-reachable action that can
+        destroy sovereign access.  Once an operator exists it is therefore
+        gated on the operator's own two factors -- ``password`` (``scrypt``)
+        and ``live_pin`` (``pbkdf2_hmac``) -- exactly like a LIVE elevation:
+
+        * no/invalid factors   -> ``401 AUTH_REQUIRED``
+        * both factors, wrong  -> ``403 INVALID_CREDENTIALS``
+        * clean slate (no vault) -> allowed with no body, so first-run
+          initialisation stays idempotent.
+
+        Protects fatal flaw 6 (prompt-injection exposure of broker keys): a
+        Paper tab that is talked into calling the reset cannot lock the human
+        operator out of their own install.
+        """
+        from ring0_vault.silos.key_vault.operator_auth import (
+            OperatorAuthError,
+            ResetCredentialsMissing,
+            ResetCredentialsRejected,
+        )
+
+        payload = request or AuthResetRequest()
+        try:
+            credential = self.operator_auth().reset_operator_workspace(
+                payload.password, payload.live_pin
+            )
+        except ResetCredentialsMissing as exc:
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED") from exc
+        except (ResetCredentialsRejected, OperatorAuthError) as exc:
+            raise HTTPException(
+                status_code=403, detail="INVALID_CREDENTIALS"
+            ) from exc
+        report = self.reset_workspace()
+        # The instance stays wired on purpose: it holds no cached record, so it
+        # re-reads the (now absent) vault file and reports ``initialized:false``
+        # without falling back to the process-wide default vault.
+        return {"ok": True, "credential": credential, **report}
+
     def reset_workspace(self) -> dict[str, Any]:
         """Zero-demo factory reset of the *current* (Paper) workspace."""
         owner = getattr(self.autopilot_runner, "__self__", None)
@@ -5982,12 +6036,16 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return response
 
     @app.post("/api/v2/auth/reset")
-    def auth_reset() -> dict[str, Any]:
-        """Factory reset: operator credentials + zero-demo workspace."""
-        control.operator_auth().reset_operator_workspace()
-        report = control.reset_workspace()
-        control._operator_auth = None  # noqa: SLF001 - Ring 3 internal
-        return {"ok": True, **report}
+    def auth_reset(payload: AuthResetRequest | None = None) -> JSONResponse:
+        """Factory reset: operator credentials + zero-demo workspace.
+
+        Requires ``{password, live_pin}`` once an operator exists; a clean-slate
+        install (``initialized == false``) still resets with no body.
+        """
+        result = control.auth_reset(payload)
+        response = JSONResponse(result)
+        response.delete_cookie("nios_session", path="/")
+        return response
 
     # ---- V1.1: dual /paper and /live workspaces -----------------------
     @app.get("/api/v2/workspace/paper/state")

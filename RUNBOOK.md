@@ -107,7 +107,7 @@ afterwards.
 | `/api/v2/auth/login` | `POST` | PAPER session (`username`, `password`) |
 | `/api/v2/auth/elevate-live` | `POST` | Second factor (`live_pin`) → LIVE session |
 | `/api/v2/auth/logout` | `POST` | Revoke the presented session |
-| `/api/v2/auth/reset` | `POST` | Factory reset: delete the operator credential **and** zero the workspace |
+| `/api/v2/auth/reset` | `POST` | Factory reset: delete the operator credential **and** zero the workspace. Requires `{password, live_pin}` once an operator exists — see SOP 1B.6 |
 
 Credentials live in Ring 0 (`ring0_vault/silos/key_vault/operator_auth.py`): the password is
 scrypt-hashed, the PIN is PBKDF2-derived, and sessions are HMAC-signed files under
@@ -192,6 +192,42 @@ python scripts/run_nios.py --host 127.0.0.1 --port 8001
 
 # 4. Shut down cleanly; `git status --porcelain` must be empty.
 ```
+
+### 1B.6 Factory reset costs both factors
+
+`POST /api/v2/auth/reset` is the most destructive action Ring 3 can reach: it deletes
+`<vault>/operator/operator_auth.json`, including the HMAC session key, and revokes every
+outstanding token. A UI "confirm?" click is therefore **not** proof of identity. Once an
+operator exists the call costs the same two factors as a LIVE elevation:
+
+| Caller supplies | Ring 0 verdict | HTTP |
+|---|---|---|
+| no body, or one factor only | `verify_reset_credentials()` raises `ResetCredentialsMissing` | `401 AUTH_REQUIRED` |
+| both factors, either one wrong | `ResetCredentialsRejected` | `403 INVALID_CREDENTIALS` |
+| `password` + `live_pin` both match | vault erased, workspace zeroed | `200`, `credential.credential_verified == true` |
+| nothing, on a clean slate (`initialized == false`) | not gated, no-op | `200`, `credential.removed == false` |
+
+Verification is done in Ring 0 against the stored digests: `password` against the `scrypt`
+hash, `live_pin` against the `pbkdf2_hmac` hash. Both are always derived before the comparison,
+so a wrong password cannot be distinguished from a wrong PIN by response latency. The
+clean-slate branch keeps first-run initialisation idempotent: resetting an uninitialised
+install is a no-op, not an authentication event.
+
+```bash
+# Factory reset with the operator's own two factors (initialized install)
+curl.exe -X POST http://127.0.0.1:8000/api/v2/auth/reset \
+  -H "Content-Type: application/json" \
+  -d '{"password":"<operator password>","live_pin":"<live pin>"}'
+
+# Clean-slate reset (no operator on disk) — no body required
+curl.exe -X POST http://127.0.0.1:8000/api/v2/auth/reset
+```
+
+The response drops the `nios_session` cookie, so the cockpit lands back on `/setup` with
+`initialized: false`. The same form is on `/control` and `/paper/control` under
+**Sovereign factory reset**; it prompts for `password` and `live_pin` before it calls the
+route. `POST /api/v2/control/workspace/reset` remains the credential-free, non-destructive
+way to zero values while keeping the operator.
 
 ---
 
@@ -291,16 +327,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 284 tests / 19 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 285 tests / 19 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.2.0-V1.1`: `pytest tests -q` must report **284 passed, 0 failed, 0 warnings**
+Release seal for `v3.2.0-V1.1`: `pytest tests -q` must report **285 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 19-suite / 284-test inventory
+### 3.2a The 19-suite / 285-test inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -322,7 +358,7 @@ prerequisites for re-tagging; neither may be waived.
 | 16 | `tests/test_phase3_step4_soak_metrics_and_chaos.py` | Soak metrics, chaos drills |
 | 17 | `tests/test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS tuning, key rotation, runbook |
 | 18 | `tests/test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight, forge |
-| 19 | `tests/test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard |
+| 19 | `tests/test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard, credential-gated factory reset |
 
 ### 3.3 Chaos / crash injection
 
@@ -572,7 +608,7 @@ and verdicts only — Ring 0 alone signs.
 | `POST` | `/api/v2/auth/login` | PAPER session |
 | `POST` | `/api/v2/auth/elevate-live` | LIVE PIN → LIVE session (30 min, single-use) |
 | `POST` | `/api/v2/auth/logout` | Revoke the presented session |
-| `POST` | `/api/v2/auth/reset` | Delete the operator credential and zero the workspace |
+| `POST` | `/api/v2/auth/reset` | Delete the operator credential and zero the workspace (`{password, live_pin}` required once initialized) |
 | `GET` | `/api/v2/workspace/paper/state` | Mode-scoped Paper telemetry |
 | `GET` | `/api/v2/workspace/live/state` | Mode-scoped Live telemetry (`tier=LIVE` only) |
 | `POST` | `/api/v2/control/ledger/fund-paper` | Operator-chosen paper capital, double entry |

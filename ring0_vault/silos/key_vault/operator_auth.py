@@ -44,6 +44,8 @@ __all__ = [
     "OperatorExistsError",
     "OperatorSession",
     "LivePinRejected",
+    "ResetCredentialsMissing",
+    "ResetCredentialsRejected",
     "SessionInvalid",
     "default_operator_auth",
     "reset_operator_auth_singleton",
@@ -92,6 +94,22 @@ class LivePinRejected(OperatorAuthError):
 
 class SessionInvalid(OperatorAuthError):
     """Token missing, malformed, expired, revoked or unknown-key signed."""
+
+
+class ResetCredentialsMissing(OperatorAuthFailed):
+    """A factory reset was attempted with no credential on an initialized vault.
+
+    Neither factor was supplied, so the caller never proved it owns the
+    operator identity.  The gateway maps this to ``401 AUTH_REQUIRED``.
+    """
+
+
+class ResetCredentialsRejected(OperatorAuthError):
+    """A factory reset supplied both factors and at least one was wrong.
+
+    The caller *did* attempt authentication, so the gateway maps this to
+    ``403 INVALID_CREDENTIALS`` rather than a generic 401.
+    """
 
 
 @dataclass(frozen=True)
@@ -390,9 +408,63 @@ class OperatorAuth:
                 "clean_slate_active": False,
             }
 
-    def reset_operator_workspace(self) -> dict[str, Any]:
-        """Factory reset: delete the credential file and every session."""
+    def verify_reset_credentials(
+        self, password: str | None, live_pin: str | None
+    ) -> bool:
+        """Demand BOTH factors before a factory reset may delete the vault.
+
+        A factory reset is the most destructive Ring 0 operation an operator
+        can reach: it erases the credential file, the signing/session key and
+        every outstanding session.  Once a vault exists it therefore costs the
+        same two factors as a LIVE elevation:
+
+        * ``password`` -- verified against the stored ``scrypt`` digest;
+        * ``live_pin`` -- verified against the stored ``pbkdf2_hmac`` digest.
+
+        A *clean slate* (no credential on disk) returns ``False`` and is not
+        gated, so first-run initialisation stays idempotent: resetting an
+        uninitialised install is a no-op, not an authentication event.
+
+        Raises:
+            ResetCredentialsMissing: initialized vault, either factor absent.
+            ResetCredentialsRejected: initialized vault, either factor wrong.
+        """
         with self._lock:
+            record = self._load()
+            if record is None:
+                return False
+            secret = str(password or "")
+            pin = str(live_pin or "").strip()
+            if not secret or not pin:
+                raise ResetCredentialsMissing(
+                    "password and live_pin are required to reset an initialized install"
+                )
+            stored_pw = record.get("password") or {}
+            pw_salt = _b64d(str(stored_pw.get("salt", "")))
+            pw_expected = _b64d(str(stored_pw.get("hash", "")))
+            stored_pin = record.get("live_pin") or {}
+            pin_salt = _b64d(str(stored_pin.get("salt", "")))
+            pin_expected = _b64d(str(stored_pin.get("hash", "")))
+            # Both digests are always derived so a wrong password cannot be
+            # told apart from a wrong PIN by response latency alone.
+            pw_ok = hmac.compare_digest(_derive_scrypt(secret, pw_salt), pw_expected)
+            pin_ok = hmac.compare_digest(_derive_pbkdf2(pin, pin_salt), pin_expected)
+            if not (pw_ok and pin_ok):
+                raise ResetCredentialsRejected("password or live PIN rejected")
+            return True
+
+    def reset_operator_workspace(
+        self, password: str | None = None, live_pin: str | None = None
+    ) -> dict[str, Any]:
+        """Factory reset: delete the credential file and every session.
+
+        When a credential exists the caller must present ``password`` **and**
+        ``live_pin`` (see :meth:`verify_reset_credentials`).  An uninitialised
+        install may be reset with no credential, so clean-slate initialisation
+        remains idempotent.
+        """
+        with self._lock:
+            verified = self.verify_reset_credentials(password, live_pin)
             removed = False
             try:
                 self._path.unlink()
@@ -402,7 +474,12 @@ class OperatorAuth:
             except OSError as exc:  # pragma: no cover - locked vault
                 raise OperatorAuthError(f"operator vault reset failed: {exc}") from exc
             self._revoked.clear()
-            return {"reset": True, "removed": removed, "path": str(self._path)}
+            return {
+                "reset": True,
+                "removed": removed,
+                "credential_verified": bool(verified),
+                "path": str(self._path),
+            }
 
 
 _SINGLETON: OperatorAuth | None = None

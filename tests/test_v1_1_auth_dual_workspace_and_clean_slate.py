@@ -537,3 +537,88 @@ def test_gate4_live_mutations_require_a_live_session(client, paper_session):
         headers=live_headers,
     )
     assert after.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Gate 5 -- factory reset costs both factors once an operator exists
+# ---------------------------------------------------------------------------
+
+
+def test_gate5_auth_reset_requires_password_and_live_pin(client, paper_session):
+    """``POST /api/v2/auth/reset`` is credential-gated, not merely confirm-gated.
+
+    A reset deletes the credential file, the HMAC session key and every
+    outstanding token, so a UI "confirm?" click is not proof of identity: it is
+    the one Ring 3-reachable action that can lock the human operator out of
+    their own install.  Once a vault exists the route therefore costs the same
+    two factors as a LIVE elevation -- ``password`` (``scrypt`` digest) and
+    ``live_pin`` (``pbkdf2_hmac`` digest):
+
+    * no factor / one factor -> ``401 AUTH_REQUIRED``
+    * both supplied, any wrong -> ``403 INVALID_CREDENTIALS``
+    * both correct -> ``200`` and the vault really is erased
+    * clean slate (no vault) -> ``200`` with no body, so first-run
+      initialisation stays idempotent.
+
+    Every rejected attempt must leave the credential intact; this test is last
+    in the module because the accepted attempt destroys the operator.
+    """
+    headers = _headers(paper_session["token"])
+
+    # --- nothing supplied: the caller never proved who it is ------------
+    anonymous = client.post("/api/v2/auth/reset")
+    assert anonymous.status_code == 401, anonymous.text
+    assert anonymous.json()["detail"] == "AUTH_REQUIRED"
+
+    # --- one factor is never enough for a destructive reset -------------
+    for partial in (
+        {"password": PASSWORD, "live_pin": ""},
+        {"password": "", "live_pin": LIVE_PIN},
+    ):
+        missing = client.post("/api/v2/auth/reset", json=partial, headers=headers)
+        assert missing.status_code == 401, (partial, missing.text)
+        assert missing.json()["detail"] == "AUTH_REQUIRED"
+
+    # --- both supplied, either wrong: authenticated but rejected --------
+    for wrong in (
+        {"password": "wrong-password", "live_pin": LIVE_PIN},
+        {"password": PASSWORD, "live_pin": "000000"},
+    ):
+        rejected = client.post("/api/v2/auth/reset", json=wrong, headers=headers)
+        assert rejected.status_code == 403, (wrong, rejected.text)
+        assert rejected.json()["detail"] == "INVALID_CREDENTIALS"
+
+    # --- every rejection left the vault and the session intact ----------
+    still_there = client.get("/api/v2/auth/status", headers=headers)
+    assert still_there.status_code == 200
+    assert still_there.json()["initialized"] is True
+    assert still_there.json()["authenticated"] is True
+
+    # --- the real pair performs the factory reset -----------------------
+    done = client.post(
+        "/api/v2/auth/reset",
+        json={"password": PASSWORD, "live_pin": LIVE_PIN},
+        headers=headers,
+    )
+    assert done.status_code == 200, done.text
+    body = done.json()
+    assert body["ok"] is True
+    assert body["reset"] is True
+    assert body["clean_slate_active"] is True
+    assert body["credential"]["reset"] is True
+    assert body["credential"]["removed"] is True
+    assert body["credential"]["credential_verified"] is True
+
+    # --- the credential and every session are gone ----------------------
+    client.cookies.clear()
+    after = client.get("/api/v2/auth/status", headers=headers)
+    assert after.status_code == 200
+    assert after.json()["initialized"] is False
+    assert after.json()["authenticated"] is False
+    assert after.json()["tier"] == "NONE"
+
+    # --- a clean slate is idempotent: a bare reset still succeeds -------
+    idempotent = client.post("/api/v2/auth/reset")
+    assert idempotent.status_code == 200, idempotent.text
+    assert idempotent.json()["ok"] is True
+    assert idempotent.json()["credential"]["removed"] is False
