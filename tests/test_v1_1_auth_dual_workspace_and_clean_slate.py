@@ -390,3 +390,150 @@ def test_gate3b_workspace_state_contracts(client, paper_session):
     joined = "".join(path.read_text(encoding="utf-8") for path in assets)
     for marker in ("PAPER SANDBOX", "Live Production", "Clean Slate"):
         assert marker.lower() in joined.lower(), marker
+
+
+# ---------------------------------------------------------------------------
+# Gate 4 -- LIVE mutation guard: a PAPER session can never move live capital
+# ---------------------------------------------------------------------------
+
+LIVE_MUTATIONS = [
+    (
+        "/api/v2/control/brokers",
+        {"silo": "US_IBKR", "mode": "LIVE", "confirm_live": True},
+    ),
+    (
+        "/api/v2/control/brokers/credentials",
+        {
+            "silo": "US_IBKR",
+            "venue": "alpaca",
+            "api_key": "guard-key-AAA1",
+            "api_secret": "guard-secret-BBB2",
+            "sandbox": True,
+        },
+    ),
+    (
+        "/api/v2/control/brokers/testnet-order",
+        {
+            "silo": "US_IBKR",
+            "venue": "alpaca",
+            "symbol": "NVDA",
+            "side": "BUY",
+            "qty": 10.0,
+            "limit_price": 120.0,
+            "sandbox": True,
+            "confirm_sandbox": True,
+        },
+    ),
+    (
+        "/api/v2/control/vault/rotate-keys",
+        {"operator": "pytest.v11.guard", "reason": "live mutation guard drill"},
+    ),
+]
+
+
+def test_gate4_live_mutations_require_a_live_session(client, paper_session):
+    """Once an operator exists, every live-mutating route demands ``tier=LIVE``.
+
+    ``/api/v2/control/brokers`` (``mode=LIVE``), ``/brokers/credentials``,
+    ``/brokers/testnet-order`` and ``/vault/rotate-keys`` are the four Ring 0
+    surfaces where a Paper tab could otherwise escalate.  A configured operator
+    turns each of them into a 401 (no session) / 403 (PAPER session) gate, and
+    ``POST /api/v2/auth/elevate-live`` is the only way through.
+    """
+    paper_headers = _headers(paper_session["token"])
+
+    # --- a PAPER session is refused on all four live mutations ----------
+    for route, payload in LIVE_MUTATIONS:
+        denied = client.post(route, json=payload, headers=paper_headers)
+        assert denied.status_code == 403, (route, denied.text)
+        assert denied.json()["detail"] == "LIVE_ELEVATION_REQUIRED", route
+
+    # --- no session at all is an authentication failure -----------------
+    client.cookies.clear()
+    for route, payload in LIVE_MUTATIONS:
+        anonymous = client.post(route, json=payload)
+        assert anonymous.status_code == 401, (route, anonymous.text)
+        assert anonymous.json()["detail"] == "AUTH_REQUIRED", route
+
+    # --- a PAPER-only mutation stays open (guard is scoped to LIVE) -----
+    paper_mode = client.post(
+        "/api/v2/control/brokers",
+        json={"silo": "US_IBKR", "mode": "PAPER"},
+        headers=paper_headers,
+    )
+    assert paper_mode.status_code == 200, paper_mode.text
+    assert paper_mode.json()["broker"]["mode"] == "PAPER"
+
+    # --- the PIN is the only door to the live surface -------------------
+    login = client.post(
+        "/api/v2/auth/login",
+        json={"username": USERNAME, "password": PASSWORD},
+    )
+    assert login.status_code == 200, login.text
+    elevated = client.post(
+        "/api/v2/auth/elevate-live",
+        json={"live_pin": LIVE_PIN},
+        headers=_headers(login.json()["token"]),
+    )
+    assert elevated.status_code == 200, elevated.text
+    live_headers = _headers(elevated.json()["token"])
+    assert elevated.json()["tier"] == "LIVE"
+
+    # --- credentials + key rotation now succeed -------------------------
+    stored = client.post(
+        "/api/v2/control/brokers/credentials",
+        json=LIVE_MUTATIONS[1][1],
+        headers=live_headers,
+    )
+    assert stored.status_code == 200, stored.text
+
+    rotated = client.post(
+        "/api/v2/control/vault/rotate-keys",
+        json=LIVE_MUTATIONS[3][1],
+        headers=live_headers,
+    )
+    assert rotated.status_code == 200, rotated.text
+    assert rotated.json()["status"] == "ROTATED"
+
+    # --- the sandbox dispatch clears the guard and signs a receipt ------
+    dispatched = client.post(
+        "/api/v2/control/brokers/testnet-order",
+        json=LIVE_MUTATIONS[2][1],
+        headers=live_headers,
+    )
+    assert dispatched.status_code == 200, dispatched.text
+    receipt = dispatched.json()
+    assert receipt["venue"] == "alpaca"
+    assert receipt["order"]["symbol"] == "NVDA"
+
+    # --- the LIVE cutover clears the guard (pre-flight still governs) ---
+    cutover = client.post(
+        "/api/v2/control/brokers",
+        json=LIVE_MUTATIONS[0][1],
+        headers=live_headers,
+    )
+    assert cutover.status_code in (200, 409), cutover.text
+    detail = cutover.json().get("detail") if cutover.status_code == 409 else None
+    if isinstance(detail, dict):
+        assert detail.get("error") == "PRE_FLIGHT_GATE_BLOCKED"
+    else:
+        assert cutover.status_code == 200
+    assert cutover.status_code != 403
+
+    # Leave the runtime paper-only and unauthenticated again.
+    back_to_paper = client.post(
+        "/api/v2/control/brokers",
+        json={"silo": "US_IBKR", "mode": "PAPER"},
+        headers=live_headers,
+    )
+    assert back_to_paper.status_code == 200, back_to_paper.text
+    assert back_to_paper.json()["broker"]["mode"] == "PAPER"
+
+    logout = client.post("/api/v2/auth/logout", headers=live_headers)
+    assert logout.status_code == 200
+    after = client.post(
+        "/api/v2/control/vault/rotate-keys",
+        json=LIVE_MUTATIONS[3][1],
+        headers=live_headers,
+    )
+    assert after.status_code == 401

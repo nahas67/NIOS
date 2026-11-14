@@ -1,8 +1,8 @@
 # NIOS Production Operator Runbook
 
 **Document ID:** NIOS-OPS-2026-V3
-**Release tag:** `v3.1.0-V1` (supersedes `v3.0.0-PROD`, which stays frozen)
-**Branch:** `V1`
+**Release tag:** `v3.2.0-V1.1` (supersedes `v3.1.0-V1` and `v3.0.0-PROD`, both frozen)
+**Branch:** `V1.1`
 **Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
 **Operating constitution:** `AGENTS.md`
@@ -79,6 +79,119 @@ publish the Ring 0 or Ring 1 networks to the host.
 `Ctrl+C` / `docker compose down` is graceful. The supervisor stops workers, the paper
 autopilot task is cancelled, and `CrashAtomicOutbox` leaves any in-flight reservation in a
 recoverable state. Do **not** kill a live process mid-order; use the kill switch (SOP 2).
+
+---
+
+## SOP 1B — V1.1 Sovereign Operator, Dual Workspaces & Clean Slate
+
+`V1.1` replaces the shared three-tab cockpit with a **two-tier operator session** and two
+physically separated workspaces. Nothing in the UI is reachable without an operator
+credential, and no live mutation is reachable with a PAPER-tier session.
+
+### 1B.1 The two tiers
+
+| Tier | How it is minted | Lifetime | Can reach |
+|---|---|---|---|
+| `PAPER` | `POST /api/v2/auth/setup` (first run) or `POST /api/v2/auth/login` | 12 h | `/paper/*`, read-only telemetry, paper orders, paper funding |
+| `LIVE` | `POST /api/v2/auth/elevate-live` with the numeric `live_pin` | 30 min | everything PAPER can, plus every live-mutating route |
+
+The session travels as either the `X-NIOS-Session` header or the `HttpOnly; SameSite=Strict`
+`nios_session` cookie. Elevation is **single-use**: the PAPER token that was elevated is
+revoked the moment the LIVE token is issued, so a stolen PAPER token cannot be replayed
+afterwards.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/v2/auth/status` | `GET` | `{initialized, authenticated, username, tier, clean_slate_active}` |
+| `/api/v2/auth/setup` | `POST` | First-run operator registration (`username`, `password`, `live_pin`, `start_clean_slate`) |
+| `/api/v2/auth/login` | `POST` | PAPER session (`username`, `password`) |
+| `/api/v2/auth/elevate-live` | `POST` | Second factor (`live_pin`) → LIVE session |
+| `/api/v2/auth/logout` | `POST` | Revoke the presented session |
+| `/api/v2/auth/reset` | `POST` | Factory reset: delete the operator credential **and** zero the workspace |
+
+Credentials live in Ring 0 (`ring0_vault/silos/key_vault/operator_auth.py`): the password is
+scrypt-hashed, the PIN is PBKDF2-derived, and sessions are HMAC-signed files under
+`<vault>/operator/operator_auth.json`. Ring 3 never stores either secret.
+
+### 1B.2 The two workspaces
+
+| Workspace | SPA routes | State endpoint |
+|---|---|---|
+| Paper sandbox | `/paper`, `/paper/dashboard`, `/paper/orders`, `/paper/analyzer`, `/paper/quant`, `/paper/brain`, `/paper/forge`, `/paper/ledger`, `/paper/verification`, `/paper/control` | `GET /api/v2/workspace/paper/state` |
+| Live production | `/live`, `/live/dashboard`, `/live/orders`, `/live/positions`, `/live/quant`, `/live/brain`, `/live/ledger`, `/live/control` | `GET /api/v2/workspace/live/state` |
+
+The two trees are separate React entry points with separate state contracts. The Live tree
+is sealed: `GET /api/v2/workspace/live/state` answers `401 AUTH_REQUIRED` with no session and
+`403 LIVE_ELEVATION_REQUIRED` with a PAPER session. The legacy routes (`/dashboard`,
+`/orders`, `/ledger`, `/control`, `/`) keep resolving so old bookmarks do not 404.
+
+### 1B.3 Clean-Slate first boot
+
+A fresh install boots with **no demo money and no running tape**:
+
+- every silo × vault balance is `0` micros, `silo_nav_micros == 0`, and the double-entry
+  invariant holds over an empty journal;
+- `orders == []`, `events == ()`, `reservations == []`, `transfers == []`;
+- `shadow_fills == 0`, `remaining_fills == 30`, `graduated == false`;
+- `token_spend_usd == 0.0`;
+- `autopilot.enabled == false` and `clean_slate_active == true`.
+
+Setup with `start_clean_slate: true` (the default) re-asserts all of the above. Nothing is
+funded until the operator funds it:
+
+```bash
+# Deposit the operator's own paper capital (double entry: CASH debit, vault credits)
+curl.exe -X POST http://127.0.0.1:8000/api/v2/control/ledger/fund-paper \
+  -H "X-NIOS-Session: $PAPER_TOKEN" -H "Content-Type: application/json" \
+  -d '{"silo":"US_IBKR","amount_units":25000.0,"vault":"ALL_CANONICAL"}'
+
+# Zero the workspace again without touching the credential
+curl.exe -X POST http://127.0.0.1:8000/api/v2/control/workspace/reset \
+  -H "X-NIOS-Session: $PAPER_TOKEN"
+
+# Play / pause the paper tape (default OFF)
+curl.exe -X POST http://127.0.0.1:8000/api/v2/control/workspace/autopilot \
+  -H "X-NIOS-Session: $PAPER_TOKEN" -H "Content-Type: application/json" \
+  -d '{"enabled":true}'
+```
+
+`fund-paper` rejects an unknown silo with `404 UNKNOWN_SILO` and allocates the deposit across
+the canonical vaults (`ReserveYield`, `LongTermCompounder`, `TacticalSwing`, `SpinalScalper`).
+Funding is the only way capital enters a workspace.
+
+### 1B.4 The LIVE mutation guard
+
+Once an operator credential exists on disk, four Ring 0 surfaces stop accepting PAPER-tier
+sessions. The guard is inert on a first-run install (`operator_auth.initialized() == false`),
+which is what keeps the legacy unit suites byte-identical.
+
+| Route | Guard condition |
+|---|---|
+| `POST /api/v2/control/brokers` | only when `mode == "LIVE"` |
+| `POST /api/v2/control/brokers/credentials` | always |
+| `POST /api/v2/control/brokers/testnet-order` | always |
+| `POST /api/v2/control/vault/rotate-keys` | always |
+
+Failures are `401 AUTH_REQUIRED` (no/invalid session) or `403 LIVE_ELEVATION_REQUIRED`
+(valid PAPER session). `POST /api/v2/control/brokers` with `mode: "PAPER"` stays open — a
+Paper tab may always de-escalate a silo.
+
+### 1B.5 Non-destructive V1.1 burn-in drill
+
+```bash
+# 1. Point the operator vault at a scratch directory so the drill cannot
+#    claim the real install's credential.
+$env:NIOS_OPERATOR_AUTH_DIR = "$env:TEMP\nios-v11-drill"
+
+# 2. Boot on a free port and confirm the clean slate
+python scripts/run_nios.py --host 127.0.0.1 --port 8001
+#    /api/v2/workspace/paper/state -> every vault 0, orders [], autopilot false
+
+# 3. setup -> login -> paper state -> fund-paper -> live state (403)
+#    -> elevate-live -> live state (200) -> logout
+
+# 4. Shut down cleanly; `git status --porcelain` must be empty.
+```
 
 ---
 
@@ -178,14 +291,38 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 283 tests / 19 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 284 tests / 19 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.1.0-V1`: `pytest tests -q` must report **283 passed, 0 failed, 0 warnings**
+Release seal for `v3.2.0-V1.1`: `pytest tests -q` must report **284 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
+
+### 3.2a The 19-suite / 284-test inventory
+
+| # | Suite | Covers |
+|---|---|---|
+| 1 | `tests/test_step2_core_spine.py` | SHM SeqLock, NATS contracts, bitemporal lake |
+| 2 | `tests/test_step3_truth_and_quant.py` | SHA-256 grounding ledger, 480+ factors, DCF/Comps |
+| 3 | `tests/test_step4_ring2_cognition.py` | System 1 lease writer, TradingAgents committee |
+| 4 | `tests/test_step5_ring1_spinal.py` | 0.14 ms scalper, breakers, feed quarantine |
+| 5 | `tests/test_step6_ring0_vault.py` | Double-entry IBOR, outbox, conformal gate |
+| 6 | `tests/test_step7_cockpit_and_e2e.py` | Cockpit tabs, hot-swap, kill switch |
+| 7 | `tests/test_step8_forge_mcp_and_deploy.py` | Forge, read-only MCP bridge, deploy |
+| 8 | `tests/test_step9_paper_autopilot.py` | Paper autopilot tape |
+| 9 | `tests/test_phase2_step1_donor_activation.py` | Donor activation, ring isolation |
+| 10 | `tests/test_phase2_step2_silo_adapters.py` | Four silos, PAPER→LIVE toggle |
+| 11 | `tests/test_phase2_step3_feeds_and_llm_pool.py` | Dual-vendor feed, LLM pool budgets |
+| 12 | `tests/test_phase2_step4_formal_vopr_and_hedger.py` | TLA+/VOPR, tail hedger |
+| 13 | `tests/test_phase3_step1_multiprocess_and_live_daemons.py` | Four-ring OS processes |
+| 14 | `tests/test_phase3_step2_live_cutover_and_cockpit.py` | Live cutover, masked credentials |
+| 15 | `tests/test_phase3_step3_testnet_supervisor_and_security.py` | Testnet bridge, supervisor, security |
+| 16 | `tests/test_phase3_step4_soak_metrics_and_chaos.py` | Soak metrics, chaos drills |
+| 17 | `tests/test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS tuning, key rotation, runbook |
+| 18 | `tests/test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight, forge |
+| 19 | `tests/test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard |
 
 ### 3.3 Chaos / crash injection
 
@@ -426,7 +563,26 @@ shared-memory segment so a drill never disarms the live Ring 1 lease table, and 
 campaign is a pure simulator. `/brain/*` and `/forge/*` are Ring 2 surfaces that emit proposals
 and verdicts only — Ring 0 alone signs.
 
-#### 5.3.5 MCP bridge and metrics
+#### 5.3.5 V1.1 operator auth, dual workspaces and clean slate
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v2/auth/status` | `initialized`, `authenticated`, `username`, `tier`, `clean_slate_active` |
+| `POST` | `/api/v2/auth/setup` | First-run operator registration → PAPER session |
+| `POST` | `/api/v2/auth/login` | PAPER session |
+| `POST` | `/api/v2/auth/elevate-live` | LIVE PIN → LIVE session (30 min, single-use) |
+| `POST` | `/api/v2/auth/logout` | Revoke the presented session |
+| `POST` | `/api/v2/auth/reset` | Delete the operator credential and zero the workspace |
+| `GET` | `/api/v2/workspace/paper/state` | Mode-scoped Paper telemetry |
+| `GET` | `/api/v2/workspace/live/state` | Mode-scoped Live telemetry (`tier=LIVE` only) |
+| `POST` | `/api/v2/control/ledger/fund-paper` | Operator-chosen paper capital, double entry |
+| `POST` | `/api/v2/control/workspace/reset` | Zero the workspace, keep the credential |
+| `POST` | `/api/v2/control/workspace/autopilot` | Play / pause the paper tape (default OFF) |
+
+`/api/v2/control/brokers` (`mode=LIVE`), `/brokers/credentials`, `/brokers/testnet-order` and
+`/vault/rotate-keys` require a `LIVE` session once an operator exists — see SOP 1B.4.
+
+#### 5.3.6 MCP bridge and metrics
 
 | Method | Path | Purpose |
 |---|---|---|

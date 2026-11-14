@@ -158,7 +158,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**283 tests · 19 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**284 tests · 19 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -171,24 +171,96 @@ python -m pytest tests -q
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 ```
 
-| File | Covers |
-|---|---|
-| `test_step2_core_spine.py` | SHM SeqLock, NATS bus, bitemporal lake |
-| `test_step3_truth_and_quant.py` | 490-factor zoo, scan SLA, grounding ledger, valuation |
-| `test_step4_ring2_cognition.py` | MiroFish cascade, System 1/2 switchboard |
-| `test_step5_ring1_spinal.py` | Tier-0 latency + throughput, OFI/breaker gates |
-| `test_step6_ring0_vault.py` | Conformal gate, firewall, signing, ADR-009 |
-| `test_step7_cockpit_and_e2e.py` | Cockpit REST/SSE, kill switch, full-ring E2E |
-| `test_step8_forge_mcp_and_deploy.py` | Alpha Forge, MCP air-gap, deployment |
-| `test_step9_paper_autopilot.py` | Paper autopilot, rearm, runtime version contract |
-| `test_phase2_step1…step4` | Donor activation, silo adapters, feeds/LLM pool, TLA+/VOPR/hedger |
-| `test_phase2_step4_formal_vopr_and_hedger.py` | Also holds the Phase 2 certification gate (compiled `dist/` served at `/`) |
-| `test_phase3_step1…step4` | 4-ring OS supervisor, live cutover/cockpit, testnet + security, soak/metrics/chaos |
-| `test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS/socket low-latency auditor, zero-downtime Fernet + Ed25519 rotation, runbook completeness, `v3.0.0-PROD` certification |
-| `test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight certificate, supervisor forge/tail-hedge, Phase 4 release seal |
+| # | Suite | Covers |
+|---|---|---|
+| 1 | `test_step2_core_spine.py` | SHM SeqLock, NATS bus, bitemporal lake |
+| 2 | `test_step3_truth_and_quant.py` | 490-factor zoo, scan SLA, grounding ledger, valuation |
+| 3 | `test_step4_ring2_cognition.py` | MiroFish cascade, System 1/2 switchboard |
+| 4 | `test_step5_ring1_spinal.py` | Tier-0 latency + throughput, OFI/breaker gates |
+| 5 | `test_step6_ring0_vault.py` | Conformal gate, firewall, signing, ADR-009 |
+| 6 | `test_step7_cockpit_and_e2e.py` | Cockpit REST/SSE, kill switch, full-ring E2E |
+| 7 | `test_step8_forge_mcp_and_deploy.py` | Alpha Forge, MCP air-gap, deployment |
+| 8 | `test_step9_paper_autopilot.py` | Paper autopilot, rearm, runtime version contract |
+| 9 | `test_phase2_step1_donor_activation.py` | Donor activation, ring isolation |
+| 10 | `test_phase2_step2_silo_adapters.py` | Four silos, PAPER→LIVE toggle |
+| 11 | `test_phase2_step3_feeds_and_llm_pool.py` | Dual-vendor feed, LLM pool budgets |
+| 12 | `test_phase2_step4_formal_vopr_and_hedger.py` | TLA+/VOPR, tail hedger, Phase 2 certification gate (compiled `dist/` served at `/`) |
+| 13 | `test_phase3_step1_multiprocess_and_live_daemons.py` | 4-ring OS supervisor |
+| 14 | `test_phase3_step2_live_cutover_and_cockpit.py` | Live cutover, masked credentials |
+| 15 | `test_phase3_step3_testnet_supervisor_and_security.py` | Testnet bridge, supervisor, security |
+| 16 | `test_phase3_step4_soak_metrics_and_chaos.py` | Soak metrics, chaos drills |
+| 17 | `test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS/socket auditor, zero-downtime Fernet + Ed25519 rotation, runbook completeness |
+| 18 | `test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight certificate, supervisor forge/tail-hedge, Phase 4 release seal |
+| 19 | `test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard |
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
 independent of whatever happens to be installed in the interpreter.
+
+---
+
+## V1.1 — sovereign operator auth, dual workspaces, clean slate
+
+`V1.1` makes the cockpit an operator-owned surface: nothing renders before an operator
+credential exists, and Paper can never touch live capital.
+
+### Two-tier sessions
+
+| Tier | Minted by | Lifetime | Reaches |
+|---|---|---|---|
+| `PAPER` | `POST /api/v2/auth/setup` / `POST /api/v2/auth/login` | 12 h | `/paper/*`, read-only telemetry |
+| `LIVE` | `POST /api/v2/auth/elevate-live` + numeric `live_pin` | 30 min | everything, plus the four live-mutating routes |
+
+The session rides in `X-NIOS-Session` or the `HttpOnly; SameSite=Strict` `nios_session`
+cookie. Elevation is single-use: the elevated PAPER token is revoked when the LIVE token is
+issued. SPA entry points are `/setup`, `/login` and `/live-unlock`.
+
+| Endpoint | Effect |
+|---|---|
+| `GET /api/v2/auth/status` | `{initialized, authenticated, username, tier, clean_slate_active}` |
+| `POST /api/v2/auth/setup` | First-run operator registration → PAPER session |
+| `POST /api/v2/auth/login` | PAPER session |
+| `POST /api/v2/auth/elevate-live` | LIVE session (second factor) |
+| `POST /api/v2/auth/logout` | Revoke the presented session |
+| `POST /api/v2/auth/reset` | Delete the credential **and** zero the workspace |
+
+### Two physical workspaces
+
+`/paper/*` (10 routes) and `/live/*` (8 routes) are separate React trees with separate state
+contracts. `GET /api/v2/workspace/paper/state` is Paper-scoped; `GET /api/v2/workspace/live/state`
+answers `401 AUTH_REQUIRED` with no session and `403 LIVE_ELEVATION_REQUIRED` with a PAPER
+session. Legacy routes (`/dashboard`, `/orders`, `/ledger`, `/control`, `/`) still resolve.
+
+### Clean-Slate first boot
+
+A fresh install comes up with **no demo money and no running tape**: every silo × vault
+balance `0`, `silo_nav_micros == 0`, `orders == []`, `reservations == []`, `shadow_fills == 0`,
+`token_spend_usd == 0.0`, `autopilot.enabled == false`, `clean_slate_active == true`.
+
+```bash
+# Operator funds their own paper capital (double entry, canonical vault split)
+curl.exe -X POST http://127.0.0.1:8000/api/v2/control/ledger/fund-paper \
+  -H "X-NIOS-Session: $PAPER_TOKEN" -H "Content-Type: application/json" \
+  -d '{"silo":"US_IBKR","amount_units":25000.0,"vault":"ALL_CANONICAL"}'
+
+curl.exe -X POST http://127.0.0.1:8000/api/v2/control/workspace/reset -H "X-NIOS-Session: $PAPER_TOKEN"
+curl.exe -X POST http://127.0.0.1:8000/api/v2/control/workspace/autopilot \
+  -H "X-NIOS-Session: $PAPER_TOKEN" -H "Content-Type: application/json" -d '{"enabled":true}'
+```
+
+### LIVE mutation guard
+
+Once `operator_auth.initialized()` is `true`, these routes refuse PAPER sessions with
+`403 LIVE_ELEVATION_REQUIRED` (or `401 AUTH_REQUIRED` when unauthenticated):
+
+| Route | Guarded when |
+|---|---|
+| `POST /api/v2/control/brokers` | `mode == "LIVE"` (PAPER de-escalation stays open) |
+| `POST /api/v2/control/brokers/credentials` | always |
+| `POST /api/v2/control/brokers/testnet-order` | always |
+| `POST /api/v2/control/vault/rotate-keys` | always |
+
+On a first-run install with no credential on disk the guard is inert, so pre-V1.1 behaviour is
+preserved exactly.
 
 ---
 
@@ -290,7 +362,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     283 tests across 19 suites
+tests/                     284 tests across 19 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 22-gate go-live readiness certificate (--strict / --fast)
@@ -304,17 +376,18 @@ start_nios.bat / .sh       1-click launch
 
 ---
 
-## Release seal — `v3.1.0-V1`
+## Release seal — `v3.2.0-V1.1`
 
 | Gate | Command | Required result |
 |---|---|---|
-| Unit / integration | `pytest tests -q` | **283 passed**, 0 failed, 0 warnings |
+| Unit / integration | `pytest tests -q` | **284 passed**, 0 failed, 0 warnings |
 | Smoke suite | `python scripts/run_nios.py --smoke-test` | **22/22 rows**, `EXIT=0` |
 | Go-live certificate | `python scripts/preflight_golive.py --fast` | **22/22 PASS**, `EXIT=0` |
-| Live 9-page burn-in | boot, sweep, shut down | **9/9 routes**, **7/7 page endpoints**, **12/12 controls** at `200 OK`, then empty `git status --porcelain` |
+| Live `V1.1` burn-in | boot on `:8001`, `setup → login → paper state → fund-paper → live state (403) → elevate-live → live state (200) → logout`, shut down | **clean slate on boot**, **`403` before elevation**, **`200` after**, then empty `git status --porcelain` |
 
-The seal is documentation + tag only. It asserts nothing new about live capital, changes no
-gate threshold, and leaves `main` and the annotated tag `v3.0.0-PROD` untouched.
+The seal asserts nothing new about live capital: every silo still boots `PAPER`, the 22-gate
+certificate still governs a LIVE cutover, and `main` (`9a8ac5f` / `v3.0.0-PROD`) and `V1`
+(`ff67b5c` / `v3.1.0-V1`) are untouched.
 
 ---
 

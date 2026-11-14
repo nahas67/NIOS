@@ -4605,6 +4605,37 @@ class ControlPlane:
             self._operator_auth = default_operator_auth()
         return self._operator_auth
 
+    def live_tier_guard(self, session_token: str | None) -> None:
+        """Demand a ``LIVE`` session on live-mutating endpoints.
+
+        The guard is *inert* until an operator credential exists on disk, so a
+        first-run or legacy install keeps the pre-V1.1 contract byte for byte.
+        Once ``setup`` has run, a PAPER token (or no token at all) is refused
+        before Ring 0 is ever reached: a compromised Paper tab cannot flip a
+        silo to LIVE, write broker credentials, dispatch a testnet order or
+        rotate the signing keys.
+
+        Protects fatal flaw 6 (prompt-injection exposure of broker keys) and
+        preserves Law 2: the human operator, not the model, owns the LIVE gate.
+        """
+        auth = self.operator_auth()
+        probe = getattr(auth, "is_initialized", None) or getattr(
+            auth, "initialized", None
+        )
+        if not callable(probe):
+            return  # no credential store at all -> legacy behaviour
+        try:
+            configured = bool(probe())
+        except Exception:  # pragma: no cover - unreadable vault fails closed
+            configured = True
+        if not configured:
+            return
+        claims = auth.authenticate(session_token)
+        if claims is None:
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
+        if str(claims.get("tier", "NONE")) != "LIVE":
+            raise HTTPException(status_code=403, detail="LIVE_ELEVATION_REQUIRED")
+
     def auth_status(self, session_token: str | None = None) -> dict[str, Any]:
         try:
             payload = dict(self.operator_auth().status(session_token))
@@ -5672,16 +5703,29 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             },
         )
 
+    # ---- V1.1: LIVE-tier guard shared by every live-mutating route -----
+    def _session_token(request: Request) -> str | None:
+        header = request.headers.get("X-NIOS-Session")
+        if header and header.strip():
+            return header.strip()
+        cookie = request.cookies.get("nios_session")
+        return cookie.strip() if cookie else None
+
     @app.post("/api/v2/control/brokers")
-    def control_brokers(request: BrokerControlRequest) -> dict[str, Any]:
-        return control.update_broker(request)
+    def control_brokers(
+        payload: BrokerControlRequest, http_request: Request
+    ) -> dict[str, Any]:
+        if str(payload.mode or "").strip().upper() == "LIVE":
+            control.live_tier_guard(_session_token(http_request))
+        return control.update_broker(payload)
 
     # ---- Phase 3 Step 2: write-only broker testnet credentials ---------
     @app.post("/api/v2/control/brokers/credentials")
     def control_broker_credentials(
-        request: BrokerCredentialRequest,
+        payload: BrokerCredentialRequest, http_request: Request
     ) -> dict[str, Any]:
-        return control.store_broker_credentials(request)
+        control.live_tier_guard(_session_token(http_request))
+        return control.store_broker_credentials(payload)
 
     @app.get("/api/v2/control/brokers/credentials")
     def control_broker_credentials_state() -> dict[str, Any]:
@@ -5749,8 +5793,11 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return control.testnet_state()
 
     @app.post("/api/v2/control/brokers/testnet-order")
-    def control_testnet_order(request: TestnetOrderRequest) -> dict[str, Any]:
-        return control.dispatch_testnet_order(request)
+    def control_testnet_order(
+        payload: TestnetOrderRequest, http_request: Request
+    ) -> dict[str, Any]:
+        control.live_tier_guard(_session_token(http_request))
+        return control.dispatch_testnet_order(payload)
 
     @app.post("/api/v2/control/rearm")
     def control_rearm(request: RearmRequest | None = None) -> dict[str, Any]:
@@ -5759,8 +5806,10 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     # ---- Phase 3 Step 5: zero-downtime Ring 0 vault key rotation --------
     @app.post("/api/v2/control/vault/rotate-keys")
     def control_vault_rotate(
+        http_request: Request,
         request: VaultRotationRequest | None = None,
     ) -> dict[str, Any]:
+        control.live_tier_guard(_session_token(http_request))
         return control.rotate_vault_keys(request)
 
     @app.get("/api/v2/control/vault/status")
@@ -5875,13 +5924,6 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return control.evaluate_challenger(request)
 
     # ---- V1.1: sovereign operator authentication -----------------------
-    def _session_token(request: Request) -> str | None:
-        header = request.headers.get("X-NIOS-Session")
-        if header and header.strip():
-            return header.strip()
-        cookie = request.cookies.get("nios_session")
-        return cookie.strip() if cookie else None
-
     @app.get("/api/v2/auth/status")
     def auth_status(request: Request) -> dict[str, Any]:
         return control.auth_status(_session_token(request))
