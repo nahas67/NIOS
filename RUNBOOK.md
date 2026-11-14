@@ -1,8 +1,8 @@
 # NIOS Production Operator Runbook
 
 **Document ID:** NIOS-OPS-2026-V3
-**Release tag:** `v3.7.0-V1.6` (supersedes `v3.6.0-V1.5`, `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
-**Branch:** `V1.6`
+**Release tag:** `v3.8.0-V1.7` (supersedes `v3.7.0-V1.6`, `v3.6.0-V1.5`, `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
+**Branch:** `V1.7`
 **Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
 **Operating constitution:** `AGENTS.md`
@@ -330,7 +330,7 @@ To verify a payload: remove `payload_sha256`, serialise with sorted keys and
 
 ### 1D.3 Instrument and statutory data completeness
 
-`core/instrument_registry.py` holds 48 canonical instruments across the four
+`core/instrument_registry.py` holds 274 canonical instruments across the four
 silos with exact `lot_size`, `tick_size_micros`, `freeze_quantity`,
 `circuit_limit_pct`, initial/maintenance margin, settlement cycle, UTC session
 and option strike step. `SmartOMS` rejects an off-lot or over-freeze quantity
@@ -363,6 +363,41 @@ loaders and the 17 regional engines on `GET /api/v2/cockpit/quant`.
   `AgentTaskDispatcher` and the control plane serialize mutations behind
   re-entrant locks. `POST /control/orders/paper` accepts `idempotency_key`: a
   duplicate replays the original receipt and never double-debits the vault.
+
+---
+
+## SOP 1E - V1.7 Institutional Universe, Feature Store and Catalysts
+
+`v3.8.0-V1.7` expands the tradable catalogue from 48 to **274 canonical instruments** and
+gives every one of them a deep, SHA-256-grounded feature profile. Ring 3 stays headless.
+
+### 1E.1 What the universe now holds
+
+| Silo | Count | Coverage |
+|---|---|---|
+| `INDIA_ZERODHA_DHAN` | 76 | 8 indices, all 50 NIFTY 50 constituents, 14 MCX commodity futures, 4 NSE currency futures |
+| `CRYPTO_BINANCE` | 80 | 30 layer-1 / blue-chip perps + 50 DeFi, L2, AI, DePIN, RWA, gaming and meme perps |
+| `US_IBKR` | 79 | 50 mega/large-cap equities, 23 benchmark and sector ETFs, 6 CME futures |
+| `FX_MT5` | 39 | 28 G10 majors and crosses, 5 EM crosses, 4 precious metals, 2 energy CFDs |
+
+Every entry carries `symbol`, `display_name`, `silo`, `venue`, `asset_class`, `sub_category`,
+`sector`, `currency`, `lot_size`, `tick_size_micros`, `freeze_quantity`, `circuit_limit_pct`,
+`margin_initial_pct`, `margin_maintenance_pct`, `settlement_cycle`, `trading_hours_utc`,
+`option_strike_step`, `has_options` and `isin_or_id`. Symbols are unique across all four
+silos, so `GET /api/v2/instruments/BTCUSDT` is never ambiguous.
+
+### 1E.2 The five data surfaces
+
+| Surface | Backing module | Contract |
+|---|---|---|
+| Contract catalogue | `core/instrument_registry.py` | Deterministic `query(silo, asset_class, sector, search, has_options, limit, offset)` |
+| Attribute features | `core/market_features_store.py` | Equity fundamentals, crypto on-chain/derivatives, FX carry/COT per asset class |
+| Options surface | `core/market_features_store.py` | `7DTE/30DTE/60DTE/90DTE` term structure, `iv_rank`, skew, GEX, vanna, charm, PCR, max pain |
+| Sector heatmaps | `ring2_brain/quant/macro_and_catalysts.py` | India NSE, US GICS, crypto narratives with advance/decline breadth |
+| Macro catalysts | `ring2_brain/quant/macro_and_catalysts.py` | Release calendar with consensus, previous, impact tier and volatility multiplier |
+
+A paper order for a symbol that is not in the registry is now rejected with
+`422 INSTRUMENT_REJECTED`, so an unknown ticker can no longer bypass the contract spec.
 
 ---
 
@@ -462,16 +497,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 24 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 25 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.7.0-V1.6`: `pytest tests -q` must report **462 passed, 0 failed, 0 warnings**
+Release seal for `v3.8.0-V1.7`: `pytest tests -q` must report **522 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 23-suite inventory
+### 3.2a The 25-suite inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -498,6 +533,7 @@ prerequisites for re-tagging; neither may be waived.
 | 21 | `tests/test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.3** separate `/paper/login` + `/live/login` portals, options chain with Greeks/PCR/Max Pain, six multi-leg payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15 pages across all three route trees |
 | 22 | `tests/test_v1_4_clean_room_masterpiece_ui.py` | **V1.4** clean-room rebuild: 15 bespoke workstation pages, dual-shell separation, four auth portals, six zero-dependency SVG charts, biome-clean source, clean-slate rendering |
 | 23 | `tests/test_v1_5_institutional_terminal_ui.py` | **V1.6** headless institutional contract: 50-route status document, integer micro money, exact itemized statutory floors, 15-page catalogue, dual workspace boundary, reproducible payload digest |
+| 25 | `tests/test_v1_7_deep_market_universe_and_feature_audit.py` | **V1.7** 274-instrument universe completeness, deep asset-class feature store + options surface with SHA-256 grounding, instrument search/filter/pagination, macro calendar + four cross-asset heatmaps, SmartOMS + walk-forward lot/tick/statutory-floor enforcement |
 | 24 | `tests/test_v1_6_backend_bug_hunt_security_and_data_completeness.py` | **V1.6** master instrument registry + lot/tick/freeze enforcement, itemized statutory cost engine, adversarial numerical/boundary fuzzing, 32-thread idempotency + double-entry conservation, auth brute-force lockout + secret non-leakage |
 
 ### 3.3 Chaos / crash injection
@@ -817,6 +853,20 @@ The logbook applies the statutory cost floor per silo before attribution: `INDIA
 8.50 bps, `CRYPTO_BINANCE` 16.00 bps, `US_IBKR` 2.80 bps, `FX_MT5` 1.60 bps. A clean-slate
 boot starts with `entries == []`, and `POST /api/v2/control/workspace/reset` clears it back to
 `[]` along with every other workspace value.
+
+#### 5.3.8 V1.7 instrument discovery, deep features, heatmaps and macro
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v2/instruments` | Paginated contract catalogue: `silo`, `asset_class`, `sector`, `search`, `has_options`, `limit` (1..500), `offset` (>= 0) |
+| `GET` | `/api/v2/instruments/{symbol}` | Contract spec + asset-class feature profile + options surface + itemized statutory cost + grounded decision score |
+| `GET` | `/api/v2/market/heatmaps` | India sectors, US GICS sectors, crypto narratives and the G10 currency strength matrix |
+| `GET` | `/api/v2/market/macro-calendar` | Release schedule with optional `?region=` and `?impact=` (HIGH / MEDIUM) filters |
+
+Each response carries `schema_version`, `generated_at_ns`, `payload_sha256` and a per-block
+`grounding` object whose `payload_sha256` is a verified `GroundedFactPacket` digest. An
+unknown silo, asset class, sector, region, impact tier, over-long search string or
+out-of-range page is `422`; an unknown symbol is `404 INSTRUMENT_NOT_FOUND`.
 
 ---
 

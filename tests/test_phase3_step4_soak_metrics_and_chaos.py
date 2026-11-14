@@ -304,7 +304,7 @@ def test_gate3_chaos_sigkill_lease_and_tick_recovery(tmp_path) -> None:
 
 def test_gate4_test_inventory_is_twenty_one_files() -> None:
     test_files = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 24, test_files
+    assert len(test_files) == 25, test_files
     for expected in (
         "test_phase3_step1_multiprocess_and_live_daemons.py",
         "test_phase3_step2_live_cutover_and_cockpit.py",

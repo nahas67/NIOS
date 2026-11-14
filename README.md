@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**462 tests · 24 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**522 tests · 25 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -200,10 +200,59 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 21 | `test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.6** separate `/paper/login` + `/live/login` portals, options chain (Greeks/PCR/Max Pain), six payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15-page catalogue across all three route trees, headless document |
 | 22 | `test_v1_4_clean_room_masterpiece_ui.py` | **V1.6** headless backend contract: no frontend tree, 55-route zero-JavaScript document, envelope + risk telemetry on 13 page endpoints, dual workspace boundary, clean-slate rendering |
 | 23 | `test_v1_5_institutional_terminal_ui.py` | **V1.6** headless institutional contract: 50-route status document, integer micro money, exact itemized statutory floors, 15-page catalogue, dual workspace boundary, reproducible payload digest |
+| 25 | `test_v1_7_deep_market_universe_and_feature_audit.py` | **V1.7** 274-instrument institutional universe (all 50 NIFTY 50, 80 crypto perps, 79 US names, 28 G10 pairs, MCX + CME), asset-class fundamental / on-chain / COT feature store, four-expiry IV term structure + GEX surface, India / US / crypto heatmaps and the G10 strength matrix, macro calendar, instrument search / filter / detail APIs, SmartOMS + walk-forward lot, tick and statutory-floor enforcement |
 | 24 | `test_v1_6_backend_bug_hunt_security_and_data_completeness.py` | **V1.6** master instrument registry + lot/tick/freeze enforcement, itemized statutory cost engine, adversarial numerical/boundary fuzzing, 32-thread idempotency + double-entry conservation, auth brute-force lockout + secret non-leakage |
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
 independent of whatever happens to be installed in the interpreter.
+
+---
+
+## V1.7 - institutional multi-asset universe, deep features and catalysts
+
+`v3.8.0-V1.7` turns the 48-instrument skeleton into a 274-instrument institutional
+catalogue and gives every entry a real, SHA-256-grounded data profile:
+
+* **274 canonical instruments, zero duplicate symbols.** 76 India (8 indices, all 50
+  NIFTY 50 constituents, 14 MCX commodity futures, 4 NSE currency futures), 80 Binance
+  USDT perpetuals across layer-1, DeFi, L2, AI/DePIN, RWA, gaming and meme narratives,
+  79 US names (50 mega/large caps, 23 benchmark and sector ETFs, 6 CME futures) and 39
+  FX/CFD contracts (all 28 G10 pairs, 5 EM crosses, 4 precious metals, 2 energy CFDs).
+  Every row carries display name, venue, asset class, sub-category, sector, currency,
+  lot, tick, freeze, circuit, initial/maintenance margin, settlement, UTC session,
+  option strike step, `has_options` and a venue identifier.
+* **Asset-class feature store.** `core/market_features_store.py` emits equity
+  fundamentals (`pe_ratio`, `forward_pe`, `ev_ebitda`, `roe_pct`, `roce_pct`,
+  `week_52_high/low`, `beta`, `adv_30d_units`, ownership, earnings date, relative
+  strength), crypto derivatives and on-chain data (`fdv_usd`, `open_interest_usd`,
+  `funding_rate_8h_pct`, `annualized_basis_pct`, `long_short_account_ratio`,
+  `liquidations_24h_usd`, `onchain_active_addresses_24h`, `exchange_netflow_24h_usd`,
+  `btc_dominance_pct`) and FX/commodity carry and positioning (`base_policy_rate_pct`,
+  `rate_differential_bps`, `annualized_carry_pct`, `cot_net_non_commercial_lots`,
+  `cot_percentile_52w`, `implied_vol_1m/3m_pct`, `risk_reversal_25d`, `active_session`,
+  `pip_value_per_standard_lot`).
+* **Four-expiry options surface.** `get_options_surface_profile()` returns a
+  `7DTE/30DTE/60DTE/90DTE` term structure plus `iv_rank`, `iv_percentile`, 25-delta
+  skew and butterfly, dealer `net_gamma_exposure_usd` (GEX), vanna, charm, PCR (OI and
+  volume) and `max_pain_strike`. Non-optionable instruments still carry a modeled
+  surface, flagged `modeled=true`, so the endpoint never returns a hole.
+* **Cross-asset heatmaps and a macro calendar.** `ring2_brain/quant/macro_and_catalysts.py`
+  aggregates the catalogue into the India NSE sector heatmap, the US GICS sector
+  heatmap, the crypto narrative heatmap and the G10 currency strength matrix
+  (`-100..+100` relative strength plus carry-adjusted momentum and every pair
+  differential), and publishes a release calendar covering RBI, India CPI/IIP/GST,
+  FOMC, US CPI/PCE/NFP/ISM, ECB, BoE, BoJ, EIA crude and the BTC quarterly expiry with
+  consensus, previous, impact tier and volatility multiplier.
+* **Discovery APIs.** `GET /api/v2/instruments` (filter by silo, asset class, sector,
+  free-text search and option eligibility, paginated 1..500), `GET
+  /api/v2/instruments/{symbol}` (contract spec + features + surface + itemized
+  statutory cost + grounded decision score in one response), `GET
+  /api/v2/market/heatmaps` and `GET /api/v2/market/macro-calendar`. The terminal,
+  options, quant and agent pages now draw from the full universe instead of a hardcoded
+  ticker list.
+* **Registry enforcement is total.** `SmartOMS` rejects an unknown symbol, an off-lot
+  quantity or a quantity above the exchange freeze with `422 INSTRUMENT_REJECTED`, and
+  snaps an off-tick limit price onto the exact tick grid before the outbox is touched.
 
 ---
 
@@ -495,7 +544,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     462 tests across 24 suites
+tests/                     522 tests across 25 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 22-gate go-live readiness certificate (--strict / --fast)

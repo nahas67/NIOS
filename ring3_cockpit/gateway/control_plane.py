@@ -56,7 +56,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal, Mapping
+from typing import Any, ClassVar, Iterable, Iterator, Literal, Mapping
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -65,7 +65,21 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from core.instrument_registry import (
+    MICROS,
+    SILO_IDS,
     registry as instrument_registry,
+)
+from core.market_features_store import (
+    feature_summary,
+    get_decision_score,
+    get_feature_profile,
+    get_options_surface_profile,
+    profile_index,
+    reference_price,
+)
+from ring2_brain.quant.macro_and_catalysts import (
+    get_macro_calendar,
+    get_market_heatmaps,
 )
 from core.nats_bus import STREAM_RING3_COCKPIT, LocalJetStreamBus
 from core.schemas import (
@@ -320,6 +334,50 @@ TERMINAL_LEVEL_STEP_PCT: float = 0.00004
 #: Lee-Ready tape length on a terminal frame.
 TERMINAL_TAPE_SIZE: int = 24
 
+#: Contract asset class -> the terminal's coarse volatility bucket.
+_TERMINAL_ASSET_BY_CLASS: dict[str, str] = {
+    "PERPETUAL": "CRYPTO",
+    "INDEX_FUTURE": "INDEX",
+    "FUTURE": "INDEX",
+    "COMMODITY_FUTURE": "INDEX",
+    "CURRENCY_FUTURE": "FX",
+    "ETF": "EQUITY",
+    "EQUITY": "EQUITY",
+    "FX": "FX",
+    "METAL": "FX",
+    "ENERGY": "FX",
+}
+
+#: The V1.7 market-terminal watchlist: one representative per silo from every
+#: asset class in the institutional universe (indices, cash equities, commodity
+#: and currency futures, crypto majors/minors, US equities and ETFs, FX, metals).
+TERMINAL_UNIVERSE_: tuple[str, ...] = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "NIFTY",
+    "BANKNIFTY",
+    "RELIANCE",
+    "TCS",
+    "HDFCBANK",
+    "GOLD",
+    "CRUDEOIL",
+    "USDINR",
+    "SPY",
+    "QQQ",
+    "NVDA",
+    "AAPL",
+    "TSLA",
+    "GLD",
+    "TLT",
+    "ES",
+    "CL",
+    "EURUSD",
+    "GBPJPY",
+    "XAUUSD",
+)
+
 
 def _stable_unit(*parts: Any) -> float:
     """A deterministic ``[0, 1)`` draw keyed on the arguments.
@@ -446,7 +504,7 @@ class StrictRequest(BaseModel):
 
 #: Identifier grammar: letters, digits, dot, dash, underscore, colon.  A path
 #: separator, a null byte or a traversal token can never match.
-IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,127}$"
+IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:\-&]{0,127}$"
 
 
 def _identifier(value: str, *, field_name: str = "identifier") -> str:
@@ -2764,7 +2822,13 @@ class ControlPlane:
         try:
             instrument_spec = instrument_registry.get(request.silo, symbol)
         except KeyError:
-            instrument_spec = None
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"INSTRUMENT_REJECTED: {symbol} is not in the "
+                    f"{request.silo} contract registry"
+                ),
+            ) from None
         if instrument_spec is not None:
             instrument_check = instrument_registry.validate_order(
                 request.silo, symbol, float(request.quantity), price
@@ -4654,6 +4718,11 @@ class ControlPlane:
                 "task": "/api/v2/control/agents/tasks/{task_id}",
                 "cancel": "/api/v2/control/agents/cancel",
             },
+            "universe": {
+                "total_instruments": instrument_registry.total(),
+                "silo_counts": instrument_registry.counts(),
+                "feature_profiles": profile_index()["per_profile"],
+            },
         }
 
     def assign_agent_task(self, request: AgentAssignRequest) -> dict[str, Any]:
@@ -4766,13 +4835,58 @@ class ControlPlane:
     # ------------------------------------------------------------------
     # V1.3 options chain, market terminal, trade logbook and broker hub
     # ------------------------------------------------------------------
+    _RISK_FREE_BY_CCY: ClassVar[dict[str, float]] = {
+        "INR": 0.065,
+        "USD": 0.043,
+        "USDT": 0.045,
+        "EUR": 0.025,
+        "GBP": 0.040,
+        "JPY": 0.005,
+        "CHF": 0.008,
+        "AUD": 0.040,
+        "CAD": 0.030,
+        "NZD": 0.040,
+    }
+
     def _options_underlying(self, symbol: str) -> dict[str, Any]:
-        """Resolve one optionable underlying or reject with ``422``."""
+        """Resolve one optionable underlying or reject with ``422``.
+
+        The six hand-tuned defaults in :data:`OPTIONS_UNDERLYINGS` win for the
+        blue-chip proxies; anything else in the 274-instrument registry is
+        modelled from its own contract spec and options-surface profile, so the
+        chain works for every optionable symbol instead of a fixed ticker list.
+        """
         key = str(symbol or "").strip().upper()
         spec = OPTIONS_UNDERLYINGS.get(key)
-        if spec is None:
+        if spec is not None:
+            return {"symbol": key, **dict(spec)}
+
+        contract = instrument_registry.resolve(key)
+        if contract is None:
             raise HTTPException(status_code=422, detail=f"UNKNOWN_UNDERLYING:{key}")
-        return {"symbol": key, **dict(spec)}
+        surface = get_options_surface_profile(contract.symbol)
+        spot = float(surface["spot_reference"])
+        if spot <= 0.0:
+            raise HTTPException(status_code=422, detail=f"UNKNOWN_UNDERLYING:{key}")
+        step = float(contract.option_strike_step)
+        if step <= 0.0:
+            step = max(round(spot * 0.02, 4), 10.0 ** -4)
+        precision = 4 if spot < 5.0 else 2
+        return {
+            "symbol": contract.symbol,
+            "silo": contract.silo,
+            "spot": spot,
+            "volatility": round(float(surface["atm_iv_pct"]) / 100.0, 6),
+            "days_to_expiry": 30,
+            "strike_step": step,
+            "strike_precision": precision,
+            "lot_size": max(1, int(round(contract.lot_size))),
+            "oi_scale": 50_000.0,
+            "currency": contract.currency,
+            "risk_free_rate": self._RISK_FREE_BY_CCY.get(contract.currency, 0.040),
+            "has_options": bool(contract.has_options),
+            "asset_class": contract.asset_class,
+        }
 
     @staticmethod
     def _option_iv(base_volatility: float, strike: float, spot: float) -> float:
@@ -5034,15 +5148,12 @@ class ControlPlane:
             "generated_at_ns": time.time_ns(),
         }
 
-    def options_page(self) -> dict[str, Any]:
-        """``GET /api/v2/cockpit/options`` -- underlyings, strategies, live chain."""
-        chain = self.options_chain(OptionsChainRequest(symbol="NIFTY"))
-        return {
-            "page": "options",
-            "title": "Options Chain & Multi-Leg Strategy Lab",
-            "ring": "RING 2",
-            "read_only": True,
-            "underlyings": [
+    def options_underlyings(self) -> list[dict[str, Any]]:
+        """Every optionable underlying: the tuned proxies first, then the universe."""
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for key, spec in OPTIONS_UNDERLYINGS.items():
+            rows.append(
                 {
                     "symbol": key,
                     "silo": str(spec["silo"]),
@@ -5052,14 +5163,55 @@ class ControlPlane:
                     "days_to_expiry": int(spec["days_to_expiry"]),
                     "strike_step": float(spec["strike_step"]),
                     "lot_size": int(spec.get("lot_size", 1)),
+                    "asset_class": "PROXY",
+                    "source": "TUNED_DEFAULT",
                 }
-                for key, spec in OPTIONS_UNDERLYINGS.items()
-            ],
+            )
+            seen.add(key)
+        for contract in sorted(
+            instrument_registry.all(), key=lambda spec: (spec.silo, spec.symbol)
+        ):
+            if not contract.has_options or contract.symbol in seen:
+                continue
+            surface = get_options_surface_profile(contract.symbol)
+            spot = float(surface["spot_reference"])
+            step = float(contract.option_strike_step)
+            if step <= 0.0:
+                step = max(round(spot * 0.02, 4), 10.0 ** -4)
+            rows.append(
+                {
+                    "symbol": contract.symbol,
+                    "silo": contract.silo,
+                    "currency": contract.currency,
+                    "spot": spot,
+                    "volatility": round(float(surface["atm_iv_pct"]) / 100.0, 6),
+                    "days_to_expiry": 30,
+                    "strike_step": step,
+                    "lot_size": max(1, int(round(contract.lot_size))),
+                    "asset_class": contract.asset_class,
+                    "iv_rank": float(surface["iv_rank"]),
+                    "source": "REGISTRY",
+                }
+            )
+            seen.add(contract.symbol)
+        return rows
+
+    def options_page(self) -> dict[str, Any]:
+        """``GET /api/v2/cockpit/options`` -- underlyings, strategies, live chain."""
+        chain = self.options_chain(OptionsChainRequest(symbol="NIFTY"))
+        underlyings = self.options_underlyings()
+        return {
+            "page": "options",
+            "title": "Options Chain & Multi-Leg Strategy Lab",
+            "ring": "RING 2",
+            "read_only": True,
+            "underlyings": underlyings,
             "strategies": [dict(row) for row in OPTIONS_STRATEGIES],
             "default_symbol": "NIFTY",
             "chain": chain,
             "counts": {
-                "underlyings": len(OPTIONS_UNDERLYINGS),
+                "underlyings": len(underlyings),
+                "optionable_instruments": len(underlyings),
                 "strategies": len(OPTIONS_STRATEGIES),
                 "strikes": len(chain["chain"]),
             },
@@ -5309,15 +5461,24 @@ class ControlPlane:
             if requested_silo not in known_silos:
                 raise HTTPException(status_code=422, detail=f"UNKNOWN_SILO:{requested_silo}")
         watch = next((row for row in TERMINAL_WATCHLIST if row["symbol"] == symbol), None)
+        contract = instrument_registry.resolve(symbol)
+        asset_token = "EQUITY"
+        resolved_silo = "US_IBKR"
+        reference = 100.0 * (1.0 + _stable_unit(symbol, "reference"))
+        if contract is not None:
+            asset_token = _TERMINAL_ASSET_BY_CLASS.get(contract.asset_class, "EQUITY")
+            resolved_silo = contract.silo
+            reference = reference_price(contract)
+        elif watch is not None:
+            asset_token = str(watch["asset_class"])
+            resolved_silo = str(watch["silo"])
+            reference = float(watch["reference"])
         silo = (
             str(request.silo).strip().upper()
             if request.silo is not None
-            else str(watch["silo"] if watch else "US_IBKR")
+            else resolved_silo
         )
-        asset_class = str(watch["asset_class"]) if watch else "EQUITY"
-        reference = float(watch["reference"]) if watch else 100.0 * (
-            1.0 + _stable_unit(symbol, "reference")
-        )
+        asset_class = asset_token
         bars = max(20, min(240, int(request.bars)))
         depth_levels = max(5, min(10, int(request.depth)))
 
@@ -5538,23 +5699,199 @@ class ControlPlane:
     def terminal_page(self) -> dict[str, Any]:
         """``GET /api/v2/cockpit/terminal`` -- watchlist plus a live frame."""
         frame = self.terminal_quote(TerminalQuoteRequest(symbol="BTCUSDT"))
+        watchlist = self.watchlist_rows()
         return {
             "page": "terminal",
             "title": "Market Terminal, L2 Depth & Charting",
             "ring": "RING 1",
             "read_only": True,
-            "watchlist": [dict(row) for row in TERMINAL_WATCHLIST],
+            "watchlist": watchlist,
             "default_symbol": "BTCUSDT",
             "frame": frame,
             "counts": {
-                "watchlist": len(TERMINAL_WATCHLIST),
-                "silos": len({row["silo"] for row in TERMINAL_WATCHLIST}),
+                "watchlist": len(watchlist),
+                "silos": len({row["silo"] for row in watchlist}),
+                "asset_classes": len({row["asset_class"] for row in watchlist}),
+                "universe": instrument_registry.total(),
                 "bars": len(frame["candles"]),
                 "depth_levels": frame["depth"]["level_count"],
             },
             "law": "sec_018 Law 1 - never trust a single feed or a resting order",
             "generated_at_ns": time.time_ns(),
         }
+
+    @staticmethod
+    def watchlist_rows() -> list[dict[str, Any]]:
+        """Build the terminal watchlist from the live registry, not a ticker list.
+
+        One row per representative symbol: contract spec fields plus the compact
+        asset-class feature metrics and the compact options metrics, so the
+        terminal renders a real cross-asset board.
+        """
+        rows: list[dict[str, Any]] = []
+        for symbol in TERMINAL_UNIVERSE_:
+            contract = instrument_registry.resolve(symbol)
+            if contract is None:  # pragma: no cover - registry regression guard
+                continue
+            summary = feature_summary(contract.symbol)
+            rows.append(
+                {
+                    "symbol": contract.symbol,
+                    "display_name": contract.display_name,
+                    "silo": contract.silo,
+                    "asset_class": contract.asset_class,
+                    "sub_category": contract.sub_category,
+                    "sector": contract.sector,
+                    "currency": contract.currency,
+                    "reference": float(summary["spot_reference"]),
+                    "lot_size": contract.lot_size,
+                    "tick_size_micros": contract.tick_size_micros,
+                    "has_options": contract.has_options,
+                    "feature_profile": summary["feature_profile"],
+                    "iv_rank": summary["iv_rank"],
+                    "payload_sha256": summary["payload_sha256"],
+                }
+            )
+        return rows
+
+    # ------------------------------------------------------------------
+    # V1.7 instrument discovery, deep features, heatmaps and macro
+    # ------------------------------------------------------------------
+    def _envelope(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Wrap a V1.7 market payload in the standard deterministic envelope."""
+        return enclose(
+            dict(payload),
+            workspace_mode="PAPER",
+            clean_slate_active=bool(getattr(self, "_clean_slate_active", False)),
+        )
+
+    def instrument_catalog(
+        self,
+        *,
+        silo: str | None = None,
+        asset_class: str | None = None,
+        sector: str | None = None,
+        search: str | None = None,
+        has_options: bool | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """``GET /api/v2/instruments`` -- paginated, filterable contract catalogue."""
+        silo_token = None if silo is None else str(silo).strip().upper()
+        if silo_token is not None and silo_token not in SILO_IDS:
+            raise HTTPException(status_code=422, detail=f"UNKNOWN_SILO:{silo_token}")
+        class_token = (
+            None if asset_class is None else str(asset_class).strip().upper()
+        )
+        if class_token is not None and class_token not in instrument_registry.asset_classes():
+            raise HTTPException(
+                status_code=422, detail=f"UNKNOWN_ASSET_CLASS:{class_token}"
+            )
+        sector_token = None if sector is None else str(sector).strip()
+        if sector_token is not None and sector_token not in instrument_registry.sectors():
+            raise HTTPException(status_code=422, detail=f"UNKNOWN_SECTOR:{sector_token}")
+        search_token = None if search is None else str(search).strip()
+        if search_token is not None and len(search_token) > 64:
+            raise HTTPException(status_code=422, detail="SEARCH_QUERY_TOO_LONG")
+
+        try:
+            page = instrument_registry.query(
+                silo=silo_token,
+                asset_class=class_token,
+                sector=sector_token,
+                search=search_token,
+                has_options=has_options,
+                limit=int(limit),
+                offset=int(offset),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        items: list[dict[str, Any]] = []
+        for spec in page["items"]:
+            summary = feature_summary(spec.symbol)
+            items.append(
+                {
+                    **spec.to_dict(),
+                    "feature_summary": summary,
+                    "detail_url": f"/api/v2/instruments/{spec.symbol}",
+                }
+            )
+        return self._envelope(
+            {
+                "schema_version": instrument_registry.SCHEMA_VERSION,
+                "total_count": page["total_count"],
+                "returned_count": len(items),
+                "limit": page["limit"],
+                "offset": page["offset"],
+                "has_more": page["has_more"],
+                "silo_counts": page["silo_counts"],
+                "filters": page["filters"],
+                "sector_counts": instrument_registry.sectors(),
+                "asset_class_counts": instrument_registry.asset_classes(),
+                "items": items,
+                "law": "sec_014 - a contract spec is agreed before an order is reserved",
+            }
+        )
+
+    def instrument_detail(self, symbol: str) -> dict[str, Any]:
+        """``GET /api/v2/instruments/{symbol}`` -- the authoritative single row.
+
+        One response carries the contract spec, the asset-class feature profile,
+        the options surface, the itemized statutory cost breakdown for one lot
+        and the grounded decision score.
+        """
+        token = _identifier(symbol, field_name="instrument")
+        contract = instrument_registry.resolve(token)
+        if contract is None:
+            raise HTTPException(
+                status_code=404, detail=f"INSTRUMENT_NOT_FOUND:{token.upper()}"
+            )
+        profile = get_feature_profile(contract.symbol)
+        surface = get_options_surface_profile(contract.symbol)
+        spot = float(surface["spot_reference"])
+        notional_micros = int(round(contract.lot_size * spot * MICROS))
+        if notional_micros <= 0:
+            notional_micros = MICROS
+        statutory = statutory_cost_engine.breakdown(
+            contract.silo, notional_micros, side="BUY"
+        ).to_dict()
+        decision = get_decision_score(contract.symbol)
+        check = instrument_registry.validate_order(
+            contract.silo, contract.symbol, contract.lot_size, spot
+        )
+        return self._envelope(
+            {
+                "schema_version": instrument_registry.SCHEMA_VERSION,
+                "symbol": contract.symbol,
+                "found": True,
+                "contract": contract.to_dict(),
+                "feature_profile": profile.to_dict(),
+                "options_surface": surface,
+                "statutory_cost": statutory,
+                "decision_score": decision,
+                "one_lot_check": check.to_dict(),
+                "feature_metric_count": len(profile.packet.metrics),
+                "feature_payload_sha256": profile.packet.sha256_digest,
+                "options_payload_sha256": surface["payload_sha256"],
+                "decision_payload_sha256": decision["payload_sha256"],
+                "law": "sec_018 Law 3 - every number carries a SHA-256 commitment",
+            }
+        )
+
+    def market_heatmaps(self) -> dict[str, Any]:
+        """``GET /api/v2/market/heatmaps`` -- the four cross-asset heatmaps."""
+        return self._envelope(get_market_heatmaps())
+
+    def market_macro_calendar(
+        self, *, region: str | None = None, impact: str | None = None
+    ) -> dict[str, Any]:
+        """``GET /api/v2/market/macro-calendar`` -- filtered release schedule."""
+        try:
+            payload = get_macro_calendar(region=region, impact=impact)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return self._envelope(payload)
 
     def terminal_quote(self, request: TerminalQuoteRequest) -> dict[str, Any]:
         """``POST /api/v2/control/terminal/quote`` -- one grounded frame."""
@@ -6447,6 +6784,20 @@ class ControlPlane:
             "valuation": valuation,
             "tail_hedger": hedger,
             "datasets": datasets,
+            "universe": {
+                "total_instruments": instrument_registry.total(),
+                "silo_counts": instrument_registry.counts(),
+                "asset_class_counts": instrument_registry.asset_classes(),
+                "sector_counts": instrument_registry.sectors(),
+                "feature_coverage": profile_index(),
+                "searchable": True,
+                "endpoints": {
+                    "catalog": "/api/v2/instruments",
+                    "detail": "/api/v2/instruments/{symbol}",
+                    "heatmaps": "/api/v2/market/heatmaps",
+                    "macro_calendar": "/api/v2/market/macro-calendar",
+                },
+            },
             "generated_at_ns": time.time_ns(),
         }
 
@@ -8087,6 +8438,42 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.post("/api/v2/control/terminal/quote")
     def control_terminal_quote(payload: TerminalQuoteRequest) -> dict[str, Any]:
         return control.terminal_quote(payload)
+
+    # ---- V1.7: instrument discovery, deep features, heatmaps and macro ---
+    @app.get("/api/v2/instruments")
+    def market_instruments(
+        silo: str | None = None,
+        asset_class: str | None = None,
+        sector: str | None = None,
+        search: str | None = None,
+        has_options: bool | None = None,
+        limit: int = Query(default=50, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        return control.instrument_catalog(
+            silo=silo,
+            asset_class=asset_class,
+            sector=sector,
+            search=search,
+            has_options=has_options,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get("/api/v2/instruments/{symbol}")
+    def market_instrument(symbol: str) -> dict[str, Any]:
+        return control.instrument_detail(symbol)
+
+    @app.get("/api/v2/market/heatmaps")
+    def market_heatmaps() -> dict[str, Any]:
+        return control.market_heatmaps()
+
+    @app.get("/api/v2/market/macro-calendar")
+    def market_macro_calendar(
+        region: str | None = None,
+        impact: str | None = None,
+    ) -> dict[str, Any]:
+        return control.market_macro_calendar(region=region, impact=impact)
 
     @app.get("/api/v2/cockpit/logbook")
     def cockpit_logbook() -> dict[str, Any]:
