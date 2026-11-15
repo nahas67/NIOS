@@ -350,7 +350,7 @@ def test_gate3_killswitch_preempts_everything_under_one_ms(
 
     response = client.post(
         "/api/v2/control/killswitch",
-        json={"reason": "step7 gate3", "flatten": True},
+        json={"reason": "step7 gate3", "flatten": True, "confirm": True},
     )
     assert response.status_code == 200, response.text
     body = response.json()

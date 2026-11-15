@@ -377,16 +377,26 @@ class ShadowExecutionTwin:
             trade_id=trade_id,
         )
 
-        self._counts[token] = self._counts.get(token, 0) + 1
-        self._fills.setdefault(token, []).append(fill)
-        self._settle(fill)
+        # Law 4: the fill is only *counted* once its residual reached the
+        # conformal window.  Incrementing before settlement let a silently
+        # failing store hand out 30/30 graduation with an empty window.
+        if self._settle(fill):
+            self._counts[token] = self._counts.get(token, 0) + 1
+            self._fills.setdefault(token, []).append(fill)
 
         return fill
 
     # -- conformal settlement ---------------------------------------------
-    def _settle(self, fill: ShadowFill) -> None:
-        """Feed the completed shadow trade into the 200-trade conformal window."""
+    def _settle(self, fill: ShadowFill) -> bool:
+        """Feed the completed shadow trade into the 200-trade conformal window.
+
+        Returns ``True`` only when a residual was actually recorded.  The fill
+        counter is incremented **after** this call succeeds, so ``is_graduated``
+        can never report 30/30 while the conformal window holds zero residuals
+        (Law 4: graduation is earned on calibrated fills, not on attempts).
+        """
         settle_started = time.perf_counter_ns()
+        recorded = False
         try:
             worker = self._worker
             if worker is not None and hasattr(worker, "record_prediction"):
@@ -406,6 +416,7 @@ class ShadowExecutionTwin:
                     now_ns=fill.fill_time_ns,
                     is_shadow=True,
                 )
+                recorded = True
             elif self._store is not None:
                 self._store.append_conformal_residual(
                     fill.strategy_id,
@@ -416,13 +427,21 @@ class ShadowExecutionTwin:
                     realized_net_bps=fill.realized_net_bps,
                     is_shadow=True,
                 )
+                recorded = True
+            else:
+                # No conformal sink is attached: a pure simulation twin has
+                # nothing to calibrate against, so the fill is complete.  The
+                # settle-before-count rule still binds every twin that *does*
+                # own a store or a settlement worker.
+                recorded = True
         except Exception as exc:  # pragma: no cover - injected store failure
             # A settlement failure must never mask a fill: the trade already
             # happened, and losing the residual would silently uncalibrate
-            # the gate.  Record it and keep the fill.
+            # the gate.  Record it and keep the attempt out of the counter.
             self._settlement_errors.append(f"{type(exc).__name__}: {exc}")
         finally:
             self._residual_latency_ns_total += time.perf_counter_ns() - settle_started
+        return recorded
 
     # -- conformal read-out -----------------------------------------------
     def q98_bps(self, strategy_id: str, as_of_ns: int | None = None) -> float:

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, ClassVar, Iterable, Mapping
 
 __all__ = [
@@ -652,9 +653,20 @@ class InstrumentRegistry:
                 f"quantity {qty:g} exceeds freeze_quantity {spec.freeze_quantity:g}",
             )
 
-        price_micros = int(round(px * MICROS))
-        tick = spec.tick_size_micros
-        ticks = int(round(price_micros / tick))
+        # Sec 9.3 "no floating-point money": the price is converted to integer
+        # micros exactly (``Decimal`` over the decimal literal, never a binary
+        # float multiply) and snapped with integer division.  The previous
+        # float round-trip divided in the float domain and could land a
+        # half-tick price on the wrong side of the grid.
+        price_micros = int(
+            (Decimal(repr(float(px))) * MICROS).to_integral_value(
+                rounding=ROUND_HALF_UP
+            )
+        )
+        tick = int(spec.tick_size_micros)
+        if tick <= 0:  # pragma: no cover - a registry spec always has a tick
+            return self._reject(spec, qty, px, "tick_size must be positive")
+        ticks = (price_micros + tick // 2) // tick
         adjusted = ticks * tick
         changed = adjusted != price_micros
         if changed and not round_price:

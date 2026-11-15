@@ -35,6 +35,7 @@ import struct
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
+from types import MappingProxyType
 from typing import Any, ClassVar, Iterable, Mapping, Sequence
 
 try:  # Python >= 3.11
@@ -579,7 +580,10 @@ class GroundedFactPacket:
         normalized = {
             str(key): float(value) for key, value in dict(self.metrics).items()
         }
-        object.__setattr__(self, "metrics", normalized)
+        # A frozen dataclass whose ``metrics`` dict can still be mutated is not
+        # immutable and not digest-stable: any holder could append a metric
+        # after ``compute_digest`` and invalidate a sealed packet in place.
+        object.__setattr__(self, "metrics", MappingProxyType(normalized))
         object.__setattr__(self, "valid_time_ns", valid_time_ns)
         object.__setattr__(self, "knowledge_ts_ns", knowledge_ts_ns)
         object.__setattr__(self, "as_of_ns", as_of_ns)

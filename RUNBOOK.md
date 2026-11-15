@@ -934,6 +934,23 @@ python scripts/nios_port_check.py --scan 8000 8010
 # 2. Boot the unified server on the port it printed
 python scripts/run_nios.py --host 127.0.0.1 --port <PORT>
 
+# 2b. Mint a temporary operator session (V1.8 auth closure).
+#     Every /api/v2/control/* mutation is authenticated as soon as
+#     operator_auth.is_initialized() is true, so the sweep either runs on a
+#     scratch vault or logs in with the real operator's own two factors:
+#
+#       NIOS_OPERATOR_AUTH_DIR=$(mktemp -d) python scripts/run_nios.py ...
+#
+#     curl -s -X POST localhost:<PORT>/api/v2/auth/setup \
+#       -H 'content-type: application/json' \
+#       -d '{"username":"burnin.operator","password":"Burn-In-Operator-2026",
+#            "live_pin":"8642","start_clean_slate":false}'      # -> token
+#     curl -s -X POST localhost:<PORT>/api/v2/auth/elevate-live \
+#       -H "X-NIOS-Session: $TOKEN" \
+#       -d '{"live_pin":"8642"}'                               # -> LIVE token
+#
+#     Every control call below then carries -H "X-NIOS-Session: $LIVE".
+
 # 3. Sweep all 15 SPA routes x 3 trees (base, /paper/*, /live/*) = 45 routes
 #    /dashboard /terminal /orders /options /analyzer /quant /agents /backtest
 #    /brain /forge /ledger /logbook /verification /brokers /control
@@ -948,16 +965,41 @@ python scripts/run_nios.py --host 127.0.0.1 --port <PORT>
 # 5. Sweep the workstation controls with their documented payloads (expect 200)
 #    plus the V1.3 controls: options/chain, options/strategy-payoff,
 #    terminal/quote, logbook/entry, logbook/clear, brokers/ping
+#
+#    Auth tiers (V1.8), all inert until an operator credential exists:
+#      PAPER or LIVE session -- orders/*, options/*, terminal/*, agents/*,
+#        backtest/*, logbook/*, ledger/fund-paper, ledger/reconcile,
+#        analyzer/shadow-burst, quant/*, brain/*, forge/*, verification/*,
+#        extensions, feeds, llms, workspace/autopilot, killswitch
+#      LIVE elevation only  -- rearm, supervisor (POST), supervisor/forge-hedge,
+#        brokers, brokers/ping, brokers/handshake, brokers/credentials,
+#        brokers/testnet-order, vault/rotate-keys, workspace/reset for
+#        workspace=live|all (which also costs confirm=true)
 
 # 6. Shut down cleanly; `git status --porcelain` must be empty afterwards.
 ```
 
 Acceptance: **45/45 routes**, **13/13 page endpoints**, **12/12 controls**, **5/5 V1.2
-controls** and **6/6 V1.3 controls** at `200 OK`, then a clean `Ctrl+C` and an empty
-`git status --porcelain`. Any non-200 is a release blocker — do not retry
+controls** and **6/6 V1.3 controls** at `200 OK` **with a LIVE session header**, then a clean
+`Ctrl+C` and an empty `git status --porcelain`. Any non-200 is a release blocker — do not retry
 around it, read the response body.
 
+Negative controls that must be asserted in the same sweep (V1.8):
+
+| Request | Expected |
+|---|---|
+| `POST /control/orders/paper` with no session, initialized install | `401 AUTH_REQUIRED` |
+| `POST /control/killswitch` with a session but no body | `400 confirm=true` required |
+| `POST /control/killswitch` with `{"confirm": false}` | `400` |
+| `POST /control/rearm` with a PAPER session | `403 LIVE_ELEVATION_REQUIRED` |
+| `POST /control/workspace/reset {"workspace":"all"}` with a PAPER session | `403 LIVE_ELEVATION_REQUIRED` |
+| `POST /control/workspace/reset {"workspace":"all","confirm":true}` with PAPER | `403 LIVE_ELEVATION_REQUIRED` |
+| `POST /control/supervisor {"action":"status"}` with no session | `401 AUTH_REQUIRED` |
+
 ### 6.4 Reference payloads
+
+Every payload below needs `-H "X-NIOS-Session: $LIVE"` (or `$TOKEN` for the paper-only
+routes) once the install has an operator credential.
 
 ```bash
 POST /api/v2/control/orders/paper
@@ -989,6 +1031,12 @@ POST /api/v2/control/backtest/run
 {"silo":"US_IBKR","symbol":"SPY","strategy_id":"ma_golden_cross","bars":252,"timeframe":"5m"}
 POST /api/v2/control/backtest/compare-strategies
 {"silo":"INDIA_ZERODHA_DHAN","symbol":"RELIANCE","timeframe":"1d","bars":252}
+
+# V1.8 destructive surfaces: the flags are real, not decorative.
+POST /api/v2/control/killswitch        {"reason":"manual halt","flatten":true,"confirm":true}
+POST /api/v2/control/rearm             {"reason":"operator re-arm"}
+POST /api/v2/control/workspace/reset   {"workspace":"paper"}
+POST /api/v2/control/workspace/reset   {"workspace":"all","confirm":true}   # LIVE only
 ```
 
 `committee-debate` (and `orders/paper`) reject an unknown `silo` with `422`; use a real silo id
@@ -997,6 +1045,10 @@ POST /api/v2/control/backtest/compare-strategies
 A rejected challenger, a chaotic drill that reports a violation, or a committee verdict of
 `NO_TRADE` is **data, not an error**: fix the cause or accept the abstention. Never widen a
 threshold or bypass Ring 0 to turn a red row green.
+
+`evaluate-challenger` now also refuses `PROMOTED` unless the *recorded* shadow fills carry a
+positive mean net-of-cost expectancy (`mean_net_bps > 0`). A high `candidate_sharpe` alone does
+not graduate a challenger.
 
 ---
 

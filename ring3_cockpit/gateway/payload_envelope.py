@@ -48,18 +48,102 @@ _DEFAULT_COST_FLOOR_BPS: dict[str, float] = {
 MICROS_PER_UNIT = 1_000_000
 
 
-def _stable_unit(*parts: Any) -> float:
-    text = "|".join(str(part) for part in parts)
-    digest = hashlib.sha256(text.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") / float(1 << 64)
-
-
 def _finite(value: Any, default: float = 0.0) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
+
+
+def _measured_risk_state(
+    ledger: Any, silo: str, override: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Measured risk figures from the actual risk layer (never a guess).
+
+    Ring 0 owns ``var_99_bps`` / ``max_drawdown_bps``.  When the ledger exposes
+    a risk snapshot it is used verbatim; when it does not, the caller-supplied
+    ``override`` wins; otherwise the payload reports nothing.
+    """
+    if override:
+        return dict(override)
+    for name in ("risk_metrics", "risk_snapshot", "silo_risk_metrics"):
+        method = getattr(ledger, name, None)
+        if callable(method):
+            try:
+                return dict(method(silo) or {})
+            except Exception:  # pragma: no cover - defensive telemetry
+                return {}
+    return {}
+
+
+def _equity_series(ledger: Any, silo: str) -> list[int]:
+    """Realised NAV history in micros, when the ledger keeps one."""
+    for name in ("equity_curve_micros", "nav_history_micros", "equity_series_micros"):
+        method = getattr(ledger, name, None)
+        if callable(method):
+            try:
+                return [int(value) for value in (method(silo) or [])]
+            except Exception:  # pragma: no cover - defensive telemetry
+                return []
+    return []
+
+
+def _mark_prices(ledger: Any, silo: str) -> dict[str, int]:
+    """Measured mark price per symbol in micros, when one exists."""
+    for name in ("mark_prices_micros", "marks_micros"):
+        method = getattr(ledger, name, None)
+        if callable(method):
+            try:
+                table = dict(method(silo) or {})
+            except Exception:  # pragma: no cover - defensive telemetry
+                return {}
+            return {
+                str(key).split(":")[-1].strip().upper(): int(value)
+                for key, value in table.items()
+            }
+    return {}
+
+
+def _bps_returns(series: Sequence[int]) -> list[float]:
+    """Consecutive NAV returns in basis points (integer-safe)."""
+    out: list[float] = []
+    for previous, current in zip(series, series[1:]):
+        if previous > 0:
+            out.append((current - previous) * 10_000.0 / float(previous))
+    return out
+
+
+def _var_99_bps(series: Sequence[int]) -> tuple[float, float]:
+    """99% historical VaR/CVaR in bps from the measured equity history.
+
+    Returns ``(0.0, 0.0)`` when there is no history: an unobserved tail is not
+    a 40-bps tail, and sealing a fabricated number under a SHA-256 digest is
+    exactly the failure mode this module exists to prevent.
+    """
+    returns = _bps_returns(series)
+    if not returns:
+        return 0.0, 0.0
+    losses = sorted(-value for value in returns)
+    index = max(0, math.ceil(0.99 * len(losses)) - 1)
+    var = max(0.0, losses[index])
+    tail = losses[index:] or [var]
+    cvar = max(var, sum(tail) / float(len(tail)))
+    return round(var, 4), round(cvar, 4)
+
+
+def _max_drawdown_bps(series: Sequence[int]) -> float:
+    """Peak-to-trough drawdown in bps from the measured equity history."""
+    if not series:
+        return 0.0
+    peak = series[0]
+    worst = 0.0
+    for value in series:
+        if value > peak:
+            peak = value
+        elif peak > 0:
+            worst = max(worst, (peak - value) * 10_000.0 / float(peak))
+    return round(worst, 4)
 
 
 def canonical_json(payload: Mapping[str, Any]) -> str:
@@ -96,8 +180,16 @@ def silo_risk_telemetry(
     *,
     registry: Any = None,
     cost_floor_bps: float | None = None,
+    risk_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Complete, deterministic risk & margin telemetry for one silo."""
+    """Complete, deterministic risk & margin telemetry for one silo.
+
+    Every figure is derived from actual IBOR/risk state.  A flat book on a
+    clean slate reports **zeros** for ``unrealized_pnl_micros``, ``var_99_bps``
+    and ``max_drawdown_bps`` rather than a synthetic non-zero number: an
+    invented figure sealed by ``payload_sha256`` is indistinguishable from a
+    measured one and would break Law 3's grounding contract.
+    """
     token = str(silo).strip().upper()
     nav_micros = int(_read(ledger, "silo_nav_micros", token, default=0) or 0)
     try:
@@ -105,6 +197,7 @@ def silo_risk_telemetry(
     except Exception:  # pragma: no cover - defensive
         positions = {}
     positions = dict(positions or {})
+    marks = _mark_prices(ledger, token)
 
     gross = 0
     net = 0
@@ -112,8 +205,9 @@ def silo_risk_telemetry(
     unrealized = 0
     open_positions = 0
     for symbol, row in positions.items():
-        qty = int((row or {}).get("qty_micros", 0) or 0)
-        price = int((row or {}).get("price_micros", 0) or 0)
+        row = dict(row or {})
+        qty = int(row.get("qty_micros", 0) or 0)
+        price = int(row.get("price_micros", 0) or 0)
         if qty == 0 or price == 0:
             continue
         notional = (qty * price) // MICROS_PER_UNIT
@@ -130,16 +224,53 @@ def silo_risk_telemetry(
         if spec is not None:
             initial_pct = float(spec.margin_initial_pct)
         margin_used += (abs(notional) * int(round(initial_pct * 100))) // 10_000
-        drift_bps = -25.0 + 50.0 * _stable_unit(token, symbol, "mark-drift")
-        unrealized += int(notional * drift_bps / 10_000.0)
+        # Unrealised P&L needs a *measured* mark.  Absent one it contributes
+        # nothing: a deterministic pseudo-random drift was fabrication.
+        mark = int(row.get("mark_price_micros", 0) or 0)
+        if not mark:
+            mark = int(marks.get(str(symbol).split(":")[-1].strip().upper(), 0) or 0)
+        if mark > 0:
+            # P&L micros = (qty_micros / 1e6) * (delta_price_micros / 1e6) * 1e6
+            unrealized += (qty * (mark - price)) // MICROS_PER_UNIT
 
     realized = _balance(ledger, token, "REALIZED_PNL")
     tax_paid = _balance(ledger, token, "FEE_TAX_ACCRUAL")
     free_margin = max(0, nav_micros - margin_used)
 
-    var_99 = round(40.0 + 860.0 * _stable_unit(token, "var99"), 4)
-    cvar_99 = round(var_99 * 1.35, 4)
-    max_dd = round(20.0 + 580.0 * _stable_unit(token, "max-dd"), 4)
+    measured = _measured_risk_state(ledger, token, risk_state)
+    series = _equity_series(ledger, token)
+    var_99, cvar_99 = _var_99_bps(series)
+    max_dd = _max_drawdown_bps(series)
+    for key, current in (
+        ("var_99_bps", var_99),
+        ("cvar_99_bps", cvar_99),
+        ("max_drawdown_bps", max_dd),
+    ):
+        if key in measured and measured[key] is not None:
+            value = _finite(measured[key], current)
+            if key == "var_99_bps":
+                var_99 = value
+            elif key == "cvar_99_bps":
+                cvar_99 = value
+            else:
+                max_dd = value
+    if "unrealized_pnl_micros" in measured and measured["unrealized_pnl_micros"] is not None:
+        unrealized = int(_finite(measured["unrealized_pnl_micros"], float(unrealized)))
+
+    # Clean slate: an untouched, flat silo has no tail, no drawdown, no P&L.
+    # A *measured* risk snapshot always wins: Ring 0 may know about a closed
+    # book whose tail risk is still live.
+    if not positions and nav_micros == 0 and realized == 0 and not measured:
+        unrealized = 0
+        var_99 = 0.0
+        cvar_99 = 0.0
+        max_dd = 0.0
+
+    # Tail coherence: CVaR is the mean of the tail beyond VaR, so it can never
+    # sit below it, and a drawdown is a magnitude.
+    cvar_99 = max(float(cvar_99), float(var_99))
+    max_dd = max(0.0, float(max_dd))
+
     floor = (
         float(cost_floor_bps)
         if cost_floor_bps is not None
@@ -153,9 +284,9 @@ def silo_risk_telemetry(
         "net_exposure_micros": int(net),
         "margin_used_micros": int(margin_used),
         "free_margin_micros": int(free_margin),
-        "var_99_bps": var_99,
-        "cvar_99_bps": cvar_99,
-        "max_drawdown_bps": max_dd,
+        "var_99_bps": float(var_99),
+        "cvar_99_bps": float(cvar_99),
+        "max_drawdown_bps": float(max_dd),
         "realized_pnl_micros": int(realized),
         "unrealized_pnl_micros": int(unrealized),
         "total_tax_paid_micros": int(tax_paid),
@@ -170,14 +301,17 @@ def risk_telemetry(
     *,
     registry: Any = None,
     cost_floors: Mapping[str, float] | None = None,
+    risk_states: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     floors = dict(cost_floors or _DEFAULT_COST_FLOOR_BPS)
+    states = dict(risk_states or {})
     return {
         str(silo): silo_risk_telemetry(
             ledger,
             silo,
             registry=registry,
             cost_floor_bps=floors.get(str(silo)),
+            risk_state=states.get(str(silo)),
         )
         for silo in silos
     }

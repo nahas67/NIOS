@@ -272,7 +272,11 @@ def test_gate3_chaos_sigkill_lease_and_tick_recovery(tmp_path) -> None:
         audit_lease_reboot,
     )
 
-    lease = audit_lease_reboot()
+    # V1.8: ``audit_lease_reboot`` attaches to the existing lease table instead
+    # of wiping it, so the drill explicitly models a factory reset (the only
+    # case whose contract is "nothing is armed after the reboot").  The
+    # non-destructive default is asserted by Gate 7.
+    lease = audit_lease_reboot(factory_reset=True)
     assert lease.stale_lease_armed
     assert lease.swept >= 1
     assert lease.active_after_reboot == 0

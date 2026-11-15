@@ -221,6 +221,8 @@ class TrustSnapshot:
     accuracy: float
     settled_count: int
     mean_abs_error_bps: float
+    #: The silo whose valuation partition holds this row (never hardcoded).
+    silo: str = ""
 
     def __post_init__(self) -> None:
         multiplier = _clamp(float(self.multiplier), TRUST_MIN, TRUST_MAX)
@@ -234,6 +236,7 @@ class TrustSnapshot:
             "accuracy": self.accuracy,
             "settled_count": self.settled_count,
             "mean_abs_error_bps": self.mean_abs_error_bps,
+            "silo": self.silo,
         }
 
 
@@ -433,6 +436,7 @@ class DelayedSettlementWorker:
                 accuracy=accuracy,
                 settled_count=len(hits),
                 mean_abs_error_bps=sum(errors) / float(len(errors)),
+                silo=str(prediction.silo),
             )
             self.store.append_valuation(
                 prediction.silo,
@@ -516,23 +520,51 @@ class DelayedSettlementWorker:
     get_trust_multiplier = trust_multiplier
     darwinian_trust_multiplier = trust_multiplier
 
-    def trust_snapshots(self, strategy_id: str) -> list[TrustSnapshot]:
-        """Read persisted trust observations for one strategy."""
-        rows = self.store.query_valuation(
-            "US", str(strategy_id), time.time_ns(), artifact_kind="darwinian_trust"
-        )
-        # ``query_valuation`` is newest-first; expose a chronological history.
+    def trust_snapshots(
+        self, strategy_id: str, *, silo: str | None = None
+    ) -> list[TrustSnapshot]:
+        """Read persisted trust observations for one strategy.
+
+        The trust vector is stored per ``(silo, strategy_id)``, so the read path
+        must ask every silo the strategy actually traded rather than hardcoding
+        ``"US"``: an ``INDIA_ZERODHA_DHAN`` or ``CRYPTO_BINANCE`` prediction's
+        snapshots live in its own valuation partition and were previously
+        invisible (and, worse, a US row could be returned for a non-US trade).
+        """
+        token = str(strategy_id)
+        silos = [str(silo)] if silo else self._known_silos(token)
+        rows: list[dict[str, Any]] = []
+        for owner in silos:
+            try:
+                found = self.store.query_valuation(
+                    owner, token, time.time_ns(), artifact_kind="darwinian_trust"
+                )
+            except Exception:  # pragma: no cover - defensive store read
+                continue
+            for row in found or ():
+                rows.append({"silo": owner, **dict(row)})
+        rows.sort(key=lambda row: (int(row.get("as_of_ns", 0)), str(row.get("silo"))))
         return [
             TrustSnapshot(
-                strategy_id=str(strategy_id),
+                strategy_id=token,
                 as_of_ns=int(row["as_of_ns"]),
                 multiplier=float(row["payload"]["trust_multiplier"]),
                 accuracy=float(row["payload"]["accuracy"]),
                 settled_count=int(row["payload"]["settled_count"]),
                 mean_abs_error_bps=float(row["payload"]["mean_abs_error_bps"]),
+                silo=str(row.get("payload", {}).get("silo") or row.get("silo") or ""),
             )
-            for row in reversed(rows)
+            for row in rows
         ]
+
+    def _known_silos(self, strategy_id: str) -> list[str]:
+        """Every silo this strategy has produced a prediction or outcome for."""
+        found: list[str] = []
+        for prediction in list(self._predictions.values()) + list(self._settled):
+            owner = str(getattr(prediction, "silo", "") or "")
+            if owner and owner not in found:
+                found.append(owner)
+        return found or ["US"]
 
     def settlements_for(self, strategy_id: str) -> tuple[SettlementOutcome, ...]:
         return tuple(

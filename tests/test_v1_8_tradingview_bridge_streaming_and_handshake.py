@@ -121,6 +121,26 @@ def headers(client, operator) -> dict[str, str]:
 
 
 @pytest.fixture(scope="module")
+def live_headers(client, runtime, operator) -> dict[str, str]:
+    """A LIVE-elevated session for the V1.8 live-tier broker surfaces.
+
+    The handshake route is LIVE-gated (V1.8), so the probe mints a fresh PAPER
+    session and elevates it in-process against the same Ring 0 vault the guard
+    reads.  The module's PAPER ``headers`` token stays valid for the read-only
+    stream assertions.
+    """
+    fresh = client.post(
+        "/api/v2/auth/login/paper",
+        json={"username": USERNAME, "password": PASSWORD},
+    )
+    assert fresh.status_code == 200, fresh.text
+    session = runtime.control.operator_auth().elevate_to_live(
+        str(fresh.json()["token"]), LIVE_PIN
+    )
+    return {"X-NIOS-Session": session.token}
+
+
+@pytest.fixture(scope="module")
 def funded(runtime):
     from ring3_cockpit.gateway.control_plane import PaperFundingRequest
 
@@ -536,11 +556,13 @@ def test_gate4_stream_respects_silo_filter(client, headers, funded):
 
 
 @pytest.mark.parametrize("venue", HANDSHAKE_VENUES)
-def test_gate4_broker_handshake_verifies_every_venue(client, headers, funded, venue):
+def test_gate4_broker_handshake_verifies_every_venue(
+    client, live_headers, funded, venue
+):
     response = client.post(
         "/api/v2/control/brokers/handshake",
         json={"venue": venue, "dry_run": True},
-        headers=headers,
+        headers=live_headers,
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -572,18 +594,20 @@ def test_gate4_broker_handshake_verifies_every_venue(client, headers, funded, ve
     assert body["guard"]["live_tier_guard_applied"] is False
 
 
-def test_gate4_handshake_rejects_unknown_venue_and_guards_live(client, headers, funded):
+def test_gate4_handshake_rejects_unknown_venue_and_guards_live(
+    client, live_headers, funded
+):
     unknown = client.post(
         "/api/v2/control/brokers/handshake",
         json={"venue": "mars_exchange", "dry_run": True},
-        headers=headers,
+        headers=live_headers,
     )
     assert unknown.status_code == 422
 
     live = client.post(
         "/api/v2/control/brokers/handshake",
         json={"venue": "binance", "dry_run": False},
-        headers=headers,
+        headers=live_headers,
     )
     assert live.status_code in (200, 401, 403), live.text
     if live.status_code == 200:

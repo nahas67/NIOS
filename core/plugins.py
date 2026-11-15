@@ -128,6 +128,9 @@ class PluginRecord:
     activated_at_ns: int = 0
     last_error: str = ""
     factory: Callable[..., Any] | None = field(default=None, repr=False)
+    #: Sum of the recorded net-of-cost bps across the shadow fills.  Law 4
+    #: requires positive *expectancy*, not just a fill count and a win count.
+    net_bps_total: float = 0.0
 
     def __post_init__(self) -> None:
         self.registered_at_ns = int(self.registered_at_ns or time.time_ns())
@@ -140,6 +143,14 @@ class PluginRecord:
     def enabled(self) -> bool:
         return self.status is not PluginStatus.DISABLED
 
+    @property
+    def mean_net_bps(self) -> float:
+        """Mean net-of-cost bps across the recorded shadow fills."""
+        count = int(self.shadow_fills)
+        if count <= 0:
+            return 0.0
+        return float(self.net_bps_total) / float(count)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             **self.manifest.to_dict(),
@@ -149,6 +160,7 @@ class PluginRecord:
             "winning_shadow_fills": self.winning_shadow_fills,
             "required_shadow_fills": REQUIRED_SHADOW_FILLS,
             "graduated": bool(self.graduated),
+            "mean_net_bps": round(self.mean_net_bps, 6),
             "registered_at_ns": self.registered_at_ns,
             "activated_at_ns": self.activated_at_ns,
             "last_error": self.last_error,
@@ -364,11 +376,13 @@ class PluginRegistry:
             if record is None:
                 raise KeyError(f"unknown plugin {name!r}")
             record.shadow_fills += 1
+            record.net_bps_total += float(net_bps)
             if float(net_bps) > 0.0:
                 record.winning_shadow_fills += 1
             record.graduated = (
                 record.shadow_fills >= REQUIRED_SHADOW_FILLS
                 and record.winning_shadow_fills >= REQUIRED_SHADOW_FILLS
+                and record.mean_net_bps > 0.0
             )
             # Shadow graduation is not live promotion: the Forge still has to
             # certify Deflated Sharpe >= 1.50 before capital is armed.
@@ -413,13 +427,22 @@ class PluginRegistry:
                     for fill in fills
                     if float(getattr(fill, "realized_net_bps", 0.0)) > 0.0
                 )
-                if len(fills) == record.shadow_fills and wins == record.winning_shadow_fills:
+                total = sum(
+                    float(getattr(fill, "realized_net_bps", 0.0)) for fill in fills
+                )
+                if (
+                    len(fills) == record.shadow_fills
+                    and wins == record.winning_shadow_fills
+                    and abs(total - record.net_bps_total) < 1e-9
+                ):
                     continue
                 record.shadow_fills = len(fills)
                 record.winning_shadow_fills = wins
+                record.net_bps_total = total
                 record.graduated = (
                     record.shadow_fills >= REQUIRED_SHADOW_FILLS
                     and record.winning_shadow_fills >= REQUIRED_SHADOW_FILLS
+                    and record.mean_net_bps > 0.0
                 )
                 self._sync_forge(record)
                 updated += 1
@@ -453,5 +476,7 @@ class PluginRegistry:
                 0, REQUIRED_SHADOW_FILLS - record.shadow_fills
             ),
             "graduated": record.graduated,
+            "mean_net_bps": round(record.mean_net_bps, 6),
+            "net_bps_total": round(float(record.net_bps_total), 6),
             "forge_challenger": f"plugin:{record.name}",
         }

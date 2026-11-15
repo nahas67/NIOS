@@ -58,7 +58,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, ClassVar, Iterable, Iterator, Literal, Mapping
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -680,11 +680,38 @@ class LLMControlRequest(StrictRequest):
 
 
 class KillSwitchRequest(StrictRequest):
-    """``POST /api/v2/control/killswitch`` payload."""
+    """``POST /api/v2/control/killswitch`` payload.
+
+    ``confirm`` defaults to ``False``: a global halt flattens every silo, so an
+    operator (or a prompt-injected caller) must assert the intent explicitly.
+    A default of ``True`` made the manual confirmation flag decorative.
+    """
 
     reason: str = "manual operator kill switch"
     flatten: bool = True
-    confirm: bool = True
+    confirm: bool = False
+
+
+class WorkspaceResetRequest(StrictRequest):
+    """``POST /api/v2/control/workspace/reset`` payload.
+
+    ``workspace`` selects the blast radius.  ``paper`` (the default, and the
+    pre-V1.8 contract) zeroes the demo sandbox and needs any authenticated
+    session; ``live`` / ``all`` reach live state and therefore cost a
+    LIVE-elevated session plus an explicit ``confirm=true``.
+    """
+
+    reason: str = "clean slate reset"
+    workspace: str = "paper"
+    confirm: bool = False
+
+    @field_validator("workspace")
+    @classmethod
+    def _workspace_ok(cls, value: str) -> str:
+        token = str(value or "").strip().lower()
+        if token not in ("paper", "live", "all"):
+            raise ValueError("workspace must be paper, live or all")
+        return token
 
 
 class RearmRequest(StrictRequest):
@@ -4629,6 +4656,10 @@ class ControlPlane:
         # about their intent, not about the tape) but the gate is decided on
         # what the registry actually recorded.
         recorded = int(getattr(record, "shadow_fills", 0) or 0)
+        # Law 4 also demands a positive net-of-cost *expectancy* across the
+        # recorded fills.  A count alone let a challenger that lost money on
+        # every one of its 30 fills graduate on volume.
+        mean_net_bps = float(getattr(record, "mean_net_bps", 0.0) or 0.0)
 
         genome_id = f"plugin:{name}"
         genome = StrategyGenome(
@@ -4656,7 +4687,8 @@ class ControlPlane:
             nursery = dict(registry.shadow_report(name) or {})
         stored = forge.get_challenger(genome_id)
         dsr_ok = sharpe >= dsr_floor
-        nursery_ok = recorded >= min_fills
+        expectancy_ok = mean_net_bps > 0.0
+        nursery_ok = recorded >= min_fills and expectancy_ok
         graduated = bool(nursery.get("graduated", False)) and nursery_ok
         promoted = bool(dsr_ok and nursery_ok and graduated)
         reasons: list[str] = []
@@ -4664,10 +4696,15 @@ class ControlPlane:
             reasons.append(
                 f"deflated_sharpe {sharpe:.4f} < promotion floor {dsr_floor:.2f}"
             )
-        if not nursery_ok:
+        if recorded < min_fills:
             reasons.append(
                 f"shadow_fills {declared_fills} declared / {recorded} recorded "
                 f"< required {min_fills}"
+            )
+        if not expectancy_ok:
+            reasons.append(
+                f"mean_net_bps {mean_net_bps:.4f} is not a positive "
+                "net-of-cost expectancy across the recorded shadow fills"
             )
         if nursery_ok and not graduated:
             reasons.append("plugin registry has not graduated the shadow record")
@@ -4682,6 +4719,7 @@ class ControlPlane:
             "shadow_fills": declared_fills,
             "winning_shadow_fills": declared_fills,
             "recorded_fills": recorded,
+            "mean_net_bps": round(mean_net_bps, 6),
             "gates": {
                 "deflated_sharpe": {
                     "measured": sharpe,
@@ -4693,6 +4731,11 @@ class ControlPlane:
                     "required": min_fills,
                     "passed": nursery_ok,
                 },
+                "net_expectancy_bps": {
+                    "measured": round(mean_net_bps, 6),
+                    "required": "> 0",
+                    "passed": expectancy_ok,
+                },
                 "nursery_graduated": {
                     "measured": graduated,
                     "required": True,
@@ -4702,6 +4745,7 @@ class ControlPlane:
             "gate_results": {
                 "dsr_floor_met": dsr_ok,
                 "shadow_nursery_met": nursery_ok,
+                "net_expectancy_positive": expectancy_ok,
                 "nursery_graduated": graduated,
             },
             "promotion_ready": promoted,
@@ -7588,6 +7632,41 @@ class ControlPlane:
             self._operator_auth = default_operator_auth()
         return self._operator_auth
 
+    def operator_auth_initialized(self) -> bool:
+        """Whether a sovereign operator credential exists on disk.
+
+        The control-plane guards are *inert* until ``setup`` has run, so a
+        first-run or legacy install keeps its pre-V1.1 contract.  An unreadable
+        vault fails **closed**.
+        """
+        auth = self.operator_auth()
+        probe = getattr(auth, "is_initialized", None) or getattr(
+            auth, "initialized", None
+        )
+        if not callable(probe):
+            return False  # no credential store at all -> legacy behaviour
+        try:
+            return bool(probe())
+        except Exception:  # pragma: no cover - unreadable vault fails closed
+            return True
+
+    def session_guard(self, session_token: str | None) -> None:
+        """Demand a valid ``PAPER`` **or** ``LIVE`` operator session.
+
+        Every ``/api/v2/control/*`` mutation that is not itself a live-capital
+        action sits behind this guard once an operator exists (``sec_011``,
+        ``sec_016``).  It protects fatal flaw 6: without it a prompt-injected
+        Ring 2 context could drive paper orders, agent dispatch, backtests,
+        ledger reconciliation or the chaos drills with no human in the loop.
+        """
+        if not self.operator_auth_initialized():
+            return
+        claims = self.operator_auth().authenticate(session_token)
+        if claims is None:
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
+        if str(claims.get("tier", "NONE")) not in ("PAPER", "LIVE"):
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
+
     def live_tier_guard(self, session_token: str | None) -> None:
         """Demand a ``LIVE`` session on live-mutating endpoints.
 
@@ -7601,19 +7680,9 @@ class ControlPlane:
         Protects fatal flaw 6 (prompt-injection exposure of broker keys) and
         preserves Law 2: the human operator, not the model, owns the LIVE gate.
         """
-        auth = self.operator_auth()
-        probe = getattr(auth, "is_initialized", None) or getattr(
-            auth, "initialized", None
-        )
-        if not callable(probe):
-            return  # no credential store at all -> legacy behaviour
-        try:
-            configured = bool(probe())
-        except Exception:  # pragma: no cover - unreadable vault fails closed
-            configured = True
-        if not configured:
+        if not self.operator_auth_initialized():
             return
-        claims = auth.authenticate(session_token)
+        claims = self.operator_auth().authenticate(session_token)
         if claims is None:
             raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
         if str(claims.get("tier", "NONE")) != "LIVE":
@@ -9283,7 +9352,23 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         cookie = request.cookies.get("nios_session")
         return cookie.strip() if cookie else None
 
-    @app.post("/api/v2/control/brokers")
+    # ---- V1.8: the two control-plane auth gates --------------------------
+    # ``SESSION_GUARD`` costs a valid PAPER or LIVE operator session and is
+    # declared on every ``/api/v2/control/*`` mutation (paper orders, agent
+    # dispatch, backtests, ledger reconciliation, drills, extensions).
+    # ``LIVE_GUARD`` costs a LIVE-elevated session on the surfaces that can
+    # move live capital or destroy live state.  Both are inert until ``setup``
+    # has created an operator credential, so first-run installs are unchanged.
+    def _require_session(request: Request) -> None:
+        control.session_guard(_session_token(request))
+
+    def _require_live(request: Request) -> None:
+        control.live_tier_guard(_session_token(request))
+
+    SESSION_GUARD = Depends(_require_session)
+    LIVE_GUARD = Depends(_require_live)
+
+    @app.post("/api/v2/control/brokers", dependencies=[LIVE_GUARD])
     def control_brokers(
         payload: BrokerControlRequest, http_request: Request
     ) -> dict[str, Any]:
@@ -9292,7 +9377,9 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return control.update_broker(payload)
 
     # ---- Phase 3 Step 2: write-only broker testnet credentials ---------
-    @app.post("/api/v2/control/brokers/credentials")
+    @app.post(
+        "/api/v2/control/brokers/credentials", dependencies=[LIVE_GUARD]
+    )
     def control_broker_credentials(
         payload: BrokerCredentialRequest, http_request: Request
     ) -> dict[str, Any]:
@@ -9304,7 +9391,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return control.broker_credentials()
 
     # ---- Phase 3 Step 2: feed mode hot-swap ----------------------------
-    @app.post("/api/v2/control/feeds")
+    @app.post("/api/v2/control/feeds", dependencies=[SESSION_GUARD])
     def control_feeds(request: FeedControlRequest) -> dict[str, Any]:
         return control.set_feed_mode(request)
 
@@ -9312,19 +9399,21 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def control_feeds_state() -> dict[str, Any]:
         return control.feed_state()
 
-    @app.post("/api/v2/control/llms")
+    @app.post("/api/v2/control/llms", dependencies=[SESSION_GUARD])
     def control_llms(request: LLMControlRequest) -> dict[str, Any]:
         return control.update_llm(request)
 
     # ---- Phase 3 Step 2: live local Ollama / LLM probe (<250 ms) -------
-    @app.post("/api/v2/control/llms/probe")
+    @app.post("/api/v2/control/llms/probe", dependencies=[SESSION_GUARD])
     def control_llms_probe(
         request: LLMProbeRequest | None = None,
     ) -> dict[str, Any]:
         return control.probe_llms(request)
 
-    @app.post("/api/v2/control/killswitch")
+    @app.post("/api/v2/control/killswitch", dependencies=[SESSION_GUARD])
     def control_killswitch(request: KillSwitchRequest) -> dict[str, Any]:
+        # ``confirm`` defaults to False (V1.8): a global halt flattens capital,
+        # so the flag is a real human acknowledgement, not a decoration.
         return control.kill(request)
 
     # ---- Phase 3 Step 3: 4-ring OS supervisor control ------------------
@@ -9332,12 +9421,14 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def control_supervisor_state() -> dict[str, Any]:
         return control.supervisor_state()
 
-    @app.post("/api/v2/control/supervisor")
+    @app.post("/api/v2/control/supervisor", dependencies=[LIVE_GUARD])
     def control_supervisor(request: SupervisorControlRequest) -> dict[str, Any]:
         return control.control_supervisor(request)
 
     # ---- Phase 4 Step 2: closed-loop forge + tail-hedge trigger --------
-    @app.post("/api/v2/control/supervisor/forge-hedge")
+    @app.post(
+        "/api/v2/control/supervisor/forge-hedge", dependencies=[LIVE_GUARD]
+    )
     def control_supervisor_forge_hedge(
         request: ForgeHedgeRequest | None = None,
     ) -> dict[str, Any]:
@@ -9348,7 +9439,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def control_preflight_state(refresh: bool = Query(False)) -> dict[str, Any]:
         return control.preflight_state(refresh=refresh)
 
-    @app.post("/api/v2/control/preflight")
+    @app.post("/api/v2/control/preflight", dependencies=[SESSION_GUARD])
     def control_preflight(
         request: PreflightRequest | None = None,
     ) -> dict[str, Any]:
@@ -9364,19 +9455,23 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def control_testnet_state() -> dict[str, Any]:
         return control.testnet_state()
 
-    @app.post("/api/v2/control/brokers/testnet-order")
+    @app.post(
+        "/api/v2/control/brokers/testnet-order", dependencies=[LIVE_GUARD]
+    )
     def control_testnet_order(
         payload: TestnetOrderRequest, http_request: Request
     ) -> dict[str, Any]:
         control.live_tier_guard(_session_token(http_request))
         return control.dispatch_testnet_order(payload)
 
-    @app.post("/api/v2/control/rearm")
+    @app.post("/api/v2/control/rearm", dependencies=[LIVE_GUARD])
     def control_rearm(request: RearmRequest | None = None) -> dict[str, Any]:
         return control.rearm(request)
 
     # ---- Phase 3 Step 5: zero-downtime Ring 0 vault key rotation --------
-    @app.post("/api/v2/control/vault/rotate-keys")
+    @app.post(
+        "/api/v2/control/vault/rotate-keys", dependencies=[LIVE_GUARD]
+    )
     def control_vault_rotate(
         http_request: Request,
         request: VaultRotationRequest | None = None,
@@ -9388,11 +9483,11 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def control_vault_status() -> dict[str, Any]:
         return control.vault_status()
 
-    @app.get("/api/v2/control/extensions")
+    @app.get("/api/v2/control/extensions", dependencies=[SESSION_GUARD])
     def control_extensions() -> dict[str, Any]:
         return control.extensions_state()
 
-    @app.post("/api/v2/control/extensions")
+    @app.post("/api/v2/control/extensions", dependencies=[SESSION_GUARD])
     def control_extensions_update(
         request: ExtensionsControlRequest,
     ) -> dict[str, Any]:
@@ -9441,13 +9536,15 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def cockpit_options() -> dict[str, Any]:
         return control.options_page()
 
-    @app.post("/api/v2/control/options/chain")
+    @app.post("/api/v2/control/options/chain", dependencies=[SESSION_GUARD])
     def control_options_chain(
         payload: OptionsChainRequest,
     ) -> dict[str, Any]:
         return control.options_chain(payload)
 
-    @app.post("/api/v2/control/options/strategy-payoff")
+    @app.post(
+        "/api/v2/control/options/strategy-payoff", dependencies=[SESSION_GUARD]
+    )
     def control_options_strategy_payoff(
         payload: StrategyPayoffRequest,
     ) -> dict[str, Any]:
@@ -9457,7 +9554,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def cockpit_terminal() -> dict[str, Any]:
         return control.terminal_page()
 
-    @app.post("/api/v2/control/terminal/quote")
+    @app.post("/api/v2/control/terminal/quote", dependencies=[SESSION_GUARD])
     def control_terminal_quote(payload: TerminalQuoteRequest) -> dict[str, Any]:
         return control.terminal_quote(payload)
 
@@ -9503,11 +9600,11 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def cockpit_logbook() -> dict[str, Any]:
         return control.logbook_page()
 
-    @app.post("/api/v2/control/logbook/entry")
+    @app.post("/api/v2/control/logbook/entry", dependencies=[SESSION_GUARD])
     def control_logbook_entry(payload: LogbookEntryRequest) -> dict[str, Any]:
         return control.logbook_entry(payload)
 
-    @app.post("/api/v2/control/logbook/clear")
+    @app.post("/api/v2/control/logbook/clear", dependencies=[SESSION_GUARD])
     def control_logbook_clear() -> dict[str, Any]:
         return control.logbook_clear()
 
@@ -9515,11 +9612,11 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def cockpit_brokers() -> dict[str, Any]:
         return control.brokers_page()
 
-    @app.post("/api/v2/control/brokers/ping")
+    @app.post("/api/v2/control/brokers/ping", dependencies=[LIVE_GUARD])
     def control_brokers_ping(payload: BrokerPingRequest) -> dict[str, Any]:
         return control.broker_ping(payload)
 
-    @app.post("/api/v2/control/agents/assign")
+    @app.post("/api/v2/control/agents/assign", dependencies=[SESSION_GUARD])
     def control_agents_assign(request: AgentAssignRequest) -> dict[str, Any]:
         try:
             return control.assign_agent_task(request)
@@ -9539,7 +9636,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
                 status_code=404, detail=f"UNKNOWN_TASK: {task_id}"
             ) from exc
 
-    @app.post("/api/v2/control/agents/cancel")
+    @app.post("/api/v2/control/agents/cancel", dependencies=[SESSION_GUARD])
     def control_agents_cancel(request: AgentCancelRequest) -> dict[str, Any]:
         try:
             return control.cancel_agent_tasks(request)
@@ -9548,7 +9645,9 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
                 status_code=404, detail=f"UNKNOWN_TASK: {exc.args[0]}"
             ) from exc
 
-    @app.post("/api/v2/control/agents/batch-watchlist")
+    @app.post(
+        "/api/v2/control/agents/batch-watchlist", dependencies=[SESSION_GUARD]
+    )
     def control_agents_batch_watchlist(
         request: AgentBatchWatchlistRequest,
     ) -> dict[str, Any]:
@@ -9557,7 +9656,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @app.post("/api/v2/control/agents/followup")
+    @app.post("/api/v2/control/agents/followup", dependencies=[SESSION_GUARD])
     def control_agents_followup(request: AgentFollowupRequest) -> dict[str, Any]:
         try:
             return control.agent_followup(request)
@@ -9568,14 +9667,17 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @app.post("/api/v2/control/backtest/run")
+    @app.post("/api/v2/control/backtest/run", dependencies=[SESSION_GUARD])
     def control_backtest_run(request: BacktestRunRequest) -> dict[str, Any]:
         try:
             return control.run_backtest(request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @app.post("/api/v2/control/backtest/compare-strategies")
+    @app.post(
+        "/api/v2/control/backtest/compare-strategies",
+        dependencies=[SESSION_GUARD],
+    )
     def control_backtest_compare(
         request: BacktestCompareRequest,
     ) -> dict[str, Any]:
@@ -9584,7 +9686,10 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @app.post("/api/v2/control/backtest/promote-to-nursery")
+    @app.post(
+        "/api/v2/control/backtest/promote-to-nursery",
+        dependencies=[SESSION_GUARD],
+    )
     def control_backtest_promote(request: NurseryPromoteRequest) -> dict[str, Any]:
         from ring2_brain.backtest.engine import NurseryGateError
 
@@ -9600,23 +9705,25 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # ---- Phase 4 Step 5: interactive operator actions --------------------
-    @app.post("/api/v2/control/orders/paper")
+    @app.post("/api/v2/control/orders/paper", dependencies=[SESSION_GUARD])
     def control_orders_paper(request: PaperOrderRequest) -> dict[str, Any]:
         return control.submit_paper_order(request)
 
-    @app.post("/api/v2/control/orders/cancel")
+    @app.post("/api/v2/control/orders/cancel", dependencies=[SESSION_GUARD])
     def control_orders_cancel(request: CancelOrdersRequest) -> dict[str, Any]:
         return control.cancel_paper_orders(request)
 
-    @app.post("/api/v2/control/analyzer/shadow-burst")
+    @app.post(
+        "/api/v2/control/analyzer/shadow-burst", dependencies=[SESSION_GUARD]
+    )
     def control_shadow_burst(request: ShadowBurstRequest) -> dict[str, Any]:
         return control.shadow_burst(request)
 
-    @app.post("/api/v2/control/quant/price-option")
+    @app.post("/api/v2/control/quant/price-option", dependencies=[SESSION_GUARD])
     def control_quant_price_option(request: OptionPriceRequest) -> dict[str, Any]:
         return control.price_option(request)
 
-    @app.post("/api/v2/control/quant/scan")
+    @app.post("/api/v2/control/quant/scan", dependencies=[SESSION_GUARD])
     def control_quant_scan(request: QuantScanRequest) -> dict[str, Any]:
         return control.scan_factors(request)
 
@@ -9624,44 +9731,56 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     def cockpit_skill_markdown(skill_name: str) -> dict[str, Any]:
         return control.skill_markdown(skill_name)
 
-    @app.post("/api/v2/control/ledger/reconcile")
+    @app.post("/api/v2/control/ledger/reconcile", dependencies=[SESSION_GUARD])
     def control_ledger_reconcile(
         request: LedgerReconcileRequest | None = None,
     ) -> dict[str, Any]:
         return control.reconcile_ledger(request or LedgerReconcileRequest())
 
     # ---- Phase 4 Step 6: /verification, /brain, /forge operator actions ---
-    @app.post("/api/v2/control/verification/chaos-drill")
+    @app.post(
+        "/api/v2/control/verification/chaos-drill", dependencies=[SESSION_GUARD]
+    )
     def control_verification_chaos_drill(
         request: ChaosDrillRequest | None = None,
     ) -> dict[str, Any]:
         return control.chaos_drill(request or ChaosDrillRequest())
 
-    @app.post("/api/v2/control/verification/vopr")
+    @app.post(
+        "/api/v2/control/verification/vopr", dependencies=[SESSION_GUARD]
+    )
     def control_verification_vopr(
         request: VoprCampaignRequest | None = None,
     ) -> dict[str, Any]:
         return control.vopr_campaign(request or VoprCampaignRequest())
 
-    @app.post("/api/v2/control/verification/os-tune")
+    @app.post(
+        "/api/v2/control/verification/os-tune", dependencies=[SESSION_GUARD]
+    )
     def control_verification_os_tune(
         request: OsTuneRequest | None = None,
     ) -> dict[str, Any]:
         return control.os_tune(request or OsTuneRequest())
 
-    @app.post("/api/v2/control/brain/mirofish-shock")
+    @app.post(
+        "/api/v2/control/brain/mirofish-shock", dependencies=[SESSION_GUARD]
+    )
     def control_brain_mirofish_shock(
         request: MiroFishShockRequest | None = None,
     ) -> dict[str, Any]:
         return control.mirofish_shock(request or MiroFishShockRequest())
 
-    @app.post("/api/v2/control/brain/committee-debate")
+    @app.post(
+        "/api/v2/control/brain/committee-debate", dependencies=[SESSION_GUARD]
+    )
     def control_brain_committee_debate(
         request: CommitteeDebateRequest | None = None,
     ) -> dict[str, Any]:
         return control.committee_debate(request or CommitteeDebateRequest())
 
-    @app.post("/api/v2/control/forge/evaluate-challenger")
+    @app.post(
+        "/api/v2/control/forge/evaluate-challenger", dependencies=[SESSION_GUARD]
+    )
     def control_forge_evaluate_challenger(
         request: ChallengerEvalRequest,
     ) -> dict[str, Any]:
@@ -9775,16 +9894,37 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return control.workspace_state("live", _session_token(request))
 
     @app.post("/api/v2/control/workspace/reset")
-    def control_workspace_reset() -> dict[str, Any]:
+    def control_workspace_reset(
+        request: Request,
+        payload: WorkspaceResetRequest | None = None,
+    ) -> dict[str, Any]:
+        """Zero the workspace.
+
+        ``paper`` (default) needs any operator session; ``live`` / ``all`` reach
+        live state, so they cost a LIVE-elevated session and ``confirm=true``.
+        """
+        body = payload or WorkspaceResetRequest()
+        target = str(body.workspace or "paper").strip().lower()
+        if target == "paper":
+            control.session_guard(_session_token(request))
+        else:
+            control.live_tier_guard(_session_token(request))
+            if not body.confirm:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resetting live state requires confirm=true",
+                )
         return control.reset_workspace()
 
-    @app.post("/api/v2/control/workspace/autopilot")
+    @app.post(
+        "/api/v2/control/workspace/autopilot", dependencies=[SESSION_GUARD]
+    )
     def control_workspace_autopilot(
         payload: AutopilotControlRequest,
     ) -> dict[str, Any]:
         return control.set_autopilot(payload)
 
-    @app.post("/api/v2/control/ledger/fund-paper")
+    @app.post("/api/v2/control/ledger/fund-paper", dependencies=[SESSION_GUARD])
     def control_ledger_fund_paper(payload: PaperFundingRequest) -> dict[str, Any]:
         return control.fund_paper(payload)
 
@@ -9906,12 +10046,17 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
 
         return control.stream_snapshot(silo)
 
-    @app.post("/api/v2/control/brokers/handshake")
+    @app.post("/api/v2/control/brokers/handshake", dependencies=[LIVE_GUARD])
     async def control_broker_handshake(
         http_request: Request,
         request: BrokerHandshakeRequest,
     ) -> dict[str, Any]:
-        """Read-only venue handshake; live tier guarded when not a dry run."""
+        """Read-only venue handshake; read-only probes still need LIVE tier.
+
+        The handler re-checks the tier with its own session token so the
+        in-process entry point (``control.broker_handshake``) is guarded even
+        when it is called without the HTTP dependency.
+        """
 
         try:
             return control.broker_handshake(

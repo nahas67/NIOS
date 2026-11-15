@@ -271,6 +271,11 @@ class OperatorAuth:
             except OperatorAuthError:
                 return False
 
+    #: Ring 3 arm-probe name (``control_plane`` asks for ``is_initialized``).
+    def is_initialized(self) -> bool:
+        """Alias for :meth:`initialized` used by the control-plane guards."""
+        return self.initialized()
+
     # -- brute-force lockout ----------------------------------------------
     def lockout_state(self) -> dict[str, Any]:
         """Read-only view of the persisted lockout counter."""

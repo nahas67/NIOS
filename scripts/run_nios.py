@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -139,6 +140,96 @@ def fastapi_app(runtime):
 # ---------------------------------------------------------------------------
 
 
+#: Temporary operator credential minted by ``--smoke-test`` and the preflight
+#: certificate.  It lives only in a scratch vault directory for the lifetime of
+#: the process, so a developer's real operator credential is never touched.
+SCRIPT_OPERATOR = {
+    "username": "smoke.operator",
+    "password": "Smoke-Operator-V1.8",
+    "live_pin": "8642",
+}
+
+
+def install_scratch_operator_vault() -> Path:
+    """Point the Ring 0 operator vault at a throwaway directory (scripts only).
+
+    V1.8 authenticates every ``/api/v2/control/*`` mutation once an operator
+    credential exists, so the smoke test and the go-live certificate must hold
+    a real session.  They mint one in an isolated vault instead of demanding
+    (or bypassing) the operator's own two factors.
+    """
+    import os
+
+    from ring0_vault.silos.key_vault.operator_auth import (
+        reset_operator_auth_singleton,
+    )
+
+    root = Path(tempfile.mkdtemp(prefix="nios-script-operator-"))
+    os.environ["NIOS_OPERATOR_AUTH_DIR"] = str(root)
+    reset_operator_auth_singleton()
+    return root
+
+
+def operator_session_headers(
+    client: Any, runtime: Any = None, *, live: bool = True
+) -> dict[str, str]:
+    """Register a temporary operator on ``client`` and return its headers.
+
+    ``live=True`` elevates the PAPER session to a 30-minute LIVE session with
+    the PIN, exactly as the live portal does, so live-tier routes
+    (``/control/rearm``, ``/control/brokers``, ``/control/supervisor``, ...)
+    certify against the same contract a human operator uses.
+
+    The elevation is done **in-process against the Ring 0 vault**, never over
+    ``POST /auth/elevate-live``: that endpoint reports the 22-gate pre-flight
+    certificate, and the pre-flight itself needs an authenticated client.  Going
+    through HTTP therefore recursed (pre-flight -> client -> elevation ->
+    pre-flight -> ...) and wedged the whole suite.
+    """
+    payload = {**SCRIPT_OPERATOR, "start_clean_slate": False}
+    response = client.post("/api/v2/auth/setup", json=payload)
+    token = ""
+    if response.status_code == 200:
+        token = str(response.json().get("token", "") or "")
+    else:  # a re-run inside the same scratch vault: log in instead
+        login = client.post(
+            "/api/v2/auth/login",
+            json={
+                "username": SCRIPT_OPERATOR["username"],
+                "password": SCRIPT_OPERATOR["password"],
+            },
+        )
+        if login.status_code == 200:
+            token = str(login.json().get("token", "") or "")
+    if not token:
+        raise RuntimeError(
+            "temporary operator session could not be minted "
+            f"(setup={response.status_code} {response.text[:160]})"
+        )
+    headers = {"X-NIOS-Session": token}
+    if not live:
+        return headers
+
+    control = getattr(runtime, "control", None) if runtime is not None else None
+    if control is not None:
+        session = control.operator_auth().elevate_to_live(
+            token, SCRIPT_OPERATOR["live_pin"]
+        )
+        return {"X-NIOS-Session": session.token}
+
+    elevated = client.post(
+        "/api/v2/auth/elevate-live",
+        json={"live_pin": SCRIPT_OPERATOR["live_pin"]},
+        headers=headers,
+    )
+    if elevated.status_code != 200:
+        raise RuntimeError(
+            "temporary operator session could not be elevated to LIVE "
+            f"({elevated.status_code} {elevated.text[:160]})"
+        )
+    return {"X-NIOS-Session": str(elevated.json().get("token", token))}
+
+
 class _HealthTable:
     def __init__(self) -> None:
         self.rows: list[tuple[str, str, str]] = []
@@ -183,11 +274,15 @@ def run_smoke(
 
     table = _HealthTable()
     runtime = None
+    operator_vault: Path | None = None
     try:
+        # V1.8: the control plane authenticates every mutation once an
+        # operator exists, so the smoke run mints a temporary one in an
+        # isolated vault instead of touching the real credential.
+        operator_vault = install_scratch_operator_vault()
         started = time.perf_counter()
         runtime = build_runtime(workspace)
         boot_ms = (time.perf_counter() - started) * 1e3
-
         # ---- Ring 0: Sovereign Vault -----------------------------------
         def ring0() -> str:
             report = runtime.ledger.invariant_report()
@@ -338,6 +433,9 @@ def run_smoke(
 
         # ---- Ring 3: cockpit / MCP / static UI -------------------------
         client = TestClient(fastapi_app(runtime))
+        # V1.8: every row below that touches a control surface runs as a real
+        # temporary operator (PAPER -> LIVE elevation), never unauthenticated.
+        client.headers.update(operator_session_headers(client, runtime))
 
         def ring3_health() -> str:
             response = client.get("/api/v2/cockpit/health")
@@ -579,6 +677,15 @@ def run_smoke(
     finally:
         if runtime is not None:
             runtime.close()
+        if operator_vault is not None:
+            import shutil
+
+            from ring0_vault.silos.key_vault.operator_auth import (
+                reset_operator_auth_singleton,
+            )
+
+            reset_operator_auth_singleton()
+            shutil.rmtree(operator_vault, ignore_errors=True)
 
     print(table.render())
     print(

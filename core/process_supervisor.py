@@ -84,6 +84,7 @@ from core.shm_ipc import (
     LeaseTableSHM,
     OfiRingBuffer,
     ShadowBookSHM,
+    segment_name,
     shm_prefix,
 )
 
@@ -173,10 +174,14 @@ class RingHeartbeatTable:
         self,
         *,
         reset: bool = False,
-        name: str = HEARTBEAT_SHM_NAME,
+        name: str | None = None,
         slots: int = HEARTBEAT_SLOTS,
     ) -> None:
-        self.name = name
+        # V1.8: the *class* honours the SHM namespace, not just one caller.  The
+        # four ring worker processes construct their own table, so mapping the
+        # name only in the supervisor left the parent reading a prefixed segment
+        # while its children wrote the unprefixed one (zero beats observed).
+        self.name = segment_name(name or HEARTBEAT_SHM_NAME)
         self.slots = int(slots)
         self._owner = False
         self._shm = self._attach(reset=reset)
@@ -1467,7 +1472,12 @@ class RingProcessSupervisor:
 
     def heartbeat_table(self) -> RingHeartbeatTable:
         if self._heartbeats is None:
-            self._heartbeats = RingHeartbeatTable(reset=self._fresh)
+            # ``RingHeartbeatTable`` maps the name into the active SHM namespace
+            # itself, so the four worker processes and this supervisor always
+            # agree on the segment (V1.8).
+            self._heartbeats = RingHeartbeatTable(
+                reset=self._fresh, name=HEARTBEAT_SHM_NAME
+            )
             self._fresh = False
         return self._heartbeats
 

@@ -987,3 +987,805 @@ def test_gate6_no_float_coercion_on_integer_money_paths() -> None:
         not in inspect.getsource(task_dispatcher)
     )
     assert "twin.required_fills()" not in inspect.getsource(backtest_engine)
+
+
+# ---------------------------------------------------------------------------
+# Gate 7 - V1.8 Section 6 & Ring 3 Auth Closure
+# ---------------------------------------------------------------------------
+def _bare_client(client: Any) -> TestClient:
+    """A client over the same app with no session cookie or header."""
+    return TestClient(client.app)
+
+
+def test_gate7_control_plane_rejects_unauthenticated_mutations(
+    client: Any, token: str
+) -> None:
+    """Every /api/v2/control/* mutation is 401 once an operator exists."""
+    _ = token  # the operator fixture must have armed the guard
+    bare = _bare_client(client)
+    probes: list[tuple[str, str, Any]] = [
+        ("post", "/api/v2/control/logbook/clear", None),
+        ("post", "/api/v2/control/orders/cancel", {"order_id": "ALL"}),
+        ("post", "/api/v2/control/quant/scan", {"top_k": 2}),
+        ("get", "/api/v2/control/extensions", None),
+        ("post", "/api/v2/control/killswitch", {"confirm": True}),
+        ("post", "/api/v2/control/rearm", {}),
+        ("post", "/api/v2/control/supervisor", {"action": "status"}),
+        ("post", "/api/v2/control/workspace/reset", {}),
+        ("post", "/api/v2/control/analyzer/shadow-burst", {"rounds": 1}),
+        ("post", "/api/v2/control/ledger/reconcile", {"silos": None}),
+        ("post", "/api/v2/control/verification/vopr", {"seed": 1, "steps": 2}),
+        ("post", "/api/v2/control/brain/committee-debate", {"silo": US}),
+        ("post", "/api/v2/control/feeds", {"mode": "PAPER_AUTOPILOT"}),
+        ("post", "/api/v2/control/agents/cancel", {"task_id": "ALL"}),
+        ("post", "/api/v2/control/backtest/run", {"silo": US, "symbol": "SPY"}),
+    ]
+    for method, path, body in probes:
+        call = getattr(bare, method)
+        response = call(path, json=body) if body is not None else call(path)
+        assert response.status_code == 401, f"{path} -> {response.status_code}"
+        assert response.json()["detail"] == "AUTH_REQUIRED"
+
+
+def test_gate7_live_elevation_is_required_on_live_surfaces(
+    client: Any, token: str
+) -> None:
+    """A PAPER session cannot re-arm, drive the supervisor or broker calls."""
+    for path, body in (
+        ("/api/v2/control/rearm", {}),
+        ("/api/v2/control/supervisor", {"action": "status"}),
+        ("/api/v2/control/brokers/ping", {"silo": US}),
+        ("/api/v2/control/workspace/reset", {"workspace": "all", "confirm": True}),
+        ("/api/v2/control/workspace/reset", {"workspace": "live", "confirm": True}),
+    ):
+        response = client.post(path, json=body, headers=_headers(token))
+        assert response.status_code == 403, f"{path} -> {response.status_code}"
+        assert response.json()["detail"] == "LIVE_ELEVATION_REQUIRED"
+
+
+def test_gate7_killswitch_confirm_never_defaults_to_true(
+    client: Any, runtime: Any, token: str
+) -> None:
+    """A global halt costs an explicit confirm=true plus a session."""
+    from ring3_cockpit.gateway.control_plane import KillSwitchRequest
+
+    assert KillSwitchRequest().confirm is False
+    bare = _bare_client(client)
+    for body in ({}, {"confirm": False}, {"reason": "x", "flatten": True}):
+        assert bare.post("/api/v2/control/killswitch", json=body).status_code == 401
+        response = client.post(
+            "/api/v2/control/killswitch", json=body, headers=_headers(token)
+        )
+        assert response.status_code == 400, body
+        assert "confirm=true" in str(response.json()["detail"])
+    halted = client.post(
+        "/api/v2/control/killswitch",
+        json={"confirm": True, "reason": "gate7"},
+        headers=_headers(token),
+    )
+    assert halted.status_code == 200, halted.text
+    assert halted.json()["status"] == "HALTED"
+    # Leave the shared runtime ARMED for the remaining Gate 7 assertions.
+    runtime.control.rearm(None)
+
+
+def test_gate7_paper_control_routes_accept_a_paper_session(
+    client: Any, token: str
+) -> None:
+    """The paper/research surfaces work with an ordinary PAPER session."""
+    for path, body in (
+        ("/api/v2/control/logbook/clear", None),
+        ("/api/v2/control/quant/scan", {"top_k": 2}),
+        ("/api/v2/control/ledger/reconcile", {"silos": None}),
+        ("/api/v2/control/analyzer/shadow-burst", {"rounds": 1}),
+    ):
+        response = client.post(path, json=body, headers=_headers(token))
+        assert response.status_code == 200, f"{path} -> {response.text[:160]}"
+
+
+def test_gate7_payload_envelope_never_fabricates_risk_numbers() -> None:
+    """Clean-slate risk telemetry is zero, never a sealed pseudo-random guess."""
+    import inspect
+
+    from ring3_cockpit.gateway import payload_envelope as envelope
+
+    assert not hasattr(envelope, "_stable_unit")
+
+    class FlatLedger:
+        def silo_nav_micros(self, silo: str) -> int:
+            return 0
+
+        def positions(self, silo: str) -> dict[str, Any]:
+            return {}
+
+        def balance(self, silo: str, code: str) -> int:
+            return 0
+
+    for silo in (US, INDIA, CRYPTO, FX):
+        telemetry = envelope.silo_risk_telemetry(FlatLedger(), silo)
+        assert telemetry["var_99_bps"] == 0.0
+        assert telemetry["cvar_99_bps"] == 0.0
+        assert telemetry["max_drawdown_bps"] == 0.0
+        assert telemetry["unrealized_pnl_micros"] == 0
+
+    source = inspect.getsource(envelope)
+    assert "_stable_unit" not in source
+    assert "0.0 + 860.0" not in source
+    assert "20.0 + 580.0" not in source
+    assert "mark-drift" not in source
+
+
+def test_gate7_payload_envelope_uses_measured_marks_and_equity() -> None:
+    """Unrealised P&L needs a real mark; VaR/DD come from the real curve."""
+    from ring3_cockpit.gateway import payload_envelope as envelope
+
+    class MarkedLedger:
+        def silo_nav_micros(self, silo: str) -> int:
+            return 100_000_000
+
+        def positions(self, silo: str) -> dict[str, Any]:
+            return {
+                f"{silo}:SPY": {
+                    "qty_micros": 1_000_000,
+                    "price_micros": 100_000_000,
+                    "mark_price_micros": 110_000_000,
+                }
+            }
+
+        def balance(self, silo: str, code: str) -> int:
+            return 0
+
+    marked = envelope.silo_risk_telemetry(MarkedLedger(), US)
+    # 1 unit held from 100.00 to 110.00 -> +10 units -> 10_000_000 micros
+    assert marked["unrealized_pnl_micros"] == 10_000_000
+    assert marked["open_positions"] == 1
+
+    class UnmarkedLedger(MarkedLedger):
+        def positions(self, silo: str) -> dict[str, Any]:
+            return {
+                f"{silo}:SPY": {"qty_micros": 1_000_000, "price_micros": 100_000_000}
+            }
+
+    assert envelope.silo_risk_telemetry(UnmarkedLedger(), US)[
+        "unrealized_pnl_micros"
+    ] == 0
+
+    var, cvar = envelope._var_99_bps([100_000_000, 90_000_000, 95_000_000])
+    assert var == pytest.approx(1_000.0)
+    assert cvar >= var
+    assert envelope._var_99_bps([]) == (0.0, 0.0)
+    assert envelope._max_drawdown_bps(
+        [100_000_000, 90_000_000, 95_000_000]
+    ) == pytest.approx(1_000.0)
+    assert envelope._max_drawdown_bps([]) == 0.0
+
+
+def test_gate7_instrument_registry_snaps_ticks_with_integer_math() -> None:
+    """Sec 9.3: the tick grid is integer-micros, never a float division."""
+    import inspect
+
+    from core import instrument_registry as registry_module
+
+    source = inspect.getsource(registry_module.InstrumentRegistry.validate_order)
+    assert "int(round(price_micros / tick))" not in source
+    assert "(price_micros + tick // 2) // tick" in source
+    assert "ROUND_HALF_UP" in source
+
+    tick = 10_000
+    for price in (101.234567, 5.00005, 0.00001):
+        check = instrument_registry.validate_order(
+            CRYPTO, "BTC-USDT", 0.05, price, round_price=True
+        )
+        assert check.ok, check.reason
+        snapped_micros = check.ticks * tick
+        assert check.adjusted_price == pytest.approx(snapped_micros / 1_000_000)
+
+    on_grid = instrument_registry.validate_order(
+        CRYPTO, "BTC-USDT", 0.05, tick * 3 / 1_000_000, round_price=True
+    )
+    assert on_grid.price_changed is False
+    assert on_grid.reason == "OK"
+    assert on_grid.ticks * tick == 3 * tick
+
+
+def test_gate7_shadow_twin_counts_only_settled_fills(tmp_path) -> None:
+    """Law 4: a fill is counted after its residual reached the window."""
+    from core.feature_store import FeatureStore
+    from core.shm_ipc import ShadowBookSHM
+    from ring1_spinal.shadow_twin import ExecutedFlowTick, ShadowExecutionTwin
+
+    class FailingStore:
+        def append_conformal_residual(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("disk full")
+
+    def tick() -> Any:
+        return ExecutedFlowTick(
+            symbol="BTC-USDT",
+            valid_time_ns=1,
+            knowledge_ts_ns=1,
+            last_price=100.0,
+            spread_bps=1.0,
+            realized_vol_5s=0.001,
+            normal_vol_5s=0.001,
+            taker_buy_volume_5s=0.0,
+            taker_sell_volume_5s=50.0,
+            bid_cancel_to_fill_ratio=0.5,
+            ask_cancel_to_fill_ratio=0.5,
+        )
+
+    book = ShadowBookSHM(reset=True)
+    book.write_snapshot(
+        "BTC-USDT", best_bid=100.0, best_ask=100.02, bid_qty=5.0, ask_qty=5.0
+    )
+    broken = ShadowExecutionTwin(book, feature_store=FailingStore(), required_fills=1)
+    try:
+        fill = broken.execute_shadow_fill(
+            tick(), strategy_id="gate7-broken", side="BUY", silo=CRYPTO, now_ns=10
+        )
+        assert fill is not None
+        # The attempt happened, but nothing reached the conformal window.
+        assert broken.shadow_fill_count("gate7-broken") == 0
+        assert broken.fills("gate7-broken") == ()
+        assert broken.is_graduated("gate7-broken") is False
+        assert broken.shadow_report("gate7-broken")["settlement_errors"]
+    finally:
+        pass  # the shared shadow book stays open for the calibrated twin below
+
+    store = FeatureStore(tmp_path / "gate7-features")
+    working = ShadowExecutionTwin(book, feature_store=store, required_fills=1)
+    try:
+        fill = working.execute_shadow_fill(
+            tick(), strategy_id="gate7-working", side="BUY", silo=CRYPTO, now_ns=20
+        )
+        assert fill is not None
+        assert working.shadow_fill_count("gate7-working") == 1
+        assert working.fills("gate7-working")
+        assert working.is_graduated("gate7-working") is True
+    finally:
+        store.close()
+        book.close()
+        book.unlink()
+
+
+def test_gate7_challenger_needs_positive_net_expectancy() -> None:
+    """Volume alone cannot graduate a challenger that loses money."""
+    import inspect
+
+    from core.plugins import PluginManifest, PluginRegistry
+    from ring3_cockpit.gateway.control_plane import ControlPlane
+
+    source = inspect.getsource(ControlPlane.evaluate_challenger)
+    assert "mean_net_bps > 0.0" in source
+    assert "net_expectancy_bps" in source
+
+    def manifest(name: str) -> Any:
+        return PluginManifest(
+            name=name,
+            kind="factor_pack",
+            ring="ring2",
+            author="gate7",
+            description="gate7 expectancy probe",
+            factor_weights={"a": 1.0},
+        )
+
+    registry = PluginRegistry()
+    registry.register(manifest("gate7-loser"))
+    for _ in range(30):
+        registry.record_shadow_fill("gate7-loser", net_bps=-1.5)
+    loser = registry.get("gate7-loser")
+    assert loser.shadow_fills == 30
+    assert loser.winning_shadow_fills == 0
+    assert loser.mean_net_bps == pytest.approx(-1.5)
+    assert loser.graduated is False
+    assert registry.shadow_report("gate7-loser")["mean_net_bps"] == pytest.approx(-1.5)
+
+    registry.register(manifest("gate7-winner"))
+    for _ in range(30):
+        registry.record_shadow_fill("gate7-winner", net_bps=2.0)
+    winner = registry.get("gate7-winner")
+    assert winner.mean_net_bps == pytest.approx(2.0)
+    assert winner.winning_shadow_fills == 30
+    assert winner.graduated is True
+
+
+def test_gate7_backtest_promotion_requires_leakage_free() -> None:
+    """Law 4: DSR alone cannot promote a leaked walk-forward curve."""
+    from ring2_brain.backtest.engine import (
+        BacktestRun,
+        NurseryGateError,
+        WalkForwardBacktestEngine,
+    )
+
+    def receipt(leakage_free: bool | None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "backtest_id": "bt_gate7",
+            "silo": US,
+            "symbol": "SPY",
+            "strategy_id": "ma_golden_cross",
+            "deflated_sharpe_ratio": 2.4,
+            "net_edge_bps": 14.0,
+            "passes_dsr_gate": True,
+            "passes_champion_floor": True,
+        }
+        if leakage_free is not None:
+            body["purged_kfold"] = {"leakage_free": leakage_free}
+        return body
+
+    for value in (False, None):
+        engine = WalkForwardBacktestEngine()
+        engine._runs["bt_gate7"] = BacktestRun(receipt=receipt(value), created_at_ns=1)
+        with pytest.raises(NurseryGateError) as excinfo:
+            engine.promote_to_nursery("bt_gate7")
+        assert "leakage_free" in str(excinfo.value)
+        assert engine.get("bt_gate7").promoted is False
+
+    clean = WalkForwardBacktestEngine()
+    clean._runs["bt_gate7"] = BacktestRun(receipt=receipt(True), created_at_ns=1)
+    promoted = clean.promote_to_nursery("bt_gate7")
+    assert promoted["promoted"] is True
+    assert clean.get("bt_gate7").promoted is True
+
+
+def test_gate7_trust_snapshots_preserve_the_prediction_silo(tmp_path) -> None:
+    """Trust rows live in their own silo partition, never a hardcoded US."""
+    import inspect
+
+    from core.feature_store import FeatureStore
+    from ring2_brain.truth.settlement_worker import DelayedSettlementWorker
+
+    assert '"US", str(strategy_id), time.time_ns()' not in inspect.getsource(
+        DelayedSettlementWorker.trust_snapshots
+    )
+
+    store = FeatureStore(tmp_path / "gate7-settlement")
+    try:
+        worker = DelayedSettlementWorker(store, persist_trust=True)
+        worker.record_prediction(
+            "gate7-india",
+            strategy_id="gate7-strategy",
+            symbol="RELIANCE",
+            predicted_net_bps=12.0,
+            horizon_ns=0,
+            created_at_ns=0,
+            silo=INDIA,
+        )
+        worker.settle_prediction("gate7-india", 14.0, now_ns=1_000)
+        snapshots = worker.trust_snapshots("gate7-strategy")
+        assert snapshots, "the India trust snapshot was not persisted"
+        assert {snapshot.silo for snapshot in snapshots} == {INDIA}
+        assert all(snapshot.silo != "US" for snapshot in snapshots)
+        assert snapshots[0].to_dict()["silo"] == INDIA
+    finally:
+        store.close()
+
+
+def test_gate7_mcp_tool_failure_is_never_a_200() -> None:
+    """A failed MCP tool call is a 4xx, not a green 200 with ok=false."""
+    from dataclasses import replace
+
+    from fastapi import FastAPI
+
+    from ring3_cockpit.gateway.mcp_bridge import MCPBridge
+
+    class _Control:
+        registry = None
+        ledger = None
+
+    def raiser(exc: Exception):
+        def handler(arguments: dict[str, Any]) -> Any:
+            raise exc
+
+        return handler
+
+    bridge = MCPBridge(_Control())  # type: ignore[arg-type]
+    app = FastAPI()
+    bridge.register_routes(app)
+    client = TestClient(app)
+    name = "nios_get_ibor_vaults"
+    original = bridge._tools[name]
+    bridge._enabled[name] = True
+    try:
+        bridge._tools[name] = replace(original, handler=raiser(ValueError("bad args")))
+        assert client.post("/api/v2/mcp/call", json={"name": name}).status_code == 422
+
+        bridge._tools[name] = replace(original, handler=raiser(RuntimeError("boom")))
+        failed = client.post("/api/v2/mcp/call", json={"name": name})
+        assert failed.status_code == 400
+        assert failed.json()["detail"]["ok"] is False
+        assert "boom" in failed.json()["detail"]["error"]
+
+        bridge._tools[name] = original
+        assert client.post("/api/v2/mcp/call", json={"name": "nope"}).status_code == 404
+        assert (
+            client.post("/api/v2/mcp/call", json={"arguments": {}}).status_code == 422
+        )
+    finally:
+        bridge._tools[name] = original
+
+
+def test_gate7_heartbeat_segment_honours_the_shm_prefix(monkeypatch) -> None:
+    """A test/prefixed process must not attach to the live heartbeat segment."""
+    from core.process_supervisor import HEARTBEAT_SHM_NAME, RingProcessSupervisor
+
+    prefix = f"nios-gate7-hb-{os.getpid()}"
+    monkeypatch.setenv("NIOS_SHM_PREFIX", prefix)
+    supervisor = RingProcessSupervisor(autostart=False, fresh_heartbeats=False)
+    try:
+        table = supervisor.heartbeat_table()
+        assert table.name != HEARTBEAT_SHM_NAME
+        assert table.name.startswith(prefix), table.name
+        assert "ring-heartbeats" in table.name
+        assert table.uri == f"shm://{table.name}"
+    finally:
+        try:
+            supervisor.heartbeat_table().unlink()
+        except Exception:  # pragma: no cover - best effort teardown
+            pass
+        supervisor.stop()
+
+
+def test_gate7_chaos_recovery_never_wipes_live_leases() -> None:
+    """Attaching to the lease table must not disarm a running platform."""
+    import inspect
+
+    from core import chaos_recovery
+    from core.schemas import LeaseMode, System1Lease
+    from core.shm_ipc import LeaseTableSHM
+
+    source = inspect.getsource(chaos_recovery.audit_lease_reboot)
+    assert "LeaseTableSHM(reset=True)" not in source
+    assert "factory_reset: bool = False" in source
+
+    now = 10**15
+    table = LeaseTableSHM(reset=True)
+    try:
+        table.write_lease(
+            System1Lease(
+                symbol="ETH-USDT",
+                mode=LeaseMode.LONG_ONLY,
+                target_bps=10.0,
+                stop_bps=8.0,
+                # A legal dead-man TTL: 30 s of remaining authority.
+                expires_at_ns=now + 30_000_000_000,
+                strategy_id_hash=0x5150,
+            ),
+            now_ns=now - 1_000,
+        )
+    finally:
+        table.close()
+
+    report = chaos_recovery.audit_lease_reboot(now_ns=now)
+    # ``passed`` certifies an *empty* post-reboot table, and the live ETH lease
+    # deliberately is not empty.  What must hold is that only the stale lease
+    # was swept and the live authority survived.
+    assert report.stale_lease_armed is True
+    assert report.swept == 1
+    assert report.mode_after_reboot == int(LeaseMode.DISARMED)
+
+    reader = LeaseTableSHM(reset=False)
+    try:
+        survivor = reader.read_lease("ETH-USDT", now)
+        assert survivor.mode is LeaseMode.LONG_ONLY, "a live lease was wiped"
+        assert survivor.target_bps == pytest.approx(10.0)
+        assert reader.active_count(now) == 1
+    finally:
+        reader.close()
+
+
+def test_gate7_feature_store_keeps_an_uncommitted_contagion_batch(tmp_path) -> None:
+    """The contagion buffer is cleared only after the write returned."""
+    import inspect
+    import sqlite3
+
+    from core.feature_store import FeatureStore
+    from core.schemas import ContagionFeatures
+
+    source = inspect.getsource(FeatureStore._flush_contagion)
+    assert "self._contagion_pending = []" not in source
+
+    store = FeatureStore(tmp_path / "gate7-store")
+    try:
+        store.append_contagion(
+            CRYPTO,
+            ContagionFeatures(
+                symbol="BTCUSDT",
+                as_of_ns=1,
+                crowd_asymmetry_score=0.1,
+                cascade_fragility_index=0.2,
+                narrative_exhaustion_divergence=0.3,
+            ),
+        )
+        assert len(store._contagion_pending) == 1
+
+        class _BrokenConnection:
+            def executemany(self, *args: Any, **kwargs: Any) -> None:
+                raise sqlite3.OperationalError("database is locked")
+
+        real = store._con
+        store._con = _BrokenConnection()  # type: ignore[assignment]
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                store.flush()
+            assert len(store._contagion_pending) == 1, "the batch was dropped"
+        finally:
+            store._con = real
+        assert store.flush() == 1
+        assert store._contagion_pending == []
+    finally:
+        store.close()
+
+
+def test_gate7_grounded_metrics_are_immutable() -> None:
+    """A sealed packet's metrics mapping cannot be mutated after the digest."""
+    from core.schemas import GroundedFactPacket
+
+    packet = GroundedFactPacket(
+        symbol="SPY",
+        valid_time_ns=1,
+        knowledge_ts_ns=1,
+        as_of_ns=1,
+        metrics={"momentum_20d": 0.42},
+    )
+    with pytest.raises(TypeError):
+        packet.metrics["injected_metric"] = 99.0  # type: ignore[index]
+    assert packet.verify() is True
+    assert dict(packet.metrics) == {"momentum_20d": 0.42}
+
+
+def test_gate7_operator_vault_exposes_is_initialized() -> None:
+    """The guard probe documented in V1.8 exists on the Ring 0 vault."""
+    import inspect
+
+    from ring0_vault.silos.key_vault.operator_auth import OperatorAuth
+
+    assert hasattr(OperatorAuth, "is_initialized")
+    assert "is_initialized" in inspect.getsource(OperatorAuth)
+    assert OperatorAuth.is_initialized is not OperatorAuth.initialized
+
+
+def test_gate7_workspace_reset_live_state_needs_a_live_session(
+    client: Any, runtime: Any, token: str
+) -> None:
+    """Last: a LIVE session plus confirm=true really resets live state."""
+    # Mint the LIVE token straight from the Ring 0 vault (the same instance the
+    # guard reads) so the assertion does not pay the 22-gate login pre-flight.
+    live_token = (
+        runtime.control.operator_auth().elevate_to_live(token, LIVE_PIN).token
+    )
+    live_headers = _headers(live_token)
+
+    denied = client.post(
+        "/api/v2/control/workspace/reset",
+        json={"workspace": "all", "confirm": False},
+        headers=live_headers,
+    )
+    assert denied.status_code == 400, denied.text
+
+    allowed = client.post(
+        "/api/v2/control/workspace/reset",
+        json={"workspace": "all", "confirm": True},
+        headers=live_headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["clean_slate_active"] is True
+
+
+# ---------------------------------------------------------------------------
+# Gate 7b - V1.8 wedged-service bounding (thread/socket leak closure)
+# ---------------------------------------------------------------------------
+def test_gate7b_feed_transport_breaker_fails_fast(monkeypatch) -> None:
+    """A dead network costs N attempts once, then zero sockets per call."""
+    import urllib.error
+    import urllib.request
+
+    from ring2_brain.truth.live_public_feeds import (
+        FEED_BREAKER_FAILURES,
+        FeedUnavailable,
+        HttpTransport,
+    )
+
+    attempts = {"count": 0}
+
+    def dead_urlopen(request, timeout=None):  # noqa: ARG001
+        attempts["count"] += 1
+        raise urllib.error.URLError("name resolution unavailable")
+
+    monkeypatch.setattr(urllib.request, "urlopen", dead_urlopen)
+
+    transport = HttpTransport(timeout_s=0.05, breaker_cooldown_s=30.0)
+    for _ in range(FEED_BREAKER_FAILURES):
+        with pytest.raises(FeedUnavailable):
+            transport.get_json("https://feeds.invalid/book")
+    assert transport.breaker_open is True
+    assert transport.status()["breaker_trips"] == 1
+    assert attempts["count"] == FEED_BREAKER_FAILURES
+
+    # Every further call is refused *before* urllib is touched.
+    for _ in range(25):
+        with pytest.raises(FeedUnavailable):
+            transport.get_json("https://feeds.invalid/book")
+    assert attempts["count"] == FEED_BREAKER_FAILURES, "the open breaker still dialled out"
+    assert transport.status()["breaker_open"] is True
+
+
+def test_gate7b_ingest_pass_stops_touching_the_network_at_its_deadline(
+    monkeypatch,
+) -> None:
+    """A four-silo pass is bounded and still emits one labelled frame per silo."""
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from ring2_brain.truth.live_public_feeds import (
+        FeedUnavailable,
+        LiveDualVendorFeedConnector,
+    )
+
+    def dead_urlopen(request, timeout=None):  # noqa: ARG001
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr(urllib.request, "urlopen", dead_urlopen)
+
+    connector = LiveDualVendorFeedConnector(silo=CRYPTO, timeout_s=0.05)
+    before = threading.active_count()
+    frames = connector.ingest_all(deadline_s=0.0)
+    after = threading.active_count()
+    assert frames, "a dead feed must still emit synthetic frames"
+    assert connector._mode == "SYNTHETIC_FALLBACK"
+    assert after - before <= 1, (before, after)
+    with pytest.raises(FeedUnavailable):
+        connector._fetch_book(connector.symbols[0], connector.primary)
+    assert connector.budget_exhausted >= 1
+
+
+def test_gate7b_multi_silo_ingest_has_a_wall_clock_budget() -> None:
+    """The pre-flight feed gate can never block a control request for minutes."""
+    import inspect
+    import time
+
+    from ring2_brain.truth.live_public_feeds import (
+        FEED_INGEST_BUDGET_S,
+        MultiSiloFeedConnector,
+    )
+    from scripts import preflight_golive
+
+    assert FEED_INGEST_BUDGET_S <= 15.0
+    gate_source = inspect.getsource(preflight_golive.gate_dual_vendor_feeds)
+    assert "deadline_s=FEED_INGEST_BUDGET_S" in gate_source
+
+    connector = MultiSiloFeedConnector(timeout_s=0.05)
+    started = time.monotonic()
+    frames = connector.ingest_all(deadline_s=0.0)
+    elapsed = time.monotonic() - started
+    connector.close()
+    assert frames
+    assert elapsed < 5.0, f"unbounded ingest pass took {elapsed:.2f}s"
+    assert connector.status().get("feed_mode") == "SYNTHETIC_FALLBACK"
+
+
+def test_gate7b_ledger_store_probe_false_never_probes() -> None:
+    """``probe=False`` means no daemon probe, so no blocked probe thread."""
+    import threading
+
+    from ring0_vault.ibor.ledger_outbox import LedgerStore
+
+    before = threading.active_count()
+    stores = [LedgerStore(in_memory=True, probe=False) for _ in range(10)]
+    after = threading.active_count()
+    try:
+        assert after - before <= 1, (before, after)
+        for store in stores:
+            assert store.probed is False
+            tigerbeetle = store.statuses[0]
+            assert tigerbeetle.available is False
+            assert "probe suppressed" in tigerbeetle.detail
+            assert store.statuses[2].name == "sqlite"
+            assert store.statuses[2].available is True
+    finally:
+        for store in stores:
+            store.close()
+
+
+def test_gate7b_switchboard_never_stacks_probe_threads() -> None:
+    """One wedged provider probe, not one thread per route attempt."""
+    import threading
+
+    from ring2_brain.cognition.system1_instinct import (
+        InstinctContext,
+        LLMProvider,
+        MultiLLMSwitchboard,
+    )
+
+    release = threading.Event()
+
+    def wedged(context: Any) -> None:  # noqa: ARG001
+        release.wait(20.0)
+        return None
+
+    provider = LLMProvider("gate7b-wedged", "local", "model", wedged, 1)
+    board = MultiLLMSwitchboard(
+        [provider], probe_timeout_ms=20.0, hard_timeout_ms=250.0
+    )
+    context = InstinctContext(symbol="BTCUSDT")
+    before = threading.active_count()
+    try:
+        for _ in range(20):
+            response, _elapsed, error = board._invoke(provider, context)
+            assert response is None
+            assert error
+        after = threading.active_count()
+        probe_threads = [
+            item
+            for item in threading.enumerate()
+            if item.name.startswith("nios-s1-probe-gate7b-wedged")
+        ]
+        assert len(probe_threads) == 1, probe_threads
+        assert after - before <= 1, (before, after)
+        assert board.abandoned_probes >= 1
+    finally:
+        release.set()
+
+
+def test_gate7b_preflight_feed_gate_is_bounded_and_degrades() -> None:
+    """The certificate's feed gate returns quickly on an air-gapped host."""
+    import time
+
+    from scripts.preflight_golive import PreflightContext, gate_dual_vendor_feeds
+
+    ctx = PreflightContext(silo_scope="ALL", strict=False, tempdir=".")
+    started = time.monotonic()
+    gate = gate_dual_vendor_feeds(ctx)
+    elapsed = time.monotonic() - started
+    assert elapsed < 20.0, f"feed gate took {elapsed:.1f}s"
+    assert gate.gate_id == "feeds.dual_vendor_four_silos_lee_ready"
+    assert "ingest_elapsed_ms" in gate.evidence
+    assert gate.evidence["ingest_budget_s"] <= 15.0
+
+
+def test_gate7b_preflight_session_elevation_cannot_recurse() -> None:
+    """Elevation is in-process: ``/auth/elevate-live`` reports the pre-flight.
+
+    Going through HTTP recursed (pre-flight -> client -> elevation -> pre-flight)
+    and was the thread/portal explosion that wedged every control-plane suite.
+    """
+    import inspect
+    from types import SimpleNamespace
+
+    import scripts.run_nios as runner
+
+    source = inspect.getsource(runner.operator_session_headers)
+    assert "elevate_to_live" in source
+    assert "runtime" in source
+
+    calls: list[str] = []
+
+    class _Auth:
+        def elevate_to_live(self, token: str, pin: str) -> Any:
+            assert token == "paper-token"
+            assert pin == runner.SCRIPT_OPERATOR["live_pin"]
+            return SimpleNamespace(token="live-token")
+
+    class _Control:
+        def operator_auth(self) -> Any:
+            return _Auth()
+
+    class _Runtime:
+        control = _Control()
+
+    class _Client:
+        def post(self, path: str, json: Any = None, headers: Any = None) -> Any:
+            calls.append(path)
+            return SimpleNamespace(
+                status_code=200, text="", json=lambda: {"token": "paper-token"}
+            )
+
+    headers = runner.operator_session_headers(_Client(), _Runtime())
+    assert headers == {"X-NIOS-Session": "live-token"}
+    assert calls == ["/api/v2/auth/setup"], calls
+    assert "/api/v2/auth/elevate-live" not in calls
+
+    from scripts.preflight_golive import PreflightContext
+
+    context = PreflightContext(silo_scope="ALL", strict=False, tempdir=".")
+    assert context._auth_ready is False
+    assert "_auth_ready" in inspect.getsource(PreflightContext.client)

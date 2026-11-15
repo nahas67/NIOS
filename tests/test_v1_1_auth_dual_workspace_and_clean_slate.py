@@ -443,14 +443,17 @@ def test_gate4_live_mutations_require_a_live_session(client, paper_session):
         assert anonymous.status_code == 401, (route, anonymous.text)
         assert anonymous.json()["detail"] == "AUTH_REQUIRED", route
 
-    # --- a PAPER-only mutation stays open (guard is scoped to LIVE) -----
+    # --- V1.8: every /control/brokers call is a LIVE-tier mode change ---
+    # The pre-V1.8 contract left ``mode=PAPER`` open to a PAPER session; a
+    # broker-mode switch is a Ring 0 state change, so the whole surface now
+    # costs LIVE elevation.
     paper_mode = client.post(
         "/api/v2/control/brokers",
         json={"silo": "US_IBKR", "mode": "PAPER"},
         headers=paper_headers,
     )
-    assert paper_mode.status_code == 200, paper_mode.text
-    assert paper_mode.json()["broker"]["mode"] == "PAPER"
+    assert paper_mode.status_code == 403, paper_mode.text
+    assert paper_mode.json()["detail"] == "LIVE_ELEVATION_REQUIRED"
 
     # --- the PIN is the only door to the live surface -------------------
     login = client.post(

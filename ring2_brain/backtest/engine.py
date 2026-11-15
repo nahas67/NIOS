@@ -998,6 +998,10 @@ class WalkForwardBacktestEngine:
         receipt = run.receipt
         dsr = _sane(receipt.get("deflated_sharpe_ratio"))
         net_edge = _sane(receipt.get("net_edge_bps"))
+        kfold = dict(receipt.get("purged_kfold") or {})
+        leakage_free = bool(
+            receipt.get("leakage_free", kfold.get("leakage_free", False))
+        )
         if not receipt.get("passes_dsr_gate") or not receipt.get(
             "passes_champion_floor"
         ):
@@ -1006,6 +1010,15 @@ class WalkForwardBacktestEngine:
                 f"deflated_sharpe_ratio={dsr:.4f} (gate {DSR_GATE:.2f}), "
                 f"net_edge_bps={net_edge:.4f} "
                 f"(floor {CHAMPION_NET_EDGE_FLOOR_BPS:.2f})",
+                receipt=receipt,
+            )
+        # Law 4: a run whose purged/embargoed K-fold could not certify that it
+        # was leakage-free is not a nursery candidate.  Without this check a
+        # lookahead-contaminated curve could buy a 30-fill shadow graduation.
+        if not leakage_free:
+            raise NurseryGateError(
+                "NURSERY-GATE-REJECTED: purged K-fold walk-forward did not "
+                "certify leakage_free=true",
                 receipt=receipt,
             )
 
@@ -1055,11 +1068,21 @@ class WalkForwardBacktestEngine:
                 shadow_fills = 0
                 required_fills = 30
 
+        # Re-assert the Law 4 gate at the exact assignment site: neither flag
+        # may have been mutated by a registry/shadow hand-off above.
+        if not (receipt.get("passes_dsr_gate") and leakage_free):
+            raise NurseryGateError(
+                "NURSERY-GATE-REJECTED: Law 4 gate re-check failed before "
+                "promotion (passes_dsr_gate and leakage_free are both required)",
+                receipt=receipt,
+            )
+
         run.promoted = True
         run.nursery_plugin = plugin_name
         run.receipt["promoted"] = True
         run.receipt["nursery_plugin"] = plugin_name
         run.receipt["nursery_shadow_fills"] = shadow_fills
+        run.receipt["leakage_free"] = leakage_free
 
         return {
             "promoted": True,

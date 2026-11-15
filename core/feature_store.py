@@ -256,15 +256,27 @@ class FeatureStore:
         return self._flush_contagion()
 
     def _flush_contagion(self) -> int:
-        """Commit the buffered contagion batch in one transaction."""
+        """Commit the buffered contagion batch in one transaction.
+
+        The batch is detach-and-commit, never commit-and-hope: rows are copied
+        out under the pending lock, written under the store lock, and **only
+        removed from the buffer after the write returned**.  The previous
+        ``rows = pending; pending = []`` order silently dropped a batch whenever
+        ``executemany`` raised (locked database, disk full, killed process),
+        which is exactly the durability the tier-2 lake promises not to break.
+        """
         with self._pending_lock:
             if not self._contagion_pending:
                 return 0
-            rows = self._contagion_pending
-            self._contagion_pending = []
+            rows = list(self._contagion_pending)
         with self._lock:
             self._con.executemany(_CONTAGION_INSERT_SQL, rows)
-        return len(rows)
+        committed = len(rows)
+        with self._pending_lock:
+            # Drop exactly the committed prefix; rows appended while the write
+            # was in flight stay buffered for the next flush.
+            del self._contagion_pending[:committed]
+        return committed
 
     def __enter__(self) -> "FeatureStore":
         return self

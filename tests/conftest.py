@@ -78,3 +78,31 @@ if pytest is not None:
             unlink_all()
         except Exception:  # pragma: no cover - teardown is best effort
             pass
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _nios_operator_vault_reset():
+        """Every suite starts from a first-run (uninitialised) operator vault.
+
+        V1.8 authenticates every ``/api/v2/control/*`` mutation as soon as
+        ``operator_auth.is_initialized()`` is true.  Without a module boundary
+        reset, the operator that ``test_v1_1`` deliberately registers would arm
+        the guard for every later suite in the same pytest process and turn
+        their unauthenticated paper calls into ``401 AUTH_REQUIRED``.  A suite
+        that wants an operator registers one itself (and passes its headers).
+        """
+        root = Path(os.environ["NIOS_OPERATOR_AUTH_DIR"])
+        try:
+            (root / "operator_auth.json").unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:  # pragma: no cover - best effort
+            pass
+        try:
+            from ring0_vault.silos.key_vault.operator_auth import (
+                reset_operator_auth_singleton,
+            )
+
+            reset_operator_auth_singleton()
+        except Exception:  # pragma: no cover - import failure reported elsewhere
+            pass
+        yield

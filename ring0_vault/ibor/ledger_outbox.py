@@ -402,6 +402,41 @@ def probe_backends(
     )
 
 
+#: V1.8: at most one blocked TigerBeetle probe thread can ever exist.  The
+#: client blocks indefinitely against a dead replica, so a second probe must not
+#: be started while the first is still stuck (that was one leaked thread and one
+#: leaked socket per ``LedgerStore`` construction).
+_TB_PROBE_LOCK = threading.Lock()
+_TB_PROBE_THREAD: threading.Thread | None = None
+
+
+def _unprobed_statuses() -> tuple[BackendStatus, BackendStatus, BackendStatus]:
+    """The honest answer when the caller asked for no daemon probe.
+
+    ``LedgerStore(probe=False)`` means "use the local ACID journal, do not go
+    looking for TigerBeetle or PostgreSQL".  Reporting that explicitly keeps the
+    cockpit truthful while never touching a socket.
+    """
+    return (
+        BackendStatus(
+            name="tigerbeetle",
+            available=False,
+            detail="probe suppressed by the caller (probe=False)",
+        ),
+        BackendStatus(
+            name="postgres",
+            available=False,
+            detail="probe suppressed by the caller (probe=False)",
+        ),
+        BackendStatus(
+            name="sqlite",
+            available=True,
+            detail="in-process ACID journal (128-bit micro-units as decimal text)",
+            version=sqlite3.sqlite_version,
+        ),
+    )
+
+
 def _probe_tigerbeetle(address: str | None, *, timeout_s: float) -> BackendStatus:
     try:
         import tigerbeetle as tb  # noqa: F401
@@ -409,6 +444,9 @@ def _probe_tigerbeetle(address: str | None, *, timeout_s: float) -> BackendStatu
         return BackendStatus(
             name="tigerbeetle", available=False, detail=f"client not importable: {exc}"
         )
+
+    import os
+
     target = (address or os.environ.get("TB_ADDRESS") or "3000").strip()
     enabled = os.environ.get("NIOS_PROBE_LEDGER_BACKENDS", "").strip().lower() in (
         "1",
@@ -439,6 +477,18 @@ def _probe_tigerbeetle(address: str | None, *, timeout_s: float) -> BackendStatu
             outcome["error"] = f"{type(exc).__name__}: {exc}"
 
     thread = threading.Thread(target=_attempt, name="tb-probe", daemon=True)
+    global _TB_PROBE_THREAD
+    with _TB_PROBE_LOCK:
+        if _TB_PROBE_THREAD is not None and _TB_PROBE_THREAD.is_alive():
+            return BackendStatus(
+                name="tigerbeetle",
+                available=False,
+                detail=(
+                    "a previous daemon probe is still blocked against "
+                    f"{target}; not starting a second one (degraded mode)"
+                ),
+            )
+        _TB_PROBE_THREAD = thread
     thread.start()
     thread.join(max(0.05, float(timeout_s)))
     if thread.is_alive():
@@ -627,8 +677,14 @@ class LedgerStore:
         for statement in _SCHEMA:
             self._conn.execute(statement)
 
-        self.statuses: tuple[BackendStatus, BackendStatus, BackendStatus] = probe_backends()
+        # ``probe=False`` is a real contract: the caller asked for the local ACID
+        # journal and no daemon probe.  It used to be stored *after* an
+        # unconditional ``probe_backends()``, so every such construction still
+        # paid a blocked TigerBeetle probe thread.
         self.probed = bool(probe)
+        self.statuses: tuple[BackendStatus, BackendStatus, BackendStatus] = (
+            probe_backends() if self.probed else _unprobed_statuses()
+        )
         self._warm_statements()
 
     def _warm_statements(self) -> None:

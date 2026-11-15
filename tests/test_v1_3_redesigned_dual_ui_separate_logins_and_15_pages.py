@@ -782,11 +782,16 @@ def test_gate3_broker_hub_covers_all_twelve_venues(client, operator) -> None:
 
 
 @pytest.mark.parametrize("venue", VENUES)
-def test_gate3_broker_ping_proves_signing(client, operator, venue: str) -> None:
-    token = client.post(
+def test_gate3_broker_ping_proves_signing(
+    client, runtime, operator, venue: str
+) -> None:
+    # V1.8: /control/brokers/ping is a LIVE-tier surface, so the probe elevates
+    # a fresh PAPER session in-process against the Ring 0 vault.
+    paper = client.post(
         "/api/v2/auth/login/paper",
         json={"username": USERNAME, "password": PASSWORD},
     ).json()["token"]
+    token = runtime.control.operator_auth().elevate_to_live(paper, LIVE_PIN).token
 
     response = client.post(
         "/api/v2/control/brokers/ping",

@@ -374,14 +374,21 @@ def audit_lease_reboot(
     *,
     symbol: str = "BTC-USDT",
     now_ns: int | None = None,
+    factory_reset: bool = False,
 ) -> LeaseRebootReport:
-    """Prove an expired lease is swept to ``DISARMED`` after a reboot."""
+    """Prove an expired lease is swept to ``DISARMED`` after a reboot.
+
+    ``factory_reset=False`` (the default) **attaches** to whatever lease
+    segment already exists.  V1.8 made this non-destructive on purpose: the old
+    unconditional ``reset=True`` wiped every live lease in the shared segment,
+    so merely auditing reboot recovery disarmed a running platform.
+    """
     from core.shm_ipc import LeaseTableSHM
 
     stamp = time.monotonic_ns() if now_ns is None else int(now_ns)
     report = LeaseRebootReport(symbol=symbol)
 
-    writer = LeaseTableSHM(reset=True)
+    writer = LeaseTableSHM(reset=bool(factory_reset))
     reader = None
     try:
         stale = System1Lease(

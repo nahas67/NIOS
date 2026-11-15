@@ -573,13 +573,26 @@ class MCPBridge:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
             except PermissionError as exc:
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
-            except Exception as exc:  # tool failure is reported, not 500
-                return {
-                    "name": tool_name,
-                    "ok": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "elapsed_ms": (time.perf_counter() - started) * 1e3,
-                }
+            except ValueError as exc:
+                # Argument validation is a client error, not a 200.
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"MCP_VALIDATION_FAILED: {exc}",
+                ) from exc
+            except Exception as exc:  # tool failure is reported, not a 500
+                # V1.8: a failed tool call used to answer ``200 {ok: false}``,
+                # so an HTTP monitor (and the preflight certificate) saw a
+                # green response for a broken bridge.  Execution failures are
+                # now a 400 with the same structured body.
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "name": tool_name,
+                        "ok": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "elapsed_ms": (time.perf_counter() - started) * 1e3,
+                    },
+                ) from exc
             return {
                 "name": tool_name,
                 "ok": True,

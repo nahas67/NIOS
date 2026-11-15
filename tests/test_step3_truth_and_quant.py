@@ -381,8 +381,16 @@ def test_gate3_wrong_arithmetic_is_rejected() -> None:
 
 
 def test_gate3_tampered_packet_is_rejected() -> None:
+    # V1.8: a sealed packet's metrics mapping is immutable, so an in-place
+    # tamper is refused outright rather than silently accepted and caught later
+    # by the digest check.
     packet = _grounded_packet()
-    packet.metrics["dcf_value"] = 999.0  # in-place tamper
+    with pytest.raises(TypeError):
+        packet.metrics["dcf_value"] = 999.0  # type: ignore[index]
+    assert packet.verify() is True
+
+    # Replacing the mapping wholesale is still caught by the digest gate.
+    object.__setattr__(packet, "metrics", {"dcf_value": 999.0})
     with pytest.raises(UngroundedNumericalClaim) as excinfo:
         verify_thesis_claims("The DCF value is 999.0.", packet)
     assert UNGROUNDED_CLAIM_CODE in str(excinfo.value)

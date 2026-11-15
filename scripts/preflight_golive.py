@@ -256,7 +256,9 @@ class PreflightContext:
     tempdir: str
     full_smoke: bool = True
     runtime: Any = None
+    operator_vault: Any = None
     _client: Any = None
+    _auth_ready: bool = False
 
     @property
     def silos(self) -> tuple[str, ...]:
@@ -269,6 +271,10 @@ class PreflightContext:
         if self.runtime is None:
             import scripts.run_nios as runner
 
+            # V1.8: every control mutation is authenticated once an operator
+            # credential exists, so the certificate mints a temporary operator
+            # in an isolated vault and never touches the real one.
+            self.operator_vault = runner.install_scratch_operator_vault()
             self.runtime = runner.build_runtime()
         return self.runtime
 
@@ -279,16 +285,43 @@ class PreflightContext:
             import scripts.run_nios as runner
 
             self._client = TestClient(runner.fastapi_app(self.orchestrator()))
+            # Elevation is in-process (Ring 0 vault), never `POST /auth/elevate-live`:
+            # that route reports the 22-gate certificate, which needs this very
+            # client.  The guard flag makes a nested call during setup return the
+            # bare client instead of re-entering.
+            if not self._auth_ready:
+                self._auth_ready = True
+                self._client.headers.update(
+                    runner.operator_session_headers(self._client, self.runtime)
+                )
         return self._client
 
     def close(self) -> None:
+        client = self._client
         self._client = None
+        if client is not None:
+            # A TestClient owns an anyio portal thread; dropping the reference
+            # is not a teardown.  Closing it keeps one pre-flight at one portal.
+            try:
+                client.close()
+            except Exception:  # pragma: no cover - teardown best effort
+                pass
         if self.runtime is not None:
             try:
                 self.runtime.close()
             except Exception:  # pragma: no cover - teardown best effort
                 pass
             self.runtime = None
+        if self.operator_vault is not None:
+            import shutil
+
+            from ring0_vault.silos.key_vault.operator_auth import (
+                reset_operator_auth_singleton,
+            )
+
+            reset_operator_auth_singleton()
+            shutil.rmtree(self.operator_vault, ignore_errors=True)
+            self.operator_vault = None
 
 
 # ---------------------------------------------------------------------------
@@ -1005,18 +1038,38 @@ def gate_cost_floor(ctx: PreflightContext) -> Gate:
 
 
 def gate_dual_vendor_feeds(ctx: PreflightContext) -> Gate:
-    """Four silos ingest dual-vendor quotes and emit Lee-Ready executed flow."""
-    from ring2_brain.truth.live_public_feeds import MultiSiloFeedConnector
+    """Four silos ingest dual-vendor quotes and emit Lee-Ready executed flow.
+
+    V1.8: the gate carries a hard wall-clock budget.  The certificate runs
+    inside a synchronous control request (``POST /control/brokers`` consults it
+    before a LIVE cutover), so an unreachable public venue must degrade to the
+    connector's labelled synthetic frames in seconds rather than pay a DNS
+    lookup per symbol per venue.
+    """
+    from ring2_brain.truth.live_public_feeds import (
+        FEED_INGEST_BUDGET_S,
+        MultiSiloFeedConnector,
+    )
 
     connector = MultiSiloFeedConnector()
+    started = time.monotonic()
     try:
-        frames = connector.ingest_all()
+        frames = connector.ingest_all(deadline_s=FEED_INGEST_BUDGET_S)
         status = connector.status()
+    except Exception as exc:  # noqa: BLE001 - a feed must never hang the gate
+        return Gate(
+            "feeds.dual_vendor_four_silos_lee_ready",
+            "Dual-vendor four-silo quotes with Lee-Ready executed flow",
+            FAIL,
+            f"feed ingest raised {type(exc).__name__}: {exc}",
+            {"error": f"{type(exc).__name__}: {exc}"},
+        )
     finally:
         try:
             connector.close()
         except Exception:  # pragma: no cover
             pass
+    elapsed_ms = (time.monotonic() - started) * 1e3
     silos = sorted({str(frame.silo) for frame in frames})
     venues = status.get("venues") or {}
     dual = {
@@ -1036,7 +1089,8 @@ def gate_dual_vendor_feeds(ctx: PreflightContext) -> Gate:
         "Multi-silo dual-vendor feed + Lee-Ready flow",
         PASS if ok else FAIL,
         f"{len(frames)} Lee-Ready frames across {len(silos)} silos "
-        f"({status.get('feed_mode', 'n/a')}), dual-vendor silos={len(dual)}",
+        f"({status.get('feed_mode', 'n/a')}), dual-vendor silos={len(dual)}, "
+        f"{elapsed_ms:.0f} ms",
         {
             "silos": silos,
             "frames": len(frames),
@@ -1044,6 +1098,11 @@ def gate_dual_vendor_feeds(ctx: PreflightContext) -> Gate:
             "feed_mode": str(status.get("feed_mode", "")),
             "venues": {name: dual[name] for name in sorted(dual)},
             "rounds": int(status.get("rounds", 0) or 0),
+            # Runtime telemetry only (stripped from the certificate digest so a
+            # 2 s and a 5 s pass certify identically on the same commit).
+            "ingest_elapsed_ms": round(elapsed_ms, 3),
+            "ingest_budget_s": FEED_INGEST_BUDGET_S,
+            "transport": status.get("transport") or {},
         },
     )
 

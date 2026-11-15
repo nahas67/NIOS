@@ -257,6 +257,13 @@ class MultiLLMSwitchboard:
         self._lock = threading.RLock()
         self._routes = 0
         self._fallbacks = 0
+        #: V1.8: at most ONE outstanding probe thread per provider.  The old
+        #: thread-per-attempt pattern abandoned a blocked probe and started a
+        #: fresh thread on the next route, so a dead Ollama endpoint leaked a
+        #: thread (and its socket) roughly five times a second.
+        self._probe_threads: dict[str, threading.Thread] = {}
+        self._probe_threads_lock = threading.Lock()
+        self.abandoned_probes = 0
         if auto_probe and transport_pool is not None:
             for provider in self.providers:
                 try:
@@ -325,28 +332,46 @@ class MultiLLMSwitchboard:
         """Call a probe with a hard wall-clock budget.
 
         Returns ``(response, elapsed_ms, error)``.  A probe still running after
-        the timeout is abandoned (daemon thread) and reported as an error, so a
-        stalled endpoint can never hold the lease refresh past the SLA.
+        the timeout is reported as an error and **left where it is**: the next
+        attempt refuses to start a second thread for the same provider until the
+        stalled one returns.  That bounds the switchboard at one probe thread
+        per provider no matter how long an endpoint stays wedged (V1.8).
         """
-        outcome: dict[str, Any] = {}
-
-        def _target() -> None:
-            try:
-                outcome["value"] = (
-                    provider.probe(context) if provider.probe is not None else None
+        with self._probe_threads_lock:
+            outstanding = self._probe_threads.get(provider.name)
+            if outstanding is not None and outstanding.is_alive():
+                self.abandoned_probes += 1
+                return (
+                    None,
+                    0.0,
+                    f"probe still outstanding from a previous attempt "
+                    f"(>{self.probe_timeout_ms:.0f}ms); not restarted",
                 )
-            except BaseException as exc:  # noqa: BLE001 - reported as failure
-                outcome["error"] = exc
 
-        started = time.perf_counter()
-        worker = threading.Thread(
-            target=_target, name=f"nios-s1-probe-{provider.name}", daemon=True
-        )
+            outcome: dict[str, Any] = {}
+
+            def _target() -> None:
+                try:
+                    outcome["value"] = (
+                        provider.probe(context) if provider.probe is not None else None
+                    )
+                except BaseException as exc:  # noqa: BLE001 - reported as failure
+                    outcome["error"] = exc
+
+            started = time.perf_counter()
+            worker = threading.Thread(
+                target=_target, name=f"nios-s1-probe-{provider.name}", daemon=True
+            )
+            self._probe_threads[provider.name] = worker
+
         worker.start()
         worker.join(self.probe_timeout_ms / 1e3)
         elapsed = (time.perf_counter() - started) * 1e3
         if worker.is_alive():
             return None, elapsed, f"timeout>{self.probe_timeout_ms:.0f}ms"
+        with self._probe_threads_lock:
+            if self._probe_threads.get(provider.name) is worker:
+                self._probe_threads.pop(provider.name, None)
         error = outcome.get("error")
         if error is not None:
             return None, elapsed, f"{type(error).__name__}: {error}"

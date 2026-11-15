@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -96,6 +97,19 @@ SECONDARY_VENUE = "okx"
 
 #: Conservative socket budget.  A blocked host fails in ~1.2 s, never hangs.
 FEED_TIMEOUT_S = 1.2
+
+#: V1.8 hang remediation: a *socket* timeout does not bound DNS resolution, so a
+#: host with no network can still block ``urlopen`` for many seconds per lookup.
+#: After this many consecutive transport failures the feed is treated as known
+#: absent and every further call fails fast for ``FEED_BREAKER_COOLDOWN_S``.
+#: A dead network therefore costs seconds once, not seconds per symbol.
+FEED_BREAKER_FAILURES = 2
+FEED_BREAKER_COOLDOWN_S = 60.0
+
+#: Hard wall-clock budget for one ``ingest_all`` pass.  Past it the connector
+#: stops touching the network and emits its labelled synthetic frames, so a
+#: pre-flight gate can never block a control-plane request for minutes.
+FEED_INGEST_BUDGET_S = 6.0
 
 #: Public, unauthenticated REST bases.  No key, no signature, no account scope.
 VENDOR_ENDPOINTS: dict[str, dict[str, str]] = {
@@ -434,34 +448,108 @@ class FeedFrame:
 # ---------------------------------------------------------------------------
 
 
+#: One process-wide transport (and therefore one circuit breaker) for the public
+#: feed venues.  Without this, a four-silo pass pays the resolver twice *per
+#: connector*; with it, an unreachable network costs at most
+#: ``FEED_BREAKER_FAILURES`` lookups until the cooldown expires.
+_SHARED_FEED_TRANSPORT: "HttpTransport | None" = None
+_SHARED_TRANSPORT_LOCK = threading.Lock()
+
+
+def default_feed_transport(timeout_s: float = FEED_TIMEOUT_S) -> "HttpTransport":
+    """The shared public-feed transport (one breaker for every silo)."""
+    global _SHARED_FEED_TRANSPORT
+    with _SHARED_TRANSPORT_LOCK:
+        if _SHARED_FEED_TRANSPORT is None:
+            _SHARED_FEED_TRANSPORT = HttpTransport(timeout_s=timeout_s)
+        return _SHARED_FEED_TRANSPORT
+
+
+def reset_feed_transport() -> None:
+    """Drop the shared transport (tests / a forced recovery)."""
+    global _SHARED_FEED_TRANSPORT
+    with _SHARED_TRANSPORT_LOCK:
+        _SHARED_FEED_TRANSPORT = None
+
+
 class HttpTransport:
     """Minimal JSON GET transport with a hard socket timeout.
 
     Swappable so tests can inject a mock transport and never touch the network.
+
+    V1.8: a socket timeout bounds ``connect``/``read`` but **not** DNS, so a
+    host with no network can still block a lookup for tens of seconds.  A
+    consecutive-failure circuit breaker makes the "feed absent" path a
+    first-class fast result: after ``breaker_failures`` misses every further
+    call raises :class:`FeedUnavailable` immediately for ``breaker_cooldown_s``,
+    instead of re-paying the resolver for every symbol and venue.
     """
 
-    def __init__(self, *, timeout_s: float = FEED_TIMEOUT_S, user_agent: str = "nios-feed/1.0"):
+    def __init__(
+        self,
+        *,
+        timeout_s: float = FEED_TIMEOUT_S,
+        user_agent: str = "nios-feed/1.0",
+        breaker_failures: int = FEED_BREAKER_FAILURES,
+        breaker_cooldown_s: float = FEED_BREAKER_COOLDOWN_S,
+    ):
         self.timeout_s = float(timeout_s)
         self.user_agent = user_agent
         self.calls = 0
         self.failures = 0
         self.last_error = ""
+        self.breaker_failures = max(1, int(breaker_failures))
+        self.breaker_cooldown_s = max(0.0, float(breaker_cooldown_s))
+        self._consecutive_failures = 0
+        self._breaker_open_until = 0.0
+        self._breaker_trips = 0
+
+    # -- circuit breaker ---------------------------------------------------
+    @property
+    def breaker_open(self) -> bool:
+        return (
+            self._breaker_open_until > 0.0
+            and time.monotonic() < self._breaker_open_until
+        )
+
+    def _guard_breaker(self) -> None:
+        if self.breaker_open:
+            self.failures += 1
+            self.last_error = "feed transport circuit open (network unreachable)"
+            raise FeedUnavailable(self.last_error)
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._breaker_open_until = 0.0
+
+    def _record_failure(self, detail: str) -> None:
+        self.failures += 1
+        self.last_error = detail
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.breaker_failures:
+            self._breaker_open_until = (
+                time.monotonic() + self.breaker_cooldown_s
+            )
+            self._breaker_trips += 1
 
     def get_json(self, url: str) -> Any:
+        self._guard_breaker()
         request = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         self.calls += 1
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
                 payload = response.read()
-            return json.loads(payload.decode("utf-8"))
+            value = json.loads(payload.decode("utf-8"))
         except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
-            self.failures += 1
-            self.last_error = f"{type(exc).__name__}: {exc}"
+            self._record_failure(f"{type(exc).__name__}: {exc}")
             raise FeedUnavailable(self.last_error) from exc
+        self._record_success()
+        return value
 
     def get_text(self, url: str) -> str:
         """Plain-text GET for CSV venues (Stooq).  Same hard socket budget."""
 
+        self._guard_breaker()
         request = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         self.calls += 1
         try:
@@ -469,13 +557,12 @@ class HttpTransport:
                 payload = response.read()
             text = payload.decode("utf-8", errors="replace").strip()
         except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
-            self.failures += 1
-            self.last_error = f"{type(exc).__name__}: {exc}"
+            self._record_failure(f"{type(exc).__name__}: {exc}")
             raise FeedUnavailable(self.last_error) from exc
         if not text:
-            self.failures += 1
-            self.last_error = "empty body"
+            self._record_failure("empty body")
             raise FeedUnavailable("empty body")
+        self._record_success()
         return text
 
     def status(self) -> dict[str, Any]:
@@ -484,6 +571,10 @@ class HttpTransport:
             "calls": self.calls,
             "failures": self.failures,
             "last_error": self.last_error,
+            "breaker_failures": self.breaker_failures,
+            "breaker_cooldown_s": self.breaker_cooldown_s,
+            "breaker_open": self.breaker_open,
+            "breaker_trips": self._breaker_trips,
         }
 
 
@@ -1146,7 +1237,15 @@ class LiveDualVendorFeedConnector:
         self.symbols = chosen
         self.primary = primary
         self.secondary = secondary
-        self.transport = transport if transport is not None else HttpTransport(timeout_s=timeout_s)
+        # One shared transport (and breaker) for the default budget, so an
+        # unreachable network costs two lookups for the whole four-silo pass.
+        # An explicit transport or a custom budget keeps its own instance.
+        if transport is not None:
+            self.transport = transport
+        elif float(timeout_s) == float(FEED_TIMEOUT_S):
+            self.transport = default_feed_transport(timeout_s)
+        else:
+            self.transport = HttpTransport(timeout_s=timeout_s)
         self.guard = guard
         self.multiplexer = multiplexer
         self.shadow_book = shadow_book
@@ -1173,6 +1272,10 @@ class LiveDualVendorFeedConnector:
         self.last_frame: FeedFrame | None = None
         self._mode = FEED_MODE_SYNTHETIC
         self._frames: list[FeedFrame] = []
+        #: Absolute ``time.monotonic()`` deadline for the current ingest pass.
+        #: Past it the connector stops touching the network entirely.
+        self._deadline_mono: float | None = None
+        self.budget_exhausted = 0
 
     # -- venue adapters -----------------------------------------------------
 
@@ -1331,7 +1434,17 @@ class LiveDualVendorFeedConnector:
 
         Stooq serves CSV; everything else serves JSON.  A transport without
         ``get_text`` (a minimal test double) is still supported for JSON venues.
+
+        V1.8: past the pass deadline the network is not touched again.  A host
+        with no route to a venue (every public endpoint, in an air-gapped
+        install) therefore degrades to the labelled synthetic frame in
+        milliseconds instead of paying DNS per symbol for minutes.
         """
+
+        deadline = self._deadline_mono
+        if deadline is not None and time.monotonic() >= deadline:
+            self.budget_exhausted += 1
+            raise FeedUnavailable("feed ingest budget exhausted (network degraded)")
 
         url = self._book_url(symbol, venue)
         fmt = str(VENDOR_ENDPOINTS[venue].get("format", "json"))
@@ -1607,11 +1720,24 @@ class LiveDualVendorFeedConnector:
         *,
         now_ns: int | None = None,
         round_index: int | None = None,
+        deadline_s: float | None = None,
     ) -> list[FeedFrame]:
-        return [
-            self.ingest(symbol, now_ns=now_ns, round_index=round_index)
-            for symbol in self.symbols
-        ]
+        """One poll of every symbol, with an optional hard wall-clock budget.
+
+        ``deadline_s`` bounds the *whole* pass.  Chronic long tail here is the
+        V1.8 wedge: an unreachable venue paid a DNS lookup per symbol per venue
+        while a ``/control/brokers`` request held the pre-flight gate open.
+        """
+        previous = self._deadline_mono
+        if deadline_s is not None:
+            self._deadline_mono = time.monotonic() + max(0.0, float(deadline_s))
+        try:
+            return [
+                self.ingest(symbol, now_ns=now_ns, round_index=round_index)
+                for symbol in self.symbols
+            ]
+        finally:
+            self._deadline_mono = previous
 
     def stream(
         self,
@@ -1801,17 +1927,33 @@ class MultiSiloFeedConnector:
         now_ns: int | None = None,
         round_index: int | None = None,
         silos: Sequence[str] | None = None,
+        deadline_s: float | None = None,
     ) -> list[FeedFrame]:
-        """One dual-vendor poll of every symbol in every selected silo."""
+        """One dual-vendor poll of every symbol in every selected silo.
+
+        ``deadline_s`` is a *total* budget shared by every silo, so a dead
+        network degrades to synthetic frames after that many seconds instead of
+        blocking the caller (the pre-flight gate runs inside a control request).
+        """
 
         targets = (
             tuple(str(item).strip().upper() for item in silos) if silos else self.silos
         )
+        deadline = (
+            None
+            if deadline_s is None
+            else time.monotonic() + max(0.0, float(deadline_s))
+        )
         frames: list[FeedFrame] = []
         for silo in targets:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
             frames.extend(
                 self.connector(silo).ingest_all(
-                    now_ns=now_ns, round_index=round_index
+                    now_ns=now_ns,
+                    round_index=round_index,
+                    deadline_s=remaining,
                 )
             )
         self.rounds += 1
