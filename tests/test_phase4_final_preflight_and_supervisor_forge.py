@@ -1558,9 +1558,12 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
         "net_expectancy_positive": False,
         "nursery_graduated": False,
     }
-    assert len(failure["rejection_reasons"]) == 2
+    # V1.8: three distinct reasons now - DSR, recorded fills and the
+    # net-of-cost expectancy gate are reported separately.
+    assert len(failure["rejection_reasons"]) == 3
     assert "1.1000" in failure["rejection_reasons"][0]
     assert "12" in failure["rejection_reasons"][1]
+    assert "expectancy" in failure["rejection_reasons"][2]
     assert failure["hold_reason"]
 
     # The gates are inclusive: exactly 1.50 and exactly 30 clears both.
