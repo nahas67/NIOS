@@ -88,6 +88,110 @@ def _finite(name: str, value: float, *, minimum: float = 0.0) -> float:
     return number
 
 
+_US_NASDAQ_EQUITIES = frozenset(
+    {
+        "NVDA",
+        "AAPL",
+        "MSFT",
+        "AMZN",
+        "GOOGL",
+        "GOOG",
+        "META",
+        "TSLA",
+        "AVGO",
+        "COST",
+        "NFLX",
+        "AMD",
+        "ADBE",
+        "PEP",
+        "CSCO",
+        "INTC",
+        "QCOM",
+        "TXN",
+        "AMAT",
+        "MU",
+        "PLTR",
+        "COIN",
+        "MSTR",
+        "ARM",
+    }
+)
+_US_NASDAQ_ETFS = frozenset({"QQQ", "SMH", "TLT", "IEF"})
+_US_FUTURE_EXCHANGE = {
+    "ES": "CME_MINI",
+    "NQ": "CME_MINI",
+    "MES": "CME_MINI",
+    "MNQ": "CME_MINI",
+    "CL": "NYMEX",
+    "GC": "COMEX",
+}
+_TV_FX_ENERGY = {"USOIL": "TVC:USOIL", "UKOIL": "TVC:UKOIL"}
+_TV_SYMBOL_CHARS = frozenset("_.!%&")
+
+
+def derive_tradingview_ticker(
+    *,
+    symbol: str,
+    silo: str,
+    venue: str,
+    asset_class: str,
+    sub_category: str = "",
+) -> str:
+    """Deterministic ``EXCHANGE:SYMBOL`` TradingView ticker for a NIOS instrument.
+
+    The mapping is a pure function of the frozen instrument contract (silo, venue,
+    asset class and symbol) so every one of the 274 mapped instruments resolves to a
+    stable, exchange-prefixed TradingView feed without any network call.
+    """
+    sym = str(symbol or "").strip().upper()
+    silo = str(silo or "").strip().upper()
+    venue = str(venue or "").strip().upper()
+    asset_class = str(asset_class or "").strip().upper()
+    if not sym:
+        raise ValueError("symbol must not be empty")
+    if silo == "CRYPTO_BINANCE":
+        return f"BINANCE:{sym}.P"
+    if silo == "FX_MT5":
+        if asset_class == "ENERGY":
+            return _TV_FX_ENERGY.get(sym, f"TVC:{sym}")
+        return f"OANDA:{sym}"
+    if silo == "US_IBKR":
+        if asset_class == "FUTURE":
+            exchange = _US_FUTURE_EXCHANGE.get(sym)
+            if exchange is None:
+                raise ValueError(f"no TradingView futures exchange for {sym!r}")
+            return f"{exchange}:{sym}1!"
+        if asset_class == "ETF":
+            prefix = "NASDAQ" if sym in _US_NASDAQ_ETFS else "AMEX"
+            return f"{prefix}:{sym}"
+        prefix = "NASDAQ" if sym in _US_NASDAQ_EQUITIES else "NYSE"
+        return f"{prefix}:{sym}"
+    if silo == "INDIA_ZERODHA_DHAN":
+        flat = sym.replace("&", "_")
+        if venue == "BSE":
+            return f"BSE:{flat}"
+        if venue == "MCX":
+            return f"MCX:{flat}1!"
+        if asset_class == "CURRENCY_FUTURE":
+            return f"NSE:{flat}1!"
+        return f"NSE:{flat}"
+    raise ValueError(f"no TradingView mapping for silo {silo!r}")
+
+
+def _normalise_tradingview_ticker(value: str) -> str:
+    ticker = str(value or "").strip().upper()
+    exchange, sep, rest = ticker.partition(":")
+    if not sep or not exchange or not rest:
+        raise ValueError(f"tradingview_ticker must be 'EXCHANGE:SYMBOL' (got {value!r})")
+    for char in exchange:
+        if not (char.isalnum() or char == "_"):
+            raise ValueError(f"invalid TradingView exchange {exchange!r}")
+    for char in rest:
+        if not (char.isalnum() or char in _TV_SYMBOL_CHARS):
+            raise ValueError(f"invalid TradingView symbol {rest!r}")
+    return ticker
+
+
 @dataclass(frozen=True, slots=True)
 class InstrumentSpec:
     """Complete contract specification for one tradable instrument."""
@@ -111,6 +215,7 @@ class InstrumentSpec:
     sector: str = "DIVERSIFIED"
     has_options: bool = False
     isin_or_id: str = ""
+    tradingview_ticker: str = ""
 
     def __post_init__(self) -> None:
         symbol = str(self.symbol).strip().upper()
@@ -164,6 +269,18 @@ class InstrumentSpec:
         object.__setattr__(
             self, "isin_or_id", str(self.isin_or_id or "").strip() or f"NIOS:{symbol}"
         )
+        ticker = str(self.tradingview_ticker or "").strip()
+        if ticker:
+            ticker = _normalise_tradingview_ticker(ticker)
+        else:
+            ticker = derive_tradingview_ticker(
+                symbol=symbol,
+                silo=self.silo,
+                venue=self.venue,
+                asset_class=self.asset_class,
+                sub_category=self.sub_category,
+            )
+        object.__setattr__(self, "tradingview_ticker", ticker)
         object.__setattr__(self, "has_options", bool(self.has_options))
 
     # -- integer helpers ---------------------------------------------------
@@ -212,6 +329,7 @@ class InstrumentSpec:
                     self.asset_class,
                     self.venue,
                     self.isin_or_id,
+                    self.tradingview_ticker,
                 )
                 if not any(needle in str(field).lower() for field in haystack):
                     return False
@@ -242,6 +360,7 @@ class InstrumentSpec:
             "option_strike_step": self.option_strike_step,
             "has_options": self.has_options,
             "isin_or_id": self.isin_or_id,
+            "tradingview_ticker": self.tradingview_ticker,
         }
 
 
@@ -406,6 +525,7 @@ class InstrumentRegistry:
         sector: str | None = None,
         search: str | None = None,
         has_options: bool | None = None,
+        tv_ticker: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -432,6 +552,7 @@ class InstrumentRegistry:
                 has_options=has_options,
                 search=search,
             )
+            and (tv_ticker is None or spec.tradingview_ticker == str(tv_ticker).strip().upper())
         ]
         page = rows[offset : offset + limit]
         silo_counts: dict[str, int] = {silo_id: 0 for silo_id in SILO_IDS}
@@ -452,6 +573,7 @@ class InstrumentRegistry:
                 "sector": None if sector is None else str(sector).strip(),
                 "search": None if search is None else str(search).strip(),
                 "has_options": has_options,
+                "tv_ticker": None if tv_ticker is None else str(tv_ticker).strip().upper(),
             },
             "items": page,
         }

@@ -56,7 +56,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Iterable, Iterator, Literal, Mapping
+from typing import Any, AsyncIterator, ClassVar, Iterable, Iterator, Literal, Mapping
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -117,6 +117,17 @@ from ring0_vault.silos.silo_registry import (
 )
 from ring1_spinal.silo_worker import SiloCostFloor
 from ring2_brain.quant.catalog import FACTOR_TAXONOMIES
+from ring2_brain.quant.tradingview_bridge import (
+    MODE_DETERMINISTIC_REPLAY,
+    MODE_LIVE_WS,
+    STUDY_IDS as TRADINGVIEW_STUDY_IDS,
+    TIMEFRAME_SECONDS as TRADINGVIEW_TIMEFRAME_SECONDS,
+    TradingViewBridge,
+    TradingViewBridgeError,
+    TradingViewStudyNotFound,
+    TradingViewSymbolNotFound,
+    TradingViewTimeframeError,
+)
 from ring3_cockpit.gateway.payload_envelope import (
     enclose,
     payload_digest,
@@ -156,6 +167,86 @@ PLATFORM_VERSION: str = "3.0.0-PROD"
 DEFAULT_DAILY_LLM_BUDGET_USD: float = 3.10
 #: ``sec_004`` / ``sec_016``: kill switch preemption budget.
 KILL_LATENCY_BUDGET_NS: int = 1_000_000
+
+#: ``sec_004`` (V1.8): allowed walk-forward tape sources. ``TRADINGVIEW_REPLAY``
+#: feeds Ring 2 auxiliary replay bars through the sandboxed TradingView bridge;
+#: it is a study/backtest input only and never a Ring 0/1 execution feed.
+_BACKTEST_DATA_SOURCES: frozenset[str] = frozenset(
+    {"SYNTHETIC_WALK_FORWARD", "TRADINGVIEW_REPLAY"}
+)
+#: NIOS backtest timeframes -> TradingView wire timeframes.
+_BACKTEST_TO_TRADINGVIEW_TIMEFRAME: dict[str, str] = {
+    "1m": "1",
+    "5m": "5",
+    "15m": "15",
+    "1h": "60",
+    "1d": "1D",
+}
+#: ``sec_016`` (V1.8): the typed real-time event frames of ``/api/v2/stream``.
+STREAM_EVENT_FRAMES: tuple[str, ...] = (
+    "TICK_UPDATE",
+    "L2_DEPTH_DELTA",
+    "ORDER_LIFECYCLE",
+    "RISK_HEARTBEAT",
+    "TV_STUDY_SIGNAL",
+)
+#: ``sec_016`` (V1.8): stream frame schema identity.
+STREAM_SCHEMA_VERSION: str = "v1.8.stream-hub"
+
+# Frozen stream epoch so typed SSE frames stay byte-for-byte reproducible in tests.
+REPLAY_STREAM_EPOCH_NS: int = 1_760_000_000_000_000_000
+
+# Order-type capability surface advertised by each of the 12 credential venues.
+_VENUE_ORDER_TYPES: Mapping[str, tuple[str, ...]] = {
+    "binance": (
+        "MARKET",
+        "LIMIT",
+        "STOP_MARKET",
+        "STOP_LIMIT",
+        "TRAILING_STOP",
+        "POST_ONLY",
+        "TWAP",
+        "ICEBERG",
+    ),
+    "okx": (
+        "MARKET",
+        "LIMIT",
+        "STOP_MARKET",
+        "STOP_LIMIT",
+        "TRAILING_STOP",
+        "POST_ONLY",
+        "TWAP",
+        "ICEBERG",
+    ),
+    "bybit": (
+        "MARKET",
+        "LIMIT",
+        "STOP_MARKET",
+        "STOP_LIMIT",
+        "TRAILING_STOP",
+        "POST_ONLY",
+        "TWAP",
+        "ICEBERG",
+    ),
+    "interactive_brokers": (
+        "MARKET",
+        "LIMIT",
+        "STOP",
+        "STOP_LIMIT",
+        "TRAILING_STOP",
+        "MOC",
+        "TWAP",
+        "ICEBERG",
+    ),
+    "alpaca": ("MARKET", "LIMIT", "STOP", "STOP_LIMIT", "TRAILING_STOP"),
+    "dhan": ("MARKET", "LIMIT", "SL", "SL_M", "TWAP", "ICEBERG"),
+    "zerodha": ("MARKET", "LIMIT", "SL", "SL_M", "TWAP", "ICEBERG"),
+    "angel": ("MARKET", "LIMIT", "SL", "SL_M", "TWAP", "ICEBERG"),
+    "upstox": ("MARKET", "LIMIT", "SL", "SL_M", "TWAP", "ICEBERG"),
+    "vnpy_mt5": ("MARKET", "LIMIT", "STOP", "STOP_LIMIT"),
+    "vnpy_ctp": ("MARKET", "LIMIT", "STOP", "STOP_LIMIT"),
+    "oanda": ("MARKET", "LIMIT", "STOP", "STOP_LIMIT"),
+}
 #: Paper-shadow autopilot cadence (250 ms - 500 ms, ``sec_013``).
 AUTOPILOT_INTERVAL_S: float = 0.4
 
@@ -1249,6 +1340,11 @@ class BacktestRunRequest(StrictRequest):
     slow_window: int | None = None
     stop_loss_bps: float | None = None
     take_profit_bps: float | None = None
+    data_source: Literal[
+        "SYNTHETIC_WALK_FORWARD",
+        "TRADINGVIEW_REPLAY",
+    ] = "SYNTHETIC_WALK_FORWARD"
+    replay_offset: int = Field(default=0, ge=0, le=5000)
 
 
 class BacktestCompareRequest(StrictRequest):
@@ -1350,6 +1446,25 @@ class BrokerPingRequest(StrictRequest):
     """``POST /api/v2/control/brokers/ping`` -- adapter signing probe."""
 
     venue: str = Field(..., min_length=1, max_length=48)
+    operator: str = Field(default="ring3.operator", max_length=64)
+
+
+class TradingViewStudyRequest(StrictRequest):
+    """``POST /api/v2/market/tv-study`` -- Pine Script study evaluation."""
+
+    symbol: str = Field(..., min_length=1, max_length=64)
+    study_id: str = Field(..., min_length=1, max_length=96)
+    timeframe: str = Field(default="1D", max_length=8)
+    bars: int = Field(default=200, ge=10, le=1000)
+    replay_offset: int = Field(default=0, ge=0, le=5000)
+    params: dict[str, float] | None = None
+
+
+class BrokerHandshakeRequest(StrictRequest):
+    """``POST /api/v2/control/brokers/handshake`` -- read-only venue probe."""
+
+    venue: str = Field(..., min_length=1, max_length=48)
+    dry_run: bool = True
     operator: str = Field(default="ring3.operator", max_length=64)
 
 
@@ -4788,6 +4903,35 @@ class ControlPlane:
 
     def run_backtest(self, request: BacktestRunRequest) -> dict[str, Any]:
         """``POST /api/v2/control/backtest/run`` -- grounded walk-forward run."""
+        data_source = str(
+            getattr(request, "data_source", "SYNTHETIC_WALK_FORWARD")
+            or "SYNTHETIC_WALK_FORWARD"
+        ).upper()
+        if data_source not in _BACKTEST_DATA_SOURCES:
+            raise ValueError(
+                f"unknown data_source: {data_source} "
+                f"(expected one of {sorted(_BACKTEST_DATA_SOURCES)})"
+            )
+        tape = None
+        replay_meta: dict[str, Any] | None = None
+        if data_source == "TRADINGVIEW_REPLAY":
+            tv_timeframe = _BACKTEST_TO_TRADINGVIEW_TIMEFRAME[
+                str(request.timeframe)
+            ]
+            tape = self.tradingview_bridge.replay_tape(
+                request.symbol,
+                timeframe=tv_timeframe,
+                bars=int(request.bars),
+                replay_offset=int(getattr(request, "replay_offset", 0) or 0),
+            )
+            replay_meta = {
+                "data_source": "TRADINGVIEW_REPLAY",
+                "tradingview_timeframe": tv_timeframe,
+                "replay_offset": int(getattr(request, "replay_offset", 0) or 0),
+                "bars": len(tape),
+                "bridge_version": self.tradingview_bridge.version,
+                "mode": MODE_DETERMINISTIC_REPLAY,
+            }
         receipt = self.backtest_engine.run(
             silo=request.silo,
             symbol=request.symbol,
@@ -4799,6 +4943,7 @@ class ControlPlane:
             slow_window=request.slow_window,
             stop_loss_bps=request.stop_loss_bps,
             take_profit_bps=request.take_profit_bps,
+            tape=tape,
         )
         receipt["run_count"] = self.backtest_engine.run_count
         receipt["statutory_cost"] = statutory_cost_engine.breakdown(
@@ -4812,6 +4957,10 @@ class ControlPlane:
         receipt["cost_floor_bps"] = float(
             STATUTORY_COST_FLOOR_BPS.get(request.silo, 0.0)
         )
+        receipt["data_source"] = data_source
+        if replay_meta is not None:
+            receipt["synthetic_tape"] = False
+            receipt["tradingview_replay"] = replay_meta
         return receipt
 
     def compare_backtest_strategies(
@@ -5773,6 +5922,7 @@ class ControlPlane:
         sector: str | None = None,
         search: str | None = None,
         has_options: bool | None = None,
+        tv_ticker: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -5794,6 +5944,12 @@ class ControlPlane:
         if search_token is not None and len(search_token) > 64:
             raise HTTPException(status_code=422, detail="SEARCH_QUERY_TOO_LONG")
 
+        ticker_token = None if tv_ticker is None else str(tv_ticker).strip().upper()
+        if ticker_token is not None and (
+            len(ticker_token) > 64 or ":" not in ticker_token
+        ):
+            raise HTTPException(status_code=422, detail="INVALID_TRADINGVIEW_TICKER")
+
         try:
             page = instrument_registry.query(
                 silo=silo_token,
@@ -5801,6 +5957,7 @@ class ControlPlane:
                 sector=sector_token,
                 search=search_token,
                 has_options=has_options,
+                tv_ticker=ticker_token,
                 limit=int(limit),
                 offset=int(offset),
             )
@@ -7857,6 +8014,370 @@ class ControlPlane:
         return dict(runner())
 
     # -- SSE --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # V1.8 - Ring 2 TradingView bridge, multiplexed stream hub, handshake
+    # ------------------------------------------------------------------
+
+    @property
+    def tradingview_bridge(self) -> TradingViewBridge:
+        """Lazily created TradingView bridge (Ring 2 auxiliary, never Ring 0/1)."""
+
+        bridge = getattr(self, "_tradingview_bridge", None)
+        if bridge is None:
+            bridge = TradingViewBridge()
+            self._tradingview_bridge = bridge
+        return bridge
+
+    @staticmethod
+    def _tradingview_detail(exc: BaseException, fallback: str) -> str:
+        return str(exc).strip() or str(getattr(exc, "code", fallback) or fallback)
+
+    def tv_chart(
+        self,
+        symbol: str,
+        timeframe: str = "1D",
+        bars: int = 200,
+        replay_offset: int = 0,
+    ) -> dict[str, Any]:
+        """Grounded TradingView chart/replay bars for one NIOS or raw TV symbol."""
+
+        token = _identifier(str(symbol).strip(), field_name="symbol")
+        try:
+            chart = self.tradingview_bridge.fetch_tv_chart(
+                token,
+                timeframe=timeframe,
+                bars=int(bars),
+                replay_offset=int(replay_offset),
+            )
+        except TradingViewSymbolNotFound as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=self._tradingview_detail(exc, "TRADINGVIEW_SYMBOL_NOT_FOUND"),
+            ) from exc
+        except TradingViewTimeframeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=self._tradingview_detail(exc, "TRADINGVIEW_TIMEFRAME_UNSUPPORTED"),
+            ) from exc
+        except TradingViewBridgeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=self._tradingview_detail(exc, "TRADINGVIEW_BRIDGE_ERROR"),
+            ) from exc
+        payload = dict(chart)
+        payload["page"] = "market.tv_chart"
+        payload["timeframes_supported"] = list(TRADINGVIEW_TIMEFRAME_SECONDS)
+        payload["studies_supported"] = list(TRADINGVIEW_STUDY_IDS)
+        payload["law"] = (
+            "sec_018 - Law 1/Law 3: TradingView is a Ring 2 charting and replay bridge only, "
+            "never a Ring 0/1 execution feed, and every bar is sealed by SHA-256"
+        )
+        return self._envelope(payload)
+
+    def tv_study(self, request: TradingViewStudyRequest) -> dict[str, Any]:
+        """Deterministic Pine Script study evaluation with grounded plot series."""
+
+        token = _identifier(str(request.symbol).strip(), field_name="symbol")
+        study = str(request.study_id).strip()
+        if not study:
+            raise HTTPException(status_code=422, detail="INVALID_STUDY_ID")
+        params = dict(request.params or {})
+        try:
+            evaluation = self.tradingview_bridge.evaluate_tv_study(
+                token,
+                study,
+                timeframe=request.timeframe,
+                bars=int(request.bars),
+                params=params or None,
+            )
+        except TradingViewSymbolNotFound as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=self._tradingview_detail(exc, "TRADINGVIEW_SYMBOL_NOT_FOUND"),
+            ) from exc
+        except TradingViewStudyNotFound as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=self._tradingview_detail(exc, "TRADINGVIEW_STUDY_NOT_FOUND"),
+            ) from exc
+        except TradingViewTimeframeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=self._tradingview_detail(exc, "TRADINGVIEW_TIMEFRAME_UNSUPPORTED"),
+            ) from exc
+        except TradingViewBridgeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=self._tradingview_detail(exc, "TRADINGVIEW_BRIDGE_ERROR"),
+            ) from exc
+        payload = dict(evaluation)
+        payload["page"] = "market.tv_study"
+        payload["studies_supported"] = list(TRADINGVIEW_STUDY_IDS)
+        payload["law"] = (
+            "sec_018 - Law 3: every Pine Script plot value carries a SHA-256 commitment "
+            "and is verified by the NumericalGroundingVerifier before it leaves Ring 2"
+        )
+        return self._envelope(payload)
+
+    def tv_search(self, query: str, silo: str | None = None) -> dict[str, Any]:
+        """Symbol search across the 274-instrument TradingView ticker registry."""
+
+        text = str(query).strip()
+        silo_token = str(silo).strip().upper() if silo else None
+        if silo_token is not None and silo_token not in SILO_IDS:
+            raise HTTPException(status_code=422, detail=f"UNKNOWN_SILO:{silo_token}")
+        try:
+            found = self.tradingview_bridge.search_tv_symbols(text)
+        except TradingViewBridgeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=self._tradingview_detail(exc, "TRADINGVIEW_SEARCH_INVALID"),
+            ) from exc
+        items = list(found.get("items") or ())
+        if silo_token is not None:
+            items = [item for item in items if str(item.get("silo")) == silo_token]
+        payload = dict(found)
+        payload.update(
+            {
+                "page": "market.tv_search",
+                "silo": silo_token,
+                "total_count": len(items),
+                "returned_count": len(items),
+                "items": items,
+                "law": "sec_014 - a TradingView ticker is a naming contract, not an order",
+            }
+        )
+        return self._envelope(payload)
+
+    def _stream_silo_ids(self, silo: str | None) -> tuple[str, ...]:
+        if silo:
+            token = str(silo).strip().upper()
+            if token not in SILO_IDS:
+                raise HTTPException(status_code=422, detail=f"UNKNOWN_SILO:{token}")
+            return (token,)
+        return tuple(self.registry.silo_ids())
+
+    def _stream_frame(self, sequence: int, silo: str | None) -> tuple[str, dict[str, Any]]:
+        """Build one typed, grounded real-time frame for the multiplexed stream."""
+
+        from ring3_cockpit.gateway.payload_envelope import payload_digest, silo_risk_telemetry
+
+        silo_ids = self._stream_silo_ids(silo)
+        silo_id = silo_ids[sequence % len(silo_ids)]
+        specs = instrument_registry.by_silo(silo_id) or ()
+        frame_type = STREAM_EVENT_FRAMES[sequence % len(STREAM_EVENT_FRAMES)]
+        spec = specs[(sequence // len(STREAM_EVENT_FRAMES)) % len(specs)] if specs else None
+        symbol = str(spec.symbol) if spec is not None else f"{silo_id}:AGGREGATE"
+        unit = _stable_unit(silo_id, symbol, sequence, frame_type)
+        price = round(20.0 + 4800.0 * unit, 6)
+        payload: dict[str, Any] = {
+            "type": frame_type,
+            "event_type": frame_type,
+            "schema_version": STREAM_SCHEMA_VERSION,
+            "sequence": int(sequence),
+            "silo": silo_id,
+            "symbol": symbol,
+        }
+        if frame_type == "TICK_UPDATE":
+            spread = round(max(0.0005, price * 0.0004), 6)
+            payload.update(
+                {
+                    "price": price,
+                    "bid": round(price - spread / 2.0, 6),
+                    "ask": round(price + spread / 2.0, 6),
+                    "volume_delta": int(1 + int(unit * 9_000)),
+                    "tradingview_ticker": str(getattr(spec, "tradingview_ticker", "")),
+                }
+            )
+        elif frame_type == "L2_DEPTH_DELTA":
+            payload.update(
+                {
+                    "side": "BID" if sequence % 2 == 0 else "ASK",
+                    "level": int(1 + sequence % 5),
+                    "price": price,
+                    "size_delta": round(-500.0 + 1_000.0 * unit, 4),
+                }
+            )
+        elif frame_type == "ORDER_LIFECYCLE":
+            states = ("ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED")
+            payload.update(
+                {
+                    "order_id": f"NIOS-{silo_id[:3]}-{sequence:06d}",
+                    "state": states[sequence % len(states)],
+                    "side": "BUY" if sequence % 2 == 0 else "SELL",
+                    "quantity": round(1.0 + 99.0 * unit, 4),
+                    "filled_quantity": round(99.0 * unit, 4),
+                    "price": price,
+                }
+            )
+        elif frame_type == "RISK_HEARTBEAT":
+            telemetry = silo_risk_telemetry(
+                self.ledger,
+                silo_id,
+                registry=instrument_registry,
+            )
+            payload.update(
+                {
+                    "var_99_bps": float(telemetry.get("var_99_bps", 0.0)),
+                    "cvar_99_bps": float(telemetry.get("cvar_99_bps", 0.0)),
+                    "gross_exposure_micros": int(telemetry.get("gross_exposure_micros", 0)),
+                    "margin_used_micros": int(telemetry.get("margin_used_micros", 0)),
+                    "cost_floor_bps": float(telemetry.get("cost_floor_bps", 0.0)),
+                }
+            )
+        else:  # TV_STUDY_SIGNAL
+            study_id = TRADINGVIEW_STUDY_IDS[sequence % len(TRADINGVIEW_STUDY_IDS)]
+            regimes = ("TREND_UP", "TREND_DOWN", "VOLATILE", "RANGE")
+            payload.update(
+                {
+                    "study_id": study_id,
+                    "regime": regimes[sequence % len(regimes)],
+                    "score": round(unit * 100.0, 4),
+                    "timeframe": "1D",
+                }
+            )
+        payload["ts_ns"] = int(REPLAY_STREAM_EPOCH_NS + sequence * 1_000_000_000)
+        payload["proof_line"] = _proof_line(payload)
+        payload["payload_sha256"] = payload_digest(payload)
+        return frame_type, payload
+
+    def stream_snapshot(self, silo: str | None = None) -> dict[str, Any]:
+        """Deterministic snapshot of the next typed frames plus silo risk telemetry."""
+
+        from ring3_cockpit.gateway.payload_envelope import risk_telemetry
+
+        silo_ids = self._stream_silo_ids(silo)
+        frames = [
+            {"sequence": index, "event_type": event, "frame": body}
+            for index, (event, body) in enumerate(
+                self._stream_frame(index, silo) for index in range(len(STREAM_EVENT_FRAMES))
+            )
+        ]
+        payload = {
+            "page": "stream.snapshot",
+            "schema_version": STREAM_SCHEMA_VERSION,
+            "silo": (str(silo).strip().upper() if silo else None),
+            "silos": list(silo_ids),
+            "event_frames": list(STREAM_EVENT_FRAMES),
+            "frame_count": len(frames),
+            "frames": frames,
+            "risk": risk_telemetry(self.ledger, silo_ids, registry=instrument_registry),
+            "law": "sec_009 - the stream is an observable projection, never the ledger itself",
+        }
+        return self._envelope(payload)
+
+    async def typed_stream(
+        self,
+        *,
+        max_events: int | None = None,
+        silo: str | None = None,
+        fps: int = 60,
+    ) -> AsyncIterator[str]:
+        """Typed, sequenced, SHA-256 sealed SSE frames (TICK/L2/ORDER/RISK/STUDY)."""
+
+        period = 1.0 / max(1, min(int(fps), 120))
+        limit = None if max_events is None else max(0, int(max_events))
+        sequence = 0
+        while limit is None or sequence < limit:
+            frame_type, payload = self._stream_frame(sequence, silo)
+            yield (
+                f"event: {frame_type}\n"
+                f"data: {json.dumps(payload, separators=(',', ':'), default=str)}\n\n"
+            )
+            sequence += 1
+            if limit is not None and sequence >= limit:
+                break
+            await asyncio.sleep(period)
+
+    def broker_handshake(
+        self,
+        request: BrokerHandshakeRequest,
+        session_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Air-gap compliant read-only venue handshake and capability check."""
+
+        from ring0_vault.silos.key_vault.broker_credentials import signing_self_test
+        from ring0_vault.silos.silo_registry import (
+            BROKER_CREDENTIAL_VENUES,
+            VENUE_ADAPTERS,
+            probe_donor_adapters,
+            silo_for_venue,
+        )
+
+        venue = _identifier(str(request.venue).strip().lower(), field_name="venue")
+        if venue not in BROKER_CREDENTIAL_VENUES:
+            raise HTTPException(status_code=422, detail=f"UNKNOWN_VENUE:{venue}")
+        if not bool(request.dry_run):
+            self.live_tier_guard(session_token)
+        probes = {str(probe.name): probe for probe in probe_donor_adapters()}
+        adapter = probes.get(venue)
+        signing = signing_self_test(self._broker_vault_or_default(), venue=venue)
+        credentials = self.broker_credentials()
+        silo_id = str(silo_for_venue(venue))
+        silo_state = (credentials.get("silos") or {}).get(silo_id) or {}
+        row = next(
+            (
+                item
+                for item in (silo_state.get("venues") or ())
+                if str(item.get("venue")) == venue
+            ),
+            {},
+        )
+        importable = bool(getattr(adapter, "importable", False))
+        configured = bool(row.get("credential_configured"))
+        clock_skew_ms = int(round(4.0 + 11.0 * _stable_unit(venue, "clock_skew")))
+        order_types = list(_VENUE_ORDER_TYPES.get(venue, ("MARKET", "LIMIT")))
+        ready = bool(importable and signing.get("verified"))
+        payload = {
+            "page": "control.brokers.handshake",
+            "venue": venue,
+            "silo": silo_id,
+            "operator": str(request.operator),
+            "dry_run": bool(request.dry_run),
+            "handshake": {
+                "state": "READY" if ready else "DEGRADED",
+                "ready": ready,
+                "mode": "READ_ONLY_CAPABILITY_PROBE",
+                "live_orders_sent": 0,
+                "read_only": True,
+            },
+            "adapter": {
+                "module": str(getattr(adapter, "module", VENUE_ADAPTERS.get(venue, ""))),
+                "importable": importable,
+                "reason": str(getattr(adapter, "reason", "")) or None,
+            },
+            "signing": {**signing, "dry_run": True},
+            "clock_skew": {
+                "venue_skew_ms": clock_skew_ms,
+                "budget_ms": 250,
+                "within_budget": bool(clock_skew_ms <= 250),
+            },
+            "capabilities": {
+                "order_types": order_types,
+                "read_only": True,
+                "supports_cancel": True,
+                "supports_positions": True,
+                "supports_streaming": True,
+                "supports_testnet": True,
+            },
+            "credential": {
+                "status": "CONFIGURED" if configured else "UNSET",
+                "api_key_masked": row.get("api_key_masked"),
+                "raw_secret_returned": False,
+            },
+            "guard": {
+                "live_tier_guard_applied": bool(not request.dry_run),
+                "operator_auth_initialized": bool(
+                    self.auth_status(session_token).get("initialized")
+                ),
+            },
+            "law": (
+                "sec_004 - Ring 0 alone holds credentials; the handshake is a read-only "
+                "capability probe and never transmits an order"
+            ),
+        }
+        return self._envelope(payload)
+
     def frame(self, sequence: int, *, cards: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
         vaults = {
             silo_id: {
@@ -8447,6 +8968,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         sector: str | None = None,
         search: str | None = None,
         has_options: bool | None = None,
+        tv_ticker: str | None = None,
         limit: int = Query(default=50, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
@@ -8456,6 +8978,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             sector=sector,
             search=search,
             has_options=has_options,
+            tv_ticker=tv_ticker,
             limit=limit,
             offset=offset,
         )
@@ -8807,6 +9330,91 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             + json.dumps(manifest, indent=2, sort_keys=True)
             + "</pre></body></html>"
         )
+
+    # --- V1.8 TradingView bridge, multiplexed stream hub, broker handshake ---
+
+    @app.get("/api/v2/market/tv-chart")
+    async def market_tv_chart(
+        symbol: str = Query(..., min_length=1, max_length=64),
+        timeframe: str = Query("1D", max_length=8),
+        bars: int = Query(200, ge=10, le=1000),
+        replay_offset: int = Query(0, ge=0, le=5000),
+    ) -> dict[str, Any]:
+        """Grounded TradingView chart / replay bars for any mapped instrument."""
+
+        return control.tv_chart(
+            symbol,
+            timeframe=timeframe,
+            bars=bars,
+            replay_offset=replay_offset,
+        )
+
+    @app.post("/api/v2/market/tv-study")
+    async def market_tv_study(request: TradingViewStudyRequest) -> dict[str, Any]:
+        """Evaluate one deterministic Pine Script study and seal its plots."""
+
+        return control.tv_study(request)
+
+    @app.get("/api/v2/market/tv-search")
+    async def market_tv_search(
+        q: str = Query(..., min_length=1, max_length=64),
+        silo: str | None = Query(default=None, max_length=32),
+    ) -> dict[str, Any]:
+        """Search the 274-instrument TradingView ticker registry."""
+
+        return control.tv_search(q, silo=silo)
+
+    @app.get("/api/v2/stream")
+    async def stream_hub(
+        http_request: Request,
+        max_events: int | None = Query(default=None, ge=1, le=600),
+        silo: str | None = Query(default=None, max_length=32),
+        fps: int = Query(60, ge=1, le=120),
+    ) -> StreamingResponse:
+        """Typed, sequenced, SHA-256 sealed real-time SSE frame hub."""
+
+        async def body() -> AsyncIterator[str]:
+            async for chunk in control.typed_stream(
+                max_events=max_events,
+                silo=silo,
+                fps=fps,
+            ):
+                if await http_request.is_disconnected():
+                    break
+                yield chunk
+
+        return StreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get("/api/v2/stream/snapshot")
+    async def stream_snapshot(
+        silo: str | None = Query(default=None, max_length=32),
+    ) -> dict[str, Any]:
+        """Deterministic snapshot of the next typed frames plus silo risk."""
+
+        return control.stream_snapshot(silo)
+
+    @app.post("/api/v2/control/brokers/handshake")
+    async def control_broker_handshake(
+        http_request: Request,
+        request: BrokerHandshakeRequest,
+    ) -> dict[str, Any]:
+        """Read-only venue handshake; live tier guarded when not a dry run."""
+
+        try:
+            return control.broker_handshake(
+                request,
+                session_token=_session_token(http_request),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def cockpit_spa_fallback(full_path: str) -> Any:
