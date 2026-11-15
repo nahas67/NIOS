@@ -9,6 +9,10 @@ segments, and whichever process created one second would race the other into a
 ``FileExistsError`` (or reset a live lease table).  A process-unique
 ``NIOS_SHM_PREFIX`` gives every test process its own namespace, so the two can
 never collide.  An explicitly supplied prefix (CI shard, xdist worker) wins.
+
+The same reasoning applies to the on-disk state journal: ``NIOS_DATA_DIR`` and
+``NIOS_JOURNAL_PATH`` point into a process-unique scratch directory, so a test
+can never write ``<repo>/data/``.
 """
 
 from __future__ import annotations
@@ -30,6 +34,23 @@ os.environ.setdefault("NIOS_SHM_PREFIX", f"nios-test-{os.getpid()}")
 os.environ.setdefault(
     "NIOS_OPERATOR_AUTH_DIR",
     str(Path(tempfile.gettempdir()) / f"nios-operator-test-{os.getpid()}"),
+)
+
+# Active release: the workstation persists its logbook, backtests and agent
+# tasks in a crash-safe journal (``ring0_vault.ibor.state_journal``), which
+# resolves ``NIOS_DATA_DIR`` before the checked-out ``<repo>/data`` directory.
+# A suite that exercised a writer would otherwise drop
+# ``nios_workstation_journal.json`` into the developer's real ``data/`` folder
+# and pollute the next manual burn-in. A process-unique scratch directory keeps
+# every write inside the temp tree. An explicitly supplied location still wins.
+os.environ.setdefault(
+    "NIOS_DATA_DIR",
+    str(Path(tempfile.gettempdir()) / f"nios-data-test-{os.getpid()}"),
+)
+Path(os.environ["NIOS_DATA_DIR"]).mkdir(parents=True, exist_ok=True)
+os.environ.setdefault(
+    "NIOS_JOURNAL_PATH",
+    str(Path(os.environ["NIOS_DATA_DIR"]) / "nios_workstation_journal.json"),
 )
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -2,7 +2,7 @@
 
 **Document ID:** NIOS-OPS-2026-V3
 **Release tag:** `v3.9.0-V1.8` (supersedes `v3.8.0-V1.7`, `v3.7.0-V1.6`, `v3.6.0-V1.5`, `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
-**Branch:** `V1.7`
+**Branch:** `V1.8`
 **Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
 **Operating constitution:** `AGENTS.md`
@@ -497,16 +497,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 26 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 27 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
 ```
 
-Release seal for `v3.9.0-V1.8`: `pytest tests -q` must report **557 passed, 0 failed, 0 warnings**
+Release seal for `v3.9.0-V1.8`: `pytest tests -q` must report **602 passed, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 26-suite inventory
+### 3.2a The 27-suite inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -536,6 +536,7 @@ prerequisites for re-tagging; neither may be waived.
 | 24 | `tests/test_v1_6_backend_bug_hunt_security_and_data_completeness.py` | **V1.6** master instrument registry + lot/tick/freeze enforcement, itemized statutory cost engine, adversarial numerical/boundary fuzzing, 32-thread idempotency + double-entry conservation, auth brute-force lockout + secret non-leakage |
 | 25 | `tests/test_v1_7_deep_market_universe_and_feature_audit.py` | **V1.7** 274-instrument universe completeness, deep asset-class feature store + options surface with SHA-256 grounding, instrument search/filter/pagination, macro calendar + four cross-asset heatmaps, SmartOMS + walk-forward lot/tick/statutory-floor enforcement |
 | 26 | `tests/test_v1_8_tradingview_bridge_streaming_and_handshake.py` | **V1.8** `Mathieu2301/TradingView-API` harvest into Ring 2, 274 canonical `EXCHANGE:SYMBOL` tickers, deterministic replay chart + eight Pine Script study evaluators under SHA-256 grounding, `TRADINGVIEW_REPLAY` backtests on statutory floors, multiplexed typed SSE stream hub, 12-venue broker handshake |
+| 27 | `tests/test_v1_8_deep_gap_closure_and_cross_engine_audit.py` | **V1.8** universal options chain + terminal quote across all 274 registry instruments (registry `option_strike_step`, `OptionsSurfaceProfile` GEX/`iv_rank`/max-pain, tick-snapped L2), `INSTRUMENT_NOT_OPTIONABLE` on spot FX, segment- and side-aware Finance Act 2026 statutory tax, circuit-band / margin / drawdown-breaker enforcement, crash-safe atomic state journal with Clean-Slate reset, SSE disconnect + `1..500` bound fuzzing + 16-reader concurrency |
 
 ### 3.3 Chaos / crash injection
 

@@ -36,7 +36,7 @@ import gc
 import functools
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from core.instrument_registry import (
     InstrumentCheck,
@@ -90,6 +90,7 @@ __all__ = [
     "MakerPegChaser",
     "IcebergPlan",
     "TwapIcebergSlicer",
+    "DrawdownCircuitBreaker",
     "SmartOMS",
 ]
 
@@ -1187,6 +1188,215 @@ class TwapIcebergSlicer:
         )
 
 
+def _silo_key(silo: str) -> str:
+    """Normalise a silo identifier for the drawdown watermark maps."""
+    key = str(silo or "").strip().upper()
+    if not key:
+        raise ValueError("INVALID_SILO")
+    return key
+
+
+class DrawdownCircuitBreaker:
+    """Per-silo and global equity drawdown trip for the Ring 0 gate.
+
+    ``sec_010`` / ``sec_004``: a realised equity drawdown is a *hard* risk
+    input, not a hint.  Once a silo (or the aggregate book) has given back
+    ``max_drawdown_bps`` of its own peak equity -- ``500 bps`` by default --
+    the breaker trips and :meth:`SmartOMS.validate_proposal` refuses every new
+    order for that silo with ``DRAWDOWN_CIRCUIT_BREAKER_TRIPPED``.  This is the
+    `sec_018` Law 4 abstention default applied to a losing book: the answer
+    stays "no trade" until an operator resets it with a recorded reason.
+
+    Peaks are per-silo watermarks in micro-units of equity.  ``drawdown_bps``
+    is measured from that watermark, so a silo that recovers to a new high
+    carries zero drawdown again.  A global trip covers the cross-silo case
+    where no single silo has breached but the book as a whole has.
+
+    ``reset`` re-bases every peak onto the current equity, so a reset can never
+    re-trip on the same observation.  All mutation happens under one
+    :class:`threading.RLock`; every public read is written by the same lock.
+    """
+
+    DEFAULT_MAX_DRAWDOWN_BPS: float = 500.0
+
+    TRIP_REASON: str = "MAX_DRAWDOWN_BREACHED"
+
+    __slots__ = (
+        "_max_drawdown_bps",
+        "_lock",
+        "_peak",
+        "_last",
+        "_tripped_silos",
+        "_tripped_at_ns",
+        "_global_tripped",
+        "_global_tripped_at_ns",
+        "_reset_count",
+    )
+
+    def __init__(self, *, max_drawdown_bps: float = DEFAULT_MAX_DRAWDOWN_BPS) -> None:
+        value = float(max_drawdown_bps)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("max_drawdown_bps must be a finite positive number")
+        self._max_drawdown_bps = value
+        self._lock = threading.RLock()
+        self._peak: dict[str, int] = {}
+        self._last: dict[str, int] = {}
+        self._tripped_silos: set[str] = set()
+        self._tripped_at_ns: dict[str, int] = {}
+        self._global_tripped = False
+        self._global_tripped_at_ns = 0
+        self._reset_count = 0
+
+    # -- reads ------------------------------------------------------------
+    @property
+    def max_drawdown_bps(self) -> float:
+        return self._max_drawdown_bps
+
+    def drawdown_bps(self, silo: str) -> float:
+        """Current drawdown of ``silo`` from its own peak equity watermark."""
+        key = _silo_key(silo)
+        with self._lock:
+            return self._drawdown_locked(key)
+
+    def global_drawdown_bps(self) -> float:
+        """Drawdown of the summed peak equity versus the summed last equity."""
+        with self._lock:
+            return self._global_drawdown_locked()
+
+    def tripped(self, silo: str | None = None) -> bool:
+        """``True`` when ``silo`` -- or ``None``: any silo / the book -- is tripped.
+
+        A global trip blocks every silo: a book-level breach must not be
+        escapable by routing the next order through a silo whose own
+        watermark is still intact.
+        """
+        key = None if silo is None else _silo_key(silo)
+        with self._lock:
+            return self._tripped_locked(key)
+
+    def trip_reason(self, silo: str | None = None) -> str | None:
+        """``MAX_DRAWDOWN_BREACHED`` while tripped, else ``None``."""
+        key = None if silo is None else _silo_key(silo)
+        with self._lock:
+            return self.TRIP_REASON if self._tripped_locked(key) else None
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._snapshot_locked()
+
+    # -- mutation ----------------------------------------------------------
+    def record_equity(self, silo: str, equity_micros: int) -> dict[str, Any]:
+        """Record one equity observation and evaluate the trip condition.
+
+        ``equity_micros`` is an integer amount in micro-units.  Bools are
+        rejected (``bool`` is an ``int`` subclass but never a valid balance),
+        non-integers raise :class:`TypeError` and a negative balance raises
+        :class:`ValueError` -- all with ``INVALID_EQUITY``.
+        """
+        key = _silo_key(silo)
+        if isinstance(equity_micros, bool) or not isinstance(equity_micros, int):
+            raise TypeError("INVALID_EQUITY")
+        value = int(equity_micros)
+        if value < 0:
+            raise ValueError("INVALID_EQUITY")
+        with self._lock:
+            peak = self._peak.get(key, value)
+            if value > peak:
+                peak = value
+            self._peak[key] = peak
+            self._last[key] = value
+            drawdown = self._drawdown_locked(key)
+            if drawdown >= self._max_drawdown_bps:
+                if key not in self._tripped_silos:
+                    self._tripped_at_ns[key] = time.time_ns()
+                self._tripped_silos.add(key)
+            aggregate = self._global_drawdown_locked()
+            if aggregate >= self._max_drawdown_bps:
+                if not self._global_tripped:
+                    self._global_tripped_at_ns = time.time_ns()
+                self._global_tripped = True
+            tripped = self._tripped_locked(key)
+            return {
+                "silo": key,
+                "equity_micros": value,
+                "peak_equity_micros": peak,
+                "drawdown_bps": drawdown,
+                "global_drawdown_bps": aggregate,
+                "max_drawdown_bps": self._max_drawdown_bps,
+                "tripped": tripped,
+                "trip_reason": self.TRIP_REASON if tripped else None,
+            }
+
+    def reset(self, *, operator: str = "operator", reason: str = "") -> dict[str, Any]:
+        """Clear every trip and re-base each peak onto the current equity."""
+        label = str(operator or "").strip() or "operator"
+        note = str(reason or "").strip()
+        with self._lock:
+            self._tripped_silos.clear()
+            self._tripped_at_ns.clear()
+            self._global_tripped = False
+            self._global_tripped_at_ns = 0
+            for key, last in self._last.items():
+                self._peak[key] = last
+            self._reset_count += 1
+            return {
+                "reset": True,
+                "operator": label,
+                "reason": note,
+                "tripped_silos": [],
+                "max_drawdown_bps": self._max_drawdown_bps,
+                "snapshot": self._snapshot_locked(),
+            }
+
+    # -- internals (caller must hold the lock) -----------------------------
+    def _drawdown_locked(self, key: str) -> float:
+        peak = self._peak.get(key, 0)
+        if peak <= 0:
+            return 0.0
+        last = self._last.get(key, peak)
+        return max(0.0, round((peak - last) * 10_000 / peak, 6))
+
+    def _global_drawdown_locked(self) -> float:
+        peak = sum(self._peak.values())
+        if peak <= 0:
+            return 0.0
+        last = sum(self._last.values())
+        return max(0.0, round((peak - last) * 10_000 / peak, 6))
+
+    def _tripped_locked(self, key: str | None) -> bool:
+        if key is None:
+            return bool(self._global_tripped or self._tripped_silos)
+        return bool(self._global_tripped or key in self._tripped_silos)
+
+    def _snapshot_locked(self) -> dict[str, Any]:
+        silos: dict[str, dict[str, Any]] = {}
+        for key in sorted(set(self._peak) | set(self._last)):
+            silos[key] = {
+                "peak_equity_micros": int(self._peak.get(key, 0)),
+                "last_equity_micros": int(self._last.get(key, 0)),
+                "drawdown_bps": self._drawdown_locked(key),
+                "tripped": self._tripped_locked(key),
+            }
+        tripped = self._tripped_locked(None)
+        return {
+            "max_drawdown_bps": self._max_drawdown_bps,
+            "global_drawdown_bps": self._global_drawdown_locked(),
+            "tripped": tripped,
+            "tripped_silos": sorted(self._tripped_silos),
+            "trip_reason": self.TRIP_REASON if tripped else None,
+            "reset_count": int(self._reset_count),
+            "silos": silos,
+        }
+
+
+def _silo_key(silo: str) -> str:
+    """Normalise a silo identifier for the drawdown watermark maps."""
+    key = str(silo or "").strip().upper()
+    if not key:
+        raise ValueError("INVALID_SILO")
+    return key
+
+
 class SmartOMS:
     """Maker-peg + TWAP/Iceberg execution with outbox-backed cancellation.
 
@@ -1197,6 +1407,10 @@ class SmartOMS:
 
     Because cancellation is the *only* way an order leaves the working set
     without a fill, ``NoOrphanedOrders`` holds by construction (``sec_012``).
+
+    :meth:`validate_proposal` is the single pre-trade gate: instrument
+    contract, exchange circuit band, initial-margin sufficiency and the
+    per-silo/global :class:`DrawdownCircuitBreaker`.
     """
 
     def __init__(
@@ -1210,6 +1424,8 @@ class SmartOMS:
         slicer: TwapIcebergSlicer | None = None,
         instruments: InstrumentRegistry | None = None,
         strict_instruments: bool = False,
+        drawdown: DrawdownCircuitBreaker | None = None,
+        margin_provider: Callable[[str], int | None] | None = None,
     ) -> None:
         self.outbox = outbox
         self.bus = bus
@@ -1221,6 +1437,10 @@ class SmartOMS:
             instruments if instruments is not None else default_instrument_registry
         )
         self.strict_instruments = bool(strict_instruments)
+        if margin_provider is not None and not callable(margin_provider):
+            raise TypeError("margin_provider must be callable")
+        self.drawdown = drawdown if drawdown is not None else DrawdownCircuitBreaker()
+        self.margin_provider = margin_provider
         self._lock = threading.RLock()
         self._chasers: dict[str, MakerPegChaser] = {}
         self._events: list[ExecutionEvent] = []
@@ -1228,15 +1448,38 @@ class SmartOMS:
 
     # -- contract enforcement ---------------------------------------------
     def validate_proposal(self, proposal: Any) -> InstrumentCheck:
-        """Enforce lot size, tick grid and exchange freeze quantity.
+        """Enforce the Ring 0 pre-trade contract, band, margin and drawdown.
 
-        A known instrument is validated strictly: an off-lot quantity, a
-        quantity above the freeze limit or (with ``strict_instruments``) an
-        off-tick price raises :class:`ValueError`, which the gateway maps to
-        ``422``.  An instrument outside the canonical registry is reported as
-        ``SPEC_MISSING`` and, unless ``strict_instruments`` is set, allowed
-        through so the paper tape can still exercise the ratchet sweep assets
-        (``VOO``, ``RELIANCE.NS``) that are not order-entry instruments.
+        The original lot size / tick grid / exchange freeze quantity contract
+        is unchanged: a known instrument is validated strictly, an off-lot
+        quantity, a quantity above the freeze limit or (with
+        ``strict_instruments``) an off-tick price raises :class:`ValueError`,
+        which the gateway maps to ``422``.  An instrument outside the
+        canonical registry is reported as ``SPEC_MISSING`` and, unless
+        ``strict_instruments`` is set, allowed through so the paper tape can
+        still exercise the ratchet sweep assets (``VOO``, ``RELIANCE.NS``)
+        that are not order-entry instruments.
+
+        After that contract resolves, three risk gates run in this order and
+        each raises ``ValueError("<CODE>")`` so the gateway can render the
+        exact code:
+
+        1. ``CIRCUIT_LIMIT_BREACHED`` -- the limit price sits outside the
+           exchange circuit band ``reference_price(spec) +/-
+           circuit_limit_pct%``.  Skipped when the venue publishes no band
+           (``circuit_limit_pct == 0``, i.e. perpetuals / FX).  A price
+           exactly *on* the band is accepted.
+        2. ``INSUFFICIENT_MARGIN`` -- the initial margin implied by the
+           validated notional exceeds the margin the silo reports as free.
+           Skipped when no ``margin_provider`` was supplied or it answers
+           ``None`` (unknown, not zero).
+        3. ``DRAWDOWN_CIRCUIT_BREAKER_TRIPPED`` -- the silo, or the book as a
+           whole, has breached its peak-equity drawdown limit.
+
+        The circuit band and the margin gate need a resolved contract spec;
+        the drawdown breaker does not, so it is also enforced on the
+        ``SPEC_MISSING`` pass-through path -- an unlisted symbol must not be a
+        way around a tripped breaker.
         """
         try:
             spec = self.instruments.get(str(proposal.silo), str(proposal.symbol))
@@ -1245,6 +1488,7 @@ class SmartOMS:
                 raise ValueError(
                     f"unknown instrument {proposal.silo}/{proposal.symbol}"
                 ) from None
+            self._enforce_drawdown(proposal)
             return InstrumentCheck(
                 ok=True,
                 reason="SPEC_MISSING",
@@ -1267,9 +1511,58 @@ class SmartOMS:
         )
         if not check.ok:
             raise ValueError(check.reason)
+        effective_price = (
+            float(check.adjusted_price)
+            if check.price_changed
+            else float(proposal.limit_price)
+        )
+        self._enforce_circuit_band(spec, effective_price)
+        self._enforce_margin(proposal, spec, check)
+        self._enforce_drawdown(proposal)
         if check.price_changed:
             object.__setattr__(proposal, "limit_price", float(check.adjusted_price))
         return check
+
+    def _enforce_circuit_band(self, spec: Any, price: float) -> None:
+        """Reject a limit price outside the exchange circuit band."""
+        band_pct = float(getattr(spec, "circuit_limit_pct", 0.0) or 0.0)
+        if band_pct <= 0.0:
+            return
+        # Lazy import: ``core.market_features_store`` imports the registry and
+        # must not be pulled in at module import time (cycle + cold-start cost).
+        from core.market_features_store import reference_price
+
+        spot = float(reference_price(spec))
+        if not math.isfinite(spot) or spot <= 0.0:
+            return
+        if not math.isfinite(price):
+            raise ValueError("CIRCUIT_LIMIT_BREACHED")
+        band = spot * band_pct / 100.0
+        tolerance = max(abs(spot), 1.0) * 1e-12
+        if price > spot + band + tolerance or price < spot - band - tolerance:
+            raise ValueError("CIRCUIT_LIMIT_BREACHED")
+
+    def _enforce_margin(
+        self, proposal: Any, spec: Any, check: InstrumentCheck
+    ) -> None:
+        """Reject an order whose initial margin exceeds the free margin."""
+        provider = self.margin_provider
+        if provider is None:
+            return
+        free = provider(str(proposal.silo))
+        if free is None:
+            return
+        required_micros = (
+            int(check.notional_micros)
+            * int(round(float(spec.margin_initial_pct) * 100))
+        ) // 10_000
+        if required_micros > int(free):
+            raise ValueError("INSUFFICIENT_MARGIN")
+
+    def _enforce_drawdown(self, proposal: Any) -> None:
+        """Reject every order for a tripped silo (or tripped book)."""
+        if self.drawdown.tripped(str(proposal.silo)):
+            raise ValueError("DRAWDOWN_CIRCUIT_BREAKER_TRIPPED")
 
     # -- submission -------------------------------------------------------
     def submit_maker_peg(
@@ -1582,12 +1875,17 @@ class SmartOMS:
     def cards(self) -> tuple[PlainEnglishCockpitCard, ...]:
         return tuple(self._cards)
 
+    def drawdown_snapshot(self) -> dict[str, Any]:
+        """Read-only drawdown / circuit-breaker state for the cockpit."""
+        return self.drawdown.snapshot()
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "orders": len(self._chasers),
             "working": len(self.open_orders()),
             "events": len(self._events),
             "cards": len(self._cards),
+            "drawdown": self.drawdown.snapshot(),
             "repegs": {
                 order_id: chaser.repegs
                 for order_id, chaser in self._chasers.items()
@@ -1596,10 +1894,18 @@ class SmartOMS:
         }
 
     def reset_to_clean_slate(self) -> dict[str, Any]:
-        """Cancel every working peg and forget all order history (V1.1)."""
+        """Cancel every working peg, forget all order history (V1.1) and re-arm
+        the drawdown breaker so a factory reset cannot re-trip immediately."""
         cleared = len(self._chasers)
         events = len(self._events)
         self._chasers.clear()
         self._events.clear()
         self._cards.clear()
-        return {"orders_cleared": cleared, "events_cleared": events}
+        drawdown = self.drawdown.reset(
+            operator="reset_to_clean_slate", reason="workspace factory reset"
+        )
+        return {
+            "orders_cleared": cleared,
+            "events_cleared": events,
+            "drawdown": drawdown,
+        }

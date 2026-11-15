@@ -4,7 +4,7 @@ Six specialist Ring 2 agents are dispatchable from the Glass Cockpit.  Every
 agent is air-gapped by construction (Law 2): an agent may emit grounded research
 reports, strategy scores or nursery proposals, and it can never sign an order,
 read a Ring 0 broker key, or write the IBOR.  The dispatcher holds no credential
-and imports nothing from ``ring0_vault``.
+and imports nothing from the Ring 0 vault.
 
 Every report is sealed into a :class:`core.schemas.GroundedFactPacket` and
 verified by :class:`ring2_brain.truth.grounding_gate.NumericalGroundingVerifier`
@@ -13,17 +13,45 @@ verified by :class:`ring2_brain.truth.grounding_gate.NumericalGroundingVerifier`
 
 Clean-slate boot starts with zero tasks; :meth:`AgentTaskDispatcher.reset_to_clean_slate`
 returns the queue to zero.
+
+Institutional reasoning surfaces
+--------------------------------
+A decision or technical report does not stop at the donor dashboard.  Three real
+surfaces are folded into every dispatch and every number they return is sealed
+into the same :class:`~core.schemas.GroundedFactPacket` the verifier re-derives:
+
+* :func:`core.market_features_store.get_feature_profile` -- valuation, funding /
+  basis, carry and COT positioning plus the options surface (IV rank, dealer
+  gamma, put/call ratio, max pain).
+* :class:`ring2_brain.quant.tradingview_bridge.TradingViewBridge` -- the three
+  canonical Pine studies (RSI, MACD, Supertrend) evaluated on the daily
+  timeframe and reduced to a majority verdict.
+* :func:`ring2_brain.quant.macro_and_catalysts.get_macro_calendar` -- scheduled
+  releases for the symbol's region inside the next seventy-two hours.
+
+Each provider is optional at import time: a missing module degrades the block to
+an empty mapping, so a task always completes.
+
+Durable task journal
+--------------------
+Completed and failed tasks are appended to the ``agent_tasks`` section of
+:class:`AtomicStateJournal` injected by the Ring 3 gateway, so a restart can
+rehydrate the queue instead of losing it.  A journal that cannot be imported or
+written is ignored, and Clean-Slate (:meth:`AgentTaskDispatcher.clear`) empties
+that same section -- a reset workstation reports zero tasks, always.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib  # noqa: F401 - reserved for optional provider discovery
 import math
 import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from core.llm_transport import DEFAULT_DAILY_USD_CAP, TokenBudgetLedger
@@ -40,6 +68,33 @@ from ring2_brain.quant.daily_analysis_donor import (
 )
 from ring2_brain.quant.daily_analysis_donor.strategies import _fundamental_profile
 from ring2_brain.truth.grounding_gate import NumericalGroundingVerifier
+
+# --------------------------------------------------------------------------
+# optional providers -- every one of them may be absent during bootstrap, so
+# the imports are guarded and the blocks they feed degrade to an empty mapping
+# instead of failing the task.
+# --------------------------------------------------------------------------
+
+try:  # pragma: no cover - the guard exists for partial checkouts only
+    from core.market_features_store import (
+        feature_summary,
+        get_feature_profile,
+        get_options_surface_profile,
+    )
+except ImportError:  # pragma: no cover
+    feature_summary = None  # type: ignore[assignment]
+    get_feature_profile = None  # type: ignore[assignment]
+    get_options_surface_profile = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - the bridge ships with Ring 2, the guard is defensive
+    from ring2_brain.quant.tradingview_bridge import TradingViewBridge
+except ImportError:  # pragma: no cover
+    TradingViewBridge = None  # type: ignore[assignment,misc]
+
+try:  # pragma: no cover - the macro calendar ships with Ring 2
+    from ring2_brain.quant.macro_and_catalysts import get_macro_calendar
+except ImportError:  # pragma: no cover
+    get_macro_calendar = None  # type: ignore[assignment]
 
 __all__ = [
     "AGENT_CATALOG",
@@ -79,6 +134,78 @@ REPORT_TOLERANCE = 0.02
 FOLLOWUP_TOKEN_COST_USD = 0.000092
 FOLLOWUP_PROMPT_TOKENS = 180
 FOLLOWUP_COMPLETION_TOKENS = 120
+
+#: The three canonical TradingView studies every report cites.  ``value`` is the
+#: study's primary plot at the last bar; ``score`` is the bridge's own verdict
+#: score, so the report never invents a reading of its own.
+PINE_STUDY_IDS: tuple[str, ...] = ("STD;RSI", "STD;MACD", "STD;Supertrend")
+PINE_PRIMARY_PLOT: dict[str, str] = {
+    "STD;RSI": "RSI",
+    "STD;MACD": "Histogram",
+    "STD;Supertrend": "Supertrend",
+}
+PINE_TIMEFRAME = "1D"
+#: ``TradingViewBridge`` votes in BULLISH / BEARISH / NEUTRAL; a report speaks in
+#: BUY / SELL / HOLD.
+PINE_BIAS_TO_VERDICT: dict[str, str] = {
+    "BULLISH": "BUY",
+    "BEARISH": "SELL",
+    "NEUTRAL": "HOLD",
+}
+
+#: Scheduled macro releases are only actionable inside this window, and a report
+#: never lists more than a handful of them.
+MACRO_HORIZON_HOURS = 72.0
+MACRO_MAX_EVENTS = 5
+#: Impact tiers as the calendar publishes them, weighted for the additive
+#: excess-volatility score.  A tier the calendar adds later contributes nothing
+#: rather than a guessed weight.
+MACRO_IMPACT_WEIGHT: dict[str, float] = {"HIGH": 1.0, "MEDIUM": 0.5}
+#: The calendar's real region tokens (``get_macro_calendar`` rejects anything
+#: else), mapped from the instrument's domicile.
+MACRO_REGION_CRYPTO = "CRYPTO"
+MACRO_REGION_INDIA = "INDIA"
+MACRO_REGION_DEFAULT = "US"
+MACRO_CRYPTO_PROFILE = "CRYPTO"
+MACRO_INDIA_SILO = "INDIA_ZERODHA_DHAN"
+
+#: ``get_feature_profile`` profile tag -> the positioning keys a report quotes.
+FEATURE_PROFILE_EQUITY = "EQUITY"
+FEATURE_PROFILE_CRYPTO = "CRYPTO"
+FEATURE_PROFILE_FX = "FX_COMMODITY"
+
+FEATURE_EQUITY_KEYS: tuple[str, ...] = (
+    "pe_ratio",
+    "pb_ratio",
+    "roe_pct",
+    "debt_to_equity",
+    "dividend_yield_pct",
+)
+#: ``*_pct`` -> basis points is the one unit conversion applied here; the value
+#: is the store's own number, never a modelled one.
+FEATURE_CRYPTO_KEYS: tuple[tuple[str, str, float], ...] = (
+    ("funding_rate_8h_pct", "funding_rate_bps", 100.0),
+    ("open_interest_usd", "open_interest_usd", 1.0),
+    ("annualized_basis_pct", "basis_bps", 100.0),
+    ("liquidations_24h_usd", "liquidation_24h_usd", 1.0),
+)
+FEATURE_FX_KEYS: tuple[tuple[str, str, float], ...] = (
+    ("annualized_carry_pct", "carry_differential_bps", 100.0),
+    ("cot_net_non_commercial_lots", "cot_net_contracts", 1.0),
+    ("rate_differential_bps", "rate_differential_bps", 1.0),
+)
+FEATURE_OPTIONS_KEYS: tuple[str, ...] = (
+    "iv_rank",
+    "net_gamma_exposure_usd",
+    "pcr_oi",
+    "max_pain_strike",
+)
+
+#: ``AgentTask`` status a restored in-flight row is demoted to.  A task that was
+#: running when the process died never finished, and reporting it as live would
+#: be a lie.
+JOURNAL_SECTION = "agent_tasks"
+RESTORED_INTERRUPTED_STATUS = "INTERRUPTED"
 
 #: Advice ordering used to break a signal-score tie in a watchlist ranking.
 ADVICE_RANK: dict[str, int] = {
@@ -253,6 +380,78 @@ def _float_map(obj: Any) -> dict[str, float]:
     return out
 
 
+def _parse_utc(value: Any) -> datetime | None:
+    """Parse an ISO-8601 UTC stamp; ``None`` when the provider sent something else.
+
+    The macro calendar publishes its own anchor (``as_of_utc``) alongside every
+    release, so the horizon is measured from the calendar's clock.  The wall
+    clock is never read here, which keeps a report reproducible.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    token = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        stamp = datetime.fromisoformat(token)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
+
+def _metric_token(value: Any) -> str:
+    """Reduce a label to the ``[A-Za-z0-9_]`` namespace a packet key uses."""
+
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(value)).strip("_") or "value"
+
+
+def _numeric_block(block: Mapping[str, Any], prefix: str = "") -> dict[str, float]:
+    """Flatten every finite number in a surface block into packet metric keys.
+
+    Nested mappings and sequences are walked in sorted order, then by index, so
+    two dispatches over the same data produce byte-identical metric names.
+    Strings and booleans contribute nothing: a study's ``regime`` is prose, and
+    its ``score`` is the number that has to be grounded.
+    """
+
+    out: dict[str, float] = {}
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, bool):
+            return
+        number = _finite_float(node)
+        if number is not None:
+            out[_metric_token(path)] = number
+            return
+        if isinstance(node, Mapping):
+            for key in sorted(node, key=str):
+                child = f"{path}_{key}" if path else str(key)
+                walk(node[key], child)
+            return
+        if isinstance(node, (list, tuple)):
+            for index, item in enumerate(node, start=1):
+                child = f"{path}_{index}" if path else str(index)
+                walk(item, child)
+
+    for key in sorted(block, key=str):
+        start = f"{prefix}_{key}" if prefix else str(key)
+        walk(block[key], start)
+    return out
+
+
+def _copy_number(
+    source: Mapping[str, Any], target: dict[str, Any], key: str, *, scale: float = 1.0
+) -> None:
+    """Copy one real provider number through, skipping a missing key entirely."""
+
+    number = _finite_float(source.get(key))
+    if number is None:
+        return
+    target[key] = round(number * scale, 6) if scale != 1.0 else number
+
+
 def _normalise_symbols(symbols: Any) -> list[str]:
     """Accept a list or a comma/space separated watchlist string."""
 
@@ -325,6 +524,51 @@ def _question_intent(question: str) -> frozenset[str]:
         for token in ("score", "rank", "advice", "recommend", "signal", "rating")
     ):
         intents.add("score")
+    # -- institutional surfaces folded in from the feature store, the Pine
+    # bridge and the macro calendar.  A question naming one of these must be
+    # answered from the block that actually carries it.
+    if any(
+        token in text
+        for token in (
+            "pine",
+            "rsi",
+            "macd",
+            "supertrend",
+            "study",
+            "studies",
+            "verdict",
+            "trend",
+        )
+    ):
+        intents.add("pine")
+    if any(
+        token in text
+        for token in (
+            "gex",
+            "gamma",
+            "funding",
+            "carry",
+            "open interest",
+            "basis",
+            "cot",
+            "positioning",
+            "put call",
+            "pcr",
+            "max pain",
+            "iv rank",
+            "valuation",
+            "p/e",
+            "pe ratio",
+            "roe",
+            "fundamental",
+        )
+    ):
+        intents.add("positioning")
+    if any(
+        token in text
+        for token in ("macro", "event", "calendar", "release", "cpi", "fomc", "rbi")
+    ):
+        intents.add("macro")
     if not intents:
         intents.update({"levels", "score"})
     return frozenset(intents)
@@ -669,6 +913,12 @@ class AgentTaskDispatcher:
         "_lock",
         "_completed",
         "_failed",
+        "_tv_bridge",
+        "_tv_bridge_failed",
+        "_surface_cache",
+        "_macro_cache",
+        "journal",
+        "_restored_tasks",
     )
 
     def __init__(
@@ -683,6 +933,7 @@ class AgentTaskDispatcher:
         token_ledger: TokenBudgetLedger | None = None,
         verifier: NumericalGroundingVerifier | None = None,
         clock: Callable[[], int] = time.time_ns,
+        journal: Any = None,
     ) -> None:
         self._dashboard = dashboard if dashboard is not None else DecisionDashboard()
         self._valuation = valuation
@@ -707,6 +958,155 @@ class AgentTaskDispatcher:
         self._lock = threading.RLock()
         self._completed = 0
         self._failed = 0
+        # -- institutional surfaces: one bridge, one cache per dispatch call.
+        self._tv_bridge: Any = None
+        self._tv_bridge_failed = False
+        self._surface_cache: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
+        self._macro_cache: dict[str, dict[str, Any]] = {}
+        # -- durable journal (Task B): explicit injection wins, a full install
+        # falls back to the shared workstation journal, and a partial checkout
+        # degrades to no persistence at all.
+        self.journal = self._resolve_journal(journal)
+        self._restored_tasks = 0
+        self._restore_from_journal()
+
+    # -- durable journal ------------------------------------------------
+
+    @staticmethod
+    def _resolve_journal(journal: Any) -> Any:
+        """The journal injected by the workstation shell, else ``None``.
+
+        Ring 2 is air-gapped from Ring 0, so this module never reaches for
+        persisted state on its own.  The Ring 3 control plane owns the atomic
+        journal and injects it during construction; without that injection a
+        dispatcher keeps its tasks in memory and persists nothing.
+        """
+
+        return journal
+
+    def _restore_from_journal(self) -> None:
+        """Rehydrate lightweight :class:`AgentTask` records from the journal.
+
+        Only identity, routing, status and cost metadata survive a restart: the
+        sealed packet and markdown are not replayed, so a restored task reports
+        its outcome but cannot answer a follow-up it did not carry.  A row that
+        was still ``PENDING`` / ``PROCESSING`` when the process died is recorded
+        as :data:`RESTORED_INTERRUPTED_STATUS` -- it is never resurrected as a
+        live task.
+        """
+
+        journal = self.journal
+        if journal is None:
+            return
+        try:
+            state = journal.load()
+        except Exception:  # pragma: no cover - load() is contractually safe
+            return
+        rows = state.get(JOURNAL_SECTION) if isinstance(state, Mapping) else None
+        if not isinstance(rows, (list, tuple)):
+            return
+
+        with self._lock:
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                task_id = str(row.get("task_id") or "").strip()
+                agent_id = str(row.get("agent_id") or "").strip().lower()
+                spec = _AGENTS_BY_ID.get(agent_id)
+                if not task_id or spec is None or task_id in self._tasks:
+                    continue
+                status = str(row.get("status") or "").strip().upper()
+                if status not in TASK_STATUSES:
+                    continue
+                if status in ("PENDING", "PROCESSING"):
+                    status = RESTORED_INTERRUPTED_STATUS
+                silo = str(row.get("silo") or DEFAULT_SILO).strip().upper()
+                if silo not in KNOWN_SILOS:
+                    silo = DEFAULT_SILO
+                priority = str(row.get("priority") or "NORMAL").strip().upper()
+                if priority not in TASK_PRIORITIES:
+                    priority = "NORMAL"
+                strategy = str(row.get("strategy_id") or "").strip().lower()
+                created = _finite_float(row.get("created_at_ns")) or 0.0
+                completed = _finite_float(row.get("completed_at_ns")) or 0.0
+                progress = _finite_float(row.get("progress_pct")) or 0.0
+                record = AgentTask(
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    task_type=str(row.get("task_type") or spec.task_type),
+                    silo=silo,
+                    symbols=_normalise_symbols(row.get("symbols")),
+                    strategy_id=strategy if strategy in STRATEGY_IDS else None,
+                    prompt=str(row.get("prompt") or ""),
+                    priority=priority,
+                    status=status,
+                    progress_pct=max(0, min(100, int(progress))),
+                    created_at_ns=int(created),
+                    completed_at_ns=int(completed),
+                    latency_ms=max(0.0, _finite_float(row.get("latency_ms")) or 0.0),
+                    token_cost_usd=max(
+                        0.0, _finite_float(row.get("token_cost_usd")) or 0.0
+                    ),
+                    grounding_sha256=str(row.get("grounding_sha256") or ""),
+                    verified=bool(row.get("verified")),
+                )
+                # The journal never stores ``error`` for a success; a failed or
+                # interrupted row keeps the reason it was recorded with.
+                error = row.get("error")
+                record.error = None if error is None else str(error)
+                self._tasks[record.task_id] = record
+                self._order.append(record.task_id)
+                self._restored_tasks += 1
+                if record.status == "COMPLETED":
+                    self._completed += 1
+                elif record.status == "FAILED":
+                    self._failed += 1
+
+    def _journal_task(self, task: AgentTask) -> None:
+        """Append one terminal task to the journal; a journal error is swallowed.
+
+        The report has already been sealed and verified by the time this runs, so
+        persistence can never turn a good task into a failed one.
+        """
+
+        journal = self.journal
+        if journal is None or not task.terminal:
+            return
+        try:
+            journal.append(JOURNAL_SECTION, task.to_dict())
+        except Exception:  # noqa: BLE001 - persistence is best effort
+            pass
+
+    def _journal_clear(self) -> None:
+        """Empty the ``agent_tasks`` section so Clean Slate stays at zero."""
+
+        journal = self.journal
+        if journal is None:
+            return
+        try:
+            journal.clear_section(JOURNAL_SECTION)
+        except Exception:  # noqa: BLE001 - a reset must not raise
+            pass
+
+    def journal_snapshot(self) -> dict[str, Any]:
+        """Where the queue is persisted and how many rows it currently holds."""
+
+        journal = self.journal
+        path = str(getattr(journal, "path", "") or "")
+        count = 0
+        if journal is not None:
+            try:
+                state = journal.load()
+                rows = state.get(JOURNAL_SECTION) if isinstance(state, Mapping) else None
+                if isinstance(rows, (list, tuple)):
+                    count = len(rows)
+            except Exception:  # pragma: no cover - load() is contractually safe
+                count = 0
+        return {
+            "journal_path": path,
+            "agent_tasks": int(count),
+            "restored": int(self._restored_tasks),
+        }
 
     # -- wiring ---------------------------------------------------------
 
@@ -875,6 +1275,7 @@ class AgentTaskDispatcher:
 
         question = str(prompt or "").strip()
         now_ns = int(self._clock())
+        self._begin_dispatch()
         task = AgentTask(
             task_id=f"task_{uuid.uuid4().hex[:12]}",
             agent_id=spec.agent_id,
@@ -902,6 +1303,7 @@ class AgentTaskDispatcher:
                     self._completed += 1
                 elif task.status == "FAILED":
                     self._failed += 1
+            self._journal_task(task)
         return task.to_full_dict()
 
     def batch_watchlist(
@@ -940,6 +1342,7 @@ class AgentTaskDispatcher:
 
         spec = _get_agent("daily_decision_agent")
         now_ns = int(self._clock())
+        self._begin_dispatch()
         task = AgentTask(
             task_id=f"task_{uuid.uuid4().hex[:12]}",
             agent_id=spec.agent_id,
@@ -974,12 +1377,15 @@ class AgentTaskDispatcher:
             ]
             focus = get_strategy(strategy_value) if strategy_value else None
             rows: list[dict[str, Any]] = []
+            surface_by_symbol: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
             for report in reports:
                 focus_score = (
                     float(report.strategy_scores.get(strategy_value, 0.0))
                     if strategy_value
                     else 0.0
                 )
+                positioning, pine, macro = self._surface_blocks(str(report.symbol))
+                surface_by_symbol[str(report.symbol)] = (positioning, pine, macro)
                 rows.append(
                     {
                         "symbol": report.symbol,
@@ -1003,6 +1409,9 @@ class AgentTaskDispatcher:
                         "grounding_sha256": report.grounding_sha256,
                         "verified": bool(report.verified),
                         "strategy_focus_score": round(focus_score, 4),
+                        "positioning": dict(positioning),
+                        "pine": dict(pine),
+                        "macro_risk": dict(macro),
                     }
                 )
             rows.sort(
@@ -1037,6 +1446,12 @@ class AgentTaskDispatcher:
                 if strategy_value:
                     block["strategy_score"] = float(row["strategy_focus_score"])
                 metrics.update(_prefixed(str(row["symbol"]), block))
+                positioning, pine, macro = surface_by_symbol[str(row["symbol"])]
+                metrics.update(
+                    _prefixed(str(row["symbol"]), _numeric_block(positioning, "feature"))
+                )
+                metrics.update(_prefixed(str(row["symbol"]), _numeric_block(pine)))
+                metrics.update(_prefixed(str(row["symbol"]), _numeric_block(macro)))
 
             knowledge_ts = max(
                 (int(report.knowledge_ts_ns) for report in reports), default=now_ns
@@ -1077,6 +1492,14 @@ class AgentTaskDispatcher:
                 doc.kv("Reward risk", row["reward_risk"])
                 if strategy_value:
                     doc.kv("Strategy focus score", row["strategy_focus_score"])
+                positioning, pine, macro = surface_by_symbol[str(row["symbol"])]
+                if pine.get("pine_studies"):
+                    doc.note("Pine consensus", str(pine.get("pine_consensus") or "HOLD"))
+                if macro.get("macro_events"):
+                    doc.kv("Macro risk score", macro.get("macro_risk_score"))
+                    doc.kv("High impact releases", macro.get("macro_high_impact_count"))
+                if _finite_float(positioning.get("iv_rank")) is not None:
+                    doc.kv("IV rank", positioning["iv_rank"])
             risk_union: list[str] = []
             for row in rows:
                 for risk in row["risk_factors"]:
@@ -1106,6 +1529,18 @@ class AgentTaskDispatcher:
                 "score_by_symbol": {
                     str(row["symbol"]): float(row["signal_score"]) for row in rows
                 },
+                "positioning_by_symbol": {
+                    str(symbol): dict(blocks[0])
+                    for symbol, blocks in surface_by_symbol.items()
+                },
+                "pine_by_symbol": {
+                    str(symbol): dict(blocks[1])
+                    for symbol, blocks in surface_by_symbol.items()
+                },
+                "macro_risk_by_symbol": {
+                    str(symbol): dict(blocks[2])
+                    for symbol, blocks in surface_by_symbol.items()
+                },
                 "top_symbol": rows[0]["symbol"] if rows else None,
                 "grounding_sha256": packet.sha256_digest,
                 "verified": task.verified,
@@ -1134,6 +1569,7 @@ class AgentTaskDispatcher:
                     self._completed += 1
                 elif task.status == "FAILED":
                     self._failed += 1
+            self._journal_task(task)
         return task.to_full_dict()
 
     def followup(self, *, task_id: Any, question: Any) -> dict[str, Any]:
@@ -1188,6 +1624,22 @@ class AgentTaskDispatcher:
                     value = packet.metrics.get(f"{prefix}__{name}")
                     if value is not None and name != "rank":
                         doc.kv(f"{group} {name}", value)
+            # Surface blocks (feature store / Pine bridge / macro calendar) are
+            # stored under their own namespace, so a question that names one is
+            # answered from the numbers that namespace actually carries.
+            for group, stem in (
+                ("pine", "pine_"),
+                ("positioning", "feature_"),
+                ("macro", "macro_"),
+            ):
+                if group not in intents:
+                    continue
+                base = f"{prefix}__{stem}"
+                for name in sorted(packet.metrics):
+                    if not name.startswith(base):
+                        continue
+                    short = name[len(base) :]
+                    doc.kv(f"{group} {short}", packet.metrics[name])
             risks = self._risk_factors_for_symbol(task, symbol)
             if risks and "risk" in intents:
                 doc.bullets("Risk factors", risks)
@@ -1320,6 +1772,357 @@ class AgentTaskDispatcher:
             return float(report.get("usd_cost", spec.token_cost_usd))
         except Exception:
             return spec.token_cost_usd
+
+    # -- institutional surfaces -----------------------------------------
+    #
+    # Each helper is total: a provider that is missing, unknown to the registry
+    # or raising answers an empty block, so no report depends on one being
+    # healthy.  ``assign`` / ``batch_watchlist`` / ``followup`` clear the caches
+    # on entry, which is the only place they are cleared.
+
+    def _begin_dispatch(self) -> None:
+        """Drop the per-symbol surface cache for a fresh dispatch call."""
+
+        with self._lock:
+            self._surface_cache.clear()
+            self._macro_cache.clear()
+
+    def _surface_blocks(
+        self, symbol: str
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Positioning, Pine verdict and macro risk for one symbol, memoised.
+
+        A watchlist dispatch would otherwise build the same three blocks for the
+        same symbol twice (once for the payload, once for the report); the cache
+        makes that one build per symbol per dispatch call.
+        """
+
+        key = str(symbol or "").strip().upper()
+        with self._lock:
+            cached = self._surface_cache.get(key)
+        if cached is not None:
+            return cached
+        blocks = (
+            self._market_feature_block(key),
+            self._pine_verdict_block(key),
+            self._macro_risk_block(key),
+        )
+        with self._lock:
+            self._surface_cache[key] = blocks
+        return blocks
+
+    def _market_feature_block(self, symbol: str) -> dict[str, Any]:
+        """Equity / funding / carry / options positioning for one instrument.
+
+        Every value is the store's own number.  The only arithmetic applied is a
+        percent-to-basis-point rescale, which is a unit change rather than a new
+        claim.  A symbol the registry does not know answers ``{}``.
+        """
+
+        token = str(symbol or "").strip().upper()
+        if not token:
+            return {}
+        block: dict[str, Any] = {}
+        try:
+            profile = get_feature_profile(token) if get_feature_profile is not None else None
+            if profile is not None:
+                features = profile.features
+                kind = str(getattr(profile, "profile", "") or "")
+                if kind:
+                    block["profile_kind"] = kind
+                if kind == FEATURE_PROFILE_EQUITY:
+                    for key in FEATURE_EQUITY_KEYS:
+                        _copy_number(features, block, key)
+                elif kind == FEATURE_PROFILE_CRYPTO:
+                    for source, target, scale in FEATURE_CRYPTO_KEYS:
+                        _copy_number(features, block, source, scale=scale)
+                        if target != source and source in block:
+                            block[target] = block.pop(source)
+                elif kind == FEATURE_PROFILE_FX:
+                    for source, target, scale in FEATURE_FX_KEYS:
+                        _copy_number(features, block, source, scale=scale)
+                        if target != source and source in block:
+                            block[target] = block.pop(source)
+                # The compact summary row fills any canonical key the deep
+                # profile did not carry (market cap, beta, IV and so on).
+                if feature_summary is not None:
+                    for key, value in feature_summary(token).items():
+                        number = _finite_float(value)
+                        if number is not None:
+                            block.setdefault(str(key), number)
+            if get_options_surface_profile is not None:
+                surface = get_options_surface_profile(token) or {}
+                for key in FEATURE_OPTIONS_KEYS:
+                    _copy_number(surface, block, key)
+        except Exception:  # noqa: BLE001 - an unknown symbol must not fail a task
+            return {}
+        return block
+
+    def _tv_bridge_instance(self) -> Any:
+        """One lazily built :class:`TradingViewBridge`, or ``None``.
+
+        Construction is attempted once: a bridge that cannot be built is not
+        rebuilt on every symbol of a watchlist.
+        """
+
+        if self._tv_bridge is not None or self._tv_bridge_failed:
+            return self._tv_bridge
+        with self._lock:
+            if self._tv_bridge is not None or self._tv_bridge_failed:
+                return self._tv_bridge
+            provider = TradingViewBridge
+            bridge = None
+            if provider is not None:
+                try:
+                    bridge = provider()
+                except Exception:  # noqa: BLE001 - recorded as unavailable
+                    bridge = None
+            self._tv_bridge = bridge
+            self._tv_bridge_failed = bridge is None
+        return self._tv_bridge
+
+    def _pine_verdict_block(self, symbol: str) -> dict[str, Any]:
+        """RSI / MACD / Supertrend verdicts on the daily timeframe.
+
+        The bridge's own verdict dict is reduced to ``regime``, ``bias``,
+        ``score`` plus the latest value of the study's primary plot, and the
+        consensus is the strict majority bias.  Any failure answers the neutral
+        block rather than raising into the report.
+        """
+
+        empty: dict[str, Any] = {"pine_studies": [], "pine_consensus": "HOLD"}
+        token = str(symbol or "").strip().upper()
+        if not token:
+            return empty
+        bridge = self._tv_bridge_instance()
+        if bridge is None:
+            return empty
+        studies: list[dict[str, Any]] = []
+        try:
+            for study_id in PINE_STUDY_IDS:
+                result = bridge.evaluate_tv_study(token, study_id, timeframe=PINE_TIMEFRAME)
+                verdict = result.get("verdict") or {}
+                latest = result.get("latest") or {}
+                plot = latest.get(PINE_PRIMARY_PLOT.get(study_id, ""))
+                if plot is None and latest:
+                    plot = latest[sorted(latest)[0]]
+                studies.append(
+                    {
+                        "study_id": study_id,
+                        "regime": str(verdict.get("regime") or ""),
+                        "bias": str(verdict.get("bias") or "NEUTRAL").upper(),
+                        "score": _finite_float(verdict.get("score")),
+                        "value": _finite_float(plot),
+                    }
+                )
+        except Exception:  # noqa: BLE001 - a study failure is not a task failure
+            return empty
+
+        votes = {"BUY": 0, "SELL": 0, "HOLD": 0}
+        for row in studies:
+            votes[PINE_BIAS_TO_VERDICT.get(row["bias"], "HOLD")] += 1
+        if votes["BUY"] > votes["SELL"] and votes["BUY"] > votes["HOLD"]:
+            consensus = "BUY"
+        elif votes["SELL"] > votes["BUY"] and votes["SELL"] > votes["HOLD"]:
+            consensus = "SELL"
+        else:
+            consensus = "HOLD"
+        return {"pine_studies": studies, "pine_consensus": consensus}
+
+    def _macro_region(self, symbol: str) -> str:
+        """Map an instrument onto the calendar's real region token.
+
+        A perpetual is a global risk asset (``CRYPTO``), an India-silo instrument
+        is driven by ``INDIA`` releases, and everything else -- US cash equities,
+        FX and metals -- keys off the ``US`` book, which the calendar also tags
+        as impacting the FX and crypto silos.
+        """
+
+        token = str(symbol or "").strip().upper()
+        kind = ""
+        silo = ""
+        if get_feature_profile is not None:
+            try:
+                profile = get_feature_profile(token)
+                kind = str(getattr(profile, "profile", "") or "")
+                silo = str(getattr(profile, "silo", "") or "")
+            except Exception:  # noqa: BLE001 - fall through to the heuristics
+                kind, silo = "", ""
+        if kind == MACRO_CRYPTO_PROFILE or token.endswith("USDT"):
+            return MACRO_REGION_CRYPTO
+        if silo == MACRO_INDIA_SILO:
+            return MACRO_REGION_INDIA
+        return MACRO_REGION_DEFAULT
+
+    def _macro_risk_block(self, symbol: str) -> dict[str, Any]:
+        """Scheduled releases for this symbol's region inside the next 72 hours.
+
+        ``hours_until`` is measured from the calendar's own ``as_of_utc`` anchor,
+        so the block never depends on the wall clock.  ``macro_risk_score`` is the
+        additive excess volatility of the listed releases -- the sum of
+        ``(volatility_multiplier - 1)`` weighted by impact tier -- and is zero
+        when nothing is scheduled.
+        """
+
+        empty: dict[str, Any] = {
+            "macro_events": [],
+            "macro_high_impact_count": 0,
+            "macro_risk_score": 0.0,
+        }
+        token = str(symbol or "").strip().upper()
+        if not token or get_macro_calendar is None:
+            return empty
+        try:
+            region = self._macro_region(token)
+            with self._lock:
+                cached = self._macro_cache.get(region)
+            if cached is None:
+                cached = self._build_macro_risk(region)
+                with self._lock:
+                    self._macro_cache[region] = cached
+            # The cache is shared by every symbol in the region, so the caller
+            # gets its own copy and cannot mutate another symbol's block.
+            return {
+                "macro_events": [dict(event) for event in cached["macro_events"]],
+                "macro_high_impact_count": int(cached["macro_high_impact_count"]),
+                "macro_risk_score": float(cached["macro_risk_score"]),
+            }
+        except Exception:  # noqa: BLE001 - a calendar failure is not a task failure
+            return empty
+
+    @staticmethod
+    def _build_macro_risk(region: str) -> dict[str, Any]:
+        """Filter the region's calendar down to the next five releases."""
+
+        empty: dict[str, Any] = {
+            "macro_events": [],
+            "macro_high_impact_count": 0,
+            "macro_risk_score": 0.0,
+        }
+        if get_macro_calendar is None:
+            return empty
+        payload = get_macro_calendar(region=region)
+        anchor = _parse_utc(payload.get("as_of_utc"))
+        if anchor is None:
+            return empty
+        rows: list[dict[str, Any]] = []
+        for event in payload.get("events") or ():
+            if not isinstance(event, Mapping):
+                continue
+            if str(event.get("status") or "").upper() != "SCHEDULED":
+                continue
+            release = _parse_utc(event.get("release_utc"))
+            if release is None:
+                continue
+            hours = (release - anchor).total_seconds() / 3600.0
+            if hours < 0.0 or hours > MACRO_HORIZON_HOURS:
+                continue
+            impact = str(event.get("impact_tier") or "").upper()
+            rows.append(
+                {
+                    "name": str(event.get("title") or event.get("event_id") or ""),
+                    "region": str(event.get("region") or region),
+                    "impact": impact,
+                    "hours_until": round(hours, 4),
+                    "volatility_multiplier": round(
+                        _finite_float(event.get("volatility_multiplier")) or 1.0, 4
+                    ),
+                }
+            )
+        rows.sort(key=lambda row: (row["hours_until"], row["name"]))
+        selected = rows[:MACRO_MAX_EVENTS]
+        score = 0.0
+        for row in selected:
+            weight = MACRO_IMPACT_WEIGHT.get(row["impact"], 0.0)
+            score += max(0.0, row["volatility_multiplier"] - 1.0) * weight
+        return {
+            "macro_events": selected,
+            "macro_high_impact_count": sum(
+                1 for row in selected if row["impact"] == "HIGH"
+            ),
+            "macro_risk_score": round(score, 4),
+        }
+
+    def _surface_metrics(self, symbol: str) -> dict[str, float]:
+        """Flatten a symbol's three surface blocks into prefixed packet metrics."""
+
+        positioning, pine, macro = self._surface_blocks(symbol)
+        metrics: dict[str, float] = {}
+        metrics.update(_prefixed(str(symbol), _numeric_block(positioning, "feature")))
+        metrics.update(_prefixed(str(symbol), _numeric_block(pine)))
+        metrics.update(_prefixed(str(symbol), _numeric_block(macro)))
+        return metrics
+
+    @staticmethod
+    def _render_surface_blocks(
+        doc: _Doc,
+        positioning: Mapping[str, Any],
+        pine: Mapping[str, Any],
+        macro: Mapping[str, Any],
+    ) -> None:
+        """Append the three surface sections, quoting only values that exist.
+
+        ``doc.kv`` renders nothing for a missing or zero value, so a provider that
+        answered an empty block leaves the section out entirely rather than
+        printing a fabricated zero.
+        """
+
+        profile = str(positioning.get("profile_kind") or "")
+        body = [
+            key
+            for key in (
+                "pe_ratio",
+                "pb_ratio",
+                "roe_pct",
+                "debt_to_equity",
+                "dividend_yield_pct",
+                "funding_rate_bps",
+                "open_interest_usd",
+                "basis_bps",
+                "liquidation_24h_usd",
+                "carry_differential_bps",
+                "cot_net_contracts",
+                "rate_differential_bps",
+            )
+            if _finite_float(positioning.get(key)) is not None
+        ]
+        options = [
+            key for key in FEATURE_OPTIONS_KEYS if _finite_float(positioning.get(key)) is not None
+        ]
+        if profile or body or options:
+            doc.head("Fundamentals / positioning")
+            if profile:
+                doc.note("Feature profile", profile)
+            for key in body:
+                doc.kv(key.replace("_", " "), positioning[key])
+            for key in options:
+                doc.kv(key.replace("_", " "), positioning[key])
+
+        studies = pine.get("pine_studies") or []
+        if isinstance(studies, (list, tuple)) and studies:
+            doc.head("Pine study verdicts")
+            doc.note("Pine consensus", str(pine.get("pine_consensus") or "HOLD"))
+            for row in studies:
+                if not isinstance(row, Mapping):
+                    continue
+                study_id = str(row.get("study_id") or "")
+                doc.note(f"{study_id} regime", str(row.get("regime") or "unknown"))
+                doc.note(f"{study_id} bias", str(row.get("bias") or "NEUTRAL"))
+                doc.kv(f"{study_id} score", row.get("score"))
+                doc.kv(f"{study_id} value", row.get("value"))
+
+        events = macro.get("macro_events") or []
+        if isinstance(events, (list, tuple)) and events:
+            doc.head("Macro event risk")
+            doc.kv("Macro risk score", macro.get("macro_risk_score"))
+            doc.kv("High impact releases", macro.get("macro_high_impact_count"))
+            for event in events[:MACRO_MAX_EVENTS]:
+                if not isinstance(event, Mapping):
+                    continue
+                doc.note("Scheduled release", f"{event.get('name')} ({event.get('region')})")
+                doc.note("Impact tier", str(event.get("impact") or ""))
+                doc.kv("Hours until", event.get("hours_until"))
+                doc.kv("Volatility multiplier", event.get("volatility_multiplier"))
 
     def _execute(self, task: AgentTask, spec: AgentSpec) -> None:
         start_ns = int(self._clock())
@@ -1460,6 +2263,11 @@ class AgentTaskDispatcher:
             self._counter = 0
             self._completed = 0
             self._failed = 0
+            self._surface_cache.clear()
+            self._macro_cache.clear()
+        # Clean-Slate must hold on disk too: a journal that kept the rows would
+        # resurrect them on the next construction and report a non-empty queue.
+        self._journal_clear()
         return {"cleared": cleared, "tasks": 0, "task_count": 0}
 
     def reset_to_clean_slate(self) -> dict[str, Any]:
@@ -1482,6 +2290,7 @@ class AgentTaskDispatcher:
         as_of_ns = int(self._clock())
         reports = []
         metrics: dict[str, float] = {}
+        surface_by_symbol: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
         for symbol in task.symbols:
             report = self._dashboard.evaluate(
                 symbol,
@@ -1507,6 +2316,11 @@ class AgentTaskDispatcher:
                 "max_drawdown_pct": float(report.max_drawdown_pct),
             }
             metrics.update(_prefixed(symbol, block))
+            positioning, pine, macro = self._surface_blocks(symbol)
+            surface_by_symbol[str(report.symbol)] = (positioning, pine, macro)
+            metrics.update(_prefixed(symbol, _numeric_block(positioning, "feature")))
+            metrics.update(_prefixed(symbol, _numeric_block(pine)))
+            metrics.update(_prefixed(symbol, _numeric_block(macro)))
 
         doc = _Doc("Daily Decision Report")
         doc.para(f"Agent {task.agent_id} on silo {task.silo} covering {', '.join(task.symbols)}.")
@@ -1532,6 +2346,8 @@ class AgentTaskDispatcher:
             doc.bullets("Signal reasons", report.signal_reasons)
             doc.bullets("Risk factors", report.risk_factors)
             doc.bullets("Catalysts", report.catalysts)
+            positioning, pine, macro = surface_by_symbol[str(report.symbol)]
+            self._render_surface_blocks(doc, positioning, pine, macro)
 
         structured = {
             "reports": [
@@ -1566,6 +2382,15 @@ class AgentTaskDispatcher:
             "score_by_symbol": {
                 report.symbol: round(float(report.signal_score), 4) for report in reports
             },
+            "positioning_by_symbol": {
+                symbol: dict(blocks[0]) for symbol, blocks in surface_by_symbol.items()
+            },
+            "pine_by_symbol": {
+                symbol: dict(blocks[1]) for symbol, blocks in surface_by_symbol.items()
+            },
+            "macro_risk_by_symbol": {
+                symbol: dict(blocks[2]) for symbol, blocks in surface_by_symbol.items()
+            },
         }
         extra = {
             "packets": [
@@ -1580,6 +2405,7 @@ class AgentTaskDispatcher:
     ) -> tuple[dict[str, Any], dict[str, float], _Doc, dict[str, Any]]:
         metrics: dict[str, float] = {}
         rows: list[dict[str, Any]] = []
+        surface_by_symbol: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
         doc = _Doc("Technical Strategy Evaluation")
         doc.para(
             f"Agent {task.agent_id} scoring {', '.join(task.symbols)} on silo {task.silo}."
@@ -1588,6 +2414,8 @@ class AgentTaskDispatcher:
             doc.note("Strategy template", str(get_strategy(task.strategy_id).name))
 
         for symbol in task.symbols:
+            positioning, pine, macro = self._surface_blocks(symbol)
+            surface_by_symbol[symbol] = (positioning, pine, macro)
             if task.strategy_id:
                 signals = [
                     evaluate_strategy(
@@ -1642,7 +2470,24 @@ class AgentTaskDispatcher:
                 doc.bullets("Reasons", signal.reasons)
                 doc.bullets("Risk factors", signal.risk_factors)
 
-        structured = {"signals": rows, "best": rows[0] if rows else None}
+            metrics.update(_prefixed(symbol, _numeric_block(positioning, "feature")))
+            metrics.update(_prefixed(symbol, _numeric_block(pine)))
+            metrics.update(_prefixed(symbol, _numeric_block(macro)))
+            self._render_surface_blocks(doc, positioning, pine, macro)
+
+        structured = {
+            "signals": rows,
+            "best": rows[0] if rows else None,
+            "positioning_by_symbol": {
+                symbol: dict(blocks[0]) for symbol, blocks in surface_by_symbol.items()
+            },
+            "pine_by_symbol": {
+                symbol: dict(blocks[1]) for symbol, blocks in surface_by_symbol.items()
+            },
+            "macro_risk_by_symbol": {
+                symbol: dict(blocks[2]) for symbol, blocks in surface_by_symbol.items()
+            },
+        }
         return structured, metrics, doc, {}
 
     def _run_valuation(

@@ -287,12 +287,14 @@ def test_gate2_options_page_lists_underlyings_and_templates(client, operator) ->
     assert body["ring"] == "RING 2"
     assert body["read_only"] is True
     symbols = {row["symbol"] for row in body["underlyings"]}
-    assert {"NIFTY", "BANKNIFTY", "BTCUSDT", "SPY", "EURUSD"} <= symbols
+    assert {"NIFTY", "BANKNIFTY", "BTCUSDT", "SPY"} <= symbols
+    # V1.8: spot FX carries no listed options market, so EURUSD is no longer an
+    # optionable underlying (it answers 422 INSTRUMENT_NOT_OPTIONABLE).
+    assert "EURUSD" not in symbols
     assert {row["silo"] for row in body["underlyings"]} == {
         "INDIA_ZERODHA_DHAN",
         "CRYPTO_BINANCE",
         "US_IBKR",
-        "FX_MT5",
     }
     assert [row["id"] for row in body["strategies"]] == [
         "BULL_CALL_SPREAD",

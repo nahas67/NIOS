@@ -805,7 +805,7 @@ _CRYPTO_ROWS: tuple[tuple[Any, ...], ...] = (
     # -- layer-1 / blue-chip -------------------------------------------------
     ("BTCUSDT", "Bitcoin / TetherUS Perpetual", "Layer-1 Smart Contracts", 10_000, 0.001, 100.0, True),
     ("ETHUSDT", "Ethereum / TetherUS Perpetual", "Layer-1 Smart Contracts", 10_000, 0.001, 1_000.0, True),
-    ("SOLUSDT", "Solana / TetherUS Perpetual", "Layer-1 Smart Contracts", 1_000, 0.01, 10_000.0, False),
+    ("SOLUSDT", "Solana / TetherUS Perpetual", "Layer-1 Smart Contracts", 1_000, 0.01, 10_000.0, True),
     ("BNBUSDT", "BNB / TetherUS Perpetual", "Exchange & Staking", 10_000, 0.001, 1_000.0, False),
     ("XRPUSDT", "XRP / TetherUS Perpetual", "Layer-1 Smart Contracts", 100, 1.0, 1_000_000.0, False),
     ("ADAUSDT", "Cardano / TetherUS Perpetual", "Layer-1 Smart Contracts", 100, 1.0, 1_000_000.0, False),
@@ -1283,7 +1283,11 @@ def _build() -> InstrumentRegistry:
                 settlement_cycle="T+1",
                 trading_hours_utc="22:00-21:00",
                 option_strike_step=step,
-                has_options=asset_class == "FX" and sub_category == "G10_MAJOR",
+                # V1.8: spot FX pairs have no listed option chain.  ``EURUSD`` and
+                # every other MT5 row must answer ``422 INSTRUMENT_NOT_OPTIONABLE``
+                # from the universal options endpoint instead of silently
+                # synthesising a chain from a tuned proxy.
+                has_options=False,
                 isin_or_id=f"MT5:{symbol}",
             )
         )

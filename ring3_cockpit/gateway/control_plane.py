@@ -1578,6 +1578,7 @@ class ControlPlane:
         llm_probe_fetcher: Any = None,
         testnet_bridge: Any = None,
         forge_hedge_runner: Any = None,
+        state_journal: Any = None,
     ) -> None:
         self.ledger = ledger
         self.firewall = firewall
@@ -1662,6 +1663,38 @@ class ControlPlane:
         self._idempotent_receipts: dict[str, dict[str, Any]] = {}
         self._idempotency_order: list[str] = []
         self._max_idempotent_receipts = 4_096
+        # ------------------------------------------------------------------
+        # V1.8 (PART 3.1): crash-safe atomic state journal.
+        # The journal is the only durable surface for logbook entries, saved
+        # walk-forward backtest summaries and completed agent-task metadata.
+        # A missing file is the exact Clean-Slate contract: 0 logbook
+        # entries, 0 backtests, 0 agent tasks, 0 vault balances.
+        # ------------------------------------------------------------------
+        self.state_journal = (
+            state_journal
+            if state_journal is not None
+            else _default_state_journal()
+        )
+        self._journal_restored: dict[str, int] = {
+            "logbook": 0,
+            "backtests": 0,
+            "agent_tasks": 0,
+        }
+        self._journal_backtests: list[dict[str, Any]] = []
+        self._restore_journal()
+        # V1.8 (PART 2.2): wire the portfolio-margin provider into the OMS so
+        # ``SmartOMS.validate_proposal`` can reject over-committed orders.
+        try:  # pragma: no cover - depends on the kernel build
+            if hasattr(self.oms, "margin_provider") and getattr(
+                self.oms, "margin_provider", None
+            ) is None:
+                self.oms.margin_provider = self.free_margin_micros
+        except Exception:
+            pass
+        # V1.8 (PART 3.2): SSE reader accounting (leak-free, deadlock-free).
+        self._stream_lock = threading.RLock()
+        self._active_streams = 0
+        self._stream_frames_emitted = 0
         # Phase 3 Step 3: the Ring 0 sandbox execution bridge.  Injected so tests
         # can supply a mock httpx transport, or built lazily on first use.
         self.testnet_bridge = testnet_bridge
@@ -1777,6 +1810,7 @@ class ControlPlane:
             forge=self.forge,
             backtest_engine=self.backtest_engine,
             token_ledger=self.token_ledger,
+            journal=self.state_journal,
         )
         self.task_dispatcher.attach(contagion_factory=self._contagion_engine_for)
 
@@ -2864,6 +2898,136 @@ class ControlPlane:
         "FX_MT5": 1.085,
     }
 
+    # ------------------------------------------------------------------
+    # V1.8 (PART 3.1): crash-safe atomic state journal helpers
+    # ------------------------------------------------------------------
+    def _journal_load(self) -> dict[str, Any]:
+        journal = getattr(self, "state_journal", None)
+        if journal is None:
+            return {}
+        try:
+            state = journal.load()
+        except Exception:
+            return {}
+        return dict(state) if isinstance(state, Mapping) else {}
+
+    def _restore_journal(self) -> None:
+        state = self._journal_load()
+        rows = state.get("logbook")
+        if isinstance(rows, list):
+            self._logbook_entries.extend(
+                dict(row) for row in rows if isinstance(row, Mapping)
+            )
+        self._logbook_sequence = max(
+            (int(row.get("sequence") or 0) for row in self._logbook_entries),
+            default=0,
+        )
+        backtests = state.get("backtests")
+        if isinstance(backtests, list):
+            self._journal_backtests = [
+                dict(row) for row in backtests if isinstance(row, Mapping)
+            ]
+        tasks = state.get("agent_tasks")
+        self._journal_restored = {
+            "logbook": len(self._logbook_entries),
+            "backtests": len(self._journal_backtests),
+            "agent_tasks": len(tasks) if isinstance(tasks, list) else 0,
+        }
+
+    def _journal_append(self, section: str, entry: Mapping[str, Any]) -> None:
+        journal = getattr(self, "state_journal", None)
+        if journal is None:
+            return
+        try:
+            journal.append(section, dict(entry))
+        except Exception:
+            return
+
+    def _journal_clear(self, section: str) -> None:
+        journal = getattr(self, "state_journal", None)
+        if journal is None:
+            return
+        try:
+            journal.clear_section(section)
+        except Exception:
+            return
+
+    def _journal_reset(self) -> dict[str, Any]:
+        journal = getattr(self, "state_journal", None)
+        self._journal_backtests = []
+        if journal is None:
+            return {"journal": False, "journal_path": "", "clean_slate": True}
+        try:
+            state = journal.reset()
+        except Exception:
+            return {"journal": False, "journal_path": "", "clean_slate": True}
+        return {
+            "journal": True,
+            "journal_path": str(getattr(journal, "path", "")),
+            "clean_slate": bool(state.get("clean_slate_active", True)),
+        }
+
+    def journal_snapshot(self) -> dict[str, Any]:
+        """Durable-journal state: counts per section plus the restore receipts."""
+
+        journal = getattr(self, "state_journal", None)
+        state = self._journal_load()
+        path = getattr(journal, "path", None) if journal is not None else None
+        try:
+            exists = bool(path is not None and path.exists())
+        except Exception:
+            exists = False
+        return {
+            "enabled": journal is not None,
+            "journal_path": str(path) if path is not None else "",
+            "exists": exists,
+            "logbook": len(state.get("logbook") or []),
+            "backtests": len(state.get("backtests") or []),
+            "agent_tasks": len(state.get("agent_tasks") or []),
+            "saved_backtests": len(self._journal_backtests),
+            "clean_slate_active": bool(state.get("clean_slate_active", True)),
+            "restored": dict(self._journal_restored),
+            "schema_version": str(state.get("schema_version") or ""),
+        }
+
+    def free_margin_micros(self, silo: str) -> int | None:
+        """Free initial margin available to new entries in ``silo``.
+
+        Returned in integer micro-units. ``None`` means "margin is not
+        constraining": an un-funded (Clean-Slate) silo stays permissive so
+        the V1.1 clean-slate paper contract keeps working. Once the silo
+        holds capital, the available margin is the vault total minus whatever
+        the crash-atomic outbox has already reserved.
+        """
+
+        try:
+            balances = self.ledger.vault_balances(str(silo))
+        except Exception:
+            return None
+        total = 0
+        try:
+            for value in dict(balances).values():
+                total += int(value or 0)
+        except Exception:
+            return None
+        if total <= 0:
+            return None
+        reserved = 0
+        try:
+            rows = getattr(self.outbox, "reservations", None)
+            rows = rows() if callable(rows) else []
+            for row in rows:
+                row_silo = str(getattr(row, "silo", "") or "")
+                if row_silo and row_silo != str(silo):
+                    continue
+                state = str(getattr(row, "state", "") or "").upper()
+                if state in {"SETTLED", "RELEASED", "CANCELLED"}:
+                    continue
+                reserved += int(getattr(row, "notional_micros", 0) or 0)
+        except Exception:
+            reserved = 0
+        return max(0, int(total - reserved))
+
     def _known_silos(self) -> list[str]:
         registry = self.registry
         if registry is None:
@@ -2979,6 +3143,17 @@ class ControlPlane:
             ),
             created_at_ns=now,
         )
+        # V1.8 pre-trade gates (sec_018 Law 4 - the default answer is no trade):
+        # circuit band, margin sufficiency and the drawdown breaker must fire
+        # BEFORE any capital is reserved, so a rejected order can never move the
+        # silo vault.  SmartOMS raises the bare reason codes below.
+        try:
+            self.oms.validate_proposal(proposal)
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+
         notional_micros = int(round(proposal.qty * price * MICROS_PER_UNIT))
         realized_net_micros = int(
             round(notional_micros * max(0.0, request.expected_gross_bps) / 10_000.0)
@@ -4961,6 +5136,30 @@ class ControlPlane:
         if replay_meta is not None:
             receipt["synthetic_tape"] = False
             receipt["tradingview_replay"] = replay_meta
+        # V1.8: the saved walk-forward summary is durable across restarts.
+        summary = {
+            "backtest_id": str(
+                receipt.get("backtest_id")
+                or receipt.get("run_id")
+                or f"bt-{receipt.get('run_count', 0)}"
+            ),
+            "silo": str(request.silo),
+            "symbol": str(request.symbol),
+            "strategy_id": str(request.strategy_id),
+            "timeframe": str(request.timeframe),
+            "data_source": str(data_source),
+            "bars": int(request.bars),
+            "total_return_bps": receipt.get("total_return_bps"),
+            "sharpe": receipt.get("sharpe"),
+            "max_drawdown_bps": receipt.get("max_drawdown_bps"),
+            "completed_at_ns": time.time_ns(),
+        }
+        self._journal_backtests.append(summary)
+        self._journal_append("backtests", summary)
+        receipt["journal"] = {
+            "persisted": getattr(self, "state_journal", None) is not None,
+            "saved_backtests": len(self._journal_backtests),
+        }
         return receipt
 
     def compare_backtest_strategies(
@@ -4997,45 +5196,110 @@ class ControlPlane:
         "NZD": 0.040,
     }
 
-    def _options_underlying(self, symbol: str) -> dict[str, Any]:
-        """Resolve one optionable underlying or reject with ``422``.
+    _OPTIONS_SURFACE_DEFAULTS: dict[str, Any] = {
+        "iv_rank": 50.0,
+        "net_gamma_exposure_usd": 0.0,
+        "pcr_oi": 1.0,
+        "max_pain_strike": None,
+        "spot_reference": None,
+        "atm_iv_pct": None,
+        "days_to_expiry": 30,
+        "strike_step": None,
+    }
 
-        The six hand-tuned defaults in :data:`OPTIONS_UNDERLYINGS` win for the
-        blue-chip proxies; anything else in the 274-instrument registry is
-        modelled from its own contract spec and options-surface profile, so the
-        chain works for every optionable symbol instead of a fixed ticker list.
+    def _options_surface_snapshot(self, symbol: str) -> dict[str, Any]:
+        """Best-effort ``MarketFeaturesStore`` options surface for one symbol.
+
+        The registry is the source of truth for *which* instruments exist; the
+        feature store is the source of truth for their live option surface
+        (``iv_rank``, dealer gamma, put/call open interest, max pain).  A
+        missing profile degrades to deterministic defaults instead of raising,
+        because the chain itself only needs spot/vol/step.
+        """
+        out: dict[str, Any] = dict(self._OPTIONS_SURFACE_DEFAULTS)
+        out["surface"] = {}
+        try:
+            surface = get_options_surface_profile(str(symbol))
+        except Exception:  # noqa: BLE001 - an absent profile is not fatal
+            return out
+        if not isinstance(surface, Mapping):
+            return out
+        for key in self._OPTIONS_SURFACE_DEFAULTS:
+            value = surface.get(key)
+            if value is not None:
+                out[key] = value
+        out["surface"] = dict(surface)
+        return out
+
+    def _options_underlying(self, symbol: str) -> dict[str, Any]:
+        """Resolve any optionable instrument in the 274-symbol registry.
+
+        Every symbol with ``has_options == True`` -- India F&O stocks and
+        indices, crypto perpetuals, US equities/ETFs/futures -- produces its own
+        chain from its registry ``option_strike_step`` plus its
+        ``MarketFeaturesStore`` options surface.  A spot FX pair carries no
+        optionable contract, so it is rejected with
+        ``422 INSTRUMENT_NOT_OPTIONABLE`` rather than being quietly modelled.
         """
         key = str(symbol or "").strip().upper()
-        spec = OPTIONS_UNDERLYINGS.get(key)
-        if spec is not None:
-            return {"symbol": key, **dict(spec)}
-
         contract = instrument_registry.resolve(key)
-        if contract is None:
+        if contract is None and key not in OPTIONS_UNDERLYINGS:
             raise HTTPException(status_code=422, detail=f"UNKNOWN_UNDERLYING:{key}")
-        surface = get_options_surface_profile(contract.symbol)
-        spot = float(surface["spot_reference"])
-        if spot <= 0.0:
-            raise HTTPException(status_code=422, detail=f"UNKNOWN_UNDERLYING:{key}")
-        step = float(contract.option_strike_step)
-        if step <= 0.0:
-            step = max(round(spot * 0.02, 4), 10.0 ** -4)
-        precision = 4 if spot < 5.0 else 2
-        return {
-            "symbol": contract.symbol,
-            "silo": contract.silo,
-            "spot": spot,
-            "volatility": round(float(surface["atm_iv_pct"]) / 100.0, 6),
-            "days_to_expiry": 30,
-            "strike_step": step,
-            "strike_precision": precision,
-            "lot_size": max(1, int(round(contract.lot_size))),
-            "oi_scale": 50_000.0,
-            "currency": contract.currency,
-            "risk_free_rate": self._RISK_FREE_BY_CCY.get(contract.currency, 0.040),
-            "has_options": bool(contract.has_options),
-            "asset_class": contract.asset_class,
-        }
+        if contract is not None and not bool(contract.has_options):
+            raise HTTPException(status_code=422, detail="INSTRUMENT_NOT_OPTIONABLE")
+
+        surface = self._options_surface_snapshot(
+            contract.symbol if contract is not None else key
+        )
+        tuned = OPTIONS_UNDERLYINGS.get(key)
+        if tuned is not None:
+            body: dict[str, Any] = {"symbol": key, **dict(tuned)}
+            body["has_options"] = True
+            body["asset_class"] = getattr(contract, "asset_class", "INDEX")
+        else:
+            spot = float(surface["spot_reference"] or 0.0)
+            if spot <= 0.0:
+                raise HTTPException(status_code=422, detail=f"UNKNOWN_UNDERLYING:{key}")
+            step = float(contract.option_strike_step)
+            if step <= 0.0:
+                step = max(round(spot * 0.02, 4), 10.0 ** -4)
+            body = {
+                "symbol": contract.symbol,
+                "silo": contract.silo,
+                "spot": spot,
+                "volatility": round(float(surface["atm_iv_pct"] or 0.0) / 100.0, 6),
+                "days_to_expiry": 30,
+                "strike_step": step,
+                "strike_precision": 4 if spot < 5.0 else 2,
+                "lot_size": max(1, int(round(contract.lot_size))),
+                "oi_scale": 50_000.0,
+                "currency": contract.currency,
+                "risk_free_rate": self._RISK_FREE_BY_CCY.get(contract.currency, 0.040),
+                "has_options": True,
+                "asset_class": contract.asset_class,
+            }
+
+        # The registry contract is authoritative for the strike grid, even for
+        # the hand-tuned blue-chip proxies.
+        registry_step = float(getattr(contract, "option_strike_step", 0.0) or 0.0)
+        if registry_step > 0.0:
+            body["strike_step"] = registry_step
+        if not body.get("volatility"):
+            surface_iv = float(surface["atm_iv_pct"] or 0.0)
+            if surface_iv > 0.0:
+                body["volatility"] = round(surface_iv / 100.0, 6)
+        if not body.get("spot"):
+            body["spot"] = float(surface["spot_reference"] or 0.0)
+        body["iv_rank"] = round(float(surface["iv_rank"] or 0.0), 6)
+        body["net_gamma_exposure_usd"] = float(
+            surface["net_gamma_exposure_usd"] or 0.0
+        )
+        body["pcr_oi"] = round(float(surface["pcr_oi"] or 0.0), 6)
+        max_pain = surface["max_pain_strike"]
+        body["max_pain_strike"] = float(max_pain) if max_pain is not None else None
+        body["surface_days_to_expiry"] = int(surface["days_to_expiry"] or 30)
+        body["surface"] = surface["surface"]
+        return body
 
     @staticmethod
     def _option_iv(base_volatility: float, strike: float, spot: float) -> float:
@@ -5237,6 +5501,14 @@ class ControlPlane:
         atm_strike = float(atm_row["strike"])
         max_pain_pain = float(lowest_pain if lowest_pain is not None else 0.0)
 
+        # Registry + ``MarketFeaturesStore`` option surface.  These are the same
+        # figures the dealers are watching, so they ride the grounded packet
+        # instead of being recomputed from the modelled chain.
+        surface_iv_rank = float(spec.get("iv_rank") or 0.0)
+        surface_gex = float(spec.get("net_gamma_exposure_usd") or 0.0)
+        surface_pcr = float(spec.get("pcr_oi") or 0.0)
+        surface_max_pain = float(spec.get("max_pain_strike") or 0.0)
+
         metrics: dict[str, float] = {
             "spot": resolved_spot,
             "volatility": base_vol,
@@ -5251,6 +5523,10 @@ class ControlPlane:
             "max_pain_value": max_pain_pain,
             "total_call_oi": total_call_oi,
             "total_put_oi": total_put_oi,
+            "iv_rank": surface_iv_rank,
+            "net_gamma_exposure_usd": surface_gex,
+            "surface_pcr_oi": surface_pcr,
+            "surface_max_pain": surface_max_pain,
         }
         thesis = (
             "Grounded options chain receipt. "
@@ -5278,6 +5554,8 @@ class ControlPlane:
                 "risk_free_rate": rate,
             },
             "chain": rows,
+            "asset_class": str(spec.get("asset_class", "")),
+            "surface": dict(spec.get("surface") or {}),
             "summary": {
                 "atm_strike": atm_strike,
                 "atm_iv": atm_iv,
@@ -5290,6 +5568,13 @@ class ControlPlane:
                 "total_call_oi": total_call_oi,
                 "total_put_oi": total_put_oi,
                 "strike_count": len(rows),
+                "iv_rank": surface_iv_rank,
+                "net_gamma_exposure_usd": surface_gex,
+                "pcr_oi": surface_pcr,
+                "surface_max_pain_strike": surface_max_pain,
+                "gamma_regime": (
+                    "LONG_GAMMA" if surface_gex > 0.0 else ("SHORT_GAMMA" if surface_gex < 0.0 else "FLAT_GAMMA")
+                ),
             },
             "grounding": grounding,
             "packet": grounding["packet"],
@@ -5302,6 +5587,9 @@ class ControlPlane:
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for key, spec in OPTIONS_UNDERLYINGS.items():
+            tuned_contract = instrument_registry.resolve(key)
+            if tuned_contract is not None and not bool(tuned_contract.has_options):
+                continue
             rows.append(
                 {
                     "symbol": key,
@@ -5631,6 +5919,37 @@ class ControlPlane:
         bars = max(20, min(240, int(request.bars)))
         depth_levels = max(5, min(10, int(request.depth)))
 
+        # V1.8 PART 1.2 - every quote is anchored on the canonical 274-instrument
+        # registry contract so the L2 ladder, the circuit band and the Pine study
+        # signals all agree with Ring 0 order validation.
+        tick_size_micros = int(getattr(contract, "tick_size_micros", 0) or 0)
+        if tick_size_micros <= 0:
+            tick_size_micros = 10_000 if reference >= 100.0 else 1
+        tick_size = tick_size_micros / 1_000_000.0
+        lot_size = float(getattr(contract, "lot_size", 1.0) or 1.0)
+        circuit_limit_pct = float(getattr(contract, "circuit_limit_pct", 0.0) or 0.0)
+        tradingview_ticker = str(
+            getattr(contract, "tradingview_ticker", "") or f"NIOS:{symbol}"
+        )
+        display_name = str(getattr(contract, "display_name", symbol) or symbol)
+        feature_profile = str(getattr(contract, "asset_class", asset_class) or asset_class)
+        sub_category = str(getattr(contract, "sub_category", asset_class) or asset_class)
+        sector = str(getattr(contract, "sector", "UNCLASSIFIED") or "UNCLASSIFIED")
+        currency = str(getattr(contract, "currency", "USD") or "USD")
+
+        def snap_tick(value: float, *, direction: int = 0) -> float:
+            """Snap a price onto an exact ``tick_size_micros`` increment."""
+            scaled = value * 1_000_000.0
+            units = scaled / tick_size_micros
+            if direction > 0:
+                ticks = math.ceil(units - 1e-9)
+            elif direction < 0:
+                ticks = math.floor(units + 1e-9)
+            else:
+                ticks = round(units)
+            ticks = max(1, int(ticks))
+            return round(ticks * tick_size_micros / 1_000_000.0, 6)
+
         sigma = {"CRYPTO": 0.0080, "INDEX": 0.0035, "EQUITY": 0.0042, "FX": 0.0018}.get(
             asset_class, 0.0040
         )
@@ -5699,8 +6018,13 @@ class ControlPlane:
         ask_total = 0.0
         for level in range(depth_levels):
             step = mid * TERMINAL_LEVEL_STEP_PCT * level
-            bid_price = mid - half_spread - step
-            ask_price = mid + half_spread + step
+            bid_price = snap_tick(mid - half_spread - step, direction=-1)
+            ask_price = snap_tick(mid + half_spread + step, direction=1)
+            if level and bid_price >= ladder_bid[-1]["price"]:
+                bid_price = round(ladder_bid[-1]["price"] - tick_size, 6)
+            if level and ask_price <= ladder_ask[-1]["price"]:
+                ask_price = round(ladder_ask[-1]["price"] + tick_size, 6)
+            bid_price = max(tick_size, bid_price)
             bid_qty = float(
                 max(
                     1.0,
@@ -5785,6 +6109,7 @@ class ControlPlane:
             "tape_buy_ratio": tape_buy_ratio,
             "session_change_bps": float(daily_change),
         }
+        pine_studies = self._terminal_pine_studies(symbol, closes, bid_total, ask_total)
         thesis = (
             "Grounded terminal frame receipt. "
             + " ".join(
@@ -5839,11 +6164,110 @@ class ControlPlane:
                 "sell_initiated": len(tape) - buys,
                 "buy_ratio": tape_buy_ratio,
             },
+            "contract": {
+                "symbol": symbol,
+                "display_name": display_name,
+                "silo": silo,
+                "asset_class": asset_class,
+                "sub_category": sub_category,
+                "sector": sector,
+                "currency": currency,
+                "tradingview_ticker": tradingview_ticker,
+                "tick_size_micros": tick_size_micros,
+                "tick_size": tick_size,
+                "lot_size": lot_size,
+                "circuit_limit_pct": circuit_limit_pct,
+                "circuit_band": {
+                    "lower": round(reference * (1.0 - circuit_limit_pct / 100.0), 6),
+                    "upper": round(reference * (1.0 + circuit_limit_pct / 100.0), 6),
+                    "enforced": circuit_limit_pct > 0.0,
+                },
+                "has_options": bool(getattr(contract, "has_options", False)),
+                "registry_backed": contract is not None,
+                "feature_profile": feature_profile,
+            },
+            "pine_studies": pine_studies,
             "grounding": grounding,
             "packet": grounding["packet"],
             "law": "sec_018 Law 3 - every print carries a SHA-256 commitment",
+
             "generated_at_ns": time.time_ns(),
         }
+
+    def _terminal_pine_studies(
+        self,
+        symbol: str,
+        closes: list[float],
+        bid_total: float,
+        ask_total: float,
+    ) -> list[dict[str, Any]]:
+        """Attach the three canonical Pine study verdicts to a terminal frame.
+
+        The studies are deterministic replays of the Ring 2 TradingView bridge
+        evaluators (``STD;RSI``, ``STD;MACD``, ``STD;Supertrend``) so a terminal
+        quote always carries the same signal set the agents consume.
+        """
+        if not closes:
+            return []
+        last = float(closes[-1])
+        window = closes[-min(15, len(closes)) :]
+        gains = 0.0
+        losses = 0.0
+        for previous, current in zip(window, window[1:]):
+            delta = current - previous
+            if delta >= 0:
+                gains += delta
+            else:
+                losses -= delta
+        span = max(1, len(window) - 1)
+        avg_gain = gains / span
+        avg_loss = losses / span
+        rs = avg_gain / avg_loss if avg_loss > 0 else 100.0
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        ema_fast = sum(window[-min(12, len(window)) :]) / max(
+            1, min(12, len(window))
+        )
+        ema_slow = sum(window[-min(26, len(window)) :]) / max(
+            1, min(26, len(window))
+        )
+        macd = ema_fast - ema_slow
+        atr_proxy = sum(
+            abs(current - previous) for previous, current in zip(window, window[1:])
+        ) / max(1, span)
+        band = max(1e-9, 2.0 * atr_proxy)
+        supertrend_bullish = last >= (sum(window) / len(window) - band)
+        imbalance = (bid_total - ask_total) / max(1e-9, bid_total + ask_total)
+        return [
+            {
+                "study_id": "STD;RSI",
+                "name": "Relative Strength Index",
+                "timeframe": "1D",
+                "value": round(rsi, 6),
+                "regime": (
+                    "OVERBOUGHT" if rsi >= 70.0 else ("OVERSOLD" if rsi <= 30.0 else "NEUTRAL")
+                ),
+                "bias": "SELL" if rsi >= 70.0 else ("BUY" if rsi <= 30.0 else "HOLD"),
+                "score": round(rsi / 100.0, 6),
+            },
+            {
+                "study_id": "STD;MACD",
+                "name": "MACD (12,26,9)",
+                "timeframe": "1D",
+                "value": round(macd, 6),
+                "regime": "BULLISH_MOMENTUM" if macd >= 0.0 else "BEARISH_MOMENTUM",
+                "bias": "BUY" if macd >= 0.0 else "SELL",
+                "score": round(min(1.0, abs(macd) / max(1e-9, last)), 6),
+            },
+            {
+                "study_id": "STD;Supertrend",
+                "name": "Supertrend (10,3)",
+                "timeframe": "1D",
+                "value": round(band, 6),
+                "regime": "TREND_UP" if supertrend_bullish else "TREND_DOWN",
+                "bias": "BUY" if supertrend_bullish else "SELL",
+                "score": round(min(1.0, abs(imbalance)), 6),
+            },
+        ]
 
     def terminal_page(self) -> dict[str, Any]:
         """``GET /api/v2/cockpit/terminal`` -- watchlist plus a live frame."""
@@ -6168,6 +6592,8 @@ class ControlPlane:
         }
         with self._state_lock:
             self._logbook_entries.append(record)
+        # V1.8: durably persist the entry so it survives a ControlPlane restart.
+        self._journal_append("logbook", record)
         return {
             "ok": True,
             "page": "logbook",
@@ -6185,6 +6611,8 @@ class ControlPlane:
         cleared = len(self._logbook_entries)
         self._logbook_entries = []
         self._logbook_sequence = 0
+        # V1.8: the journal entry is removed atomically, never left dangling.
+        self._journal_clear("logbook")
         return {
             "ok": True,
             "page": "logbook",
@@ -7366,10 +7794,19 @@ class ControlPlane:
         self._card_sequence = 0
         self._kill_report = {}
         logbook = self.logbook_clear()
+        # V1.8: the whole durable journal returns to the Clean-Slate shape.
+        journal = self._journal_reset()
+        try:  # pragma: no cover - depends on the kernel build
+            drawdown = getattr(self.oms, "drawdown", None)
+            if drawdown is not None and hasattr(drawdown, "reset"):
+                drawdown.reset(operator="workspace-reset", reason="CLEAN_SLATE")
+        except Exception:
+            pass
         return {
             "reset": True,
             "clean_slate": True,
             "clean_slate_active": True,
+            "journal": journal,
             "workspace": "paper",
             "agents": self.task_dispatcher.reset_to_clean_slate(),
             "backtest": self.backtest_engine.reset_to_clean_slate(),
@@ -8273,21 +8710,58 @@ class ControlPlane:
         silo: str | None = None,
         fps: int = 60,
     ) -> AsyncIterator[str]:
-        """Typed, sequenced, SHA-256 sealed SSE frames (TICK/L2/ORDER/RISK/STUDY)."""
+        """Typed, sequenced, SHA-256 sealed SSE frames (TICK/L2/ORDER/RISK/STUDY).
 
+        V1.8 hardening:
+
+        * ``?silo=`` and ``?max_events=`` are validated *before* the first byte
+          is written, so a bad request is a real ``422`` instead of a
+          half-written stream.
+        * ``max_events`` must sit in ``1..500``; only an omitted value streams
+          unbounded.
+        * Every connected reader is counted and the counter is released in a
+          ``finally`` block, so a client disconnect can never leak the
+          generator, a lock, or a background task.
+        * An SSE comment keepalive plus the typed ``RISK_HEARTBEAT`` frame (one
+          every ``len(STREAM_EVENT_FRAMES)`` frames) keep intermediary proxies
+          from idling the connection out.
+        """
+
+        self._stream_silo_ids(silo)
+        if max_events is None:
+            limit: int | None = None
+        else:
+            try:
+                limit = int(max_events)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=422, detail="MAX_EVENTS_OUT_OF_RANGE:1..500"
+                ) from None
+            if limit < 1 or limit > 500:
+                raise HTTPException(
+                    status_code=422, detail="MAX_EVENTS_OUT_OF_RANGE:1..500"
+                )
         period = 1.0 / max(1, min(int(fps), 120))
-        limit = None if max_events is None else max(0, int(max_events))
         sequence = 0
-        while limit is None or sequence < limit:
-            frame_type, payload = self._stream_frame(sequence, silo)
-            yield (
-                f"event: {frame_type}\n"
-                f"data: {json.dumps(payload, separators=(',', ':'), default=str)}\n\n"
-            )
-            sequence += 1
-            if limit is not None and sequence >= limit:
-                break
-            await asyncio.sleep(period)
+        with self._stream_lock:
+            self._active_streams += 1
+        try:
+            while limit is None or sequence < limit:
+                frame_type, payload = self._stream_frame(sequence, silo)
+                encoded = json.dumps(
+                    payload, separators=(",", ":"), default=str
+                )
+                self._stream_frames_emitted += 1
+                if sequence and sequence % 60 == 0:
+                    yield ": keepalive\n\n"
+                yield f"event: {frame_type}\ndata: {encoded}\n\n"
+                sequence += 1
+                if limit is not None and sequence >= limit:
+                    break
+                await asyncio.sleep(period)
+        finally:
+            with self._stream_lock:
+                self._active_streams = max(0, self._active_streams - 1)
 
     def broker_handshake(
         self,
@@ -9367,11 +9841,15 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.get("/api/v2/stream")
     async def stream_hub(
         http_request: Request,
-        max_events: int | None = Query(default=None, ge=1, le=600),
+        max_events: int | None = Query(default=None, ge=1, le=500),
         silo: str | None = Query(default=None, max_length=32),
         fps: int = Query(60, ge=1, le=120),
     ) -> StreamingResponse:
         """Typed, sequenced, SHA-256 sealed real-time SSE frame hub."""
+
+        # V1.8: validate the silo *before* the response starts so an unknown
+        # silo is a clean 422 rather than a truncated stream.
+        control._stream_silo_ids(silo)
 
         async def body() -> AsyncIterator[str]:
             async for chunk in control.typed_stream(
@@ -9451,6 +9929,23 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _default_state_journal() -> Any:
+    """Resolve the process-wide atomic state journal, or ``None``.
+
+    The journal lives in Ring 0 (``ring0_vault.ibor.state_journal``) and is
+    resolved lazily so a partially-installed ring never blocks the cockpit.
+    """
+
+    try:
+        from ring0_vault.ibor.state_journal import AtomicStateJournal
+    except Exception:  # pragma: no cover - ring0 always present in production
+        return None
+    try:
+        return AtomicStateJournal()
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 def _proof_line(payload: Mapping[str, Any]) -> str:
