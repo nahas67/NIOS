@@ -1049,7 +1049,7 @@ def test_gate4_control_endpoint_dispatches_a_sandbox_order(
 
 def test_gate5_test_inventory_and_rebuilt_headless_document() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 25, [path.name for path in test_files]
+    assert len(test_files) == 26, [path.name for path in test_files]
 
     index = BUNDLE_DIR / "index.html"
     assert index.exists(), "the headless status document was not rebuilt"

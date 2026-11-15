@@ -310,7 +310,7 @@ def test_gate4_regression_inventory_is_twenty_one_suites() -> None:
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 25, suites
+    assert len(suites) == 26, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"
