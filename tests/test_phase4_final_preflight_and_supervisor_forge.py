@@ -1523,6 +1523,9 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
     assert receipt["gate_results"] == {
         "dsr_floor_met": True,
         "shadow_nursery_met": True,
+        # V1.8: Law 4 also requires positive net-of-cost expectancy across the
+        # recorded shadow fills, not only a fill count.
+        "net_expectancy_positive": True,
         "nursery_graduated": True,
     }
     assert receipt["gates"]["deflated_sharpe"]["required"] == 1.5
@@ -1552,6 +1555,7 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
     assert failure["gate_results"] == {
         "dsr_floor_met": False,
         "shadow_nursery_met": False,
+        "net_expectancy_positive": False,
         "nursery_graduated": False,
     }
     assert len(failure["rejection_reasons"]) == 2

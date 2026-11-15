@@ -170,6 +170,10 @@ VOLATILE_EVIDENCE_KEYS: frozenset[str] = frozenset(
         # so the tallies move while the readiness verdict does not.
         "applied_count",
         "recommended_count",
+        # Gate 14 (V1.8): the feed ingest stopwatch and the transport counters
+        # move every run; the PASS/FAIL verdict and the budget do not.
+        "ingest_elapsed_ms",
+        "transport",
     }
 )
 
