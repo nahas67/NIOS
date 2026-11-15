@@ -160,11 +160,10 @@ class GroundingLedger:
             if not math.isfinite(value):
                 raise ValueError(f"metric {name!r} is not finite ({value!r})")
 
-        as_of = int(
-            as_of_ns
-            if as_of_ns is not None
-            else max(int(valid_time_ns), int(knowledge_ts_ns))
-        )
+        # The decision instant must never be derived from the packet's own
+        # timestamps -- that makes the point-in-time check self-referential, so
+        # any future knowledge timestamp auto-authorises itself into the ledger.
+        as_of = int(as_of_ns if as_of_ns is not None else time.time_ns())
         packet = GroundedFactPacket(
             symbol=str(symbol).strip().upper(),
             valid_time_ns=int(valid_time_ns),

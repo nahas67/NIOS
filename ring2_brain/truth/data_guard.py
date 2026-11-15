@@ -1090,7 +1090,7 @@ class DualVendorLoaderRouter:
             primary_lag_ms=primary_lag_ms,
             secondary_lag_ms=secondary_lag_ms,
         )
-        as_of = int(as_of_ns) if as_of_ns is not None else int(bar.knowledge_ts_ns)
+        as_of = int(as_of_ns) if as_of_ns is not None else int(time.time_ns())
         normalized = self.guard.ingest_bar(
             bar,
             as_of_ns=as_of,
@@ -1276,7 +1276,10 @@ class SelfHealingDataGuard:
         lookahead is a bug in the caller, not a flaky feed.
         """
         started = time.perf_counter()
-        as_of = int(as_of_ns if as_of_ns is not None else max(bar.valid_time_ns, bar.knowledge_ts_ns))
+        # Never derive the decision instant from the bar's own timestamps: doing
+        # so made Gate 4 self-referential and therefore vacuous, so a bar whose
+        # knowledge arrived in the future was silently admitted (fatal flaw #7).
+        as_of = int(as_of_ns if as_of_ns is not None else time.time_ns())
 
         # Gate 1 -- feed lag.
         if float(bar.feed_lag_ms) > FEED_LAG_GATE_MS:

@@ -479,8 +479,10 @@ class TokenBudgetLedger:
             if name in LOCAL_PROVIDERS or name == "deterministic-local":
                 return True
             if name not in self.paid_providers:
-                # Unknown providers fail closed unless explicitly local.
-                return not self.locked
+                # Unknown providers fail closed unless explicitly local: an
+                # unlisted paid endpoint must never inherit spend authority
+                # from the fact that the cap has not been hit yet.
+                return False
             if self.locked:
                 return False
             if self.spend_usd >= self.daily_usd_cap:

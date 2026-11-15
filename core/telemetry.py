@@ -102,6 +102,11 @@ class TickLatencyRecorder:
                     # incremented, so the exporter stays Prometheus-correct.
                     self._counts[idx] += 1
                     break
+            else:
+                # Samples above the final finite bound belong to the implicit
+                # +Inf bucket. Without this the exported bucket total can never
+                # reach ``count`` and p99 dashboards read low.
+                self._counts[-1] += 1
             self._sum_s += value
             self._count += 1
             self._reservoir.append(value)

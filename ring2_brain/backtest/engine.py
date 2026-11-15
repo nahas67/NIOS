@@ -1046,7 +1046,11 @@ class WalkForwardBacktestEngine:
                 shadow_fills = int(
                     twin.shadow_fill_count(self._strategy_id_tag)
                 )
-                required_fills = int(twin.required_fills())
+                # ``required_fills`` is a @property on ShadowExecutionTwin;
+                # calling it raised TypeError, was swallowed by the except
+                # below, and the handoff always reported 0/30 shadow fills.
+                required = twin.required_fills
+                required_fills = int(required() if callable(required) else required)
             except Exception:  # pragma: no cover - defensive
                 shadow_fills = 0
                 required_fills = 30

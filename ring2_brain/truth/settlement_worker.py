@@ -370,6 +370,17 @@ class DelayedSettlementWorker:
     ) -> SettlementOutcome:
         """Grade one matured prediction and update conformal + trust state."""
         prediction = self.get(prediction_id)
+        # A prediction may be graded exactly once. Without this guard a repeat
+        # call appended a second conformal residual and re-counted the hit and
+        # error, biasing Q_0.98 and the Darwinian trust multiplier.
+        if any(
+            str(outcome.prediction_id) == str(prediction_id)
+            for outcome in self._settled
+        ):
+            raise ValueError(
+                f"prediction {prediction_id!r} is already settled; a second "
+                "grade would double-count the conformal residual"
+            )
         stamp = int(now_ns) if now_ns is not None else time.time_ns()
         if not prediction.is_due(stamp):
             raise ValueError(

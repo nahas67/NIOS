@@ -255,6 +255,14 @@ class DurableConsumer:
                 break
             event = self._bus.get_event(self.stream, candidate)
             if event is None:
+                # The event is no longer retrievable because ``_trim`` removed
+                # it from the log. Everything at or below the sequence the
+                # caller just acknowledged is consumed by definition, so the
+                # cursor can still advance; otherwise it would pin forever and
+                # every already-acked event would be redelivered.
+                if candidate <= int(sequence):
+                    state.cursor = candidate
+                    continue
                 break
             state.cursor = candidate
 
@@ -437,7 +445,15 @@ class LocalJetStreamBus:
         log = self._logs[stream]
         excess = len(log) - self._max_msgs
         if excess > 0:
+            trimmed = log[:excess]
             del log[:excess]
+            # Drop the idempotency markers for the evicted events too, or the
+            # dedupe map grows for the lifetime of the process on the stream
+            # that carries every proposal (Tier 1 is long-running).
+            dedupe = self._dedupe.get(stream)
+            if dedupe is not None:
+                for event in trimmed:
+                    dedupe.pop(event.idempotency_key, None)
 
     # -- read -------------------------------------------------------------
     def replay(

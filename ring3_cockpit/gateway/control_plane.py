@@ -3154,10 +3154,22 @@ class ControlPlane:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
 
-        notional_micros = int(round(proposal.qty * price * MICROS_PER_UNIT))
-        realized_net_micros = int(
-            round(notional_micros * max(0.0, request.expected_gross_bps) / 10_000.0)
-        )
+        # Exact integer micro-units. The previous float product lost whole
+        # micro-units once qty*price exceeded 2**53 (76.6% of institutional
+        # sized samples diverged from the exact value), so the P&L reported
+        # here could disagree with the notional the outbox actually reserved.
+        from ring0_vault.ibor.ledger_outbox import to_micros as _to_micros
+
+        notional_micros = (
+            _to_micros(proposal.qty) * _to_micros(price)
+        ) // MICROS_PER_UNIT
+        # bps -> micro-bps keeps the rounding integral and half-up, matching
+        # the Ring 0 convention instead of rounding through a float.
+        _bps_scaled = int(round(max(0.0, request.expected_gross_bps) * 1_000_000))
+        _bps_denominator = 10_000 * 1_000_000
+        realized_net_micros = (
+            notional_micros * _bps_scaled + _bps_denominator // 2
+        ) // _bps_denominator
 
         try:
             reservation = self.outbox.reserve(
@@ -4609,14 +4621,14 @@ class ControlPlane:
                 status_code=502, detail="plugin registry returned no record"
             )
 
-        # Mirror the declared nursery exposure into the plugin registry. The
-        # loop is bounded by the gate itself, so a hostile payload cannot spin.
-        recorded = 0
-        current = int(getattr(record, "shadow_fills", 0) or 0)
-        for _ in range(max(0, min(declared_fills, min_fills) - current)):
-            with contextlib.suppress(Exception):
-                registry.record_fill(name, net_bps=2.5)
-                recorded += 1
+        # Law 4: graduation is earned on real L2 shadow fills, never asserted.
+        # This block used to synthesise the missing fills from the caller's own
+        # ``shadow_fills`` integer at a guaranteed +2.5 bps, so one POST could
+        # hand a brand-new plugin a full nursery record and promote it. The
+        # declared count is still reported (the operator's claim is evidence
+        # about their intent, not about the tape) but the gate is decided on
+        # what the registry actually recorded.
+        recorded = int(getattr(record, "shadow_fills", 0) or 0)
 
         genome_id = f"plugin:{name}"
         genome = StrategyGenome(
@@ -4626,10 +4638,10 @@ class ControlPlane:
                 / 255.0
             ),
             silo=str(request.silo),
-            shadow_fills=declared_fills,
-            winning_shadow_fills=declared_fills,
+            shadow_fills=recorded,
+            winning_shadow_fills=recorded,
             deflated_sharpe=sharpe,
-            metrics_source="operator_input",
+            metrics_source="registry_recorded",
         )
         try:
             forge.register_challenger(genome)
@@ -4644,8 +4656,8 @@ class ControlPlane:
             nursery = dict(registry.shadow_report(name) or {})
         stored = forge.get_challenger(genome_id)
         dsr_ok = sharpe >= dsr_floor
-        nursery_ok = declared_fills >= min_fills
-        graduated = bool(nursery.get("graduated", False))
+        nursery_ok = recorded >= min_fills
+        graduated = bool(nursery.get("graduated", False)) and nursery_ok
         promoted = bool(dsr_ok and nursery_ok and graduated)
         reasons: list[str] = []
         if not dsr_ok:
@@ -4653,7 +4665,10 @@ class ControlPlane:
                 f"deflated_sharpe {sharpe:.4f} < promotion floor {dsr_floor:.2f}"
             )
         if not nursery_ok:
-            reasons.append(f"shadow_fills {declared_fills} < required {min_fills}")
+            reasons.append(
+                f"shadow_fills {declared_fills} declared / {recorded} recorded "
+                f"< required {min_fills}"
+            )
         if nursery_ok and not graduated:
             reasons.append("plugin registry has not graduated the shadow record")
         return {
@@ -6608,9 +6623,14 @@ class ControlPlane:
 
     def logbook_clear(self) -> dict[str, Any]:
         """``POST /api/v2/control/logbook/clear`` -- zero the journal."""
-        cleared = len(self._logbook_entries)
-        self._logbook_entries = []
-        self._logbook_sequence = 0
+        # ``logbook_entry`` appends under ``_state_lock`` and ``logbook_page``
+        # iterates under it, so the reset must take the same lock: an unlocked
+        # rebind dropped a concurrently appended entry and could restart the
+        # sequence under a live reader.
+        with self._state_lock:
+            cleared = len(self._logbook_entries)
+            self._logbook_entries = []
+            self._logbook_sequence = 0
         # V1.8: the journal entry is removed atomically, never left dangling.
         self._journal_clear("logbook")
         return {
@@ -7830,7 +7850,9 @@ class ControlPlane:
                 silo, float(request.amount_units), vault=request.vault
             )
         else:  # pragma: no cover - ControlPlane without an orchestrator
-            micros = int(round(float(request.amount_units) * 1_000_000))
+            from ring0_vault.ibor.ledger_outbox import to_micros as _to_micros
+
+            micros = _to_micros(request.amount_units)
             report = self.ledger.fund_paper_capital(
                 silo, micros, vault=request.vault
             )
@@ -8008,11 +8030,16 @@ class ControlPlane:
     def publish_card(self, card: PlainEnglishCockpitCard | Mapping[str, Any]) -> dict[str, Any]:
         payload = card.to_dict() if isinstance(card, PlainEnglishCockpitCard) else dict(card)
         payload.setdefault("proof_line", _proof_line(payload))
-        self._cards.append(payload)
-        if len(self._cards) > 500:
-            del self._cards[: len(self._cards) - 500]
-        self._card_sequence += 1
-        payload["sequence"] = self._card_sequence
+        # The autopilot thread, the SSE readers and ``reset_workspace`` all
+        # touch these fields, so the append/trim/sequence trio must be atomic.
+        # Unlocked, the truncation could drop a card another thread had just
+        # appended and two publishers could mint the same sequence number.
+        with self._state_lock:
+            self._card_sequence += 1
+            payload["sequence"] = self._card_sequence
+            self._cards.append(payload)
+            if len(self._cards) > 500:
+                del self._cards[: len(self._cards) - 500]
         if self.bus is not None:
             try:
                 self.bus.publish_idempotent(

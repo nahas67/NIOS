@@ -1486,15 +1486,31 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
     )
 
     # ------------------------------------------------ 6. Challenger evaluation
+    # Law 4: graduation is earned on recorded L2 shadow fills. A declared
+    # ``shadow_fills`` count is a claim, not evidence, so the first call both
+    # registers the challenger and refuses to promote it on the claim alone.
+    challenger_body = {
+        "plugin_name": "genome_step6_alpha",
+        "candidate_sharpe": 1.92,
+        "shadow_fills": 34,
+        "silo": SILO,
+        "operator": operator,
+    }
+    refused = cockpit.post(
+        "/api/v2/control/forge/evaluate-challenger", json=challenger_body
+    )
+    assert refused.status_code == 200, refused.text
+    assert refused.json()["status"] == "REJECTED"
+    assert refused.json()["recorded_fills"] == 0
+
+    # Seed the nursery with real recorded fills, then re-evaluate.
+    for _ in range(34):
+        cockpit.app.state.control.plugins.record_fill(
+            "genome_step6_alpha", net_bps=2.5
+        )
+
     promoted = cockpit.post(
-        "/api/v2/control/forge/evaluate-challenger",
-        json={
-            "plugin_name": "genome_step6_alpha",
-            "candidate_sharpe": 1.92,
-            "shadow_fills": 34,
-            "silo": SILO,
-            "operator": operator,
-        },
+        "/api/v2/control/forge/evaluate-challenger", json=challenger_body
     )
     assert promoted.status_code == 200, promoted.text
     receipt = promoted.json()
@@ -1544,6 +1560,21 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
     assert failure["hold_reason"]
 
     # The gates are inclusive: exactly 1.50 and exactly 30 clears both.
+    # The 30 fills have to exist on the tape, not just in the POST, so the
+    # first call registers the genome and the second one promotes it.
+    edge_body = {
+        "plugin_name": "genome_step6_edge",
+        "candidate_sharpe": 1.5,
+        "shadow_fills": 30,
+        "silo": SILO,
+    }
+    registered = cockpit.post(
+        "/api/v2/control/forge/evaluate-challenger", json=edge_body
+    )
+    assert registered.status_code == 200, registered.text
+    assert registered.json()["status"] == "REJECTED"
+    for _ in range(30):
+        cockpit.app.state.control.plugins.record_fill("genome_step6_edge", net_bps=1.5)
     edge = cockpit.post(
         "/api/v2/control/forge/evaluate-challenger",
         json={

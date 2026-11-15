@@ -58,6 +58,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Any, Iterable, Mapping
 
 __all__ = [
@@ -157,6 +158,37 @@ def _apply_bps(amount_micros: int, bps: float) -> int:
     """Integer ``amount * bps / 10_000`` with micro-bp resolution (no float drift)."""
     scaled = int(round(float(bps) * _BPS_SCALE))
     return (int(amount_micros) * scaled) // (10_000 * _BPS_SCALE)
+
+
+#: Above this magnitude a binary float can no longer represent every integer,
+#: so an amount that arrives as a float is refused instead of being silently
+#: rounded to a neighbouring micro-unit (``sec_009``: money is a 128-bit int).
+EXACT_FLOAT_INT_LIMIT: int = 1 << 53
+
+
+def _exact_micros(value: Any, *, name: str) -> int:
+    """Coerce a micro-unit amount to ``int`` without routing an int through float.
+
+    An ``int`` is taken as-is, so a 128-bit notional keeps every micro-unit.
+    A float is accepted only while it stays inside
+    :data:`EXACT_FLOAT_INT_LIMIT`; beyond that ``int(round(...))`` would corrupt
+    the value by whole micro-units, which is worse than refusing the call.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer micro-unit amount")
+    if isinstance(value, int):
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    if abs(number) > EXACT_FLOAT_INT_LIMIT:
+        raise ValueError(
+            f"{name} exceeds the exact float range; pass an int micro-unit amount"
+        )
+    return int(round(number))
 
 
 def _finite(name: str, value: float, *, minimum: float = 0.0) -> float:
@@ -302,12 +334,7 @@ class StatutoryCostEngine:
         """
         token = str(silo).strip().upper()
         floor = self.floor_bps(token)
-        try:
-            amount = int(round(float(notional_micros)))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("notional_micros must be numeric") from exc
-        if not math.isfinite(float(notional_micros)):
-            raise ValueError("notional_micros must be finite")
+        amount = _exact_micros(notional_micros, name="notional_micros")
         if amount < 0:
             raise ValueError("notional_micros must be >= 0")
         side_token = str(side).strip().upper() or "BUY"
@@ -350,13 +377,30 @@ class StatutoryCostEngine:
         )
 
     def breakdown_units(
-        self, silo: str, notional_units: float, *, side: str = "BUY"
+        self, silo: str, notional_units: float | int | Decimal, *, side: str = "BUY"
     ) -> StatutoryCostBreakdown:
-        """Convenience wrapper that accepts a float notional in currency units."""
-        notional = _finite("notional_units", notional_units)
-        return self.breakdown(
-            silo, int(round(notional * MICROS_PER_UNIT)), side=side
-        )
+        """Convenience wrapper that accepts a notional in whole currency units.
+
+        The unit amount is scaled to micro-units in :class:`~decimal.Decimal`, not
+        in binary float: ``notional * 1_000_000`` overflows float's exact-integer
+        range at roughly 9.01e9 units, so a large institutional notional would
+        otherwise lose micro-units before the integer engine ever sees it.
+        """
+        if isinstance(notional_units, int) and not isinstance(notional_units, bool):
+            micros = notional_units * MICROS_PER_UNIT
+        else:
+            try:
+                exact = Decimal(repr(notional_units)) if isinstance(notional_units, float) else Decimal(notional_units)
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError("notional_units must be numeric") from exc
+            if not exact.is_finite():
+                raise ValueError("notional_units must be finite")
+            if exact < 0:
+                raise ValueError("notional_units must be >= 0")
+            micros = int(
+                (exact * MICROS_PER_UNIT).to_integral_value(rounding=ROUND_HALF_EVEN)
+            )
+        return self.breakdown(silo, micros, side=side)
 
 
 #: Module-level singleton -- the single source of statutory truth.
@@ -575,13 +619,7 @@ def india_segment_bps(segment: str) -> Mapping[str, float]:
 
 def _coerce_notional_micros(notional_micros: int) -> int:
     """Integer micro-unit notional; must be strictly positive."""
-    try:
-        value = float(notional_micros)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("INVALID_NOTIONAL") from exc
-    if not math.isfinite(value):
-        raise ValueError("INVALID_NOTIONAL")
-    amount = int(round(value))
+    amount = _exact_micros(notional_micros, name="notional")
     if amount <= 0:
         raise ValueError("INVALID_NOTIONAL")
     return amount

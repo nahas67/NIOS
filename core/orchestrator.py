@@ -629,7 +629,10 @@ class NIOSCoreOrchestrator:
         vault: str | None = None,
     ) -> dict[str, Any]:
         """Deposit user-chosen Paper capital into one silo (``sec_009``)."""
-        amount_micros = int(round(float(amount_units) * 1_000_000))
+        # ``to_micros`` is the single sanctioned float -> money boundary. The
+        # old ``int(round(float(...) * 1e6))`` destroyed exactness for any int
+        # above ~9.007e9 units even though the signature accepts ``int``.
+        amount_micros = to_micros(amount_units)
         result = self.ledger.fund_paper_capital(silo, amount_micros, vault=vault)
         self._clean_slate = False
         return result

@@ -586,14 +586,36 @@ def _windows_priority_check(apply: bool, ring: str) -> dict[str, Any]:
     before = int(kernel32.GetPriorityClass(handle))
     target_name = "HIGH" if ring == "ring1" else "ABOVE_NORMAL"
     target = _WINDOWS_PRIORITY[target_name]
+
+    # Windows priority classes are bit flags, not an ordering: HIGH is 0x80
+    # while ABOVE_NORMAL is 0x8000, so a numeric ``<`` inverts the ranking and
+    # ABOVE_NORMAL is never raised (and is reported APPLIED anyway).
+    def _rank(cls: int) -> int:
+        label = (
+            str(_WINDOWS_PRIORITY_NAMES.get(cls, ""))
+            .upper()
+            .replace("_PRIORITY_CLASS", "")
+        )
+        if "REALTIME" in label:
+            return 5
+        if "HIGH" in label:
+            return 4
+        if "ABOVE" in label:
+            return 3
+        if "BELOW" in label:
+            return 1
+        if "IDLE" in label:
+            return 0
+        return 2
+
     applied_now = False
-    if apply and before < target:
+    if apply and _rank(before) < _rank(target):
         applied_now = bool(kernel32.SetPriorityClass(handle, target))
     after = int(kernel32.GetPriorityClass(handle)) if applied_now else before
     return _check(
         "process_priority",
         f"Process priority class ({target_name}_PRIORITY_CLASS)",
-        APPLIED if after >= target else RECOMMENDED,
+        APPLIED if _rank(after) >= _rank(target) else RECOMMENDED,
         f"{_WINDOWS_PRIORITY_NAMES.get(before, hex(before))} -> "
         f"{_WINDOWS_PRIORITY_NAMES.get(after, hex(after))}",
         current={

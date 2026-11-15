@@ -2210,9 +2210,20 @@ class AgentTaskDispatcher:
             base["error"] = f"{type(exc).__name__}: {exc}"
             return base
         base["claims_checked"] = int(getattr(report, "claims_checked", 0) or 0)
-        base["derived_expressions"] = int(
-            len(getattr(report, "derived_expressions", ()) or ())
-        )
+        # ``derived_expressions`` is a count on some reports and a collection on
+        # others. ``len()`` on the integer form raised TypeError *outside* the
+        # guarded try above, so the verified-report path could never return.
+        derived = getattr(report, "derived_expressions", 0)
+        if isinstance(derived, bool):
+            derived_count = int(derived)
+        elif isinstance(derived, int):
+            derived_count = derived
+        else:
+            try:
+                derived_count = len(derived or ())
+            except TypeError:
+                derived_count = 0
+        base["derived_expressions"] = max(0, derived_count)
         base["verified"] = True
         return base
 

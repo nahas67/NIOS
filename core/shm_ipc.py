@@ -470,7 +470,7 @@ class LeaseTableSHM:
         # already-decoded lease instead of allocating a new one.  The SeqLock
         # sequence is the invalidation key, so a write can never serve stale
         # field values.
-        self._lease_cache: dict[int, tuple[int, System1Lease]] = {}
+        self._lease_cache: dict[int, tuple[int, str, System1Lease]] = {}
 
         if kill_latch is None and segment_name(name) == segment_name(LEASE_TABLE_SHM_NAME):
             try:
@@ -606,12 +606,21 @@ class LeaseTableSHM:
             if seq_before & 1:
                 continue
             cached = self._lease_cache.get(off)
-            if cached is not None and cached[0] == seq_before:
+            # The slot offset is derived from a CRC32 of the symbol, so two
+            # symbols can collide on one slot. A cached entry is only
+            # authoritative for the symbol that wrote it -- serving it for a
+            # colliding symbol would hand out another instrument's trading
+            # authority (Law 1).
+            if (
+                cached is not None
+                and cached[0] == seq_before
+                and cached[1] == symbol
+            ):
                 # A cached lease is only authoritative while its dead-man
                 # window is open; an expired entry must never be served as
                 # live authority (Law 2).
-                if cached[1].is_active(now_ns):
-                    return cached[1]
+                if cached[2].is_active(now_ns):
+                    return cached[2]
                 self._lease_cache.pop(off, None)
             raw = struct.unpack_from("<16sB7xddQQ", buf, off + _LEASE_PAYLOAD_OFFSET)
             if _U64.unpack_from(buf, off)[0] != seq_before:
@@ -627,7 +636,7 @@ class LeaseTableSHM:
                 raw[4],
                 raw[5],
             )
-            self._lease_cache[off] = (seq_before, lease)
+            self._lease_cache[off] = (seq_before, symbol, lease)
             return lease
 
         return System1Lease.disarmed(symbol)

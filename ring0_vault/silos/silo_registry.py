@@ -33,7 +33,7 @@ from typing import Any, Iterable, Mapping
 from core.schemas import VaultName
 
 from ring0_vault.conformal_copula_gate import SiloMarket
-from ring0_vault.ibor.ledger_outbox import VAULT_ASSET_MAP
+from ring0_vault.ibor.ledger_outbox import MICROS_PER_UNIT, VAULT_ASSET_MAP, to_micros
 from ring1_spinal.silo_worker import (
     CRYPTO_BINANCE,
     FX_MT5,
@@ -1435,15 +1435,42 @@ def _build_payload(
     return payload, flags
 
 
+#: Basis points are quantised to one part per million of a basis point so that
+#: ``amount * bps / 10_000`` can be evaluated entirely in integer arithmetic.
+_BPS_SCALE: int = 1_000_000
+
+
+def _apply_bps_micros(amount_micros: int, bps: float) -> int:
+    """Exact integer ``amount * bps / 10_000``, symmetric around zero.
+
+    The magnitude is rounded half-up and the sign is carried separately, because
+    Python's ``//`` floors toward negative infinity and would make an equal gain
+    and loss disagree by one micro-unit.
+    """
+    scaled = int(round(float(bps) * _BPS_SCALE))
+    numerator = int(amount_micros) * scaled
+    denominator = 10_000 * _BPS_SCALE
+    if numerator < 0:
+        return -((abs(numerator) + denominator // 2) // denominator)
+    return (numerator + denominator // 2) // denominator
+
+
 def _paper_fill(proposal: Any, silo: "MarketSilo", *, now_ns: int) -> dict[str, Any]:
-    """Deterministic maker fill used by PAPER and SHADOW dispatch."""
-    notional_micros = int(
-        round(float(proposal.qty) * float(proposal.limit_price) * 1_000_000)
-    )
+    """Deterministic maker fill used by PAPER and SHADOW dispatch.
+
+    The notional is derived exactly the way Ring 0's outbox and the orchestrator
+    derive it: each leg is quantised to integer micro-units first and the two
+    integers are multiplied.  Computing ``qty * price * 1_000_000`` in float
+    loses whole micro-units once the product passes ``2**53``, and it disagreed
+    with the notional the outbox actually reserved.
+    """
+    qty_micros = to_micros(proposal.qty)
+    price_micros = to_micros(proposal.limit_price)
+    notional_micros = (qty_micros * price_micros) // MICROS_PER_UNIT
     gross_bps = float(proposal.expected_gross_bps)
     cost_bps = float(silo.round_trip_cost_bps)
     net_bps = gross_bps - cost_bps
-    realized_net_micros = int(round(notional_micros * net_bps / 10_000.0))
+    realized_net_micros = _apply_bps_micros(notional_micros, net_bps)
     digest = hashlib.sha256(
         f"{silo.silo_id}|{proposal.proposal_id}|{proposal.symbol}|"
         f"{proposal.side}|{proposal.qty}|{proposal.limit_price}".encode("utf-8")

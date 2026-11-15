@@ -772,3 +772,218 @@ def test_gate5_stream_does_not_leak_on_early_consumer_exit(runtime) -> None:
         time.sleep(0.05)
     assert control._active_streams == 0
     del control
+
+
+# ---------------------------------------------------------------------------
+# Gate 6 -- V1.8 audit remediation regression coverage
+#
+# One test per defect confirmed by the static/AST audit and fixed in this
+# release. The behavioural tests exercise the fixed code path directly; the
+# source-invariant tests pin the absence of an idiom whose reinstatement would
+# silently re-open the same defect (they are deliberately cheap and hermetic).
+# ---------------------------------------------------------------------------
+
+
+def test_gate6_cost_engine_preserves_full_u128_notional() -> None:
+    """Integer micro-unit notionals must survive the statutory cost engine."""
+    for notional in (2**53 + 1, 12_345_678_901_234_567_890, 10**30 + 13):
+        result = cost_engine.breakdown(INDIA, notional)
+        assert result.notional_micros == notional, (
+            "breakdown() routed an integer notional through float and lost "
+            f"low-order micros: {result.notional_micros} != {notional}"
+        )
+        assert result.total_micros > 0
+
+
+def test_gate6_cost_engine_rejects_float_beyond_exact_integer_range() -> None:
+    """A float that cannot represent the notional exactly must be refused."""
+    with pytest.raises(ValueError):
+        cost_engine.breakdown(INDIA, 1e30)
+
+
+def test_gate6_breakdown_units_is_exact_for_int_and_decimal() -> None:
+    """Unit-level entry points must not round through binary floats."""
+    from decimal import Decimal
+
+    integer_call = cost_engine.breakdown_units(INDIA, 10**20 + 7)
+    assert integer_call.notional_micros == (10**20 + 7) * 1_000_000
+
+    decimal_call = cost_engine.breakdown_units(INDIA, Decimal("9007199254740993"))
+    assert decimal_call.notional_micros == 9_007_199_254_740_993_000_000
+
+
+def test_gate6_apply_bps_micros_is_exact_and_sign_symmetric() -> None:
+    """Ring 0 paper fills must apply basis points with integer arithmetic."""
+    from ring0_vault.silos.silo_registry import _apply_bps_micros
+
+    assert _apply_bps_micros(10**15, 5.5) == 550_000_000_000
+    assert _apply_bps_micros(10**15, -5.5) == -550_000_000_000
+    assert _apply_bps_micros(10**15, 5.5) + _apply_bps_micros(10**15, -5.5) == 0
+    assert _apply_bps_micros(10**18, 0.0) == 0
+
+
+def test_gate6_cached_lease_never_served_to_a_crc_colliding_symbol() -> None:
+    """A cached System 1 lease is only authoritative for its own symbol."""
+    from core.shm_ipc import LeaseMode, LeaseTableSHM, System1Lease
+
+    # n_slots=1 forces every symbol onto slot 0, which is the same collision
+    # a CRC32 clash produces in production.
+    table = LeaseTableSHM(n_slots=1, name=f"nios-gate6-lease-{os.getpid()}")
+    try:
+        now_ns = time.time_ns()
+        table.write_lease(
+            System1Lease(
+                symbol="AAA",
+                mode=LeaseMode.LONG_ONLY,
+                expires_at_ns=now_ns + 60_000_000_000,
+            )
+        )
+        first = table.read_lease("AAA")
+        assert first.mode == LeaseMode.LONG_ONLY
+        # Second read is served from the cache; a colliding symbol must not
+        # inherit that cached authority (Law 1 / Law 2).
+        assert table.read_lease("AAA").mode == LeaseMode.LONG_ONLY
+        collided = table.read_lease("ZZZ")
+        assert not collided.is_active(now_ns) or collided.symbol != "AAA"
+    finally:
+        table.close()
+
+
+def test_gate6_nats_ack_cursor_advances_past_trimmed_events(tmp_path: Any) -> None:
+    """The durable cursor must not pin at zero once the log head is trimmed."""
+    from core.nats_bus import STREAM_RING1_SCALP, LocalJetStreamBus
+
+    bus = LocalJetStreamBus(path=tmp_path / "gate6-js-ack", max_msgs_per_stream=2)
+    try:
+        for index in range(6):
+            bus.publish_idempotent(
+                "ring1.scalp.gate6",
+                {"index": index},
+                idempotency_key=f"gate6-ack-{index}",
+                stream=STREAM_RING1_SCALP,
+            )
+        consumer = bus.consumer(STREAM_RING1_SCALP, "gate6-ack")
+        consumer.ack(6)
+        assert consumer.cursor == 6
+    finally:
+        bus.close()
+
+
+def test_gate6_nats_dedupe_map_is_evicted_with_trim(tmp_path: Any) -> None:
+    """Idempotency markers must not grow for the process lifetime."""
+    from core.nats_bus import STREAM_RING1_SCALP, LocalJetStreamBus
+
+    bus = LocalJetStreamBus(path=tmp_path / "gate6-js-dedupe", max_msgs_per_stream=2)
+    try:
+        for index in range(8):
+            bus.publish_idempotent(
+                "ring1.scalp.gate6",
+                {"index": index},
+                idempotency_key=f"gate6-dedupe-{index}",
+                stream=STREAM_RING1_SCALP,
+            )
+        dedupe = bus._dedupe[STREAM_RING1_SCALP]
+        assert len(dedupe) <= 2
+    finally:
+        bus.close()
+
+
+def test_gate6_can_spend_denies_an_unlisted_provider() -> None:
+    """An unknown provider must not inherit spend authority by default."""
+    from core.llm_transport import TokenBudgetLedger
+
+    ledger = TokenBudgetLedger()
+    assert ledger.can_spend("brand-new-paid-endpoint") is False
+    assert ledger.can_spend("deterministic-local") is True
+
+
+def test_gate6_telemetry_buckets_cover_samples_above_the_last_bound() -> None:
+    """Bucket counts must total the sample count, including the +Inf bucket."""
+    from core.telemetry import TickLatencyRecorder
+
+    recorder = TickLatencyRecorder()
+    for _ in range(10):
+        recorder.observe_s(5.0)  # far above the last finite 1 ms bound
+    snapshot = recorder.snapshot()
+    assert snapshot["count"] == 10
+    buckets = snapshot["buckets"]
+    observed = 0
+    for item in buckets.values() if isinstance(buckets, dict) else buckets:
+        observed += int(item.get("count", 0)) if isinstance(item, dict) else int(item)
+    assert observed == 10
+
+
+def test_gate6_shadow_twin_required_fills_is_a_property() -> None:
+    """Calling it as a method raised TypeError and always reported 0/30."""
+    from ring1_spinal.shadow_twin import ShadowExecutionTwin
+
+    assert isinstance(ShadowExecutionTwin.__dict__["required_fills"], property)
+
+
+def test_gate6_settlement_refuses_a_second_grade_of_one_prediction() -> None:
+    """A repeat settlement must not append a second conformal residual."""
+    from core.feature_store import FeatureStore
+    from ring2_brain.truth.settlement_worker import DelayedSettlementWorker
+
+    worker = DelayedSettlementWorker(FeatureStore(), persist_trust=False)
+    worker.record_prediction(
+        "gate6-prediction",
+        strategy_id="gate6-strategy",
+        symbol="AAA",
+        predicted_net_bps=1.0,
+        horizon_ns=0,
+        created_at_ns=0,
+    )
+    worker.settle_prediction("gate6-prediction", 2.0, now_ns=1_000)
+    with pytest.raises(ValueError):
+        worker.settle_prediction("gate6-prediction", 2.0, now_ns=2_000)
+
+
+def test_gate6_shared_control_plane_state_is_mutated_under_lock() -> None:
+    """Logbook and card resets must take the same lock as their readers."""
+    import inspect
+
+    from ring3_cockpit.gateway.control_plane import ControlPlane
+
+    for name in ("logbook_clear", "publish_card"):
+        source = inspect.getsource(getattr(ControlPlane, name))
+        assert "_state_lock" in source, f"{name} must mutate shared state under _state_lock"
+
+
+def test_gate6_challenger_graduation_cannot_synthesise_shadow_fills() -> None:
+    """Law 4: graduation is earned on recorded fills, never asserted."""
+    import inspect
+
+    from ring3_cockpit.gateway.control_plane import ControlPlane
+
+    source = inspect.getsource(ControlPlane.evaluate_challenger)
+    assert "record_fill" not in source
+    assert "net_bps=2.5" not in source
+
+
+def test_gate6_point_in_time_gate_is_not_self_referential() -> None:
+    """Deriving as_of from the packet's own timestamps disabled Gate 4."""
+    import inspect
+
+    from ring2_brain.truth import data_guard, grounding_gate
+
+    for module in (data_guard, grounding_gate):
+        source = inspect.getsource(module)
+        assert "max(int(valid_time_ns), int(knowledge_ts_ns))" not in source
+        assert "max(bar.valid_time_ns, bar.knowledge_ts_ns)" not in source
+
+
+def test_gate6_no_float_coercion_on_integer_money_paths() -> None:
+    """The float-first money idioms that lost micro-units must stay gone."""
+    import inspect
+
+    from core import orchestrator
+    from ring2_brain.agents import task_dispatcher
+    from ring2_brain.backtest import engine as backtest_engine
+
+    assert "int(round(float(amount_units)" not in inspect.getsource(orchestrator)
+    assert (
+        'len(getattr(report, "derived_expressions"'
+        not in inspect.getsource(task_dispatcher)
+    )
+    assert "twin.required_fills()" not in inspect.getsource(backtest_engine)
