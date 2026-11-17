@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -314,6 +314,35 @@ class MCPBridge:
     def is_enabled(self, name: str) -> bool:
         return bool(self._enabled.get(str(name), False))
 
+    # -- auth -------------------------------------------------------------
+    def _require_session(self, http_request: Request | None = None) -> None:
+        """Require an operator session once one has been provisioned.
+
+        The bridge is inert on a clean slate: a fresh boot has no operator, so
+        gating here would break the startup preflight probe and the stdio
+        transport (which has no HTTP headers at all).  The moment an operator
+        exists, :meth:`ControlPlane.session_guard` decides -- it raises
+        ``401 AUTH_REQUIRED`` for a missing/invalid token and is a no-op while
+        ``operator_auth`` is uninitialised.
+        """
+
+        control = self.control
+        guard = getattr(control, "session_guard", None)
+        if not callable(guard):
+            return
+        token: str | None = None
+        if http_request is not None:
+            try:
+                token = http_request.headers.get("X-NIOS-Session")
+            except Exception:  # pragma: no cover - defensive
+                token = None
+            if not token:
+                try:
+                    token = http_request.cookies.get("nios_session")
+                except Exception:  # pragma: no cover - defensive
+                    token = None
+        guard(str(token).strip() if token else None)
+
     # -- invocation -------------------------------------------------------
     def call_tool(self, name: str, arguments: Mapping[str, Any] | None = None) -> Any:
         token = str(name)
@@ -561,7 +590,19 @@ class MCPBridge:
             }
 
         @app.post("/api/v2/mcp/call")
-        def call_tool(request: MCPCallRequest) -> dict[str, Any]:
+        def call_tool(
+            request: MCPCallRequest, http_request: Request
+        ) -> dict[str, Any]:
+            # V1.9 (PART 4): the tool bridge was the last unauthenticated
+            # ``POST`` on the cockpit.  Every tool is read-only or the
+            # kill switch, but "read-only" still means an anonymous caller can
+            # read vault balances and trip a global halt.  Once an operator
+            # exists, a PAPER or LIVE session is required.
+            #
+            # ``session_guard`` is inert while ``operator_auth`` is
+            # uninitialised, so a pre-setup boot (and the local stdio probe)
+            # keeps working exactly as before.
+            self._require_session(http_request)
             started = time.perf_counter()
             try:
                 tool_name = request.resolved_name()

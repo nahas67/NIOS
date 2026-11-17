@@ -395,7 +395,7 @@ def run_smoke(
             assert status["tigerbeetle"]["version"] == "0.17.9", status["tigerbeetle"]
             schema = status["postgres"]["schema"]
             assert schema["valid"], schema
-            assert len(schema["tables"]) == 7, schema["tables"]
+            assert len(schema["tables"]) == 9, schema["tables"]
             assert formatted.formatted and Path(formatted.path).exists(), formatted
             return (
                 f"TigerBeetle {status['tigerbeetle']['version']} "

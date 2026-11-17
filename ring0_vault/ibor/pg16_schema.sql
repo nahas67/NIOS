@@ -216,7 +216,59 @@ CREATE INDEX IF NOT EXISTS idx_grounding_knowledge
     ON grounding_ledger_hashes (knowledge_ts_ns);
 
 -- ---------------------------------------------------------------------------
--- 8. Operational guard rails
+-- 8. V1.9 entity-linked post-mortem memory (``gbrain`` harvest)
+--
+-- Layer 1 is append-only and immutable: a correction is a new event, never an
+-- in-place update.  Layer 2 is a deterministic cache derived from layer 1 --
+-- safe to truncate, because ``EntityMemoryGraph.load_state`` always replays the
+-- timeline and never trusts the cache.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS nios_entity_timeline (
+    event_id            TEXT        PRIMARY KEY,
+    ts_utc              BIGINT      NOT NULL CHECK (ts_utc >= 0),
+    entity_ids          JSONB       NOT NULL,
+    outcome_kind        TEXT        NOT NULL CHECK (
+        outcome_kind IN ('LOSS', 'SLIPPAGE_SPIKE', 'BREAKER_TRIP', 'ORDER_REJECTED', 'WIN')
+    ),
+    net_pnl_micros      BIGINT      NOT NULL,
+    slippage_bps        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lesson_summary      TEXT        NOT NULL DEFAULT '',
+    payload_sha256      CHAR(64)    NOT NULL,
+    recorded_at_utc     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT entity_timeline_entities_array CHECK (jsonb_typeof(entity_ids) = 'array'),
+    CONSTRAINT entity_timeline_digest_hex CHECK (payload_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_timeline_time
+    ON nios_entity_timeline (ts_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_entity_timeline_entities
+    ON nios_entity_timeline USING GIN (entity_ids);
+CREATE INDEX IF NOT EXISTS idx_entity_timeline_outcome
+    ON nios_entity_timeline (outcome_kind, ts_utc DESC);
+
+CREATE TABLE IF NOT EXISTS nios_compiled_entity_truths (
+    entity_id               TEXT        PRIMARY KEY,
+    entity_type             TEXT        NOT NULL CHECK (
+        entity_type IN ('SYMBOL', 'SILO', 'STRATEGY', 'MACRO', 'REGIME')
+    ),
+    sample_count            INTEGER     NOT NULL CHECK (sample_count >= 0),
+    win_rate_bps            DOUBLE PRECISION NOT NULL CHECK (win_rate_bps >= 0 AND win_rate_bps <= 10000),
+    avg_slippage_bps        DOUBLE PRECISION NOT NULL,
+    worst_drawdown_bps      DOUBLE PRECISION NOT NULL CHECK (worst_drawdown_bps >= 0),
+    known_failure_modes     JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    caution_regimes         JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    last_compiled_utc       BIGINT      NOT NULL DEFAULT 0,
+    truth_sha256            CHAR(64)    NOT NULL,
+    CONSTRAINT compiled_truth_modes_array CHECK (jsonb_typeof(known_failure_modes) = 'array'),
+    CONSTRAINT compiled_truth_regimes_array CHECK (jsonb_typeof(caution_regimes) = 'array'),
+    CONSTRAINT compiled_truth_digest_hex CHECK (truth_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX IF NOT EXISTS idx_compiled_truth_type
+    ON nios_compiled_entity_truths (entity_type, sample_count DESC);
+
+-- ---------------------------------------------------------------------------
+-- 9. Operational guard rails
 -- ---------------------------------------------------------------------------
 COMMENT ON TABLE financial_outbox IS
     'Durable mirror of the TigerBeetle two-phase outbox; one row per deterministic idempotency key.';
@@ -232,5 +284,9 @@ COMMENT ON TABLE source_quarantine_store IS
     'Evidence for quarantined market-data sources (lag, divergence, split guard).';
 COMMENT ON TABLE grounding_ledger_hashes IS
     'SHA-256 commitments from the Ring 2 grounding ledger; rejects lookahead facts.';
+COMMENT ON TABLE nios_entity_timeline IS
+    'Append-only post-mortem outcome events keyed by SHA-256 payload commitment (layer 1).';
+COMMENT ON TABLE nios_compiled_entity_truths IS
+    'Deterministic rolling truth per entity, derived from nios_entity_timeline (layer 2).';
 
 COMMIT;

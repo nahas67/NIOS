@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**711 tests · 31 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**716 tests · 32 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -209,6 +209,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 29 | `test_v1_9_sebi_and_regulatory_versioning.py` | **V1.9** SEBI algo-id, 10 OPS bucket + OTR, egress allowlist, TOTP renewal, freeze slicing, hedge exit ordering, effective-dated FINRA 4210 / PDT, locate fee, SSR, extended hours |
 | 30 | `test_v1_9_oms_fsm_binance_and_env_truth.py` | **V1.9** staleness watermark, all-or-none baskets, cold-start recon, order FSM, clock health, exchange calendar, fencing epoch, replay checkpoints, Binance microstructure |
 | 31 | `test_v1_9_ai_provenance_and_concept_drift.py` | **V1.9** provenance + attestation + freshness bound, injection guard, star aggregation, frozen signing inputs, concept drift, agent behaviour monitor, Gate 23 |
+| 32 | `test_v1_9_entity_memory_and_default_feasibility.py` | **V1.9** default-on mission feasibility, `gbrain` entity post-mortem memory (timeline + compiled truths + hybrid retrieval + sealed packet), pre-trade agent memory haircut, `plannotator` inline plan annotation, MCP call session guard |
 
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
@@ -552,7 +553,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     711 tests across 31 suites
+tests/                     716 tests across 32 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 23-gate go-live readiness certificate (--strict / --fast)

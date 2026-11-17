@@ -1532,6 +1532,32 @@ class MissionApproveRequest(StrictRequest):
     state: Literal["APPROVE", "OVERRIDE"] = "APPROVE"
     ttl_seconds: int | None = Field(default=None, ge=60, le=604800)
     notional_cap_units: float | None = Field(default=None, gt=0)
+    # V1.9 (PART 3, ``plannotator`` harvest): the plan-exit annotation gate.
+    # An operator may revise the plan inline while approving it -- per-tranche
+    # caps, excluded symbols, the reserve split and a free-text note.  Every
+    # override is deterministic integer/literal data, recorded as a revision
+    # audit hash; nothing here widens the mission's notional ceiling.
+    tranche_caps_micros: dict[str, int] | None = Field(default=None)
+    excluded_symbols: list[str] | None = Field(default=None, max_length=64)
+    reserve_split_override_bps: int | None = Field(default=None, ge=4000, le=9500)
+    operator_note: str | None = Field(default=None, max_length=512)
+
+
+class MemoryOutcomeRequest(StrictRequest):
+    """One immutable post-mortem outcome event (V1.9 PART 2)."""
+
+    outcome_kind: Literal[
+        "LOSS", "SLIPPAGE_SPIKE", "BREAKER_TRIP", "ORDER_REJECTED", "WIN"
+    ]
+    net_pnl_units: float = Field(ge=-1e12, le=1e12)
+    slippage_bps: float = Field(default=0.0, ge=-1e6, le=1e6)
+    symbol: str = Field(default="", max_length=32)
+    silo: str = Field(default="", max_length=32)
+    strategy_id: str = Field(default="", max_length=64)
+    regime: Literal["", "EXPANSION", "NEUTRAL", "CONTRACTION"] = ""
+    macro_event_id: str = Field(default="", max_length=64)
+    lesson_summary: str = Field(default="", max_length=512)
+    ts_utc: int | None = Field(default=None, ge=0)
 
 
 class MissionRevokeRequest(StrictRequest):
@@ -1729,8 +1755,18 @@ class ControlPlane:
             self.feed_guard = None
         self.broker_vault = broker_vault
         self._llm_probe_fetcher = llm_probe_fetcher
-        # V1.9 mission engine (A1-A8): injected, never constructed inside Ring 3.
+        # V1.9 mission engine (A1-A8).  Callers may inject a pre-configured
+        # engine (test fixtures pin their own residual windows), but a bare
+        # ``create_app()`` boot must never silently disable feasibility
+        # checking: an unconstrained mission is exactly the failure mode
+        # ``sec_018`` Law 4 exists to prevent.  The engine is Ring 2 compute --
+        # no broker credentials, no exchange sockets -- so constructing the
+        # default here keeps the air gap intact.
         self._mission_surface = mission_surface
+        if mission_feasibility is None:
+            from ring2_brain.quant.mission_engine import MissionFeasibilityEngine
+
+            mission_feasibility = MissionFeasibilityEngine()
         self._mission_feasibility = mission_feasibility
         self._feed_report: dict[str, Any] = {}
         self._credential_reports: dict[str, dict[str, Any]] = {}
@@ -1764,6 +1800,18 @@ class ControlPlane:
             "agent_tasks": 0,
         }
         self._journal_backtests: list[dict[str, Any]] = []
+        # ------------------------------------------------------------------
+        # V1.9 (PART 2): entity-linked post-mortem memory (``gbrain`` harvest).
+        # Layer 1 is an append-only timeline of immutable outcome events;
+        # layer 2 is a deterministic rolling truth per entity.  This is Ring 2
+        # compute -- it holds no broker credentials and opens no exchange
+        # socket -- and its durable copy rides the same atomic journal under an
+        # ``entity_memory`` key so a clean slate zeroes both layers at once.
+        # ------------------------------------------------------------------
+        from ring2_brain.memory.entity_graph import EntityMemoryGraph
+
+        self.entity_memory = EntityMemoryGraph()
+        self._entity_memory_lock = threading.RLock()
         self._restore_journal()
         # V1.8 (PART 2.2): wire the portfolio-margin provider into the OMS so
         # ``SmartOMS.validate_proposal`` can reject over-committed orders.
@@ -1894,6 +1942,7 @@ class ControlPlane:
             backtest_engine=self.backtest_engine,
             token_ledger=self.token_ledger,
             journal=self.state_journal,
+            entity_memory=getattr(self, "entity_memory", None),
         )
         self.task_dispatcher.attach(contagion_factory=self._contagion_engine_for)
 
@@ -3011,11 +3060,50 @@ class ControlPlane:
                 dict(row) for row in backtests if isinstance(row, Mapping)
             ]
         tasks = state.get("agent_tasks")
+        memory = state.get("entity_memory")
+        restored_memory = {"events": 0, "entities": 0}
+        if isinstance(memory, Mapping):
+            try:
+                report = self.entity_memory.load_state(memory)
+                restored_memory = {
+                    "events": int(report.get("event_count", 0) or 0),
+                    "entities": int(report.get("entity_count", 0) or 0),
+                }
+            except Exception:
+                restored_memory = {"events": 0, "entities": 0}
         self._journal_restored = {
             "logbook": len(self._logbook_entries),
             "backtests": len(self._journal_backtests),
             "agent_tasks": len(tasks) if isinstance(tasks, list) else 0,
+            "entity_memory_events": restored_memory["events"],
+            "entity_memory_entities": restored_memory["entities"],
         }
+
+    def _journal_save_entity_memory(self) -> None:
+        """Persist both post-mortem layers through the atomic journal.
+
+        ``AtomicStateJournal`` carries unknown top-level keys through verbatim,
+        so the graph rides its own ``entity_memory`` key without widening the
+        canonical ``SECTIONS`` contract (which would perturb ``counts`` and the
+        ``clean_slate_active`` derivation).
+        """
+
+        journal = getattr(self, "state_journal", None)
+        if journal is None:
+            return
+        lock = getattr(self, "_entity_memory_lock", None)
+        try:
+            state = self.entity_memory.to_state()
+        except Exception:
+            return
+        try:
+            if lock is not None:
+                with lock:
+                    journal.update(entity_memory=state)
+            else:
+                journal.update(entity_memory=state)
+        except Exception:
+            return
 
     def _journal_append(self, section: str, entry: Mapping[str, Any]) -> None:
         journal = getattr(self, "state_journal", None)
@@ -3038,16 +3126,36 @@ class ControlPlane:
     def _journal_reset(self) -> dict[str, Any]:
         journal = getattr(self, "state_journal", None)
         self._journal_backtests = []
+        memory = {"events": 0, "entities": 0}
+        try:
+            report = self.entity_memory.reset()
+            memory = {
+                "events": int(report.get("event_count", 0) or 0),
+                "entities": int(report.get("entity_count", 0) or 0),
+            }
+        except Exception:
+            memory = {"events": 0, "entities": 0}
         if journal is None:
-            return {"journal": False, "journal_path": "", "clean_slate": True}
+            return {
+                "journal": False,
+                "journal_path": "",
+                "clean_slate": True,
+                "entity_memory": memory,
+            }
         try:
             state = journal.reset()
         except Exception:
-            return {"journal": False, "journal_path": "", "clean_slate": True}
+            return {
+                "journal": False,
+                "journal_path": "",
+                "clean_slate": True,
+                "entity_memory": memory,
+            }
         return {
             "journal": True,
             "journal_path": str(getattr(journal, "path", "")),
             "clean_slate": bool(state.get("clean_slate_active", True)),
+            "entity_memory": memory,
         }
 
     def journal_snapshot(self) -> dict[str, Any]:
@@ -3071,7 +3179,120 @@ class ControlPlane:
             "clean_slate_active": bool(state.get("clean_slate_active", True)),
             "restored": dict(self._journal_restored),
             "schema_version": str(state.get("schema_version") or ""),
+            "entity_memory_events": int(self._journal_restored.get("entity_memory_events", 0)),
+            "entity_memory_entities": int(
+                self._journal_restored.get("entity_memory_entities", 0)
+            ),
         }
+
+    # ------------------------------------------------------------------
+    # V1.9 (PART 2): entity-linked post-mortem memory surface
+    # ------------------------------------------------------------------
+    def record_post_mortem(
+        self,
+        *,
+        outcome_kind: str,
+        net_pnl_micros: int,
+        slippage_bps: float = 0.0,
+        symbol: str = "",
+        silo: str = "",
+        strategy_id: str = "",
+        regime: str = "",
+        macro_event_id: str = "",
+        lesson_summary: str = "",
+        ts_utc: int | None = None,
+    ) -> dict[str, Any]:
+        """Append one immutable outcome event and recompile the touched truths.
+
+        Layer 1 is append-only; layer 2 is always derived from it.  The durable
+        copy is written through :meth:`_journal_save_entity_memory` so a
+        process restart replays the raw timeline rather than trusting a cache.
+        """
+
+        lock = getattr(self, "_entity_memory_lock", None)
+        if lock is not None:
+            with lock:
+                report = self.entity_memory.record_outcome(
+                    outcome_kind=outcome_kind,
+                    net_pnl_micros=int(net_pnl_micros),
+                    slippage_bps=float(slippage_bps),
+                    symbol=symbol,
+                    silo=silo,
+                    strategy_id=strategy_id,
+                    regime=regime,
+                    macro_event_id=macro_event_id,
+                    lesson_summary=lesson_summary,
+                    ts_utc=ts_utc,
+                )
+                self._journal_save_entity_memory()
+                return report
+        report = self.entity_memory.record_outcome(
+            outcome_kind=outcome_kind,
+            net_pnl_micros=int(net_pnl_micros),
+            slippage_bps=float(slippage_bps),
+            symbol=symbol,
+            silo=silo,
+            strategy_id=strategy_id,
+            regime=regime,
+            macro_event_id=macro_event_id,
+            lesson_summary=lesson_summary,
+            ts_utc=ts_utc,
+        )
+        self._journal_save_entity_memory()
+        return report
+
+    def query_entity_memory(
+        self,
+        *,
+        symbol: str = "",
+        silo: str = "",
+        strategy_id: str = "",
+        regime: str = "",
+        macro_context: str = "",
+        query_text: str = "",
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        return self.entity_memory.query_entity_memory(
+            symbol=symbol,
+            silo=silo,
+            strategy_id=strategy_id,
+            regime=regime,
+            macro_context=macro_context,
+            query_text=query_text,
+            top_k=top_k,
+        )
+
+    def entity_memory_snapshot(self) -> dict[str, Any]:
+        snapshot = self.entity_memory.snapshot()
+        snapshot["journal_persisted"] = int(
+            self._journal_restored.get("entity_memory_events", 0)
+        )
+        return snapshot
+
+    def memory_entities(
+        self,
+        *,
+        entity_id: str = "",
+        query: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """``GET /api/v2/memory/entities`` -- read-only post-mortem memory.
+
+        Returns compiled truths (layer 2) plus the raw event count (layer 1),
+        wrapped in the deterministic envelope so ``payload_sha256`` seals the
+        figure a client is about to act on.
+        """
+
+        payload = self.entity_memory.describe(
+            entity_id=entity_id, query=query, limit=limit
+        )
+        payload["journal_events"] = int(
+            self._journal_restored.get("entity_memory_events", 0)
+        )
+        payload["journal_entities"] = int(
+            self._journal_restored.get("entity_memory_entities", 0)
+        )
+        return self._envelope(payload)
 
     def free_margin_micros(self, silo: str) -> int | None:
         """Free initial margin available to new entries in ``silo``.
@@ -9697,6 +9918,10 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             state=payload.state,
             ttl_seconds=payload.ttl_seconds,
             notional_cap_units=payload.notional_cap_units,
+            tranche_caps_micros=payload.tranche_caps_micros,
+            excluded_symbols=payload.excluded_symbols,
+            reserve_split_override_bps=payload.reserve_split_override_bps,
+            operator_note=payload.operator_note,
         )
 
     @app.post("/api/v2/missions/{mission_id}/revoke", dependencies=[SESSION_GUARD])
@@ -9741,6 +9966,38 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return _mission_call(
             control.missions.rearm_tranche, tranche_id, operator=request.operator
         )
+
+    # ---- V1.9 (PART 2): entity-linked post-mortem memory ----------------
+    @app.get("/api/v2/memory/entities")
+    def memory_entities(
+        entity_id: str | None = Query(None),
+        q: str | None = Query(None),
+        limit: int = Query(50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        return control.memory_entities(
+            entity_id=entity_id or "", query=q or "", limit=limit
+        )
+
+    @app.post("/api/v2/memory/entities", dependencies=[SESSION_GUARD])
+    def record_memory_event(payload: MemoryOutcomeRequest) -> dict[str, Any]:
+        try:
+            report = control.record_post_mortem(
+                outcome_kind=payload.outcome_kind,
+                net_pnl_micros=int(round(payload.net_pnl_units * 1_000_000)),
+                slippage_bps=payload.slippage_bps,
+                symbol=payload.symbol,
+                silo=payload.silo,
+                strategy_id=payload.strategy_id,
+                regime=payload.regime,
+                macro_event_id=payload.macro_event_id,
+                lesson_summary=payload.lesson_summary,
+                ts_utc=payload.ts_utc,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"ENTITY_MEMORY_REJECTED: {exc}"
+            ) from exc
+        return control._envelope(dict(report))
 
     # ---- Phase 3 Step 3: Ring 0 sandbox order dispatch -----------------
     @app.get("/api/v2/control/brokers/testnet")

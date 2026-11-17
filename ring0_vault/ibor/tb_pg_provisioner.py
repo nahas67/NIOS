@@ -70,6 +70,10 @@ EXPECTED_TABLES = (
     "tax_lots",
     "source_quarantine_store",
     "grounding_ledger_hashes",
+    # V1.9 (PART 2): entity-linked post-mortem memory.  Layer 1 is the
+    # append-only outcome timeline; layer 2 is the derived truth cache.
+    "nios_entity_timeline",
+    "nios_compiled_entity_truths",
 )
 VALID_VAULTS = ("ReserveYield", "LongTermCompounder", "TacticalSwing", "SpinalScalper")
 
@@ -841,6 +845,18 @@ def _translate_for_sqlite(statement: str) -> str | None:
         "CHECK (sha256_digest ~ '^[0-9a-f]{64}$')",
         "CHECK (length(sha256_digest) = 64)",
     )
+    # V1.9 entity-memory tables: SQLite has no ``jsonb_typeof``, no regex match
+    # operator and no GIN indexes, so the same constraints are expressed with
+    # the portable equivalents.  The PostgreSQL copy keeps the strict forms.
+    for column in ("entity_ids", "known_failure_modes", "caution_regimes"):
+        translated = translated.replace(
+            f"jsonb_typeof({column}) = 'array'", f"json_valid({column})"
+        )
+    for column in ("payload_sha256", "truth_sha256"):
+        translated = translated.replace(
+            f"{column} ~ '^[0-9a-f]{{64}}$'", f"length({column}) = 64"
+        )
+    translated = translated.replace(" USING GIN (entity_ids)", " (entity_ids)")
     translated = translated.replace("CHAR(64)", "TEXT")
     return translated
 

@@ -1252,6 +1252,17 @@ class MissionSpec:
     unlock_ladder: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
     approval: MissionAuthorization | None = None
     created_at_ns: int = field(default_factory=time.time_ns)
+    # -- V1.9 (PART 3, ``plannotator`` harvest): inline plan annotation -----
+    # An operator may revise the plan at the approval gate rather than kicking
+    # it back.  The overrides are recorded verbatim on the spec so the revision
+    # is auditable after the fact, and paired with ``revision`` /
+    # ``revision_sha256`` so a replay can prove which plan was approved.
+    tranche_caps_micros: Mapping[str, int] = field(default_factory=dict)
+    excluded_symbols: tuple[str, ...] = ()
+    reserve_split_override_bps: int | None = None
+    operator_note: str = ""
+    revision: int = 0
+    revision_sha256: str = ""
 
     def __post_init__(self) -> None:
         mission_id = str(self.mission_id or "").strip()
@@ -1305,6 +1316,64 @@ class MissionSpec:
         ):
             raise TypeError("approval must be a MissionAuthorization")
 
+        # V1.9 (PART 3): the inline annotation gate.  Deterministic containers
+        # only -- sorted, deduped, integer -- so the revision hash is stable.
+        caps: dict[str, int] = {}
+        for key, value in dict(self.tranche_caps_micros or {}).items():
+            tranche_key = str(key or "").strip()
+            if not tranche_key:
+                raise ValueError("tranche_caps_micros keys must be non-empty")
+            if any(token in tranche_key for token in ("/", "\\", "\x00", "..")):
+                raise ValueError(
+                    "tranche_caps_micros keys must not contain path separators or '..'"
+                )
+            amount = int(value)
+            if amount <= 0 or amount > MONEY_CEILING_MICROS:
+                raise ValueError(
+                    "tranche_caps_micros values must be positive bounded integers"
+                )
+            caps[tranche_key] = amount
+        object.__setattr__(
+            self, "tranche_caps_micros", MappingProxyType(dict(sorted(caps.items())))
+        )
+
+        excluded: list[str] = []
+        for raw in self.excluded_symbols or ():
+            token = str(raw or "").strip().upper()
+            if not token:
+                continue
+            if len(token) > 32:
+                raise ValueError("excluded_symbols entries must be <= 32 chars")
+            if any(mark in token for mark in ("/", "\\", "\x00", "..")):
+                raise ValueError(
+                    "excluded_symbols entries must not contain path separators or '..'"
+                )
+            if token not in excluded:
+                excluded.append(token)
+        object.__setattr__(self, "excluded_symbols", tuple(sorted(excluded)))
+
+        if self.reserve_split_override_bps is not None:
+            reserve_bps = int(self.reserve_split_override_bps)
+            if reserve_bps < 4000 or reserve_bps > 9500:
+                raise ValueError("reserve_split_override_bps must lie in [4000, 9500]")
+            object.__setattr__(self, "reserve_split_override_bps", reserve_bps)
+
+        note = str(self.operator_note or "")
+        if len(note) > 512:
+            raise ValueError("operator_note must be <= 512 chars")
+        object.__setattr__(self, "operator_note", note)
+
+        revision = int(self.revision)
+        if revision < 0:
+            raise ValueError("revision must be >= 0")
+        object.__setattr__(self, "revision", revision)
+        if self.revision_sha256:
+            object.__setattr__(
+                self,
+                "revision_sha256",
+                _require_digest("revision_sha256", self.revision_sha256),
+            )
+
     # -- time / progress ---------------------------------------------------
     def days_remaining(self, now_ns: int | None = None) -> float:
         stamp = int(now_ns if now_ns is not None else time.time_ns())
@@ -1348,6 +1417,12 @@ class MissionSpec:
             "unlock_ladder": list(self.unlock_ladder),
             "approval": self.approval.to_dict() if self.approval else None,
             "created_at_ns": self.created_at_ns,
+            "tranche_caps_micros": dict(self.tranche_caps_micros),
+            "excluded_symbols": list(self.excluded_symbols),
+            "reserve_split_override_bps": self.reserve_split_override_bps,
+            "operator_note": self.operator_note,
+            "revision": self.revision,
+            "revision_sha256": self.revision_sha256,
         }
 
 

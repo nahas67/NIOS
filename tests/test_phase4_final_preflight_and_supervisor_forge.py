@@ -1,4 +1,4 @@
-﻿"""Phase 4 -- final closure certification.
+"""Phase 4 -- final closure certification.
 
 Four gates close the Main Core (Phases 1-3):
 
@@ -310,7 +310,7 @@ def test_gate4_regression_inventory_is_twenty_one_suites() -> None:
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 31, suites
+    assert len(suites) == 32, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"
@@ -960,7 +960,7 @@ def test_interactive_workstation_actions_across_pages_on_v1(cockpit: Any) -> Non
     The cockpit is no longer telemetry-only. An operator can submit a grounded
     PAPER order, cancel it, drive shadow fills to the 30-fill graduation line,
     price a grounded option, re-scan the 490-factor zoo, read a full SKILL.md on
-    demand and reconcile all four IBOR silos â€” without any of those actions able
+    demand and reconcile all four IBOR silos — without any of those actions able
     to sign a live order from Ring 3.
     """
     silo = "CRYPTO_BINANCE"

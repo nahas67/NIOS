@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """NIOS Phase 4 -- pre-flight go-live certification CLI.
 
 A human operator runs this **before** enabling ``confirm_live=true`` on any
@@ -445,18 +445,18 @@ def gate_release_tag(ctx: PreflightContext) -> Gate:
 
 
 def gate_artifacts_present(_ctx: PreflightContext) -> Gate:
-    """Every release artifact exists and the runbook advertises 31 suites."""
+    """Every release artifact exists and the runbook advertises 32 suites."""
     missing = [rel for rel in REQUIRED_ARTIFACTS if not (ROOT / rel).is_file()]
     runbook = ROOT / "RUNBOOK.md"
     suite_ok = False
     if runbook.is_file():
         text = runbook.read_text(encoding="utf-8", errors="replace")
-        suite_ok = "31 suites" in text
+        suite_ok = "32 suites" in text
     ok = not missing and suite_ok
     detail = f"{len(REQUIRED_ARTIFACTS) - len(missing)}/{len(REQUIRED_ARTIFACTS)} artifacts"
     if missing:
         detail += f", missing={missing[:4]}"
-    detail += f", runbook_31_suites={'yes' if suite_ok else 'no'}"
+    detail += f", runbook_32_suites={'yes' if suite_ok else 'no'}"
     return Gate(
         "release.artifacts_present",
         "Release artifacts + runbook suite inventory",
@@ -466,7 +466,7 @@ def gate_artifacts_present(_ctx: PreflightContext) -> Gate:
             "artifacts_expected": len(REQUIRED_ARTIFACTS),
             "artifacts_missing": len(missing),
             "missing": missing[:8],
-            "runbook_declares_31_suites": suite_ok,
+            "runbook_declares_32_suites": suite_ok,
         },
     )
 

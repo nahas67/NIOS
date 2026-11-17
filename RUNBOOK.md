@@ -482,7 +482,7 @@ event.
 ### 1F.7 Release verification for `v3.10.0-V1.9`
 
 ```bash
-python -m pytest tests -q                 # 31 suites, 711 passed, 0 failed, 0 warnings
+python -m pytest tests -q                 # 32 suites, 716 passed, 0 failed, 0 warnings
 python scripts/run_nios.py --smoke-test   # ROWS=23, EXIT=0
 python scripts/preflight_golive.py --fast # 23/23 PASS, EXIT=0
 ```
@@ -585,16 +585,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 31 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 32 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 23/23
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 23/23
 ```
 
-Release seal for `v3.10.0-V1.9`: `pytest tests -q` must report **100% pass across all 31 suites, 0 failed, 0 warnings**
+Release seal for `v3.10.0-V1.9`: `pytest tests -q` must report **100% pass across all 32 suites, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **23/23 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 31-suite inventory
+### 3.2a The 32-suite inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -629,6 +629,7 @@ prerequisites for re-tagging; neither may be waived.
 | 29 | `tests/test_v1_9_sebi_and_regulatory_versioning.py` | **V1.9** SEBI/NSE algo-id tagging (`ALGO-ID-MISSING`), global 10 OPS bucket + OTR penalty accrual, static egress IP allowlist, 03:00 UTC pre-market TOTP renewal, freeze-quantity auto-slicing, hedge-leg exit ordering, effective-dated FINRA 4210 vs legacy PDT rules, locate fee / borrow confirmation, SSR uptick and extended-hours spread guards |
 | 30 | `tests/test_v1_9_oms_fsm_binance_and_env_truth.py` | **V1.9** published high-water staleness (`STALE_POSITION_STATE`), all-or-none `LegGroup` baskets, cold-start reconciliation classes + bounded deadline, strict order FSM with `ExecID` de-duplication and venue `LeavesQty`, real clock health, DST-aware exchange calendar, fencing epoch, SHA-256 replay checkpoints, Binance 418 halt / query-before-retry / weight bucket / margin brackets / listenKey / recvWindow, ADL budget and funding in the net bound |
 | 31 | `tests/test_v1_9_ai_provenance_and_concept_drift.py` | **V1.9** evidence source allowlist + retrieval attestation + freshness lower bound, prompt-injection guard, hierarchical star aggregation, frozen signed-order inputs re-verified before signing, ADWIN/conformal-martingale concept drift (halve then pause), agent behaviour monitor, Gate 23 registration and 23/23 certificate |
+| 32 | `tests/test_v1_9_entity_memory_and_default_feasibility.py` | **V1.9** default-on `MissionFeasibilityEngine` (bare `create_app` rejects an impossible 7-day mission with `422 INFEASIBLE_MISSION`, approves a half-Kelly mission), `gbrain` two-layer entity post-mortem memory (append-only timeline, compiled truths with `truth_sha256`, hybrid BM25 + feature retrieval, sealed `GroundedFactPacket`, atomic journal replay, clean-slate zero), pre-trade post-mortem confidence/sizing haircut that keeps the agent report digit-grounded, `plannotator` inline tranche/symbol/reserve annotation at the plan-exit gate, and the `/api/v2/mcp/call` operator-session guard |
 
 
 ### 3.3 Chaos / crash injection

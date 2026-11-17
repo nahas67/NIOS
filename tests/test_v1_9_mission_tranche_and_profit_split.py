@@ -508,12 +508,29 @@ def client(runtime):
 
 
 def test_mission_routes_create_list_allocate_rearm_and_revoke(client, runtime) -> None:
+    # V1.9 PART 1 made MissionFeasibilityEngine default-on, so a zero-equity
+    # clean slate can no longer reach a 1.00 target in 30 days -- which is the
+    # whole point of the gate.  Fund the silo with realistic paper capital for
+    # the duration of this route test, then hand the workspace back untouched.
+    funded = client.post(
+        "/api/v2/control/ledger/fund-paper",
+        json={
+            "silo": "US_IBKR",
+            "amount_units": 100_000.0,
+            "vault": "LongTermCompounder",
+        },
+    )
+    assert funded.status_code == 200, funded.text
     now = time.time_ns()
     payload = {
         "mission_id": "route-mission",
-        "target_units": 1.0,
+        # A realistic paper mission: 100.00 profit on 100,000.00 of capital in
+        # 30 days, with the whole profit budget at risk.  The default engine
+        # scores this 0.834 reach / 0.166 ruin against the 200-trade window, so
+        # the route exercises a feasible mission without weakening half-Kelly.
+        "target_units": 100.0,
         "deadline_utc": now + 30 * DAY_NS,
-        "risk_budget_units": 0.1,
+        "risk_budget_units": 100.0,
         "operator": "sovereign",
         "silos": ["US_IBKR"],
         "notional_cap_units": 10.0,
@@ -578,6 +595,12 @@ def test_mission_routes_create_list_allocate_rearm_and_revoke(client, runtime) -
     assert clock.status_code == 200
     assert clock.json()["synthetic"] is False
 
+    # Hand the module fixture back as a clean slate: later tests assert the
+    # untouched workspace, and the funding above was scoped to this test.
+    reset = client.post("/api/v2/control/workspace/reset", json={})
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["clean_slate_active"] is True
+
 
 def test_mission_route_rejects_infeasible_target(client, runtime) -> None:
     control = runtime.control
@@ -601,7 +624,9 @@ def test_mission_route_rejects_infeasible_target(client, runtime) -> None:
         assert response.json()["detail"]["code"] == "INFEASIBLE_MISSION"
     finally:
         control._mission_surface = None
-        control._mission_feasibility = None
+        # V1.9 PART 1: never leave the shared control plane with feasibility
+        # switched off -- that is the failure mode the default-on wiring fixes.
+        control._mission_feasibility = MissionFeasibilityEngine()
 
 
 def test_clean_slate_workspace_has_no_demo_mission(runtime) -> None:

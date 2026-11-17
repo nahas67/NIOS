@@ -919,6 +919,8 @@ class AgentTaskDispatcher:
         "_macro_cache",
         "journal",
         "_restored_tasks",
+        "entity_memory",
+        "active_regime",
     )
 
     def __init__(
@@ -934,6 +936,7 @@ class AgentTaskDispatcher:
         verifier: NumericalGroundingVerifier | None = None,
         clock: Callable[[], int] = time.time_ns,
         journal: Any = None,
+        entity_memory: Any = None,
     ) -> None:
         self._dashboard = dashboard if dashboard is not None else DecisionDashboard()
         self._valuation = valuation
@@ -969,6 +972,14 @@ class AgentTaskDispatcher:
         self.journal = self._resolve_journal(journal)
         self._restored_tasks = 0
         self._restore_from_journal()
+        # -- V1.9 (PART 2): entity-linked post-mortem memory.  Ring 2 owns the
+        # graph; the Ring 3 control plane injects the instance whose durable
+        # copy rides the atomic journal.  ``None`` degrades to no memory, never
+        # to a fabricated lesson.
+        self.entity_memory = entity_memory
+        #: Active macro regime used to decide whether a past failure mode is
+        #: *currently* relevant.  Ring 3 sets it from the live macro surface.
+        self.active_regime = "NEUTRAL"
 
     # -- durable journal ------------------------------------------------
 
@@ -2152,6 +2163,55 @@ class AgentTaskDispatcher:
 
         task.progress_pct = 70
         finished_ns = int(self._clock())
+        # V1.9 (PART 2.4): retrieve this entity's post-mortem memory *before*
+        # the proposal is sealed.  Past failure modes and caution regimes become
+        # a deterministic confidence/sizing haircut and a digit-free warning on
+        # the grounded report -- the numbers live in the sealed packet, the
+        # prose deliberately carries none.
+        memory = self._post_mortem(task)
+        if memory is not None:
+            metrics = dict(metrics)
+            metrics.update(
+                _prefixed(
+                    task.symbols[0],
+                    {
+                        "postmortem_sample_count": float(memory["sample_count"]),
+                        "postmortem_win_rate_bps": float(memory["metrics"]["win_rate_bps"]),
+                        "postmortem_avg_slippage_bps": float(
+                            memory["metrics"]["avg_slippage_bps"]
+                        ),
+                        "postmortem_worst_drawdown_bps": float(
+                            memory["metrics"]["worst_drawdown_bps"]
+                        ),
+                        "postmortem_confidence_multiplier": float(
+                            memory["penalty"]["confidence_multiplier"]
+                        ),
+                    },
+                )
+            )
+            structured = self._apply_post_mortem(structured, memory)
+            doc.head("Post-mortem memory")
+            doc.note(
+                "Prior lessons",
+                _digitless(
+                    "past outcomes for this entity: "
+                    + (", ".join(memory["penalty"]["matched_failure_modes"]) or "none")
+                ),
+            )
+            doc.note(
+                "Caution regimes",
+                _digitless(
+                    ", ".join(memory["penalty"]["matched_caution_regimes"])
+                    or "none matched the active regime"
+                ),
+            )
+            doc.note(
+                "Sizing",
+                _digitless(
+                    "allocation haircut applied: "
+                    + ("yes" if memory["penalty"]["applied"] else "no")
+                ),
+            )
         packet = GroundedFactPacket(
             symbol=task.symbols[0],
             valid_time_ns=finished_ns,
@@ -2179,6 +2239,24 @@ class AgentTaskDispatcher:
             "verified": task.verified,
             "fact_count": len(metrics),
         }
+        if memory is not None:
+            task.structured_result["post_mortem"] = {
+                "entity_ids": list(memory["entity_ids"]),
+                "sample_count": int(memory["sample_count"]),
+                "metrics": dict(memory["metrics"]),
+                "penalty": dict(memory["penalty"]),
+                "truths": [
+                    {
+                        "entity_id": row["entity_id"],
+                        "sample_count": row["sample_count"],
+                        "win_rate_bps": row["win_rate_bps"],
+                        "truth_sha256": row["truth_sha256"],
+                        "score": row.get("score", 0.0),
+                    }
+                    for row in memory["truths"]
+                ],
+                "packet_sha256": memory["packet_sha256"],
+            }
         task.token_cost_usd = self._record_spend(spec)
         task.completed_at_ns = int(self._clock())
         task.latency_ms = max(0.0, (task.completed_at_ns - start_ns) / 1_000_000.0)
@@ -2189,6 +2267,90 @@ class AgentTaskDispatcher:
             task.status = "FAILED"
             task.progress_pct = 100
             task.error = str(verdict.get("error") or "UNGROUNDED-REPORT")
+
+    def _post_mortem(self, task: AgentTask) -> dict[str, Any] | None:
+        """Retrieve this entity's post-mortem memory before a proposal ships.
+
+        Returns ``None`` when no graph is attached or the entity has no history:
+        an empty memory must degrade to "no lesson", never to an invented one.
+        """
+
+        graph = getattr(self, "entity_memory", None)
+        if graph is None:
+            return None
+        symbol = task.symbols[0] if task.symbols else ""
+        regime = str(getattr(task, "regime", "") or getattr(self, "active_regime", ""))
+        query_text = " ".join(
+            part
+            for part in (symbol, task.task_type, task.strategy_id, regime)
+            if part
+        )
+        try:
+            report = graph.query_entity_memory(
+                symbol=symbol,
+                silo=task.silo,
+                strategy_id=task.strategy_id,
+                regime=regime,
+                macro_context="",
+                query_text=query_text,
+                top_k=5,
+            )
+        except Exception:  # noqa: BLE001 - memory must never fail a proposal
+            return None
+        if not isinstance(report, Mapping):
+            return None
+        try:
+            if int(report.get("sample_count", 0) or 0) <= 0:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return dict(report)
+
+    @staticmethod
+    def _apply_post_mortem(
+        structured: Mapping[str, Any], memory: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Apply the deterministic confidence/sizing haircut to a proposal.
+
+        The multiplier is ``1 - (0.10 * matched caution regimes + 0.05 *
+        carried failure modes)``, floored at ``0.60``: a repeated loser in the
+        active regime gets smaller, never inverted, and the operator can always
+        see the before/after pair.
+        """
+
+        try:
+            multiplier = float(memory["penalty"]["confidence_multiplier"])
+        except (KeyError, TypeError, ValueError):
+            return dict(structured)
+        out = dict(structured)
+        reports = out.get("reports")
+        if isinstance(reports, list):
+            adjusted: list[Any] = []
+            for row in reports:
+                if not isinstance(row, Mapping):
+                    adjusted.append(row)
+                    continue
+                clone = dict(row)
+                try:
+                    score: float | None = float(clone.get("signal_score"))
+                except (TypeError, ValueError):
+                    score = None
+                if score is not None:
+                    clone["signal_score_before_post_mortem"] = score
+                    clone["signal_score"] = round(score * multiplier, 6)
+                    clone["post_mortem_multiplier"] = multiplier
+                adjusted.append(clone)
+            out["reports"] = adjusted
+        scores = out.get("score_by_symbol")
+        if isinstance(scores, Mapping):
+            scaled: dict[str, float] = {}
+            for key, value in scores.items():
+                try:
+                    scaled[str(key)] = round(float(value) * multiplier, 6)
+                except (TypeError, ValueError):  # pragma: no cover - defensive
+                    continue
+            out["score_by_symbol"] = scaled
+        return out
 
     def _verify(self, packet: GroundedFactPacket, markdown: str) -> dict[str, Any]:
         base: dict[str, Any] = {
