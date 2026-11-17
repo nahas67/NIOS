@@ -482,7 +482,7 @@ event.
 ### 1F.7 Release verification for `v3.10.0-V1.9`
 
 ```bash
-python -m pytest tests -q                 # 32 suites, 716 passed, 0 failed, 0 warnings
+python -m pytest tests -q                 # 36 suites, 834 passed, 0 failed, 0 warnings
 python scripts/run_nios.py --smoke-test   # ROWS=23, EXIT=0
 python scripts/preflight_golive.py --fast # 23/23 PASS, EXIT=0
 ```
@@ -585,16 +585,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 32 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 36 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 23/23
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 23/23
 ```
 
-Release seal for `v3.10.0-V1.9`: `pytest tests -q` must report **100% pass across all 32 suites, 0 failed, 0 warnings**
+Release seal for `v4.1.0-V2.1`: `pytest tests -q` must report **100% pass across all 36 suites, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **23/23 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 32-suite inventory
+### 3.2a The 36-suite inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -630,6 +630,10 @@ prerequisites for re-tagging; neither may be waived.
 | 30 | `tests/test_v1_9_oms_fsm_binance_and_env_truth.py` | **V1.9** published high-water staleness (`STALE_POSITION_STATE`), all-or-none `LegGroup` baskets, cold-start reconciliation classes + bounded deadline, strict order FSM with `ExecID` de-duplication and venue `LeavesQty`, real clock health, DST-aware exchange calendar, fencing epoch, SHA-256 replay checkpoints, Binance 418 halt / query-before-retry / weight bucket / margin brackets / listenKey / recvWindow, ADL budget and funding in the net bound |
 | 31 | `tests/test_v1_9_ai_provenance_and_concept_drift.py` | **V1.9** evidence source allowlist + retrieval attestation + freshness lower bound, prompt-injection guard, hierarchical star aggregation, frozen signed-order inputs re-verified before signing, ADWIN/conformal-martingale concept drift (halve then pause), agent behaviour monitor, Gate 23 registration and 23/23 certificate |
 | 32 | `tests/test_v1_9_entity_memory_and_default_feasibility.py` | **V1.9** default-on `MissionFeasibilityEngine` (bare `create_app` rejects an impossible 7-day mission with `422 INFEASIBLE_MISSION`, approves a half-Kelly mission), `gbrain` two-layer entity post-mortem memory (append-only timeline, compiled truths with `truth_sha256`, hybrid BM25 + feature retrieval, sealed `GroundedFactPacket`, atomic journal replay, clean-slate zero), pre-trade post-mortem confidence/sizing haircut that keeps the agent report digit-grounded, `plannotator` inline tranche/symbol/reserve annotation at the plan-exit gate, and the `/api/v2/mcp/call` operator-session guard |
+| 33 | `tests/test_v2_1_closed_loop_profit_split_and_autopilot.py` | **V2.1** `G1` closed-loop trade-close saga (statutory `TAX_ESCROW`, `DynamicFundSplitEngine` integer-micro legs, physical `UMFUTURE_MAIN -> SPOT` sweep with settlement liquidity, virtual reserve quota on regulated silos, journal-backed checkpoints + compensation + restart recovery), `G2` automated post-mortem learning (loss / rejection / slippage / stop-out classification, live-vs-adverse wrong-action guard, "win is not an incident"), `G3` `MultiTrancheAutopilot` half-Kelly sizing, `N_eff` / 2% bucket / 6% heat gate, closed-market and memorized-failure exclusion |
+| 34 | `tests/test_v2_1_lifecycle_worker_connectors_and_bars.py` | **V2.1** `G4` `NiosLifecycleWorker` (03:00 UTC TOTP window, 30-minute `listenKey` keepalive, tiered `1s -> 5s -> 10s -> 30s -> 1m` read-only `5xx UNKNOWN` ladder with escalation, `VirtualMarginQuota` TTL sweep, concept-drift sizing cut, one failing job never stops the rest), `G5` `ConnectorRuntime` (three explicit modes, float-to-micros boundary with `NaN`/`inf`/`None` rejection, mandatory SEBI `algo_id`, `X-MBX-USED-WEIGHT` budget, crypto-only wallet sweep), `G6` `LiveBarAggregator` (`1m`/`5m`/`15m`/`1D` OHLCV, L2 ladder, IV/GEX surface) |
+| 35 | `tests/test_v2_1_analytics_alerts_settings_and_sse.py` | **V2.1** `G7` multiplexed SSE stream (seven closed-loop frames additive to the five V1.8 tape frames, `?topic=` / `?silo=` filtering, unknown-topic `422`, out-of-band event precedence), `G8` `/api/v2/analytics/performance` (equity curve, underwater drawdown, Sharpe / Sortino / Calmar, win rate, profit factor, per-silo / per-tranche / per-mission attribution), `G9` persistent alert and incident center (raise, de-duplicate, filter, acknowledge, `404`), `G10` journal-backed runtime settings (offline default, validated patch, revision history, live-critical tier carve-out, typed rejections) |
+| 36 | `tests/test_v2_1_unified_session_csrf_and_reconciliation.py` | **V2.1** `G11` unified cookie + header session (cookie-auth mutation costs a signed double-submit `X-NIOS-CSRF`, safe methods and the read-only MCP bridge stay exempt, `/api/v2/auth/session` tier + TTL + expiry + CSRF telemetry), `G12` cold-start reconciliation control (rogue venue position freezes the silo, status/run/dry-run, LIVE-elevated clear-freeze with operator note, ADR-009 loss stop refused) |
 
 
 ### 3.3 Chaos / crash injection

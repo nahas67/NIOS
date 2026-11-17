@@ -135,6 +135,10 @@ from ring3_cockpit.gateway.payload_envelope import (
     silo_risk_telemetry,
     workspace_mode_of,
 )
+from ring3_cockpit.gateway.v2_1_control import (
+    V21ControlPlaneMixin,
+    register_v2_1_routes,
+)
 
 __all__ = [
     "ARCHETYPE_GROUPS",
@@ -190,8 +194,26 @@ STREAM_EVENT_FRAMES: tuple[str, ...] = (
     "RISK_HEARTBEAT",
     "TV_STUDY_SIGNAL",
 )
+#: ``sec_016`` (V2.1 / ``G7``): the closed-loop frames multiplexed alongside the
+#: V1.8 tape frames.  They are appended, never interleaved, so the first five
+#: sequence positions -- and every V1.8 stream assertion -- stay byte-identical.
+CLOSED_LOOP_STREAM_FRAMES: tuple[str, ...] = (
+    "MISSION_PROGRESS",
+    "TRANCHE_HALT",
+    "WALLET_SWEEP",
+    "CONCEPT_DRIFT_ALERT",
+    "COLD_START_RECON",
+    "POST_MORTEM_COMPILED",
+    "SYSTEM_ALERT",
+)
+#: The full frame cycle the SSE hub emits.
+ALL_STREAM_FRAMES: tuple[str, ...] = STREAM_EVENT_FRAMES + CLOSED_LOOP_STREAM_FRAMES
+#: Every frame addressable through ``?topic=``.
+V21_STREAM_TOPICS: tuple[str, ...] = ALL_STREAM_FRAMES
 #: ``sec_016`` (V1.8): stream frame schema identity.
 STREAM_SCHEMA_VERSION: str = "v1.8.stream-hub"
+#: ``sec_016`` (V2.1): the schema identity of the closed-loop frames.
+V21_STREAM_SCHEMA_VERSION: str = "v2.1.stream-hub"
 
 # Frozen stream epoch so typed SSE frames stay byte-for-byte reproducible in tests.
 REPLAY_STREAM_EPOCH_NS: int = 1_760_000_000_000_000_000
@@ -1001,6 +1023,13 @@ class PaperOrderRequest(StrictRequest):
     strategy_id: str | None = None
     idempotency_key: str | None = Field(default=None, max_length=128)
     operator: str = "ring3.operator"
+    # V2.1 (``G1``): an order that closes a position opts into the profit-split
+    # saga.  The default is ``False``, so an opening order behaves exactly as it
+    # always did -- the closed loop is additive, never a silent side effect.
+    close_position: bool = False
+    mission_id: str | None = Field(default=None, max_length=64)
+    tranche_id: str | None = Field(default=None, max_length=64)
+    regime: str = Field(default="NEUTRAL", max_length=16)
 
     @field_validator("silo")
     @classmethod
@@ -1631,7 +1660,7 @@ class _BrokerState:
         )
 
 
-class ControlPlane:
+class ControlPlane(V21ControlPlaneMixin):
     """In-memory control + read model shared by REST and SSE.
 
     All dependencies are Ring 0 objects owned by the orchestrator; the control
@@ -3608,8 +3637,7 @@ class ControlPlane:
             "fill_price": float(price),
             "notional_micros": notional_micros,
             "realized_net_micros": realized_net_micros if filled else 0,
-            "statutory_cost": statutory,
-            "instrument": instrument_spec.to_dict() if instrument_spec else None,
+            "statutory_cost": statutory,            "instrument": instrument_spec.to_dict() if instrument_spec else None,
             "instrument_check": instrument_check.to_dict() if instrument_check else None,
             "ratchet": {
                 "applied": bool(filled and realized_net_micros > 0),
@@ -3643,6 +3671,19 @@ class ControlPlane:
                 if len(self._idempotency_order) > self._max_idempotent_receipts:
                     oldest = self._idempotency_order.pop(0)
                     self._idempotent_receipts.pop(oldest, None)
+        # ---- V2.1 (G1/G2): a fill closes the loop -------------------------
+        # A closing fill runs the profit-split saga; any negative fill, closing
+        # or not, writes a post-mortem.  Both are best-effort: a memory or saga
+        # failure must never turn a booked paper order into a 500.
+        if filled:
+            with contextlib.suppress(Exception):
+                self._v21_after_paper_fill(
+                    request=request,
+                    symbol=str(proposal.symbol),
+                    side=str(proposal.side),
+                    net_micros=int(realized_net_micros),
+                    notional_micros=int(notional_micros),
+                )
         return response
 
     @_serialised_control
@@ -8996,7 +9037,13 @@ class ControlPlane:
             return (token,)
         return tuple(self.registry.silo_ids())
 
-    def _stream_frame(self, sequence: int, silo: str | None) -> tuple[str, dict[str, Any]]:
+    def _stream_frame(
+        self,
+        sequence: int,
+        silo: str | None,
+        *,
+        topic: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         """Build one typed, grounded real-time frame for the multiplexed stream."""
 
         from ring3_cockpit.gateway.payload_envelope import payload_digest, silo_risk_telemetry
@@ -9004,15 +9051,22 @@ class ControlPlane:
         silo_ids = self._stream_silo_ids(silo)
         silo_id = silo_ids[sequence % len(silo_ids)]
         specs = instrument_registry.by_silo(silo_id) or ()
-        frame_type = STREAM_EVENT_FRAMES[sequence % len(STREAM_EVENT_FRAMES)]
-        spec = specs[(sequence // len(STREAM_EVENT_FRAMES)) % len(specs)] if specs else None
+        frames = (
+            (str(topic).strip().upper(),) if topic else ALL_STREAM_FRAMES
+        )
+        frame_type = frames[sequence % len(frames)]
+        spec = specs[(sequence // len(frames)) % len(specs)] if specs else None
         symbol = str(spec.symbol) if spec is not None else f"{silo_id}:AGGREGATE"
         unit = _stable_unit(silo_id, symbol, sequence, frame_type)
         price = round(20.0 + 4800.0 * unit, 6)
         payload: dict[str, Any] = {
             "type": frame_type,
             "event_type": frame_type,
-            "schema_version": STREAM_SCHEMA_VERSION,
+            "schema_version": (
+                STREAM_SCHEMA_VERSION
+                if frame_type in STREAM_EVENT_FRAMES
+                else V21_STREAM_SCHEMA_VERSION
+            ),
             "sequence": int(sequence),
             "silo": silo_id,
             "symbol": symbol,
@@ -9064,7 +9118,7 @@ class ControlPlane:
                     "cost_floor_bps": float(telemetry.get("cost_floor_bps", 0.0)),
                 }
             )
-        else:  # TV_STUDY_SIGNAL
+        elif frame_type == "TV_STUDY_SIGNAL":
             study_id = TRADINGVIEW_STUDY_IDS[sequence % len(TRADINGVIEW_STUDY_IDS)]
             regimes = ("TREND_UP", "TREND_DOWN", "VOLATILE", "RANGE")
             payload.update(
@@ -9075,31 +9129,138 @@ class ControlPlane:
                     "timeframe": "1D",
                 }
             )
+        elif frame_type == "MISSION_PROGRESS":
+            mission_rows: list[dict[str, Any]] = []
+            surface = getattr(self, "_mission_surface", None)
+            if surface is not None:
+                try:
+                    snapshot = surface.snapshot()
+                    mission_rows = list(snapshot.get("missions") or ())
+                except Exception:  # pragma: no cover - mission surface is optional
+                    mission_rows = []
+            row = mission_rows[sequence % len(mission_rows)] if mission_rows else {}
+            payload.update(
+                {
+                    "mission_id": str(row.get("mission_id", "")),
+                    "progress": float(row.get("progress", 0.0)),
+                    "realized_locked_micros": int(row.get("realized_locked_micros", 0)),
+                    "target_micros": int(row.get("target_micros", 0)),
+                    "sizing_multiplier": float(row.get("sizing_multiplier", 1.0)),
+                    "target_locked": bool(row.get("target_locked", False)),
+                }
+            )
+        elif frame_type == "TRANCHE_HALT":
+            payload.update(
+                {
+                    "tranche_id": f"TRN-{silo_id[:3]}-{sequence:04d}",
+                    "reason": "TRANCH_STOP_OUT" if sequence % 2 == 0 else "CORRELATED_TRANCHE_HEAT_EXCEEDED",
+                    "stop_fraction": 0.01,
+                    "reduce_only": True,
+                }
+            )
+        elif frame_type == "WALLET_SWEEP":
+            payload.update(
+                {
+                    "sweep_id": f"SWP-{silo_id[:3]}-{sequence:06d}",
+                    "from_wallet": "UMFUTURE_MAIN",
+                    "to_wallet": "MAIN",
+                    "amount_micros": int(1_000_000 + 9_000_000 * unit),
+                    "state": "COMMITTED" if sequence % 2 == 0 else "VOIDED",
+                }
+            )
+        elif frame_type == "CONCEPT_DRIFT_ALERT":
+            payload.update(
+                {
+                    "drift_kind": "CONCEPT" if sequence % 2 == 0 else "AGENT_BEHAVIOUR",
+                    "allocation_multiplier": round(0.25 + 0.75 * unit, 6),
+                    "paused": bool(unit > 0.9),
+                }
+            )
+        elif frame_type == "COLD_START_RECON":
+            guard = getattr(self, "guard", None)
+            frozen = ()
+            try:
+                frozen = tuple(guard.frozen_silos) if guard is not None else ()
+            except Exception:  # pragma: no cover - defensive
+                frozen = ()
+            payload.update(
+                {
+                    "frozen_silos": list(frozen),
+                    "classified": int(1 + sequence % 4),
+                    "passed": not frozen,
+                }
+            )
+        elif frame_type == "POST_MORTEM_COMPILED":
+            payload.update(
+                {
+                    "outcome_kind": "LOSING_TRADE" if sequence % 2 == 0 else "ORDER_REJECTION",
+                    "entity_count": int(1 + sequence % 5),
+                    "net_pnl_micros": int(-1_000_000 - 9_000_000 * unit),
+                }
+            )
+        else:  # SYSTEM_ALERT
+            payload.update(
+                {
+                    "code": "KILL_LATCH_HOT" if sequence % 2 == 0 else "TOTP_EXPIRY_WARNING",
+                    "severity": "CRITICAL" if sequence % 3 == 0 else "WARNING",
+                    "message": "typed system alert frame",
+                }
+            )
         payload["ts_ns"] = int(REPLAY_STREAM_EPOCH_NS + sequence * 1_000_000_000)
         payload["proof_line"] = _proof_line(payload)
         payload["payload_sha256"] = payload_digest(payload)
         return frame_type, payload
 
-    def stream_snapshot(self, silo: str | None = None) -> dict[str, Any]:
-        """Deterministic snapshot of the next typed frames plus silo risk telemetry."""
+    def stream_snapshot(self, silo: str | None = None, *, topic: str | None = None) -> dict[str, Any]:
+        """Deterministic snapshot of the next typed frames plus silo risk telemetry.
+
+        ``event_frames``/``frames`` keep the V1.8 contract (the five tape frames).
+        The ``G7`` closed-loop frames are advertised separately in
+        ``closed_loop_event_frames`` / ``closed_loop_frames`` so nothing that
+        asserted the original five changes meaning.
+        """
 
         from ring3_cockpit.gateway.payload_envelope import risk_telemetry
 
         silo_ids = self._stream_silo_ids(silo)
+        wanted = str(topic).strip().upper() if topic else None
+        if wanted is not None and wanted not in V21_STREAM_TOPICS:
+            raise HTTPException(status_code=422, detail=f"UNKNOWN_TOPIC:{wanted}")
+        if wanted is not None:
+            legacy_frames: tuple[str, ...] = ()
+            closed_frames: tuple[str, ...] = (wanted,)
+        else:
+            legacy_frames = STREAM_EVENT_FRAMES
+            closed_frames = CLOSED_LOOP_STREAM_FRAMES
         frames = [
             {"sequence": index, "event_type": event, "frame": body}
             for index, (event, body) in enumerate(
-                self._stream_frame(index, silo) for index in range(len(STREAM_EVENT_FRAMES))
+                self._stream_frame(index, silo) for index in range(len(legacy_frames))
             )
+        ]
+        closed_loop = [
+            {
+                "sequence": index,
+                "event_type": event,
+                "frame": self._stream_frame(index, silo, topic=event)[1],
+            }
+            for index, event in enumerate(closed_frames)
         ]
         payload = {
             "page": "stream.snapshot",
-            "schema_version": STREAM_SCHEMA_VERSION,
+            "schema_version": (V21_STREAM_SCHEMA_VERSION if wanted else STREAM_SCHEMA_VERSION),
             "silo": (str(silo).strip().upper() if silo else None),
             "silos": list(silo_ids),
-            "event_frames": list(STREAM_EVENT_FRAMES),
+            "event_frames": list(legacy_frames),
             "frame_count": len(frames),
             "frames": frames,
+            "closed_loop_event_frames": list(closed_frames),
+            "closed_loop_schema_version": V21_STREAM_SCHEMA_VERSION,
+            "closed_loop_frame_count": len(closed_loop),
+            "closed_loop_frames": closed_loop,
+            "all_event_frames": list(ALL_STREAM_FRAMES),
+            "topic": wanted,
+            "out_of_band_events": self.stream_events(silo=silo),
             "risk": risk_telemetry(self.ledger, silo_ids, registry=instrument_registry),
             "law": "sec_009 - the stream is an observable projection, never the ledger itself",
         }
@@ -9111,6 +9272,7 @@ class ControlPlane:
         max_events: int | None = None,
         silo: str | None = None,
         fps: int = 60,
+        topic: str | None = None,
     ) -> AsyncIterator[str]:
         """Typed, sequenced, SHA-256 sealed SSE frames (TICK/L2/ORDER/RISK/STUDY).
 
@@ -9130,6 +9292,9 @@ class ControlPlane:
         """
 
         self._stream_silo_ids(silo)
+        wanted = str(topic).strip().upper() if topic else None
+        if wanted is not None and wanted not in V21_STREAM_TOPICS:
+            raise HTTPException(status_code=422, detail=f"UNKNOWN_TOPIC:{wanted}")
         if max_events is None:
             limit: int | None = None
         else:
@@ -9148,8 +9313,20 @@ class ControlPlane:
         with self._stream_lock:
             self._active_streams += 1
         try:
+            # ``G7``: real out-of-band events are emitted before the synthetic
+            # cycle so a consumer that publishes an alert and then reads the
+            # stream sees that alert, not a replay of an idle tape.
+            emitted = 0
+            for event in self.stream_events(silo=silo, topic=wanted):
+                if limit is not None and emitted >= limit:
+                    break
+                body = json.dumps(event, separators=(",", ":"), default=str)
+                self._stream_frames_emitted += 1
+                yield f"event: {event['event_type']}\ndata: {body}\n\n"
+                emitted += 1
+            sequence = emitted
             while limit is None or sequence < limit:
-                frame_type, payload = self._stream_frame(sequence, silo)
+                frame_type, payload = self._stream_frame(sequence, silo, topic=wanted)
                 encoded = json.dumps(
                     payload, separators=(",", ":"), default=str
                 )
@@ -9551,9 +9728,24 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         # same PID topology as ``scripts/run_nios.py --multiprocess``.
         supervisor = _start_lifespan_supervisor(control)
         _app.state.process_supervisor = supervisor
+        # ``G4``: the in-process lifecycle worker owns the five background clocks
+        # (TOTP renewal, listenKey, UNKNOWN-order retry, quota TTL, drift).  It
+        # sleeps before its first tick, so a short-lived process never mutates
+        # runtime state merely by starting up.
+        lifecycle: Any | None = None
+        try:
+            if bool(control.runtime_settings.settings.lifecycle_enabled):
+                await control.lifecycle_worker.start(interval_s=5.0)
+                lifecycle = control.lifecycle_worker
+        except Exception:  # pragma: no cover - a scheduler failure never blocks Ring 3
+            lifecycle = None
+        _app.state.lifecycle_worker = lifecycle
         try:
             yield
         finally:
+            if lifecycle is not None:
+                with contextlib.suppress(Exception):
+                    await lifecycle.stop()
             if supervisor is not None:
                 with contextlib.suppress(Exception):
                     supervisor.stop()
@@ -10560,6 +10752,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         max_events: int | None = Query(default=None, ge=1, le=500),
         silo: str | None = Query(default=None, max_length=32),
         fps: int = Query(60, ge=1, le=120),
+        topic: str | None = Query(default=None, max_length=48),
     ) -> StreamingResponse:
         """Typed, sequenced, SHA-256 sealed real-time SSE frame hub."""
 
@@ -10572,6 +10765,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
                 max_events=max_events,
                 silo=silo,
                 fps=fps,
+                topic=topic,
             ):
                 if await http_request.is_disconnected():
                     break
@@ -10590,10 +10784,20 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     @app.get("/api/v2/stream/snapshot")
     async def stream_snapshot(
         silo: str | None = Query(default=None, max_length=32),
+        topic: str | None = Query(default=None, max_length=48),
     ) -> dict[str, Any]:
         """Deterministic snapshot of the next typed frames plus silo risk."""
 
-        return control.stream_snapshot(silo)
+        return control.stream_snapshot(silo, topic=topic)
+
+    # ---- V2.1 closed-loop surfaces (G1-G12) ---------------------------
+    register_v2_1_routes(
+        app,
+        control,
+        session_guard=_require_session,
+        live_guard=_require_live,
+        session_token=_session_token,
+    )
 
     @app.post("/api/v2/control/brokers/handshake", dependencies=[LIVE_GUARD])
     async def control_broker_handshake(

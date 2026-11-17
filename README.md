@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**716 tests · 32 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**834 tests · 36 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -210,6 +210,10 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 30 | `test_v1_9_oms_fsm_binance_and_env_truth.py` | **V1.9** staleness watermark, all-or-none baskets, cold-start recon, order FSM, clock health, exchange calendar, fencing epoch, replay checkpoints, Binance microstructure |
 | 31 | `test_v1_9_ai_provenance_and_concept_drift.py` | **V1.9** provenance + attestation + freshness bound, injection guard, star aggregation, frozen signing inputs, concept drift, agent behaviour monitor, Gate 23 |
 | 32 | `test_v1_9_entity_memory_and_default_feasibility.py` | **V1.9** default-on mission feasibility, `gbrain` entity post-mortem memory (timeline + compiled truths + hybrid retrieval + sealed packet), pre-trade agent memory haircut, `plannotator` inline plan annotation, MCP call session guard |
+| 33 | `test_v2_1_closed_loop_profit_split_and_autopilot.py` | **V2.1** `G1` trade-close profit-split saga (statutory escrow, dynamic split, physical `UMFUTURE_MAIN -> SPOT` sweep, virtual reserve quota, journal checkpoints + compensation), `G2` automated post-mortem learning, `G3` half-Kelly / `N_eff` / 6% heat multi-tranche autopilot |
+| 34 | `test_v2_1_lifecycle_worker_connectors_and_bars.py` | **V2.1** `G4` lifecycle worker (TOTP window, `listenKey`, tiered `5xx UNKNOWN` retry, quota TTL, drift), `G5` `ConnectorRuntime` float-to-micros boundary, `G6` `LiveBarAggregator` tick-to-bar + IV/GEX |
+| 35 | `test_v2_1_analytics_alerts_settings_and_sse.py` | **V2.1** `G7` closed-loop SSE topics, `G8` performance analytics, `G9` alert center, `G10` journal-backed runtime settings |
+| 36 | `test_v2_1_unified_session_csrf_and_reconciliation.py` | **V2.1** `G11` cookie + header session with CSRF double-submit and session telemetry, `G12` reconciliation status / run / clear-freeze |
 
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
@@ -553,7 +557,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     716 tests across 32 suites
+tests/                     834 tests across 36 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 23-gate go-live readiness certificate (--strict / --fast)
