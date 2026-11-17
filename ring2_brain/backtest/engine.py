@@ -324,17 +324,24 @@ class _Doc:
 
 
 def _silo_cost_floor_bps(silo: str) -> float:
-    """Return the statutory round-trip cost floor for ``silo`` in bps."""
+    """Return the statutory round-trip cost floor for ``silo`` in bps.
 
+    The frozen literal ``SILO_COST_FLOORS_BPS`` is the authority.  A live Ring 1
+    configuration may raise the floor (e.g. a venue adds a levy) but must never
+    lower it: an operator slider or env override that understates the statutory
+    tax would manufacture phantom net edge in Ring 2 backtests and let a
+    statistically empty strategy clear the champion floor.
+    """
+    frozen = float(SILO_COST_FLOORS_BPS[silo])
     try:  # pragma: no cover - the import always resolves inside NIOS
         from ring1_spinal.silo_worker import SILO_CONFIGS
 
         config = SILO_CONFIGS.get(silo)
         if config is not None:
-            return float(config.cost_floor.round_trip_cost_bps)
+            return max(frozen, float(config.cost_floor.round_trip_cost_bps))
     except Exception:  # pragma: no cover - defensive only
         pass
-    return float(SILO_COST_FLOORS_BPS[silo])
+    return frozen
 
 
 #: Public alias so the Cockpit can display the table without instantiating.
@@ -501,10 +508,21 @@ class WalkForwardBacktestEngine:
         shadow_twin: Any = None,
         clock: Any = time.time_ns,
     ) -> None:
-        if int(k_folds) < 2:
-            raise ValueError("k_folds must be >= 2")
-        if not (0.0 <= float(embargo_pct) < 0.5):
-            raise ValueError("embargo_pct must be in [0.0, 0.5)")
+        # sec_018 Law 4 / sec_010 fix the walk-forward contract at k=5 with a
+        # 2% embargo.  These are constitutional floors, not knobs: allowing a
+        # caller (plugin / env-driven config) to weaken them would let a
+        # lookahead-contaminated curve clear the DSR gate and enter the nursery.
+        if int(k_folds) < PURGED_K_FOLDS:
+            raise ValueError(
+                f"k_folds must be >= {PURGED_K_FOLDS} "
+                f"(sec_018 Law 4: k=5), got {k_folds}"
+            )
+        if not (EMBARGO_PCT <= float(embargo_pct) < 0.5):
+            raise ValueError(
+                "embargo_pct must be in "
+                f"[{EMBARGO_PCT}, 0.5) (sec_018 Law 4: 2% embargo), "
+                f"got {embargo_pct}"
+            )
         self._runs: dict[str, BacktestRun] = {}
         self._order: list[str] = []
         self._counter = 0

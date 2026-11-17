@@ -184,14 +184,52 @@ add(
 # ---------------------------------------------------------------------------
 # 3. Signed 22-gate certificate rows
 # ---------------------------------------------------------------------------
-completed = subprocess.run(
-    [PY, "-X", "utf8", str(ROOT / "scripts" / "preflight_golive.py"), "--fast", "--json"],
-    cwd=str(ROOT), capture_output=True, text=True, check=False,
-)
-report = json.loads(completed.stdout)
-gates = {gate["gate"]: gate for gate in report["gates"]}
+def _load_certificate() -> dict | None:
+    """Read the signed gate certificate, failing closed without a traceback.
 
-kill_ev = gates["cockpit.killswitch_and_rearm"]["evidence"]
+    A missing/broken preflight (or a non-JSON response) is a failed probe, not
+    a reason to crash the scorecard with ``JSONDecodeError``/``KeyError``.
+    """
+    try:
+        completed = subprocess.run(
+            [PY, "-X", "utf8", str(ROOT / "scripts" / "preflight_golive.py"), "--fast", "--json"],
+            cwd=str(ROOT), capture_output=True, text=True, check=False,
+        )
+    except OSError as exc:
+        print(f"preflight could not run: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+    if completed.returncode != 0:
+        print(
+            f"preflight exited {completed.returncode}: "
+            f"{(completed.stderr or '').strip()[:300]}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        report = json.loads(completed.stdout)
+    except (ValueError, UnicodeDecodeError) as exc:
+        print(f"preflight returned invalid JSON: {exc}", file=sys.stderr)
+        return None
+    if (
+        not isinstance(report, dict)
+        or not isinstance(report.get("gates"), list)
+        or not isinstance(report.get("certificate_sha256"), str)
+    ):
+        print("preflight certificate is missing required fields", file=sys.stderr)
+        return None
+    return report
+
+
+report = _load_certificate()
+if report is None:
+    sys.exit(2)
+gates = {
+    gate["gate"]: gate
+    for gate in report["gates"]
+    if isinstance(gate, dict) and isinstance(gate.get("gate"), str)
+}
+
+kill_ev = gates.get("cockpit.killswitch_and_rearm", {}).get("evidence", {})
 kill_ns = int(kill_ev.get("latency_ns", 0))
 add(
     "Global kill switch",
@@ -201,7 +239,7 @@ add(
     f"{kill_ev.get('halted_state')} -> {kill_ev.get('rearm_state')}",
 )
 
-contagion_ev = gates["ring2.contagion_three_tick_cascade"]["evidence"]
+contagion_ev = gates.get("ring2.contagion_three_tick_cascade", {}).get("evidence", {})
 add(
     "Gate 15 contagion SLA verdict",
     "< 1.8 ms",
@@ -211,14 +249,14 @@ add(
     f"SLA {contagion_ev.get('sla_ms')} ms",
 )
 
-obs_ev = gates["observability.metrics_and_health"]["evidence"]
+obs_ev = gates.get("observability.metrics_and_health", {}).get("evidence", {})
 machine_keys = obs_ev.get("json_keys") or []
 add(
     "Prometheus / OTel metrics + cockpit health",
     "all scrapes 200",
     f"/metrics={obs_ev.get('prometheus_status')} "
     f"json={obs_ev.get('json_status')} health={obs_ev.get('health_status')}",
-    gates["observability.metrics_and_health"]["status"] == "PASS",
+    gates.get("observability.metrics_and_health", {}).get("status") == "PASS",
     f"{len(machine_keys)} machine metric keys, health={obs_ev.get('health_state')}",
 )
 

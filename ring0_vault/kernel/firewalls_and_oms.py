@@ -34,7 +34,7 @@ import threading
 import time
 import gc
 import functools
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import IntEnum, StrEnum
 from typing import Any, Callable, Iterable, Mapping
 
@@ -725,9 +725,19 @@ class SovereignPreTradeFirewall:
             notional_micros = (qty_micros * price_micros) // 1_000_000
 
         # -- stage 4: two-phase crash-atomic outbox -----------------------
+        # The copula haircut above shrinks the *signed* order to ``effective_qty``
+        # (passed to ``signed_order`` below).  The reservation must lock the
+        # same reduced notional: reserving the original, unhaircut proposal
+        # would over-lock capital and, on fill, post a full-size entry to the
+        # book for a half-size execution.  Use a qty-adjusted intent so the
+        # deterministic outbox key, the lock amount and the signed order all
+        # describe one order.
+        reserve_proposal = (
+            replace(proposal, qty=effective_qty) if sized_down else proposal
+        )
         try:
             reservation = self.outbox.reserve(
-                proposal, now_ns=stamp, cost_floor=cost_floor
+                reserve_proposal, now_ns=stamp, cost_floor=cost_floor
             )
         except OverdraftError as exc:
             return _reject(

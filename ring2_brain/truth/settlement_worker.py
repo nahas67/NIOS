@@ -46,6 +46,7 @@ from core.feature_store import CONFORMAL_WINDOW, FeatureStore
 from core.schemas import canonical_pairs_digest
 
 __all__ = [
+    "DEFAULT_PREDICTION_SILO",
     "TRUST_MIN",
     "TRUST_MAX",
     "TRUST_WINDOW",
@@ -56,6 +57,12 @@ __all__ = [
     "donor_settlement_status",
 ]
 
+#: Neutral sentinel for a prediction whose caller omitted ``silo``.  A literal
+#: ``"US"`` default silently filed an India/crypto/forecast under the US
+#: valuation partition, making its trust snapshot invisible to its own silo and
+#: risking a US row being read back for a non-US trade.  Callers that know the
+#: silo (twin, orchestrator) always pass it explicitly.
+DEFAULT_PREDICTION_SILO = "UNSPECIFIED"
 #: ``sec_009`` Darwinian trust multiplier bounds.
 TRUST_MIN = 0.8
 TRUST_MAX = 1.5
@@ -120,7 +127,7 @@ class Prediction:
     horizon_ns: int
     created_at_ns: int
     grounding_hash: str = ""
-    silo: str = "US"
+    silo: str = DEFAULT_PREDICTION_SILO
     is_shadow: bool = True
 
     def __post_init__(self) -> None:
@@ -293,7 +300,7 @@ class DelayedSettlementWorker:
         horizon_ns: int | None = None,
         created_at_ns: int | None = None,
         grounding_hash: str = "",
-        silo: str = "US",
+        silo: str = DEFAULT_PREDICTION_SILO,
         is_shadow: bool = True,
     ) -> Prediction:
         """Log one prediction.  ``prediction_id`` defaults to a content hash.
@@ -564,7 +571,10 @@ class DelayedSettlementWorker:
             owner = str(getattr(prediction, "silo", "") or "")
             if owner and owner not in found:
                 found.append(owner)
-        return found or ["US"]
+        # No known silo means there is nothing to read.  Falling back to a
+        # hardcoded ``"US"`` queried a foreign valuation partition and could
+        # return another silo's trust row for a strategy that never traded it.
+        return found
 
     def settlements_for(self, strategy_id: str) -> tuple[SettlementOutcome, ...]:
         return tuple(

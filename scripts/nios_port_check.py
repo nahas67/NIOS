@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import socket
 import sys
+from typing import Any
 
 __all__ = [
     "DEFAULT_PORT_START",
@@ -53,9 +54,26 @@ def _family_for(host: str) -> int:
     return socket.AF_INET6 if ":" in host else socket.AF_INET
 
 
-def can_bind(host: str, port: int) -> bool:
-    """True when a listening socket can be bound to ``host:port`` right now."""
+def _valid_port(port: Any) -> bool:
+    """A bind target must be a real TCP port, never an overflowing integer."""
+    try:
+        value = int(port)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return 1 <= value <= 65_535
 
+
+def can_bind(host: str, port: int) -> bool:
+    """True when a listening socket can be bound to ``host:port`` right now.
+
+    An out-of-range port is *not bindable*, not a crash: ``socket.bind`` raises
+    ``OverflowError`` (a ``ValueError`` subclass on some runtimes) for values
+    outside 1..65535, and a CLI launcher must fail closed with an exit code
+    instead of leaking a traceback to the operator.
+    """
+
+    if not _valid_port(port):
+        return False
     sock = socket.socket(_family_for(host), socket.SOCK_STREAM)
     try:
         # Windows: refuse to share the address, matching uvicorn's default bind
@@ -67,7 +85,7 @@ def can_bind(host: str, port: int) -> bool:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, int(port)))
         return True
-    except OSError:
+    except (OSError, OverflowError, ValueError):
         return False
     finally:
         sock.close()
@@ -82,6 +100,8 @@ def first_free_port(
     low, high = int(start), int(end)
     if low > high:
         low, high = high, low
+    if not _valid_port(low) or not _valid_port(high):
+        return None
     for port in range(low, high + 1):
         if can_bind(host, port):
             return port
@@ -104,6 +124,10 @@ def resolve_port(
     workflow -- an occupied ``8000`` degrades to ``8001..8010``.
     """
     requested = int(requested)
+    if not _valid_port(requested):
+        raise PortUnavailable(
+            f"invalid port {requested!r}: expected 1..65535"
+        )
     if can_bind(host, requested):
         return requested
     if not allow_fallback:
@@ -145,6 +169,12 @@ def main(argv: list[str] | None = None) -> int:
                 start, end = int(args[1]), int(args[2])
             else:
                 raise ValueError("--scan takes at most two ports")
+            if not _valid_port(start) or not _valid_port(end):
+                print(
+                    f"invalid scan range {start}..{end}: expected ports in 1..65535",
+                    file=sys.stderr,
+                )
+                return 2
             port = first_free_port(host, start, end)
             if port is None:
                 print(
@@ -162,6 +192,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         port = int(args[1])
+        if not _valid_port(port):
+            print(
+                f"invalid port {port}: expected 1..65535",
+                file=sys.stderr,
+            )
+            return 2
     except ValueError as exc:
         print(f"invalid arguments: {exc}", file=sys.stderr)
         return 2

@@ -830,7 +830,7 @@ def test_gate6_cached_lease_never_served_to_a_crc_colliding_symbol() -> None:
     # a CRC32 clash produces in production.
     table = LeaseTableSHM(n_slots=1, name=f"nios-gate6-lease-{os.getpid()}")
     try:
-        now_ns = time.time_ns()
+        now_ns = time.monotonic_ns()
         table.write_lease(
             System1Lease(
                 symbol="AAA",
@@ -898,7 +898,12 @@ def test_gate6_can_spend_denies_an_unlisted_provider() -> None:
 
 
 def test_gate6_telemetry_buckets_cover_samples_above_the_last_bound() -> None:
-    """Bucket counts must total the sample count, including the +Inf bucket."""
+    """Overflow belongs to the exporter's +Inf series, never a finite bucket.
+
+    Prometheus histograms are cumulative: ``le=+Inf`` is emitted by the exporter
+    from ``count``. Folding overflow into the last finite bucket double-counts
+    it and makes ``le=0.001`` read as the sample total, hiding an SLA breach.
+    """
     from core.telemetry import TickLatencyRecorder
 
     recorder = TickLatencyRecorder()
@@ -910,7 +915,9 @@ def test_gate6_telemetry_buckets_cover_samples_above_the_last_bound() -> None:
     observed = 0
     for item in buckets.values() if isinstance(buckets, dict) else buckets:
         observed += int(item.get("count", 0)) if isinstance(item, dict) else int(item)
-    assert observed == 10
+    # No finite bucket absorbs the 5-second samples; the exporter's explicit
+    # le="+Inf" line (count=10) is the sole accounting for them.
+    assert observed == 0
 
 
 def test_gate6_shadow_twin_required_fills_is_a_property() -> None:
@@ -1437,6 +1444,12 @@ def test_gate7_chaos_recovery_never_wipes_live_leases() -> None:
     assert "factory_reset: bool = False" in source
 
     now = 10**15
+    # Keep this handle open for the whole drill.  On Windows a named SHM
+    # segment is destroyed when its last handle closes; if we closed it before
+    # the audit, ``audit_lease_reboot`` (reset=False) would attach to a *fresh*
+    # empty segment and the live lease would vanish for reasons unrelated to
+    # chaos recovery.  The real invariant is that the reboot audit must not
+    # disarm a lease that is still live in the shared segment.
     table = LeaseTableSHM(reset=True)
     try:
         table.write_lease(
@@ -1451,25 +1464,25 @@ def test_gate7_chaos_recovery_never_wipes_live_leases() -> None:
             ),
             now_ns=now - 1_000,
         )
+
+        report = chaos_recovery.audit_lease_reboot(now_ns=now)
+        # ``passed`` certifies an *empty* post-reboot table, and the live ETH
+        # lease deliberately is not empty.  What must hold is that only the
+        # stale lease was swept and the live authority survived.
+        assert report.stale_lease_armed is True
+        assert report.swept == 1
+        assert report.mode_after_reboot == int(LeaseMode.DISARMED)
+
+        reader = LeaseTableSHM(reset=False)
+        try:
+            survivor = reader.read_lease("ETH-USDT", now)
+            assert survivor.mode is LeaseMode.LONG_ONLY, "a live lease was wiped"
+            assert survivor.target_bps == pytest.approx(10.0)
+            assert reader.active_count(now) == 1
+        finally:
+            reader.close()
     finally:
         table.close()
-
-    report = chaos_recovery.audit_lease_reboot(now_ns=now)
-    # ``passed`` certifies an *empty* post-reboot table, and the live ETH lease
-    # deliberately is not empty.  What must hold is that only the stale lease
-    # was swept and the live authority survived.
-    assert report.stale_lease_armed is True
-    assert report.swept == 1
-    assert report.mode_after_reboot == int(LeaseMode.DISARMED)
-
-    reader = LeaseTableSHM(reset=False)
-    try:
-        survivor = reader.read_lease("ETH-USDT", now)
-        assert survivor.mode is LeaseMode.LONG_ONLY, "a live lease was wiped"
-        assert survivor.target_bps == pytest.approx(10.0)
-        assert reader.active_count(now) == 1
-    finally:
-        reader.close()
 
 
 def test_gate7_feature_store_keeps_an_uncommitted_contagion_batch(tmp_path) -> None:
@@ -1789,3 +1802,444 @@ def test_gate7b_preflight_session_elevation_cannot_recurse() -> None:
     context = PreflightContext(silo_scope="ALL", strict=False, tempdir=".")
     assert context._auth_ready is False
     assert "_auth_ready" in inspect.getsource(PreflightContext.client)
+
+
+# ---------------------------------------------------------------------------
+# Gate 8 - V1.8 multi-perspective security, memory & self-evolution audit
+# ---------------------------------------------------------------------------
+# One focused, deterministic regression per V1.8 fix.  Every test is offline,
+# in-process and bounded; HTTP tests are confined to fixes 3-5.
+
+
+def _gate8_live_headers(client: Any, runtime: Any) -> dict[str, str]:
+    """Mint a fresh LIVE session in-process (no pre-flight, no network).
+
+    Ensure the operator exists first: in an isolated ``-k gate8`` run the
+    module-scoped ``token`` fixture (which normally performs setup) never runs.
+    """
+    setup = client.post(
+        "/api/v2/auth/setup",
+        json={
+            "username": USERNAME,
+            "password": PASSWORD,
+            "live_pin": LIVE_PIN,
+            "start_clean_slate": False,
+        },
+    )
+    assert setup.status_code in (200, 409), setup.text
+    login = client.post(
+        "/api/v2/auth/login/paper",
+        json={"username": USERNAME, "password": PASSWORD},
+    )
+    assert login.status_code == 200, login.text
+    paper = str(login.json()["token"])
+    live = runtime.control.operator_auth().elevate_to_live(paper, LIVE_PIN).token
+    return _headers(live)
+
+
+def test_gate8_port_clis_fail_closed_on_out_of_range_ports() -> None:
+    """LENS 1: an invalid port is a clean exit 2, never an OverflowError."""
+    import scripts.nios_port_check as checker
+    import scripts.run_nios as runner
+
+    # nios_port_check.main() takes an explicit argv list.
+    assert checker.main(["127.0.0.1", "99999"]) == 2
+    assert checker.main(["127.0.0.1", "70000", "70010"]) != 0  # missing --scan
+    assert checker.main(["127.0.0.1", "--scan", "70000", "70010"]) == 2
+    assert checker.main(["127.0.0.1", "-5"]) == 2
+    # The helpers themselves fail closed instead of calling socket.bind.
+    assert checker._valid_port(65_535) is True
+    assert checker._valid_port(65_536) is False
+    assert checker._valid_port(0) is False
+    assert checker.can_bind("127.0.0.1", 99_999) is False
+    assert checker.first_free_port("127.0.0.1", 70_000, 70_010) is None
+
+    # run_nios.main() must reject before it ever boots a ring or binds a socket.
+    assert runner.main(["--port", "99999"]) == 2
+    assert runner.main(["--port=-7"]) == 2
+
+
+def test_gate8_latency_scorecard_fails_closed_on_bad_preflight(monkeypatch: Any) -> None:
+    """LENS 1: a broken certificate is exit 2, not JSONDecodeError/KeyError."""
+    import importlib.util
+    import subprocess
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "latency_scorecard.py"
+    assert script.is_file()
+
+    def _exit_code(returncode: int, stdout: str) -> int:
+        spec = importlib.util.spec_from_file_location("_gate8_scorecard", script)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(
+                returncode=returncode, stdout=stdout, stderr="preflight-down"
+            ),
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            spec.loader.exec_module(module)
+        return excinfo.value.code
+
+    assert _exit_code(1, "") == 2
+    assert _exit_code(0, "not json") == 2
+    assert _exit_code(0, '{"gates": []}') == 2  # missing certificate_sha256
+
+
+def test_gate8_unknown_silo_brokers_returns_404(client: Any, runtime: Any) -> None:
+    """LENS 1: an unknown silo on the broker control route is a 404, not 500."""
+    response = client.post(
+        "/api/v2/control/brokers",
+        json={"silo": "NO_SUCH_SILO", "mode": "PAPER"},
+        headers=_gate8_live_headers(client, runtime),
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == "UNKNOWN_SILO"
+
+
+def test_gate8_unknown_silo_credentials_returns_404_without_secret(
+    client: Any, runtime: Any
+) -> None:
+    """LENS 1: unknown silo -> 404 UNKNOWN_SILO, with no credential echoed."""
+    api_key = "GATE8_SUPERSECRET_KEY_9f3a"
+    api_secret = "GATE8_SUPERSECRET_VALUE_b71c"
+    response = client.post(
+        "/api/v2/control/brokers/credentials",
+        json={
+            "silo": "NO_SUCH_SILO",
+            "venue": "DHAN",
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "sandbox": True,
+        },
+        headers=_gate8_live_headers(client, runtime),
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == "UNKNOWN_SILO"
+    assert api_key not in response.text
+    assert api_secret not in response.text
+
+
+def test_gate8_skill_markdown_path_traversal_returns_404(client: Any) -> None:
+    """LENS 1: path escaping the skill registry root is never served."""
+    import inspect
+
+    from ring3_cockpit.gateway.control_plane import ControlPlane
+
+    for escaped in ("..%2f..%2fetc%2fpasswd", "a%00b"):
+        response = client.get(f"/api/v2/cockpit/skills/{escaped}")
+        assert response.status_code == 404, (escaped, response.status_code, response.text)
+
+    # The containment check itself must fail closed (no swallowed ValueError),
+    # and the token gate must reject NUL bytes / parent traversal explicitly.
+    src = inspect.getsource(ControlPlane.skill_markdown)
+    assert '"\\x00" in token' in src
+    assert '".." in token' in src
+    marker = "except (OSError, RuntimeError, ValueError):"
+    assert marker in src
+    assert "raise HTTPException" in src[src.index(marker) :]
+
+
+def test_gate8_scientific_notation_and_leading_dot_numbers_are_grounded() -> None:
+    """LENS 2 (Law 3): magnitude-carrying spellings cannot bypass grounding."""
+    from core.schemas import UngroundedNumericalClaim
+    from ring2_brain.truth.grounding_gate import (
+        UNGROUNDED_CLAIM_CODE,
+        GroundingLedger,
+        NumericalGroundingVerifier,
+        verify_thesis_claims,
+    )
+
+    base_ns = 1_700_000_000_000_000_000
+    packet = GroundingLedger(persist=False).commit(
+        "ACME",
+        {"close": 1.5},
+        valid_time_ns=base_ns,
+        knowledge_ts_ns=base_ns - 1_000,
+    )
+    # A fabricated magnitude hidden behind a grounded mantissa must be refused.
+    with pytest.raises(UngroundedNumericalClaim) as excinfo:
+        verify_thesis_claims("close price is 1.5e9.", packet)
+    assert UNGROUNDED_CLAIM_CODE in str(excinfo.value)
+
+    # Leading-dot decimals are material claims with their real value.
+    claims = NumericalGroundingVerifier().extract_claims("value .5")
+    assert any(claim.value == pytest.approx(0.5) for claim in claims), claims
+
+    # A genuinely grounded scientific-notation figure still passes.
+    report = verify_thesis_claims("close price is 1.5e0.", packet)
+    assert report.claims_checked >= 1
+
+
+def test_gate8_cold_lease_read_rejects_expired_deadline() -> None:
+    """LENS 3 (Law 2): a cold read never serves a dead System 1's armed lease."""
+    import time as _time
+
+    from core.schemas import LeaseMode, System1Lease
+    from core.shm_ipc import LeaseTableSHM
+
+    name = f"nios-gate8-cold-{os.getpid()}"
+    writer = LeaseTableSHM(n_slots=1, name=name)
+    reader = None
+    live_reader = None
+    try:
+        writer.write_lease(
+            System1Lease(
+                symbol="EXP",
+                mode=LeaseMode.LONG_ONLY,
+                expires_at_ns=_time.monotonic_ns() - 1,
+            )
+        )
+        # A FRESH reader has no cache: this is the cold decode path.
+        reader = LeaseTableSHM(n_slots=1, name=name)
+        assert reader.read_lease("EXP").mode == LeaseMode.DISARMED
+
+        writer.write_lease(
+            System1Lease(
+                symbol="LIVE",
+                mode=LeaseMode.LONG_ONLY,
+                expires_at_ns=_time.monotonic_ns() + 60_000_000_000,
+            )
+        )
+        live_reader = LeaseTableSHM(n_slots=1, name=name)
+        assert live_reader.read_lease("LIVE").mode == LeaseMode.LONG_ONLY
+    finally:
+        for handle in (reader, live_reader, writer):
+            if handle is not None:
+                handle.close()
+
+
+def test_gate8_outbox_settlement_is_single_atomic_transaction() -> None:
+    """LENS 3: commit/void/void_many share one BEGIN IMMEDIATE commit point."""
+    import inspect
+
+    from ring0_vault.ibor.ledger_outbox import CrashAtomicOutbox, LedgerStore
+
+    settle = getattr(LedgerStore, "settle_outbox_reservations", None)
+    assert callable(settle)  # absent on the pre-fix store
+    src = inspect.getsource(settle)
+    assert "BEGIN IMMEDIATE" in src and "COMMIT" in src
+    assert "ibor_double_entry_ledger" in src and "financial_outbox" in src
+    for name in ("commit", "void", "void_many"):
+        method_src = inspect.getsource(getattr(CrashAtomicOutbox, name))
+        assert "self.store.settle_outbox_reservations" in method_src, name
+
+
+def test_gate8_journal_fsyncs_parent_directory_and_boots_clean_slate(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    """LENS 3: os.replace is followed by a best-effort directory fsync."""
+    import os as _os
+
+    import ring0_vault.ibor.state_journal as sj
+
+    fake_fd = 987_654_321
+    fsynced: list[int] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(sj.os, "open", lambda path, flags, *a, **k: fake_fd)
+    monkeypatch.setattr(sj.os, "fsync", lambda fd: fsynced.append(fd))
+    monkeypatch.setattr(sj.os, "close", lambda fd: closed.append(fd))
+
+    journal = sj.AtomicStateJournal(path=tmp_path / "state.json")
+    journal.save({"logbook": [{"id": 1}]})
+    # The file fd is fsynced before replace; the directory fd after it.
+    assert fake_fd in fsynced, fsynced
+    assert fake_fd in closed, closed
+
+    # A truncated/corrupt document still degrades to a Clean Slate.
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    state = sj.AtomicStateJournal(path=corrupt).load()
+    assert state["clean_slate_active"] is True
+    assert state["logbook"] == []
+
+
+def test_gate8_copula_haircut_applied_to_reservation() -> None:
+    """LENS 3: a shield haircut reserves the reduced notional, not the full one."""
+    import inspect
+
+    from ring0_vault.kernel import firewalls_and_oms as fo
+
+    src = inspect.getsource(fo)
+    # The sized-down path must re-quantise the *reserved* proposal too.
+    assert "replace(proposal, qty=effective_qty)" in src
+    marker = "reserve_proposal = ("
+    assert marker in src
+    block = src[src.index(marker) : src.index(marker) + 600]
+    assert "self.outbox.reserve(" in block
+    assert "reserve_proposal" in block
+
+
+def test_gate8_read_lease_slot_bounds_check() -> None:
+    """LENS 3: diagnostic slot reads reject out-of-range indices."""
+    from core.shm_ipc import LeaseTableSHM
+
+    table = LeaseTableSHM(n_slots=2, name=f"nios-gate8-slot-{os.getpid()}")
+    try:
+        with pytest.raises(IndexError):
+            table.read_lease_slot(table.n_slots)
+        with pytest.raises(IndexError):
+            table.read_lease_slot(-1)
+    finally:
+        table.close()
+
+
+def test_gate8_purged_kfold_embargo_default_is_two_percent() -> None:
+    """LENS 4 (Law 4): Purged K-Fold ships with the constitutional 2% embargo."""
+    from ring2_brain.forge.alpha_forge import (
+        DEFAULT_CV_FOLDS,
+        DEFAULT_EMBARGO_FRACTION,
+        PurgedKFoldCV,
+    )
+
+    assert DEFAULT_CV_FOLDS == 5
+    assert DEFAULT_EMBARGO_FRACTION == 0.02
+    assert PurgedKFoldCV().embargo_fraction == 0.02
+    assert PurgedKFoldCV().n_folds == DEFAULT_CV_FOLDS
+
+
+def test_gate8_purged_kfold_rejects_weakened_parameters() -> None:
+    """LENS 4: k<5 and embargo<2% are refused, not silently accepted."""
+    from ring2_brain.forge.alpha_forge import PurgedKFoldCV
+
+    for kwargs in (
+        {"n_folds": 2},
+        {"n_folds": 4},
+        {"embargo_fraction": 0.0},
+        {"embargo_fraction": 0.01},
+    ):
+        with pytest.raises(ValueError):
+            PurgedKFoldCV(**kwargs)
+
+
+def test_gate8_supplied_metrics_missing_p_value_fails_closed() -> None:
+    """LENS 4: a supplied DSR without a p-value fails the FDR gate."""
+    import numpy as np
+
+    from ring2_brain.forge.alpha_forge import (
+        DEFAULT_FDR,
+        StrategyGenome,
+        benjamini_hochberg,
+    )
+
+    missing = StrategyGenome(
+        genome_id="supplied-no-p",
+        weights=np.array([1.0]),
+        deflated_sharpe=2.0,
+    )
+    assert missing.p_value == 1.0
+    rejected, _, _, _ = benjamini_hochberg([missing.p_value], DEFAULT_FDR)
+    assert not bool(rejected[0])
+
+    explicit = StrategyGenome(
+        genome_id="supplied-with-p",
+        weights=np.array([1.0]),
+        deflated_sharpe=2.0,
+        p_value=1e-9,
+    )
+    assert explicit.p_value == pytest.approx(1e-9)
+    rejected2, _, _, _ = benjamini_hochberg([explicit.p_value], DEFAULT_FDR)
+    assert bool(rejected2[0])
+
+
+def test_gate8_walk_forward_rejects_weakened_parameters() -> None:
+    """LENS 4: the walk-forward engine refuses a weakened k/embargo contract."""
+    from ring2_brain.backtest.engine import WalkForwardBacktestEngine
+
+    for kwargs in (
+        {"k_folds": 2},
+        {"k_folds": 4},
+        {"embargo_pct": 0.0},
+        {"embargo_pct": 0.01},
+        {"embargo_pct": 0.5},
+    ):
+        with pytest.raises(ValueError):
+            WalkForwardBacktestEngine(**kwargs)
+
+
+def test_gate8_cost_floor_uses_frozen_authority(monkeypatch: Any) -> None:
+    """LENS 4: live config may only raise, never lower, the statutory floor."""
+    from types import SimpleNamespace
+
+    import ring1_spinal.silo_worker as sw
+    from ring2_brain.backtest import engine as bt
+
+    frozen = bt.SILO_COST_FLOORS_BPS[INDIA]
+    assert frozen == pytest.approx(8.50)
+
+    monkeypatch.setitem(
+        sw.SILO_CONFIGS,
+        INDIA,
+        SimpleNamespace(cost_floor=SimpleNamespace(round_trip_cost_bps=1.0)),
+    )
+    assert bt._silo_cost_floor_bps(INDIA) == pytest.approx(frozen)
+
+    monkeypatch.setitem(
+        sw.SILO_CONFIGS,
+        INDIA,
+        SimpleNamespace(cost_floor=SimpleNamespace(round_trip_cost_bps=12.0)),
+    )
+    assert bt._silo_cost_floor_bps(INDIA) == pytest.approx(12.0)
+
+
+def test_gate8_prediction_silo_defaults_to_unspecified() -> None:
+    """LENS 4: forecasts no longer silently land in the US partition."""
+    from ring2_brain.truth.settlement_worker import (
+        DEFAULT_PREDICTION_SILO,
+        Prediction,
+    )
+
+    assert DEFAULT_PREDICTION_SILO == "UNSPECIFIED"
+    prediction = Prediction(
+        prediction_id="g8-pred",
+        strategy_id="g8-strat",
+        symbol="TEST",
+        predicted_net_bps=1.5,
+        horizon_ns=1_000,
+        created_at_ns=1,
+    )
+    assert prediction.silo == "UNSPECIFIED"
+
+
+def test_gate8_overflow_samples_not_folded_into_finite_bucket() -> None:
+    """LENS 5: the +Inf overflow is emitted by count, not the last finite bucket."""
+    from core.telemetry import TickLatencyRecorder
+
+    recorder = TickLatencyRecorder()
+    recorder.observe_s(50e-6)  # 50 us -> a finite bucket
+    recorder.observe_s(5.0)  # far above the last finite 1 ms bound
+    snapshot = recorder.snapshot()
+    assert snapshot["count"] == 2
+    assert snapshot["buckets"][-1] == {"le": 0.001, "count": 1}
+
+
+def test_gate8_sec_edgar_pit_fallback_uses_utc(monkeypatch: Any) -> None:
+    """LENS 5: the as_of fallback is UTC, so a local-date filing cannot leak."""
+    import inspect
+    from datetime import datetime as _datetime, timezone
+
+    import ring2_brain.truth.tradingagents.sec_edgar as se
+
+    # Behavioural: the fallback must call datetime.now(timezone.utc).
+    seen: list[Any] = []
+
+    class _FakeDateTime:
+        @staticmethod
+        def now(tz: Any = None) -> _datetime:
+            seen.append(tz)
+            return _datetime(2026, 11, 17, 23, 30, tzinfo=(tz or timezone.utc))
+
+    monkeypatch.setattr(se, "datetime", _FakeDateTime)
+    monkeypatch.setattr(se, "cik_for", lambda ticker: None)
+    try:
+        se.get_balance_sheet("AAPL", as_of_date=None)
+    except Exception:
+        pass  # cik_for -> None raises NoMarketDataError after the fallback ran
+    assert seen == [timezone.utc], seen
+
+    # Guard against a naive local-now regression in the source itself.
+    src = inspect.getsource(se._statement)
+    assert "datetime.now(timezone.utc)" in src

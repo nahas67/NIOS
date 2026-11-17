@@ -636,6 +636,20 @@ class LeaseTableSHM:
                 raw[4],
                 raw[5],
             )
+            # Fail closed on a dead-man lease whose TTL has already elapsed
+            # (Law 2).  The cached-entry branch above applies the full
+            # ``is_active`` envelope on subsequent reads; a cold read (a
+            # restarted Ring 1, or a slot never seen by this process) must at
+            # minimum refuse a lease whose monotonic deadline has passed.
+            # Without this, an expired lease left in SHM by a dead System 1 is
+            # handed out as live trading authority on the first read after
+            # boot.  The comparison is deliberately the bare deadline test, not
+            # ``is_active``: lease deadlines are monotonic, and a caller may
+            # legitimately seed a slot whose horizon is checked by the cached
+            # path / ``sweep_expired`` rather than here.
+            if now_ns >= lease.expires_at_ns:
+                self._lease_cache.pop(off, None)
+                return System1Lease.disarmed(symbol)
             self._lease_cache[off] = (seq_before, symbol, lease)
             return lease
 
@@ -643,6 +657,9 @@ class LeaseTableSHM:
 
     def read_lease_slot(self, index: int) -> tuple[int, System1Lease | None]:
         """Diagnostic read of a raw slot (used by the Cockpit X-ray tab)."""
+        index = int(index)
+        if not 0 <= index < self.n_slots:
+            raise IndexError(f"lease slot {index} outside 0..{self.n_slots - 1}")
         off = self.slot_offset(index)
         buf = self._seg.buf
         seq = _U64.unpack_from(buf, off)[0]

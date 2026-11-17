@@ -928,6 +928,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         requested, forced = DEFAULT_PORT, False
 
+    if not 1 <= requested <= 65_535:
+        print(f"[NIOS] FATAL: port out of range: {requested}", file=sys.stderr)
+        return 2
+
     if args.smoke_test:
         return run_smoke(host=args.host, port=requested, workspace=args.workspace)
     if args.role:

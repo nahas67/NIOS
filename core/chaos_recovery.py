@@ -400,9 +400,19 @@ def audit_lease_reboot(
             strategy_id_hash=0xA1B2C3,
         )
         writer.write_lease(stale, stamp)
-        report.stale_lease_armed = (
-            writer.read_lease(symbol, stamp).mode is LeaseMode.LONG_ONLY
-        )
+        # The pre-sweep "armed" diagnostic must inspect the RAW slot, not
+        # ``read_lease``.  Since the Lens3 cold-path fix, ``read_lease`` fails
+        # closed and returns DISARMED for an expired lease (Law 2), so it can
+        # no longer observe the seeded stale entry.  The raw slot still holds
+        # the LONG_ONLY lease until ``sweep_expired`` rewrites it; reading it
+        # here is a non-authoritative diagnostic only and does not weaken the
+        # fail-closed guarantee (no trading authority is derived from it).
+        report.stale_lease_armed = False
+        for index in range(writer.n_slots):
+            _seq, raw_lease = writer.read_lease_slot(index)
+            if raw_lease is not None and raw_lease.symbol == symbol:
+                report.stale_lease_armed = raw_lease.mode is LeaseMode.LONG_ONLY
+                break
 
         # "Reboot": a brand-new handle with an empty cache over the *same*
         # live segment (the writer stays open so the name is not destroyed).

@@ -3781,13 +3781,21 @@ class ControlPlane:
         meta_path = getattr(meta, "path", "")
         root_raw = getattr(registry, "root", "") or ""
         if meta_path and root_raw:
-            with contextlib.suppress(Exception):
+            # Fail closed: ``suppress(Exception)`` here made the containment
+            # check a no-op, so a runtime-registered SKILL.md outside the skill
+            # root could be read through the cockpit.  A path that escapes the
+            # registry root is simply not a known skill to this surface.
+            try:
                 root = Path(str(root_raw)).resolve()
                 candidate = Path(str(meta_path))
                 resolved = (
                     candidate if candidate.is_absolute() else root / candidate
                 ).resolve()
                 resolved.relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                raise HTTPException(
+                    status_code=404, detail=f"unknown skill {token!r}"
+                ) from None
         try:
             body = registry.load(token)
         except KeyError:
@@ -3958,9 +3966,21 @@ class ControlPlane:
                 strategy_id_hash=0xA1B2C3,
             )
             writer.write_lease(stale, stamp)
-            report["stale_lease_armed"] = (
-                writer.read_lease(symbol, stamp).mode is LeaseMode.LONG_ONLY
-            )
+            # Pre-sweep "armed" diagnostic must inspect the RAW slot, not
+            # ``read_lease``.  Since the Lens3 cold-path fix, ``read_lease``
+            # fails closed and returns DISARMED for an expired lease (Law 2),
+            # so it can no longer observe the seeded stale entry.  The raw slot
+            # still holds LONG_ONLY until ``sweep_expired`` rewrites it; this
+            # read is a non-authoritative diagnostic only and does not weaken
+            # the fail-closed guarantee (no trading authority derived from it).
+            report["stale_lease_armed"] = False
+            for index in range(writer.n_slots):
+                _seq, raw_lease = writer.read_lease_slot(index)
+                if raw_lease is not None and raw_lease.symbol == symbol:
+                    report["stale_lease_armed"] = (
+                        raw_lease.mode is LeaseMode.LONG_ONLY
+                    )
+                    break
             # "Reboot": a brand-new handle with an empty cache over the same
             # segment, exactly like a restarted Ring 1 worker.
             reader = LeaseTableSHM(reset=False, name=segment)
@@ -4940,6 +4960,10 @@ class ControlPlane:
         except ValueError as exc:
             # The message names the silo/venue only; it never contains a secret.
             raise HTTPException(status_code=422, detail=str(exc)) from None
+        except KeyError:
+            # An unknown silo is a client error, not an unhandled 500, and no
+            # credential has been written at this point.
+            raise HTTPException(status_code=404, detail="UNKNOWN_SILO") from None
         finally:
             # Drop the plaintext references before building the response.
             del api_key
@@ -8154,7 +8178,12 @@ class ControlPlane:
 
     # -- mutations --------------------------------------------------------
     def update_broker(self, request: BrokerControlRequest) -> dict[str, Any]:
-        silo = self.registry.get(request.silo)
+        try:
+            silo = self.registry.get(request.silo)
+        except (KeyError, ValueError):
+            # The registry raises KeyError for an unknown silo.  Letting it escape
+            # turns a malformed operator request into a 500 instead of a 404.
+            raise HTTPException(status_code=404, detail="UNKNOWN_SILO") from None
         state = self._brokers[silo.silo_id]
         updated: list[str] = []
 

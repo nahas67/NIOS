@@ -435,6 +435,7 @@ def test_gate4_all_four_silos_are_ready() -> None:
 
 def test_gate4_live_toggle_requires_confirm_live_and_covers_all_silos(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = NIOSCoreOrchestrator(
         workspace=tmp_path / "runtime",
@@ -445,6 +446,24 @@ def test_gate4_live_toggle_requires_confirm_live_and_covers_all_silos(
     )
     try:
         client = TestClient(runtime.control_app())
+
+        # This gate tests the confirm_live toggle, not the Phase 4 go-live
+        # certificate.  The real certificate depends on the checkout being
+        # clean (git.clean_working_tree), which is meaningless inside a test.
+        # Inject a green certificate so the test is hermetic; the production
+        # pre-flight gate is left fully intact (monkeypatch is undone after
+        # this test).
+        monkeypatch.setattr(
+            runtime.control,
+            "preflight_certificate",
+            lambda **_kwargs: {
+                "ready_for_live_cutover": True,
+                "failed_gates": 0,
+                "failed_gate_ids": [],
+                "warned_gates": 0,
+                "certificate_sha256": "a" * 64,
+            },
+        )
 
         # Without confirm_live the endpoint must refuse to arm LIVE.
         for silo_id in SILO_ORDER:

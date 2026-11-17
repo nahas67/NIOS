@@ -910,6 +910,85 @@ class LedgerStore:
                 self._conn.execute("ROLLBACK")
                 raise
 
+    def settle_outbox_reservations(
+        self,
+        rows: Iterable[tuple["Transfer", str]],
+        *,
+        phase: TransferPhase,
+        state: str,
+        updated_ns: int,
+        broker_order_id: str = "",
+        detail: str = "",
+        write_outbox: bool = True,
+    ) -> None:
+        """Atomically append each terminal transfer phase and resolve each outbox row.
+
+        This is the single commit point for the two durable writes that resolve
+        a reservation.  Previously the ledger phase row and the outbox state
+        were written in two separate autocommit statements, so a crash between
+        them replayed as PENDING-in-outbox / POSTED-in-ledger: a retried broker
+        ack then hit ``_require_pending`` and the reservation could never be
+        resolved (a stuck, permanently encumbered hold).  Writing both in one
+        ``BEGIN IMMEDIATE`` transaction means replay always sees a consistent
+        pair and a retried FILLED/CANCELLED ack resolves it exactly once.
+
+        ``write_outbox=False`` is the kill-switch fast path: the caller keeps
+        the measured preemption window sub-ms, writes the phase rows here and
+        flushes the outbox rows immediately afterwards in a separate batch.
+
+        ``rows`` is materialised once so a generator cannot be exhausted inside
+        the transaction.
+        """
+        materialised = [(transfer, str(key)) for transfer, key in rows]
+        if not materialised:
+            return
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for transfer, key in materialised:
+                    self._conn.execute(
+                        """
+                        INSERT INTO ibor_double_entry_ledger
+                            (transfer_id, silo, debit_account, credit_account,
+                             amount_micros, code, phase, pending_id, created_ns, posted_ns)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            str(transfer.transfer_id),
+                            transfer.silo,
+                            transfer.debit_account,
+                            transfer.credit_account,
+                            str(transfer.amount_micros),
+                            int(transfer.code),
+                            str(phase),
+                            None if transfer.pending_id is None else str(transfer.pending_id),
+                            int(transfer.created_ns),
+                            int(updated_ns),
+                        ),
+                    )
+                    if write_outbox:
+                        self._conn.execute(
+                            """
+                            UPDATE financial_outbox
+                               SET state = ?, updated_ns = ?,
+                                   broker_order_id = CASE WHEN ? = '' THEN broker_order_id ELSE ? END,
+                                   detail = ?
+                             WHERE outbox_idempotency_key = ?
+                            """,
+                            (
+                                state,
+                                int(updated_ns),
+                                broker_order_id,
+                                broker_order_id,
+                                detail,
+                                key,
+                            ),
+                        )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
     def get_outbox(self, key: str) -> dict[str, Any] | None:
         with self._lock:
             cursor = self._conn.execute(
@@ -1360,8 +1439,16 @@ class IBORLedger:
             self._transfers[transfer.transfer_id] = transfer
             return transfer
 
-    def post_pending(self, transfer_id: int, *, now_ns: int | None = None) -> Transfer:
-        """Phase 2a: settle a pending transfer (broker FILLED)."""
+    def post_pending(
+        self, transfer_id: int, *, now_ns: int | None = None, persist: bool = True
+    ) -> Transfer:
+        """Phase 2a: settle a pending transfer (broker FILLED).
+
+        ``persist=False`` performs the in-memory transition only.  The outbox
+        then writes the phase row and the outbox state in one atomic store
+        transaction (``settle_outbox_reservations``), closing the crash window
+        between the two durable writes.
+        """
         with self._lock:
             transfer = self._require_pending(transfer_id)
             debit_account = self.account(transfer.silo, transfer.debit_account)
@@ -1371,12 +1458,15 @@ class IBORLedger:
             credit_account.check()
             transfer.phase = TransferPhase.POSTED
             transfer.posted_ns = int(now_ns if now_ns is not None else time.time_ns())
-            self.store.write_transfer_phase(
-                transfer, phase=TransferPhase.POSTED, posted_ns=transfer.posted_ns
-            )
+            if persist:
+                self.store.write_transfer_phase(
+                    transfer, phase=TransferPhase.POSTED, posted_ns=transfer.posted_ns
+                )
             return transfer
 
-    def void_pending(self, transfer_id: int, *, now_ns: int | None = None) -> Transfer:
+    def void_pending(
+        self, transfer_id: int, *, now_ns: int | None = None, persist: bool = True
+    ) -> Transfer:
         """Phase 2b: roll a pending transfer back (CANCELED / REJECTED / timeout)."""
         with self._lock:
             transfer = self._require_pending(transfer_id)
@@ -1387,9 +1477,10 @@ class IBORLedger:
             credit_account.check()
             transfer.phase = TransferPhase.VOIDED
             transfer.posted_ns = int(now_ns if now_ns is not None else time.time_ns())
-            self.store.write_transfer_phase(
-                transfer, phase=TransferPhase.VOIDED, posted_ns=transfer.posted_ns
-            )
+            if persist:
+                self.store.write_transfer_phase(
+                    transfer, phase=TransferPhase.VOIDED, posted_ns=transfer.posted_ns
+                )
             return transfer
 
     def _replay_journal(self) -> None:
@@ -1975,15 +2066,21 @@ class CrashAtomicOutbox:
                 raise OutboxStateError(
                     f"outbox key {key[:12]}... is VOIDED and cannot be committed"
                 )
-            self.ledger.post_pending(reservation.pending_transfer_id, now_ns=stamp)
+            transfer = self.ledger.post_pending(
+                reservation.pending_transfer_id, now_ns=stamp, persist=False
+            )
             updated = self._replace(
                 reservation,
                 state=OutboxState.COMMITTED,
                 updated_ns=stamp,
                 broker_order_id=broker_order_id or reservation.broker_order_id,
             )
-            self.store.update_outbox(
-                key,
+            # One atomic commit for the ledger phase and the outbox state: a
+            # crash can no longer replay a POSTED transfer with a PENDING
+            # reservation that no retry is allowed to resolve.
+            self.store.settle_outbox_reservations(
+                [(transfer, key)],
+                phase=TransferPhase.POSTED,
                 state=str(OutboxState.COMMITTED),
                 updated_ns=stamp,
                 broker_order_id=broker_order_id,
@@ -2006,12 +2103,15 @@ class CrashAtomicOutbox:
                 raise OutboxStateError(
                     f"outbox key {key[:12]}... is COMMITTED and cannot be voided"
                 )
-            self.ledger.void_pending(reservation.pending_transfer_id, now_ns=stamp)
+            transfer = self.ledger.void_pending(
+                reservation.pending_transfer_id, now_ns=stamp, persist=False
+            )
             updated = self._replace(
                 reservation, state=OutboxState.VOIDED, updated_ns=stamp
             )
-            self.store.update_outbox(
-                key,
+            self.store.settle_outbox_reservations(
+                [(transfer, key)],
+                phase=TransferPhase.VOIDED,
                 state=str(OutboxState.VOIDED),
                 updated_ns=stamp,
                 detail=str(reason),
@@ -2036,7 +2136,7 @@ class CrashAtomicOutbox:
         tokens = [str(key) for key in keys]
         with self._lock:
             updated: list[Reservation] = []
-            changed: list[str] = []
+            changed: list[tuple[Any, str]] = []
             for key in tokens:
                 reservation = self._require(key)
                 if reservation.is_voided:
@@ -2046,22 +2146,26 @@ class CrashAtomicOutbox:
                     raise OutboxStateError(
                         f"outbox key {key[:12]}... is COMMITTED and cannot be voided"
                     )
-                self.ledger.void_pending(
-                    reservation.pending_transfer_id, now_ns=stamp
+                transfer = self.ledger.void_pending(
+                    reservation.pending_transfer_id, now_ns=stamp, persist=False
                 )
                 updated.append(
                     self._replace(
                         reservation, state=OutboxState.VOIDED, updated_ns=stamp
                     )
                 )
-                changed.append(key)
-            if persist:
-                self.store.update_outbox_many(
-                    changed,
-                    state=str(OutboxState.VOIDED),
-                    updated_ns=stamp,
-                    detail=str(reason),
-                )
+                changed.append((transfer, key))
+            # The kill-switch fast path (persist=False) still writes the phase
+            # rows here; only the outbox-state flush is deferred to the caller.
+            # A normal void commits phase + outbox together atomically.
+            self.store.settle_outbox_reservations(
+                changed,
+                phase=TransferPhase.VOIDED,
+                state=str(OutboxState.VOIDED),
+                updated_ns=stamp,
+                detail=str(reason),
+                write_outbox=persist,
+            )
             return updated
 
     def handle_ack(self, ack: BrokerAck) -> AckResult:

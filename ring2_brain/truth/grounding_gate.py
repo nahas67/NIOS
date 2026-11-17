@@ -404,7 +404,12 @@ _NUMBER_RE = re.compile(
     r"(?<![\w.])"
     r"(?P<sign>[-+])?"
     r"(?P<currency>[$₹€£])?"
-    r"(?P<num>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
+    # A figure written in scientific notation ("1.5e9", "2E+3") or as a
+    # leading-dot decimal (".5") is still a material number.  Reading only the
+    # mantissa let a fabricated magnitude pass the gate: "1.5e9" was checked as
+    # the grounded 1.5.  Consume the whole spelling so ``float`` sees its real
+    # value (Law 3 / UNGROUNDED-NUMERICAL-CLAIM).
+    r"(?P<num>(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?)"
     r"(?P<suffix>\s?(?:%|bps|bp|x|×))?"
 )
 
@@ -552,6 +557,12 @@ class NumericalGroundingVerifier:
         if self._is_date_position(start, end, self._date_spans):
             return True
 
+        # An exponent or a leading dot is a value, never a year or a small
+        # structural count: "2e3" is the number 2000, not the year 2000, and
+        # ".5" is a measurement, not a bare integer ordinal.
+        if "e" in token.lower() or token.startswith("."):
+            return False
+
         # Filing forms: 10-K, 10-Q, 8-K, 13-F.
         if text[end : end + 2].upper() in ("-K", "-Q", "-F", "-C") and value in (8, 10, 13, 20):
             return True
@@ -583,6 +594,11 @@ class NumericalGroundingVerifier:
         currency = match.group("currency") or ""
         token = str(match.group("num")).replace(",", "")
         if currency or suffix:
+            return True
+        # Scientific notation and leading-dot decimals carry their magnitude in
+        # the spelling itself; a reader treats them as precise figures, so they
+        # are material regardless of a neighbouring keyword.
+        if "e" in token.lower() or token.startswith("."):
             return True
         try:
             value = float(token)

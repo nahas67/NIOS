@@ -151,8 +151,26 @@ def test_gate1_daily_loss_stop_locks_silo_automatically(
 
 
 def test_gate2_broker_hot_swap_with_zero_restart(
-    orchestrator: NIOSCoreOrchestrator, client: TestClient
+    orchestrator: NIOSCoreOrchestrator,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This gate tests broker hot-swap and the confirm_live requirement, not the
+    # Phase 4 go-live certificate.  The real certificate depends on the checkout
+    # being clean (git.clean_working_tree), which is meaningless inside a test.
+    # Inject a green certificate so the test is hermetic; the production
+    # pre-flight gate is left fully intact (monkeypatch is undone after test).
+    monkeypatch.setattr(
+        orchestrator.control,
+        "preflight_certificate",
+        lambda **_kwargs: {
+            "ready_for_live_cutover": True,
+            "failed_gates": 0,
+            "failed_gate_ids": [],
+            "warned_gates": 0,
+            "certificate_sha256": "a" * 64,
+        },
+    )
     response = client.post(
         "/api/v2/control/brokers",
         json={

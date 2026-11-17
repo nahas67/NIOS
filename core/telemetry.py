@@ -103,10 +103,13 @@ class TickLatencyRecorder:
                     self._counts[idx] += 1
                     break
             else:
-                # Samples above the final finite bound belong to the implicit
-                # +Inf bucket. Without this the exported bucket total can never
-                # reach ``count`` and p99 dashboards read low.
-                self._counts[-1] += 1
+                # Samples above the final finite bound belong EXCLUSIVELY to
+                # the implicit +Inf bucket, which the metrics exporter emits
+                # explicitly from ``count`` (see metrics_exporter.py). Do NOT
+                # fold them into the last finite bucket: that double-counts
+                # overflow in Prometheus, makes le=0.001 read as the total,
+                # and masks a sec_010 tick-latency budget breach.
+                pass
             self._sum_s += value
             self._count += 1
             self._reservoir.append(value)

@@ -102,6 +102,24 @@ def _env_value(name: str) -> str | None:
     return value or None
 
 
+def _fsync_dir(path: Path) -> None:
+    """Best-effort durability of a directory entry change (rename/unlink).
+
+    ``os.replace``/``os.unlink`` are atomic for concurrent readers, but making
+    the change survive a power loss additionally needs the parent directory
+    flushed.  Some platforms (Windows) refuse to fsync a directory handle, so
+    this is deliberately best-effort and never breaks the operation.
+    """
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
 def journal_path() -> Path:
     """Resolve the journal location, in precedence order.
 
@@ -239,6 +257,10 @@ class AtomicStateJournal:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp, self._path)
+            # Without a directory fsync a power loss can lose the new name
+            # while the fsynced temp payload survives orphaned, silently
+            # reverting to the previous document.
+            _fsync_dir(self._path)
         except BaseException:
             # A half-written temp file must never survive to confuse a later
             # reader, and it must never shadow the last good document.
@@ -334,6 +356,7 @@ class AtomicStateJournal:
         with self._lock:
             try:
                 os.unlink(self._path)
+                _fsync_dir(self._path)
             except FileNotFoundError:
                 pass
             except OSError:

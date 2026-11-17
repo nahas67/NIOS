@@ -22,7 +22,7 @@ import logging
 import math
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import requests
@@ -189,7 +189,7 @@ def _as_of(facts: dict, tags: tuple[str, ...], as_of_date: str, spans: tuple[tup
 
 
 def _statement(kind: str, ticker: str, freq: str, as_of_date: str, title: str) -> str:
-    as_of_date = as_of_date or datetime.now().strftime("%Y-%m-%d")
+    as_of_date = as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cik = cik_for(ticker)
     if cik is None:
         raise NoMarketDataError(ticker, ticker, "not a US SEC filer")

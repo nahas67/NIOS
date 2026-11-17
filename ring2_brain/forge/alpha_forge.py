@@ -90,8 +90,10 @@ DEFAULT_GENOME_COUNT: int = 1_000
 DEFAULT_FACTOR_COUNT: int = 64
 DEFAULT_PERIODS: int = 252
 DEFAULT_CV_FOLDS: int = 5
-#: Fraction of the sample embargoed after each test block.
-DEFAULT_EMBARGO_FRACTION: float = 0.01
+#: Fraction of the sample embargoed after each test block.  ``sec_010`` /
+#: ``sec_018`` Law 4 mandate a 2% embargo; a weaker default lets serially
+#: correlated features leak across the test boundary and inflates DSR.
+DEFAULT_EMBARGO_FRACTION: float = 0.02
 #: Benjamini-Hochberg false-discovery-rate control.
 DEFAULT_FDR: float = 0.05
 #: Evaluation chunk size: vectorised but bounded in memory.
@@ -293,11 +295,21 @@ class PurgedKFoldCV:
         label_horizon: int = 1,
     ) -> None:
         folds = int(n_folds)
-        if folds < 2:
-            raise ValueError("n_folds must be at least 2")
+        if folds < DEFAULT_CV_FOLDS:
+            raise ValueError(
+                f"n_folds must be at least {DEFAULT_CV_FOLDS} "
+                f"(sec_010/sec_018 Law 4: k=5), got {folds}"
+            )
         embargo = float(embargo_fraction)
-        if not 0.0 <= embargo < 1.0:
-            raise ValueError("embargo_fraction must be in [0, 1)")
+        # The walk-forward contract is a constitutional floor, not a tunable:
+        # a challenger-search plugin or an env-driven config must not be able
+        # to weaken it to 0% and buy a leaked path to LIVE_CHAMPION.
+        if not DEFAULT_EMBARGO_FRACTION <= embargo < 1.0:
+            raise ValueError(
+                "embargo_fraction must be in "
+                f"[{DEFAULT_EMBARGO_FRACTION}, 1) "
+                f"(sec_010/sec_018 Law 4: 2% embargo), got {embargo}"
+            )
         horizon = int(label_horizon)
         if horizon < 1:
             raise ValueError("label_horizon must be at least 1")
@@ -449,10 +461,14 @@ class StrategyGenome:
             self.deflated_sharpe = float(self.deflated_sharpe)
             self.metrics_source = "supplied"
             if self.p_value is None:
-                # An externally audited DSR is accepted as a deterministic
-                # verdict; without a p-value it is treated as maximally
-                # significant so only the 30-fill gate can hold it back.
-                self.p_value = 0.0
+                # An externally audited DSR is accepted only with an explicit
+                # p-value.  Defaulting to 0.0 handed a plugin-supplied DSR a
+                # free Benjamini-Hochberg rejection without any walk-forward
+                # evaluation (supplied metrics skip ``_evaluate_challengers``),
+                # so a forged DSR alone could reach LIVE_CHAMPION.  Fail closed
+                # to maximally insignificant: the caller must supply the
+                # audit's p-value, and the FDR gate still applies.
+                self.p_value = 1.0
         if self.p_value is not None:
             self.p_value = min(max(float(self.p_value), 0.0), 1.0)
         self.registered_at_ns = int(self.registered_at_ns or time.time_ns())
