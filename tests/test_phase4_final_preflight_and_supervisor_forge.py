@@ -845,9 +845,20 @@ def test_step2_mirofish_sub_1_8ms_ring1_sub_140us_and_deterministic_cert_hash(
             assert cli_report["gates_passed"] == 23
             assert cli_report["certificate_sha256"] == first["certificate_sha256"]
             # The volatile measurement stays visible to the operator in the
-            # runtime telemetry but never enters the hashed projection.
-            assert "latency_ns" in first["gates"][-1]["evidence"]
-            hashed = cli_report["certificate"]["gates"][-1]["evidence"]
+            # runtime telemetry but never enters the hashed projection.  V1.9
+            # appends Gate 23, so the kill-switch gate is located by id rather
+            # than assumed to be last.
+            killswitch = next(
+                gate
+                for gate in first["gates"]
+                if gate["gate"] == "cockpit.killswitch_and_rearm"
+            )
+            assert "latency_ns" in killswitch["evidence"]
+            hashed = next(
+                gate
+                for gate in cli_report["certificate"]["gates"]
+                if gate["gate"] == "cockpit.killswitch_and_rearm"
+            )["evidence"]
             assert "latency_ns" not in hashed
             assert hashed["within_budget"] is True
     finally:
