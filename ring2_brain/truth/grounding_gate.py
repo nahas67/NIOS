@@ -778,3 +778,54 @@ def verify_thesis_claims(
     return NumericalGroundingVerifier(tolerance=tolerance).verify_thesis_claims(
         thesis_text, packet
     )
+
+# ---------------------------------------------------------------------------
+# V1.9 (F1 / F3) -- evidence provenance and freshness lower bound
+# ---------------------------------------------------------------------------
+#
+# A digest proves a packet was not edited; it does not prove *where* the numbers
+# came from or *when* they stopped being current.  These helpers add the two
+# missing commitments and keep them in Ring 2, where the evidence is assembled.
+
+
+def verify_packet_provenance(
+    packet: Any,
+    *,
+    silo: str | None = None,
+    allowlist: Mapping[str, Iterable[str]] | None = None,
+    now_ns: int | None = None,
+) -> Any:
+    """Delegate to :class:`EvidenceProvenanceGuard` without importing at module load."""
+    from ring2_brain.truth.provenance_guard import verify_evidence_provenance
+
+    return verify_evidence_provenance(
+        packet, silo=silo, allowlist=allowlist, now_ns=now_ns
+    )
+
+
+def require_provenance(
+    packet: Any,
+    *,
+    silo: str | None = None,
+    allowlist: Mapping[str, Iterable[str]] | None = None,
+) -> Any:
+    """Raise ``ProvenanceError`` unless the packet is sourced, attested and fresh."""
+    from ring2_brain.truth.provenance_guard import EvidenceProvenanceGuard
+
+    return EvidenceProvenanceGuard(allowlist=allowlist).enforce(packet, silo=silo)
+
+
+def freshness_lower_bound_violation(
+    packet: Any, *, not_stale_before_utc: int | None = None
+) -> str:
+    """Return the violation code, or ``""`` when the packet is fresh enough."""
+    bound = (
+        int(not_stale_before_utc)
+        if not_stale_before_utc is not None
+        else int(getattr(packet, "not_stale_before_utc", 0) or 0)
+    )
+    if bound <= 0:
+        return ""
+    if int(getattr(packet, "knowledge_ts_ns", 0)) < bound:
+        return "STALE_EVIDENCE"
+    return ""

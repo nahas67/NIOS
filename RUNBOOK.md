@@ -1,8 +1,8 @@
 # NIOS Production Operator Runbook
 
 **Document ID:** NIOS-OPS-2026-V3
-**Release tag:** `v3.9.0-V1.8` (supersedes `v3.8.0-V1.7`, `v3.7.0-V1.6`, `v3.6.0-V1.5`, `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
-**Branch:** `V1.8`
+**Release tag:** `v3.10.0-V1.9` (supersedes `v3.9.0-V1.8`, `v3.8.0-V1.7`, `v3.7.0-V1.6`, `v3.6.0-V1.5`, `v3.5.0-V1.4`, `v3.4.0-V1.3`, `v3.3.0-V1.2`, `v3.2.0-V1.1`, `v3.1.0-V1` and `v3.0.0-PROD`, all frozen)
+**Branch:** `V1.9`
 **Runtime platform version:** `3.0.0-PROD` (`GET /api/v2/cockpit/health` → `version`)
 **Governing specification:** `NIOS_Core_architecture.json` (`sec_001`–`sec_018`)
 **Operating constitution:** `AGENTS.md`
@@ -284,7 +284,7 @@ curl.exe -X POST http://127.0.0.1:8000/api/v2/auth/login/live \
 | | Paper sandbox | Live production |
 |---|---|---|
 | Palette | deep obsidian, lavender `#a78bfa` + cyan `#22d3ee` | matte carbon, crimson `#f43f5e` + amber `#f59e0b` |
-| Ribbon | `PAPER SANDBOX`, `SIMULATED NAV`, autopilot play/pause, deposit, reset-to-zero, *switch to live vault* | hazard stripes, `🔒 LIVE PRODUCTION — REAL CAPITAL`, 22-gate status, live TTL countdown, `<1ms emergency kill switch`, *lock live vault (drop to paper)* |
+| Ribbon | `PAPER SANDBOX`, `SIMULATED NAV`, autopilot play/pause, deposit, reset-to-zero, *switch to live vault* | hazard stripes, `🔒 LIVE PRODUCTION — REAL CAPITAL`, 23-gate status, live TTL countdown, `<1ms emergency kill switch`, *lock live vault (drop to paper)* |
 | Affordances | deposit paper capital, reset to zero, shadow metrics | **no** deposit control, **no** shadow-burst control; the live journal is separate |
 
 A page under `/live/*` never renders a paper deposit button or a synthetic shadow-burst
@@ -399,6 +399,94 @@ silos, so `GET /api/v2/instruments/BTCUSDT` is never ambiguous.
 A paper order for a symbol that is not in the registry is now rejected with
 `422 INSTRUMENT_REJECTED`, so an unknown ticker can no longer bypass the contract spec.
 
+
+---
+
+## SOP 1F - V1.9 Multi-Tranche Missions, Tranches and Environment Truth
+
+`v3.10.0-V1.9` adds goal-driven capital missions, per-tranche risk isolation, the
+dynamic profit split, SEBI/NSE compliance and effective-dated US/FX rules. Ring 3 stays
+headless; every new surface below is REST-only.
+
+### 1F.1 Mission lifecycle (three-state operator workflow)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v2/missions` | Create a mission; the Ring 2 feasibility engine may answer `422 INFEASIBLE_MISSION` |
+| `GET` | `/api/v2/missions` | List every mission with its approval state, pacing and tranches |
+| `GET` | `/api/v2/missions/{mission_id}` | One mission: target, deadline, risk budget, `daily_velocity_target_micros`, feasibility |
+| `POST` | `/api/v2/missions/{mission_id}/approve` | Re-scope the approval (`APPROVE` or `OVERRIDE`) |
+| `POST` | `/api/v2/missions/{mission_id}/revoke` | `REVOKE` the approval and halt every tranche that belongs to it |
+| `POST` | `/api/v2/missions/{mission_id}/tranches` | Allocate one tranche under the mission's scoped notional cap |
+
+A mission is only tradeable while its signed `MissionAuthorization` is live and covers the
+silo and notional. `REVOKE` is immediate and halts the mission's tranches; it never touches
+another mission or silo.
+
+### 1F.2 Tranche isolation and re-arm
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v2/tranches` | List tranches (optional `?mission_id=`) with stop, HWM, heat and status |
+| `GET` | `/api/v2/tranches/{tranche_id}` | One tranche's risk state |
+| `POST` | `/api/v2/tranches/{tranche_id}/rearm` | Human re-arm of exactly one halted tranche |
+
+A tranche that gives back `stop_micros` (85% of its share of the silo daily-loss limit) is
+halted through `TrancheLatchTable`. `GLOBAL_HALT` is **not** tripped: sibling tranches and
+unrelated silos keep trading. Re-arming resets the give-back baseline, never the realised P&L.
+
+### 1F.3 Pacing, target lock and profit split
+
+`MissionPacingController` throttles sizing once 80% of the target is locked
+(`f_g = f_0 * max(0.25, (1-g)^2)`), caps any single UTC day at 35% of the target, and latches
+`TARGET_LOCK` at 100% so a completed mission cannot give the gain back. Unrealised P&L never
+raises the mission high-water mark. `DynamicFundSplitEngine` splits every realised profit in
+exact integer micros across `LongTermCompounder`, `ReserveYield`, `TAX_ESCROW` and
+`SpinalScalper`; the legs sum to the realised amount and `cross_border_wire_bps == 0`.
+
+### 1F.4 Capital mobility
+
+* **Crypto (physical):** a realised win in `CRYPTO_BINANCE` produces a signed
+  `WalletSweepIntent` executed as an internal `SPOT <-> UMFUTURE_MAIN` transfer. It is gated
+  by the firewall, the signer and the kill latch, and liquidity is credited only after the
+  venue ack.
+* **India / US / FX (virtual):** broker APIs prohibit fund transfers, so
+  `VirtualMarginQuotaEngine` issues a signed, expiring, TigerBeetle-style pending reservation
+  granting virtual margin headroom (`quota <= locked ReserveYield`) with a T+1
+  `available_at_utc`. **No funds move** and a hot kill latch revokes the quota immediately.
+
+### 1F.5 Environment truth and SEBI compliance
+
+| Control | Behaviour |
+|---|---|
+| Exchange algo id (`B1`) | Indian orders carry `exchange_algo_id`; Ring 0 refuses a missing/`GENERIC` id when a registered one is required (`ALGO-ID-MISSING`) |
+| 10 OPS bucket (`B2`) | Deterministic UTC-second integer-micro token bucket shared by Ring 1/Ring 0 (`OPS-LIMIT`) |
+| Egress allowlist (`B3`) | Only registered static IPs may originate Indian orders (`EGRESS_IP_NOT_WHITELISTED`) |
+| TOTP renewal (`B4`) | 03:00 UTC (08:30 IST) pre-market renewal with TTL telemetry |
+| Freeze slicing (`B5`) | F&O orders above `freeze_quantity` become compliant child slices under one parent key |
+| Hedge exit (`B6`) | High-margin/short leg closes first, protective hedge last (`HEDGE_EXIT_ORDERING_VIOLATION`) |
+| Effective-dated rules (`D1`) | FINRA 4210 intraday margin replaces the `$25k` PDT floor on `2026-06-04`; historical dates keep the legacy row |
+| Locate fee / borrow (`D2`) | Short theses carry `locate_fee_bps` + `borrow_confirmed`; an unconfirmed borrow is refused |
+| SSR (`D4`) / extended hours (`D5`) | Uptick-only shorts while SSR is active; a spread cap applies outside regular hours |
+
+### 1F.6 Clock, calendar, staleness and replay
+
+`GET /api/v2/cockpit/clock` reports the real monotonic-anchored clock offset
+(`synthetic: false`); a breach fails closed at `FirewallStage.TIME_HEALTH`. `core/exchange_calendar.py`
+is DST-aware for all four silos and refuses an order outside a session (`VENUE_CLOSED`).
+`LocalJetStreamBus.published_high_water` drives `STALE_POSITION_STATE` when a read model trails
+the published watermark beyond `staleness_budget`. `AtomicStateJournal.write_checkpoint`
+binds a SHA-256 state digest to an event boundary, so a replay can prove it reached the right
+event.
+
+### 1F.7 Release verification for `v3.10.0-V1.9`
+
+```bash
+python -m pytest tests -q                 # 31 suites, 711 passed, 0 failed, 0 warnings
+python scripts/run_nios.py --smoke-test   # ROWS=23, EXIT=0
+python scripts/preflight_golive.py --fast # 23/23 PASS, EXIT=0
+```
+
 ---
 
 ## SOP 2 — Emergency Incident Response
@@ -497,16 +585,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 27 suites, 0 failures, 0 warnings
-python scripts/preflight_golive.py --strict      # go-live readiness certificate, 22/22
-python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 22/22
+python -m pytest tests -q                        # 31 suites, 0 failures, 0 warnings
+python scripts/preflight_golive.py --strict      # go-live readiness certificate, 23/23
+python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 23/23
 ```
 
-Release seal for `v3.9.0-V1.8`: `pytest tests -q` must report **602 passed, 0 failed, 0 warnings**
-and `python scripts/preflight_golive.py --fast` must report **22/22 PASS, EXIT=0**. Both are
+Release seal for `v3.10.0-V1.9`: `pytest tests -q` must report **100% pass across all 31 suites, 0 failed, 0 warnings**
+and `python scripts/preflight_golive.py --fast` must report **23/23 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 27-suite inventory
+### 3.2a The 31-suite inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -527,7 +615,7 @@ prerequisites for re-tagging; neither may be waived.
 | 15 | `tests/test_phase3_step3_testnet_supervisor_and_security.py` | Testnet bridge, supervisor, security |
 | 16 | `tests/test_phase3_step4_soak_metrics_and_chaos.py` | Soak metrics, chaos drills |
 | 17 | `tests/test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS tuning, key rotation, runbook |
-| 18 | `tests/test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight, forge |
+| 18 | `tests/test_phase4_final_preflight_and_supervisor_forge.py` | 23-gate pre-flight, forge |
 | 19 | `tests/test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard, credential-gated factory reset |
 | 20 | `tests/test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** `daily_stock_analysis` harvest (8 strategies, grounded decision dashboard), 6 specialist agent tasks, tax-net walk-forward backtester, 30-fill nursery gate, 11-page SPA |
 | 21 | `tests/test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.3** separate `/paper/login` + `/live/login` portals, options chain with Greeks/PCR/Max Pain, six multi-leg payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15 pages across all three route trees |
@@ -537,6 +625,11 @@ prerequisites for re-tagging; neither may be waived.
 | 25 | `tests/test_v1_7_deep_market_universe_and_feature_audit.py` | **V1.7** 274-instrument universe completeness, deep asset-class feature store + options surface with SHA-256 grounding, instrument search/filter/pagination, macro calendar + four cross-asset heatmaps, SmartOMS + walk-forward lot/tick/statutory-floor enforcement |
 | 26 | `tests/test_v1_8_tradingview_bridge_streaming_and_handshake.py` | **V1.8** `Mathieu2301/TradingView-API` harvest into Ring 2, 274 canonical `EXCHANGE:SYMBOL` tickers, deterministic replay chart + eight Pine Script study evaluators under SHA-256 grounding, `TRADINGVIEW_REPLAY` backtests on statutory floors, multiplexed typed SSE stream hub, 12-venue broker handshake |
 | 27 | `tests/test_v1_8_deep_gap_closure_and_cross_engine_audit.py` | **V1.8** universal options chain + terminal quote across all 274 registry instruments (registry `option_strike_step`, `OptionsSurfaceProfile` GEX/`iv_rank`/max-pain, tick-snapped L2), `INSTRUMENT_NOT_OPTIONABLE` on spot FX, segment- and side-aware Finance Act 2026 statutory tax, circuit-band / margin / drawdown-breaker enforcement, crash-safe atomic state journal with Clean-Slate reset, SSE disconnect + `1..500` bound fuzzing + 16-reader concurrency |
+| 28 | `tests/test_v1_9_mission_tranche_and_profit_split.py` | **V1.9** mission contract + three-state authorization, half-Kelly feasibility (`422 INFEASIBLE_MISSION`), per-tranche stop isolation without `GLOBAL_HALT`, correlation independence gate (`N_eff`, 2% buckets, 6% heat), goal pacing / best-day cap / `TARGET_LOCK`, dynamic integer-micro profit split with monotonic reserve floor, physical crypto wallet sweeps, virtual India/US/FX margin quotas, `/api/v2/missions` + `/api/v2/tranches` |
+| 29 | `tests/test_v1_9_sebi_and_regulatory_versioning.py` | **V1.9** SEBI/NSE algo-id tagging (`ALGO-ID-MISSING`), global 10 OPS bucket + OTR penalty accrual, static egress IP allowlist, 03:00 UTC pre-market TOTP renewal, freeze-quantity auto-slicing, hedge-leg exit ordering, effective-dated FINRA 4210 vs legacy PDT rules, locate fee / borrow confirmation, SSR uptick and extended-hours spread guards |
+| 30 | `tests/test_v1_9_oms_fsm_binance_and_env_truth.py` | **V1.9** published high-water staleness (`STALE_POSITION_STATE`), all-or-none `LegGroup` baskets, cold-start reconciliation classes + bounded deadline, strict order FSM with `ExecID` de-duplication and venue `LeavesQty`, real clock health, DST-aware exchange calendar, fencing epoch, SHA-256 replay checkpoints, Binance 418 halt / query-before-retry / weight bucket / margin brackets / listenKey / recvWindow, ADL budget and funding in the net bound |
+| 31 | `tests/test_v1_9_ai_provenance_and_concept_drift.py` | **V1.9** evidence source allowlist + retrieval attestation + freshness lower bound, prompt-injection guard, hierarchical star aggregation, frozen signed-order inputs re-verified before signing, ADWIN/conformal-martingale concept drift (halve then pause), agent behaviour monitor, Gate 23 registration and 23/23 certificate |
+
 
 ### 3.3 Chaos / crash injection
 
@@ -598,7 +691,7 @@ dry-run receipt. Repeat per venue (`binance`, `dhan`, `ibkr`, `oanda`, `mt5`).
 ### 4.3 Transition a silo from `PAPER` to `LIVE`
 
 Preconditions: the venue credential is configured (`dry_run_verified=true`), every adapter
-in the silo is `ready`, the kill latch is clear, **and the 22-gate pre-flight certificate
+in the silo is `ready`, the kill latch is clear, **and the 23-gate pre-flight certificate
 reports `failed_gates == 0`**.
 
 ```bash
@@ -616,7 +709,7 @@ is broken. The change applies in memory with zero worker restart. Reverse with
 `"mode":"PAPER"` (always allowed). Paper is the default after every restart — live is never
 sticky.
 
-### 4.4 22-gate go-live certificate
+### 4.4 23-gate go-live certificate
 
 ```bash
 curl.exe -s http://127.0.0.1:8000/api/v2/control/preflight            # fast path
@@ -626,7 +719,7 @@ python scripts/preflight_golive.py --strict                           # CLI, rel
 ```
 
 The fast path replays a short-lived in-process certificate and the persisted receipt of the
-last certified 22-row smoke suite for the current commit, so the cockpit stays responsive.
+last certified 23-row smoke suite for the current commit, so the cockpit stays responsive.
 `full_smoke=true` (or `--fast` omitted on the CLI) re-runs every gate from scratch. The reply
 carries `ready_for_live_cutover`, `passed_gates` / `total_gates`, `failed_gates`,
 `failed_gate_ids`, the per-gate checklist and a deterministic 64-character
@@ -753,7 +846,7 @@ hydrate from `GET /api/v2/cockpit/state` plus `GET /api/v2/cockpit/formal-proofs
 | `POST` | `/api/v2/control/rearm` | Human reset back to `ARMED` |
 | `GET`/`POST` | `/api/v2/control/supervisor` | 4-ring process supervision |
 | `POST` | `/api/v2/control/supervisor/forge-hedge` | Closed-loop forge + Ring 0 signed tail hedge |
-| `GET`/`POST` | `/api/v2/control/preflight` | 22-gate go-live readiness certificate |
+| `GET`/`POST` | `/api/v2/control/preflight` | 23-gate go-live readiness certificate |
 | `GET`/`POST` | `/api/v2/control/extensions` | Skills / plugins / MCP / Forge |
 | `POST` | `/api/v2/control/vault/rotate-keys` | Zero-downtime Fernet + Ed25519 rotation |
 | `GET` | `/api/v2/control/vault/status` | Key version, fingerprint, OS tuning |
@@ -897,7 +990,7 @@ direct navigation or browser refresh on any route is served by the SPA catch-all
 | 12 | Trade Logbook | `/logbook` | `/journal` | Ring 0 | Ledger & Verification | Cost-adjusted journal, net P&L, R-multiple, win/loss attribution |
 | 13 | Proofs, Chaos & Telemetry | `/verification` | — | Ring 0 | Ledger & Verification | TLA+ BFS proofs, VOPR campaign, OS tuning, metrics |
 | 14 | Broker Hub & Feeds | `/brokers` | `/venues` | Ring 0 | Sovereign Control | 12-venue matrix, masked credentials, Ed25519 dry-run, feed health |
-| 15 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | Sovereign Control | 22-gate pre-flight, credential vault, LLM switchboard, MCP |
+| 15 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | Sovereign Control | 23-gate pre-flight, credential vault, LLM switchboard, MCP |
 
 `/api` and `/metrics` are excluded from the catch-all, so an unknown API path still returns a
 real `404` instead of the SPA shell.

@@ -2,7 +2,7 @@
 
 Four gates close the Main Core (Phases 1-3):
 
-* Gate 1 -- the expanded 22-row ``run_nios.py --smoke-test`` suite exits ``0``.
+* Gate 1 -- the expanded 23-row ``run_nios.py --smoke-test`` suite exits ``0``.
 * Gate 2 -- the closed-loop ``NocturnalAlphaForge`` + ``TacticalTailHedger``
   cycle runs inside the Ring 2 worker process, revokes a decayed champion's
   shared-memory lease, and routes a grounded protective put across the process
@@ -104,7 +104,7 @@ def _pass_row_count(output: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Gate 1 -- 22-row extended smoke test
+# Gate 1 -- 23-row extended smoke test
 # ---------------------------------------------------------------------------
 
 
@@ -115,8 +115,8 @@ def test_gate1_extended_smoke_suite_certifies_22_organs() -> None:
 
     assert completed.returncode == 0, output[-4000:]
     assert "SMOKE TEST PASSED" in output, output[-4000:]
-    assert "ROWS=22" in output, output[-4000:]
-    assert _pass_row_count(output) == 22, output[-6000:]
+    assert "ROWS=23" in output, output[-4000:]
+    assert _pass_row_count(output) == 23, output[-6000:]
     assert "  FAIL  " not in output, output[-6000:]
 
     # The four Phase 3 Step 2-5 organs must be named explicitly, in order.
@@ -259,21 +259,21 @@ def test_gate3_preflight_golive_cli_certifies_release() -> None:
     assert report["ready_for_live_cutover"] is True
     assert report["failed_gates"] == 0
     assert report["warned_gates"] == 0
-    assert report["gates_expected"] == 22
-    assert report["gates_passed"] == 22
+    assert report["gates_expected"] == 23
+    assert report["gates_passed"] == 23
 
     digest = report["certificate_sha256"]
     assert isinstance(digest, str) and len(digest) == 64
     int(digest, 16)  # valid lowercase/uppercase hex, 256 bits
 
     gates = report["gates"]
-    assert len(gates) == 22
-    assert [gate["status"] for gate in gates] == ["PASS"] * 22
+    assert len(gates) == 23
+    assert [gate["status"] for gate in gates] == ["PASS"] * 23
     gate_ids = [gate["gate"] for gate in gates]
-    assert len(set(gate_ids)) == 22
+    assert len(set(gate_ids)) == 23
     for required in (
         "git.no_tracked_secrets",
-        "smoke.22_row_suite",
+        "smoke.23_row_suite",
         "formal.tla_four_proofs",
         "formal.vopr_1000_steps",
         "ring0.key_vault_integrity",
@@ -294,7 +294,7 @@ def test_gate3_preflight_golive_cli_certifies_release() -> None:
     # Determinism: the digest covers gate outcomes, never wall-clock state.
     certificate = report["certificate"]
     assert certificate["schema"] == "nios_preflight_golive_certificate_v1"
-    assert len(certificate["gates"]) == 22
+    assert len(certificate["gates"]) == 23
     assert all("duration_ms" not in gate for gate in certificate["gates"])
 
 
@@ -310,7 +310,7 @@ def test_gate4_regression_inventory_is_twenty_one_suites() -> None:
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 27, suites
+    assert len(suites) == 31, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"
@@ -368,8 +368,8 @@ def test_step2_get_preflight_certifies_22_gates(cockpit: Any) -> None:
     assert body["ready_for_live_cutover"] is True
     assert body["failed_gates"] == 0
     assert body["warned_gates"] == 0
-    assert body["passed_gates"] == 22
-    assert body["total_gates"] == 22
+    assert body["passed_gates"] == 23
+    assert body["total_gates"] == 23
     assert body["failed_gate_ids"] == []
 
     digest = body["certificate_sha256"]
@@ -377,9 +377,9 @@ def test_step2_get_preflight_certifies_22_gates(cockpit: Any) -> None:
     int(digest, 16)
 
     gates = body["gates"]
-    assert len(gates) == 22
-    assert [gate["status"] for gate in gates] == ["PASS"] * 22
-    assert len(body["gate_checklist"]) == 22
+    assert len(gates) == 23
+    assert [gate["status"] for gate in gates] == ["PASS"] * 23
+    assert len(body["gate_checklist"]) == 23
     assert body["endpoint"] == "/api/v2/control/preflight"
     assert body["served_from"] in {"in_process_cache", "fresh_run"}
 
@@ -560,7 +560,7 @@ def test_step2_preflight_under_active_autopilot_passes_22_of_22() -> None:
                 assert response.status_code == 200, response.text
                 body = response.json()
                 assert body["ready_for_live_cutover"] is True
-                assert body["passed_gates"] == 22
+                assert body["passed_gates"] == 23
                 assert body["failed_gates"] == 0
                 assert body["failed_gate_ids"] == []
                 assert body["autopilot_tape_active"] is True
@@ -810,7 +810,7 @@ def test_step2_mirofish_sub_1_8ms_ring1_sub_140us_and_deterministic_cert_hash(
                 assert response.status_code == 200, response.text
                 body = response.json()
                 assert body["ready_for_live_cutover"] is True
-                assert body["passed_gates"] == 22
+                assert body["passed_gates"] == 23
                 assert body["failed_gates"] == 0
                 assert body["autopilot_tape_active"] is True
                 assert body["autopilot_quiesced"] is True
@@ -834,7 +834,7 @@ def test_step2_mirofish_sub_1_8ms_ring1_sub_140us_and_deterministic_cert_hash(
             # agree on the same commit, which is only possible because the
             # certificate hashes invariant verdicts, never measurements.
             get_body = client.get("/api/v2/control/preflight").json()
-            assert get_body["passed_gates"] == 22
+            assert get_body["passed_gates"] == 23
             assert get_body["certificate_sha256"] == first["certificate_sha256"]
 
             cli = _run(
@@ -842,7 +842,7 @@ def test_step2_mirofish_sub_1_8ms_ring1_sub_140us_and_deterministic_cert_hash(
             )
             assert cli.returncode == 0, (cli.stdout or "")[-3000:]
             cli_report = json.loads(cli.stdout)
-            assert cli_report["gates_passed"] == 22
+            assert cli_report["gates_passed"] == 23
             assert cli_report["certificate_sha256"] == first["certificate_sha256"]
             # The volatile measurement stays visible to the operator in the
             # runtime telemetry but never enters the hashed projection.

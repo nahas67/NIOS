@@ -532,6 +532,13 @@ FORGE_HEDGE_DRILL_FILLS_BPS: tuple[float, ...] = (-1.4, -1.1, -1.9, -0.8, -1.2, 
 # ---------------------------------------------------------------------------
 
 
+#: ``V1.9``: UTC nanosecond stamps are legitimately larger than ``1e18``
+#: (2026 is ~1.77e18 ns), so the generic magnitude bound must not reject them.
+TIMESTAMP_FIELDS: frozenset[str] = frozenset(
+    {"deadline_utc", "issued_at_ns", "created_at_ns", "now_ns", "expires_at_utc"}
+)
+
+
 class StrictRequest(BaseModel):
     """Base class for every Ring 3 request model (V1.6 hardening).
 
@@ -555,7 +562,8 @@ class StrictRequest(BaseModel):
             if abs(value) > 1e18:
                 raise ValueError(f"{info.field_name} is out of bounds")
         elif isinstance(value, int) and abs(value) > 10**18:
-            raise ValueError(f"{info.field_name} is out of bounds")
+            if info.field_name not in TIMESTAMP_FIELDS:
+                raise ValueError(f"{info.field_name} is out of bounds")
         elif isinstance(value, (list, tuple)):
             for item in value:
                 if isinstance(item, float) and not math.isfinite(item):
@@ -1500,6 +1508,49 @@ class BrokerHandshakeRequest(StrictRequest):
 # ---------------------------------------------------------------------------
 
 
+class MissionCreateRequest(StrictRequest):
+    """``POST /api/v2/missions`` -- create and (optionally) approve a mission."""
+
+    mission_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    target_units: float = Field(gt=0)
+    deadline_utc: int = Field(gt=0)
+    risk_budget_units: float = Field(gt=0)
+    operator: str = Field(min_length=1, max_length=128)
+    silos: list[str] = Field(min_length=1, max_length=8)
+    notional_cap_units: float = Field(gt=0)
+    ttl_seconds: int = Field(default=3600, ge=60, le=604800)
+    kelly_fraction_cap: float = Field(default=0.5, gt=0, le=0.5)
+    strategy_lineage_digests: list[str] = Field(default_factory=list, max_length=64)
+    unlock_ladder: list[float] = Field(
+        default_factory=lambda: [0.0, 0.25, 0.5, 0.75, 1.0], max_length=16
+    )
+    state: Literal["APPROVE", "OVERRIDE"] = "APPROVE"
+
+
+class MissionApproveRequest(StrictRequest):
+    operator: str = Field(min_length=1, max_length=128)
+    state: Literal["APPROVE", "OVERRIDE"] = "APPROVE"
+    ttl_seconds: int | None = Field(default=None, ge=60, le=604800)
+    notional_cap_units: float | None = Field(default=None, gt=0)
+
+
+class MissionRevokeRequest(StrictRequest):
+    operator: str = Field(default="operator", min_length=1, max_length=128)
+    reason: str = Field(default="", max_length=512)
+
+
+class MissionTrancheRequest(StrictRequest):
+    silo: str = Field(min_length=1, max_length=32)
+    allocated_units: float = Field(gt=0)
+    side: Literal["LONG", "SHORT"] = "LONG"
+    stop_units: float | None = Field(default=None, gt=0)
+    lineage_digest: str = Field(default="", max_length=64)
+
+
+class TrancheRearmRequest(StrictRequest):
+    operator: str = Field(default="operator", min_length=1, max_length=128)
+
+
 @dataclass(slots=True)
 class _LLMSlot:
     provider: str
@@ -1606,6 +1657,8 @@ class ControlPlane:
         testnet_bridge: Any = None,
         forge_hedge_runner: Any = None,
         state_journal: Any = None,
+        mission_surface: Any = None,
+        mission_feasibility: Any = None,
     ) -> None:
         self.ledger = ledger
         self.firewall = firewall
@@ -1676,6 +1729,9 @@ class ControlPlane:
             self.feed_guard = None
         self.broker_vault = broker_vault
         self._llm_probe_fetcher = llm_probe_fetcher
+        # V1.9 mission engine (A1-A8): injected, never constructed inside Ring 3.
+        self._mission_surface = mission_surface
+        self._mission_feasibility = mission_feasibility
         self._feed_report: dict[str, Any] = {}
         self._credential_reports: dict[str, dict[str, Any]] = {}
         self._llm_probe: dict[str, Any] = {}
@@ -2468,7 +2524,7 @@ class ControlPlane:
             time.sleep(0.05)
         return False
 
-    # -- Phase 4 Step 2: 22-gate pre-flight go-live certificate -----------
+    # -- Phase 4 Step 2: 23-gate pre-flight go-live certificate -----------
     @staticmethod
     def _preflight_body(report: Mapping[str, Any]) -> dict[str, Any]:
         """Normalise the CLI report into the cockpit/contract payload."""
@@ -2511,7 +2567,7 @@ class ControlPlane:
         silo: str = "ALL",
         refresh: bool = False,
     ) -> dict[str, Any]:
-        """Run (or replay) the 22-gate pre-flight go-live certificate.
+        """Run (or replay) the 23-gate pre-flight go-live certificate.
 
         The certificate is deterministic over gate outcomes, so a short-lived
         in-process cache is both safe and necessary: the cockpit polls it and
@@ -6913,7 +6969,7 @@ class ControlPlane:
 
         One request carries username, password and the live PIN.  Ring 0
         verifies both digests in constant time and the gateway reports the
-        22-gate pre-flight verdict on the same response, so the vault door can
+        23-gate pre-flight verdict on the same response, so the vault door can
         render readiness without a second call.  A missing or non-numeric PIN is
         ``403 LIVE_PIN_REJECTED``; a wrong password is ``401``.
         """
@@ -7131,7 +7187,7 @@ class ControlPlane:
                 "ring": "RING 3",
                 "read_only": True,
                 "group": "SOVEREIGN_CONTROL",
-                "summary": "22-gate pre-flight, credential vault, LLM switchboard, MCP.",
+                "summary": "23-gate pre-flight, credential vault, LLM switchboard, MCP.",
             },
         ]
 
@@ -7798,7 +7854,7 @@ class ControlPlane:
             raise HTTPException(status_code=401, detail="AUTH_REQUIRED") from exc
         if str(claims.get("t")) != "PAPER":
             raise HTTPException(status_code=409, detail="ALREADY_ELEVATED")
-        # 22-gate pre-flight is *checked and reported* on every elevation.  A
+        # 23-gate pre-flight is *checked and reported* on every elevation.  A
         # PAPER-only install has no live broker handshake yet, so a non-green
         # certificate is a warning rather than a hard block; the LIVE workspace
         # surfaces the same certificate verbatim.
@@ -8198,7 +8254,7 @@ class ControlPlane:
                 )
             if request.mode == SiloMode.LIVE.value and request.confirm_live:
                 # Phase 4 Step 2 -- Pre-Flight Go-Live Gate.  A silo may only
-                # leave PAPER when the 22-gate certificate is green: an
+                # leave PAPER when the 23-gate certificate is green: an
                 # uncertified invariant (dirty tree, broken proof, stale vault)
                 # must fail closed *before* capital is exposed.
                 certificate = self.preflight_certificate(full_smoke=False)
@@ -8209,7 +8265,7 @@ class ControlPlane:
                         detail={
                             "error": "PRE_FLIGHT_GATE_BLOCKED",
                             "message": (
-                                "LIVE cutover refused: the 22-gate pre-flight "
+                                "LIVE cutover refused: the 23-gate pre-flight "
                                 "certificate does not certify this release"
                             ),
                             "failed_gates": failed,
@@ -9032,6 +9088,115 @@ class ControlPlane:
                 break
             await asyncio.sleep(period)
 
+    # ------------------------------------------------------------------
+    # V1.9 -- missions, tranches, clock health and star aggregation
+    # ------------------------------------------------------------------
+    @property
+    def missions(self) -> Any:
+        """Lazily build the mission surface around this control plane's Ring 0 objects."""
+        surface = getattr(self, "_mission_surface", None)
+        if surface is None:
+            from ring0_vault.kernel.mission_pacing import MissionPacingController
+            from ring3_cockpit.gateway.mission_control import MissionControlSurface
+
+            try:
+                from ring0_vault.ibor.ledger_outbox import (
+                    DynamicFundSplitEngine,
+                    TrancheGuard,
+                )
+
+                tranche_guard = TrancheGuard(self.ledger)
+                split_engine = DynamicFundSplitEngine(self.ledger)
+            except Exception:  # pragma: no cover - ledger is always present in practice
+                tranche_guard = None
+                split_engine = None
+            surface = MissionControlSurface(
+                ledger=self.ledger,
+                feasibility=getattr(self, "_mission_feasibility", None),
+                pacing=MissionPacingController(),
+                tranche_guard=tranche_guard,
+                split_engine=split_engine,
+            )
+            self._mission_surface = surface
+        return surface
+
+    def clock_health(self) -> dict[str, Any]:
+        """``E5``: real monotonic/UTC offset telemetry, not a synthetic constant.
+
+        Two clocks are compared: the wall clock (``time.time_ns``) and the
+        monotonic clock (``time.monotonic_ns``) anchored once at process start.
+        A wall clock that jumps relative to the monotonic anchor is a clock
+        adjustment, and Ring 0 fails closed when the drift exceeds the budget.
+        """
+        now_wall = time.time_ns()
+        now_mono = time.monotonic_ns()
+        anchor_wall = int(getattr(self, "_clock_anchor_wall_ns", now_wall))
+        anchor_mono = int(getattr(self, "_clock_anchor_mono_ns", now_mono))
+        expected_wall = anchor_wall + (now_mono - anchor_mono)
+        offset_ms = (now_wall - expected_wall) / 1_000_000.0
+        budget_ms = float(getattr(self, "_clock_budget_ms", 250.0))
+        return {
+            "ok": abs(offset_ms) <= budget_ms,
+            "offset_ms": round(offset_ms, 6),
+            "budget_ms": budget_ms,
+            "wall_clock_ns": now_wall,
+            "monotonic_ns": now_mono,
+            "source": "monotonic_anchor",
+            "synthetic": False,
+        }
+
+    def set_clock_budget_ms(self, budget_ms: float) -> float:
+        self._clock_budget_ms = max(1.0, float(budget_ms))
+        return self._clock_budget_ms
+
+    def star_aggregate(self, contributions: Any) -> dict[str, Any]:
+        """``F1``: hierarchical star aggregation instead of peer-to-peer debate.
+
+        Each analyst reports to the centre with a signed conviction and a
+        grounded evidence digest; the centre never lets two agents argue with
+        each other directly, so a confident wrong agent cannot drag a correct
+        one into a false consensus.
+        """
+        rows: list[dict[str, Any]] = []
+        for item in contributions:
+            if isinstance(item, Mapping):
+                rows.append(dict(item))
+            else:
+                rows.append(
+                    {
+                        "agent": str(getattr(item, "agent", getattr(item, "role", "analyst"))),
+                        "stance": str(getattr(item, "stance", "NEUTRAL")).upper(),
+                        "conviction": float(getattr(item, "conviction", 0.0)),
+                        "evidence_digest": str(getattr(item, "evidence_digest", "")),
+                    }
+                )
+        if not rows:
+            return {"decision": "ABSTAIN", "score": 0.0, "contributors": 0, "reasons": ["NO_CONTRIBUTIONS"]}
+        total_weight = 0.0
+        score = 0.0
+        for row in rows:
+            conviction = max(0.0, min(1.0, float(row.get("conviction", 0.0))))
+            stance = str(row.get("stance", "NEUTRAL")).upper()
+            direction = 1.0 if stance in ("BULL", "BULLISH", "BUY", "LONG") else (
+                -1.0 if stance in ("BEAR", "BEARISH", "SELL", "SHORT") else 0.0
+            )
+            grounded = len(str(row.get("evidence_digest", ""))) == 64
+            weight = conviction if grounded else 0.0
+            score += direction * weight
+            total_weight += weight
+        normalized = (score / total_weight) if total_weight > 0 else 0.0
+        decision = "LONG" if normalized >= 0.25 else ("SHORT" if normalized <= -0.25 else "ABSTAIN")
+        return {
+            "decision": decision,
+            "score": round(normalized, 6),
+            "contributors": len(rows),
+            "grounded_contributors": sum(
+                1 for row in rows if len(str(row.get("evidence_digest", ""))) == 64
+            ),
+            "aggregation": "hierarchical_star",
+            "reasons": [] if total_weight > 0 else ["NO_GROUNDED_CONTRIBUTIONS"],
+        }
+
 
 # ---------------------------------------------------------------------------
 # FastAPI application
@@ -9463,7 +9628,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     ) -> dict[str, Any]:
         return control.run_forge_and_hedge(request or ForgeHedgeRequest())
 
-    # ---- Phase 4 Step 2: 22-gate pre-flight go-live certificate --------
+    # ---- Phase 4 Step 2: 23-gate pre-flight go-live certificate --------
     @app.get("/api/v2/control/preflight")
     def control_preflight_state(refresh: bool = Query(False)) -> dict[str, Any]:
         return control.preflight_state(refresh=refresh)
@@ -9477,6 +9642,104 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             full_smoke=payload.full_smoke,
             silo=payload.silo,
             refresh=payload.refresh,
+        )
+
+    # ---- V1.9: missions, tranches and real clock health ----------------
+    def _mission_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        from ring3_cockpit.gateway.mission_control import MissionControlError
+
+        try:
+            return fn(*args, **kwargs)
+        except MissionControlError as exc:
+            raise HTTPException(
+                status_code=exc.http_status,
+                detail={"code": exc.code, "detail": str(exc)},
+            ) from exc
+
+    @app.get("/api/v2/cockpit/clock")
+    def cockpit_clock() -> dict[str, Any]:
+        return control.clock_health()
+
+    @app.post("/api/v2/missions", dependencies=[SESSION_GUARD])
+    def create_mission(payload: MissionCreateRequest) -> dict[str, Any]:
+        return _mission_call(
+            control.missions.create,
+            mission_id=payload.mission_id,
+            target_units=payload.target_units,
+            deadline_utc=payload.deadline_utc,
+            risk_budget_units=payload.risk_budget_units,
+            operator=payload.operator,
+            silos=payload.silos,
+            notional_cap_units=payload.notional_cap_units,
+            ttl_seconds=payload.ttl_seconds,
+            kelly_fraction_cap=payload.kelly_fraction_cap,
+            strategy_lineage_digests=payload.strategy_lineage_digests,
+            unlock_ladder=payload.unlock_ladder,
+            state=payload.state,
+        )
+
+    @app.get("/api/v2/missions")
+    def list_missions() -> dict[str, Any]:
+        return control.missions.list_missions()
+
+    @app.get("/api/v2/missions/{mission_id}")
+    def mission_status(mission_id: str) -> dict[str, Any]:
+        return _mission_call(control.missions.mission_status, mission_id)
+
+    @app.post("/api/v2/missions/{mission_id}/approve", dependencies=[SESSION_GUARD])
+    def approve_mission(
+        mission_id: str, payload: MissionApproveRequest
+    ) -> dict[str, Any]:
+        return _mission_call(
+            control.missions.approve,
+            mission_id,
+            operator=payload.operator,
+            state=payload.state,
+            ttl_seconds=payload.ttl_seconds,
+            notional_cap_units=payload.notional_cap_units,
+        )
+
+    @app.post("/api/v2/missions/{mission_id}/revoke", dependencies=[SESSION_GUARD])
+    def revoke_mission(
+        mission_id: str, payload: MissionRevokeRequest | None = None
+    ) -> dict[str, Any]:
+        request = payload or MissionRevokeRequest()
+        return _mission_call(
+            control.missions.revoke,
+            mission_id,
+            operator=request.operator,
+            reason=request.reason,
+        )
+
+    @app.post("/api/v2/missions/{mission_id}/tranches", dependencies=[SESSION_GUARD])
+    def allocate_tranche(
+        mission_id: str, payload: MissionTrancheRequest
+    ) -> dict[str, Any]:
+        return _mission_call(
+            control.missions.allocate_tranche,
+            mission_id,
+            silo=payload.silo,
+            allocated_units=payload.allocated_units,
+            side=payload.side,
+            stop_units=payload.stop_units,
+            lineage_digest=payload.lineage_digest,
+        )
+
+    @app.get("/api/v2/tranches")
+    def list_tranches(mission_id: str | None = Query(None)) -> dict[str, Any]:
+        return control.missions.list_tranches(mission_id=mission_id)
+
+    @app.get("/api/v2/tranches/{tranche_id}")
+    def tranche_status(tranche_id: str) -> dict[str, Any]:
+        return _mission_call(control.missions.tranche_status, tranche_id)
+
+    @app.post("/api/v2/tranches/{tranche_id}/rearm", dependencies=[SESSION_GUARD])
+    def rearm_tranche(
+        tranche_id: str, payload: TrancheRearmRequest | None = None
+    ) -> dict[str, Any]:
+        request = payload or TrancheRearmRequest()
+        return _mission_call(
+            control.missions.rearm_tranche, tranche_id, operator=request.operator
         )
 
     # ---- Phase 3 Step 3: Ring 0 sandbox order dispatch -----------------

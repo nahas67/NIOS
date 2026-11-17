@@ -27,7 +27,7 @@ tuning — live in [`RUNBOOK.md`](RUNBOOK.md).
 On first use on Linux/macOS, make the script executable: `chmod +x start_nios.sh`.
 
 Both scripts resolve a Python interpreter, verify it can import the runtime, confirm the port
-is bindable, run the **22-gate release smoke test**, and only launch the unified server if every
+is bindable, run the **23-gate release smoke test**, and only launch the unified server if every
 check passes. A failed precondition or smoke test aborts the launch — a non-certified build is
 never served.
 
@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**602 tests · 27 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**711 tests · 31 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -194,7 +194,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 15 | `test_phase3_step3_testnet_supervisor_and_security.py` | Testnet bridge, supervisor, security |
 | 16 | `test_phase3_step4_soak_metrics_and_chaos.py` | Soak metrics, chaos drills |
 | 17 | `test_phase3_step5_os_tuning_key_rotation_and_runbook.py` | OS/socket auditor, zero-downtime Fernet + Ed25519 rotation, runbook completeness |
-| 18 | `test_phase4_final_preflight_and_supervisor_forge.py` | 22-gate pre-flight certificate, supervisor forge/tail-hedge, Phase 4 release seal |
+| 18 | `test_phase4_final_preflight_and_supervisor_forge.py` | 23-gate pre-flight certificate, supervisor forge/tail-hedge, Phase 4 release seal |
 | 19 | `test_v1_1_auth_dual_workspace_and_clean_slate.py` | **V1.1** operator auth, dual workspaces, clean slate, LIVE mutation guard |
 | 20 | `test_v1_2_agent_tasks_backtesting_and_daily_analysis.py` | **V1.2** 8 harvested strategies, grounded decision dashboard, 6 agent tasks, watchlist batch ranking, grounded Q&A follow-up, 5-timeframe backtester, 8-way comparison, 30-fill nursery gate |
 | 21 | `test_v1_3_redesigned_dual_ui_separate_logins_and_15_pages.py` | **V1.6** separate `/paper/login` + `/live/login` portals, options chain (Greeks/PCR/Max Pain), six payoff templates, market terminal, cost-adjusted logbook, 12-venue broker hub, 15-page catalogue across all three route trees, headless document |
@@ -202,6 +202,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 23 | `test_v1_5_institutional_terminal_ui.py` | **V1.6** headless institutional contract: 50-route status document, integer micro money, exact itemized statutory floors, 15-page catalogue, dual workspace boundary, reproducible payload digest |
 | 25 | `test_v1_7_deep_market_universe_and_feature_audit.py` | **V1.7** 274-instrument institutional universe (all 50 NIFTY 50, 80 crypto perps, 79 US names, 28 G10 pairs, MCX + CME), asset-class fundamental / on-chain / COT feature store, four-expiry IV term structure + GEX surface, India / US / crypto heatmaps and the G10 strength matrix, macro calendar, instrument search / filter / detail APIs, SmartOMS + walk-forward lot, tick and statutory-floor enforcement |
 | 24 | `test_v1_6_backend_bug_hunt_security_and_data_completeness.py` | **V1.6** master instrument registry + lot/tick/freeze enforcement, itemized statutory cost engine, adversarial numerical/boundary fuzzing, 32-thread idempotency + double-entry conservation, auth brute-force lockout + secret non-leakage |
+| 25 | `test_v1_7_deep_market_universe_and_feature_audit.py` | **V1.7** 274-instrument universe, asset-class feature store, options surface, heatmaps, macro calendar, instrument APIs |
+| 26 | `test_v1_8_tradingview_bridge_streaming_and_handshake.py` | **V1.8** TradingView replay bridge, 274 `EXCHANGE:SYMBOL` tickers, eight Pine study evaluators, SSE stream hub, 12-venue handshake |
+| 27 | `test_v1_8_deep_gap_closure_and_cross_engine_audit.py` | **V1.8** universal options chain, segment-aware statutory tax, circuit/margin/drawdown enforcement, crash-safe state journal, SSE disconnect fuzzing |
+| 28 | `test_v1_9_mission_tranche_and_profit_split.py` | **V1.9** mission authorization, half-Kelly feasibility, tranche isolation, correlation gate, pacing/target lock, dynamic split, crypto sweeps, virtual margin quotas |
+| 29 | `test_v1_9_sebi_and_regulatory_versioning.py` | **V1.9** SEBI algo-id, 10 OPS bucket + OTR, egress allowlist, TOTP renewal, freeze slicing, hedge exit ordering, effective-dated FINRA 4210 / PDT, locate fee, SSR, extended hours |
+| 30 | `test_v1_9_oms_fsm_binance_and_env_truth.py` | **V1.9** staleness watermark, all-or-none baskets, cold-start recon, order FSM, clock health, exchange calendar, fencing epoch, replay checkpoints, Binance microstructure |
+| 31 | `test_v1_9_ai_provenance_and_concept_drift.py` | **V1.9** provenance + attestation + freshness bound, injection guard, star aggregation, frozen signing inputs, concept drift, agent behaviour monitor, Gate 23 |
+
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
 independent of whatever happens to be installed in the interpreter.
@@ -413,7 +421,7 @@ SHA-256 `GroundedFactPacket`.
 **Two shells that cannot be confused.** `/paper/*` renders the lavender/cyan Paper Sandbox
 ribbon (simulated NAV, autopilot play/pause, deposit paper capital, reset to zero, switch to
 live vault). `/live/*` renders the crimson/amber hazard-striped Live Production ribbon
-(`🔒 LIVE PRODUCTION — REAL CAPITAL`, 22-gate status, live TTL countdown, `<1ms` kill switch,
+(`🔒 LIVE PRODUCTION — REAL CAPITAL`, 23-gate status, live TTL countdown, `<1ms` kill switch,
 lock live vault). No page under `/live/*` mounts a paper deposit or shadow-burst control.
 
 ---
@@ -446,7 +454,7 @@ shadow-burst control.
 | 12 | Trade Logbook | `/logbook` | `/journal` | Ring 0 | Cost-adjusted journal, net P&L, R-multiple, win/loss attribution |
 | 13 | Proofs, Chaos & Telemetry | `/verification` | — | Ring 0 | TLA+ BFS proofs, VOPR campaign, OS tuning, metrics |
 | 14 | Broker Hub & Feeds | `/brokers` | `/venues` | Ring 0 | 12-venue matrix, masked credentials, Ed25519 dry-run, feed health |
-| 15 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | 22-gate pre-flight, credential vault, LLM switchboard, MCP |
+| 15 | Control Room & MCP | `/control` | `/mcp` | Ring 3 | 23-gate pre-flight, credential vault, LLM switchboard, MCP |
 
 ---
 
@@ -544,10 +552,10 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     602 tests across 27 suites
+tests/                     711 tests across 31 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
-scripts/preflight_golive.py 22-gate go-live readiness certificate (--strict / --fast)
+scripts/preflight_golive.py 23-gate go-live readiness certificate (--strict / --fast)
 scripts/tune_os_performance.py  OS/socket low-latency audit (--check/--apply/--json)
 scripts/soak_test_harness.py    accelerated soak + memory-leak audit
 RUNBOOK.md                 production SOPs 1-6
@@ -563,11 +571,11 @@ start_nios.bat / .sh       1-click launch
 | Gate | Command | Required result |
 |---|---|---|
 | Unit / integration | `pytest tests -q` | **462 passed**, 0 failed, 0 warnings |
-| Smoke suite | `python scripts/run_nios.py --smoke-test` | **22/22 rows**, `EXIT=0` |
-| Go-live certificate | `python scripts/preflight_golive.py --fast` | **22/22 PASS**, `EXIT=0` |
+| Smoke suite | `python scripts/run_nios.py --smoke-test` | **23/23 rows**, `EXIT=0` |
+| Go-live certificate | `python scripts/preflight_golive.py --fast` | **23/23 PASS**, `EXIT=0` |
 | Live `V1.5` burn-in | boot on `:8001` with the flat terminal bundle, walk `/setup`, `/paper/login`, `/live/login` and all 45 page routes, then shut down | **50/50 routes at 200**, clean slate on boot, port `8001` free afterwards, empty `git status --porcelain` |
 
-The seal asserts nothing new about live capital: every silo still boots `PAPER`, the 22-gate
+The seal asserts nothing new about live capital: every silo still boots `PAPER`, the 23-gate
 certificate still governs a LIVE cutover, and `main` (`9a8ac5f` / `v3.0.0-PROD`), `V1`
 (`ff67b5c` / `v3.1.0-V1`), `V1.1` (`99ea43a` / `v3.2.0-V1.1`), `V1.2` (`874d817` / `v3.3.0-V1.2`),
 `V1.3` (`05c8575` / `v3.4.0-V1.3`) and `V1.4` (`46195f3` / `v3.5.0-V1.4`) are untouched; the

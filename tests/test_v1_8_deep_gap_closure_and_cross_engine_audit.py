@@ -1561,7 +1561,7 @@ def test_gate7_workspace_reset_live_state_needs_a_live_session(
 ) -> None:
     """Last: a LIVE session plus confirm=true really resets live state."""
     # Mint the LIVE token straight from the Ring 0 vault (the same instance the
-    # guard reads) so the assertion does not pay the 22-gate login pre-flight.
+    # guard reads) so the assertion does not pay the 23-gate login pre-flight.
     live_token = (
         runtime.control.operator_auth().elevate_to_live(token, LIVE_PIN).token
     )

@@ -383,3 +383,45 @@ def signing_self_test(
         "message_sha256": hashlib.sha256(message).hexdigest(),
         "signature_length": len(signature),
     }
+
+# ---------------------------------------------------------------------------
+# V1.9 (B1) -- SEBI/NSE exchange algo identification
+# ---------------------------------------------------------------------------
+#
+# Paper mode is allowed to use the generic tag so the paper tape stays
+# byte-identical to V1.8.  Live mode must supply the broker-registered algo id;
+# Ring 0 refuses an Indian order that carries only the generic tag when the
+# silo is configured to require a registered id.
+
+DEFAULT_GENERIC_ALGO_ID = "NIOS_GENERIC_ALGO"
+ALGO_ID_ENV_TEMPLATE = "NIOS_{VENUE}_ALGO_ID"
+
+
+def resolve_exchange_algo_id(
+    venue: str,
+    *,
+    mode: str = "PAPER",
+    configured: str | None = None,
+) -> tuple[str, str]:
+    """Return ``(exchange_algo_id, algo_id_kind)`` for one venue.
+
+    A configured id (argument or ``NIOS_<VENUE>_ALGO_ID``) is ``REGISTERED``.
+    Without one, paper mode falls back to the generic tag while live mode keeps
+    the generic tag *and* reports ``GENERIC`` so Ring 0 can refuse it.
+    """
+    key = str(venue).strip().lower()
+    explicit = str(configured or "").strip()
+    if not explicit:
+        import os as _os
+
+        explicit = str(
+            _os.environ.get(ALGO_ID_ENV_TEMPLATE.format(VENUE=key.upper()), "")
+        ).strip()
+    if explicit:
+        return explicit, "REGISTERED"
+    del mode  # the caller decides whether GENERIC is acceptable
+    return DEFAULT_GENERIC_ALGO_ID, "GENERIC"
+
+
+def algo_id_required(silo: str) -> bool:
+    return str(silo).strip().upper() == "INDIA_ZERODHA_DHAN"

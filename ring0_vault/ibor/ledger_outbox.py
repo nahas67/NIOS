@@ -46,6 +46,9 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from core.schemas import (
     ALL_VAULTS,
+    SplitPolicy,
+    TrancheRiskState,
+    TrancheStatus,
     UnsignedProposal,
     VaultName,
     canonical_pairs_digest,
@@ -95,6 +98,16 @@ __all__ = [
     "SiloGuard",
     "ReconcileReport",
     "LiveReconciler",
+    # V1.9 multi-tranche mission engine
+    "TRANCHE_STOP_DLL_FRACTION",
+    "TrancheBreach",
+    "TrancheGuard",
+    "TAX_ESCROW_ACCOUNT",
+    "SplitResult",
+    "DynamicFundSplitEngine",
+    "DefinedRiskSpec",
+    "LegGroup",
+    "BasketReservation",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1213,8 @@ class IBORLedger:
         self._transfers: dict[int, Transfer] = {}
         self._positions: dict[tuple[str, str], dict[str, int]] = {}
         self._silos: set[str] = set()
+        #: ``V1.9`` (``B2``): cumulative exchange OTR penalties per silo.
+        self._otr_penalty_micros: dict[str, int] = {}
         self._next_transfer_id = 1
         self._created_ns = int(now_ns if now_ns is not None else time.time_ns())
         for silo in silos:
@@ -1667,6 +1682,44 @@ class IBORLedger:
                 str(key): float(value) for key, value in (component_bps or {}).items()
             },
         }
+
+    def accrue_otr_penalty(
+        self,
+        silo: str,
+        penalty_micros: int,
+        *,
+        now_ns: int | None = None,
+    ) -> int:
+        """Book an exchange Order-to-Trade-Ratio penalty (``B2``).
+
+        The penalty is a real statutory drag: it leaves ``CASH`` and lands in
+        ``FEE_TAX_ACCRUAL``, so the double-entry invariant still holds and the
+        cost floor cannot silently ignore it.  An unaffordable penalty is
+        skipped rather than overdrafting the silo.
+        """
+        amount = int(penalty_micros)
+        if amount <= 0:
+            return 0
+        try:
+            self.transfer_now(
+                str(silo),
+                debit=str(AccountCode.CASH),
+                credit=str(AccountCode.FEES),
+                amount_micros=amount,
+                code=int(TransferCode.CHARGE_ACCRUAL),
+                now_ns=now_ns,
+            )
+        except OverdraftError:
+            return 0
+        self._otr_penalty_micros[str(silo)] = (
+            int(self._otr_penalty_micros.get(str(silo), 0)) + amount
+        )
+        return amount
+
+    def otr_penalty_micros(self, silo: str | None = None) -> int:
+        if silo is None:
+            return sum(int(value) for value in self._otr_penalty_micros.values())
+        return int(self._otr_penalty_micros.get(str(silo), 0))
 
     # -- positions --------------------------------------------------------
     def set_position(
@@ -2167,6 +2220,78 @@ class CrashAtomicOutbox:
                 write_outbox=persist,
             )
             return updated
+
+    # -- V1.9 (E2): all-or-none multi-leg basket --------------------------
+    def reserve_basket(
+        self,
+        group: "LegGroup",
+        *,
+        now_ns: int | None = None,
+        cost_floor: Any = None,
+    ) -> "BasketReservation":
+        """Reserve every leg or none of them.
+
+        A defined-risk basket is only defined-risk if the legs exist together:
+        a filled short leg with an unhedged protective leg is a naked position.
+        If any child reservation fails, the children already reserved are voided
+        immediately and the caller is told to flatten (``REDUCING``).
+        """
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        reservations: list[Reservation] = []
+        total_notional = 0
+        for proposal in group.legs:
+            try:
+                reservation = self.reserve(proposal, now_ns=stamp, cost_floor=cost_floor)
+            except LedgerError as exc:
+                self.void_many(
+                    [r.outbox_idempotency_key for r in reservations],
+                    reason=f"BASKET_ATOMICITY_FAILURE:{proposal.proposal_id}",
+                    now_ns=stamp,
+                )
+                return BasketReservation(
+                    group_id=group.group_id,
+                    silo=group.silo,
+                    state=OutboxState.VOIDED,
+                    reservations=(),
+                    total_notional_micros=0,
+                    max_loss_micros=group.max_loss_micros,
+                    flatten_required=True,
+                    failed_leg=str(proposal.proposal_id),
+                    reason=f"BASKET_REJECTED: {exc}",
+                )
+            reservations.append(reservation)
+            total_notional += int(reservation.notional_micros)
+        if group.max_loss_micros and total_notional > int(group.max_loss_micros):
+            self.void_many(
+                [r.outbox_idempotency_key for r in reservations],
+                reason="DEFINED_RISK_EXCEEDED",
+                now_ns=stamp,
+            )
+            return BasketReservation(
+                group_id=group.group_id,
+                silo=group.silo,
+                state=OutboxState.VOIDED,
+                reservations=(),
+                total_notional_micros=0,
+                max_loss_micros=group.max_loss_micros,
+                flatten_required=True,
+                failed_leg="",
+                reason=(
+                    "DEFINED_RISK_EXCEEDED: basket notional "
+                    f"{total_notional} > max_loss {group.max_loss_micros}"
+                ),
+            )
+        return BasketReservation(
+            group_id=group.group_id,
+            silo=group.silo,
+            state=OutboxState.PENDING,
+            reservations=tuple(reservations),
+            total_notional_micros=total_notional,
+            max_loss_micros=group.max_loss_micros,
+            flatten_required=False,
+            failed_leg="",
+            reason="BASKET_RESERVED",
+        )
 
     def handle_ack(self, ack: BrokerAck) -> AckResult:
         """Apply one broker ack with inbox-level de-duplication."""
@@ -2714,4 +2839,506 @@ class LiveReconciler:
                 for position in self._broker_positions.values()
             ],
             "history": [report.to_dict() for report in self._history[-10:]],
+        }
+
+# ---------------------------------------------------------------------------
+# V1.9 -- per-tranche risk isolation (A1 / A2 / A8)
+# ---------------------------------------------------------------------------
+
+#: ``A1``: a tranche stops at 85% of the silo daily-loss limit, scaled by its
+#: share of silo NAV.  Ring 0 never waits for the full DLL to trip a tranche.
+TRANCHE_STOP_DLL_FRACTION: float = 0.85
+
+
+@dataclass(slots=True)
+class TrancheBreach:
+    """Evidence for one tranche-local halt.
+
+    ``global_halt`` is always ``False`` by construction: the whole point of the
+    tranche latch is that a sibling tranche (or another silo) keeps trading.
+    """
+
+    tranche_id: str
+    silo: str
+    reason: str
+    giveback_micros: int
+    stop_micros: int
+    halted: bool
+    unrelated_tranches_halted: int
+    global_halt: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tranche_id": self.tranche_id,
+            "silo": self.silo,
+            "reason": self.reason,
+            "giveback_micros": self.giveback_micros,
+            "stop_micros": self.stop_micros,
+            "halted": self.halted,
+            "unrelated_tranches_halted": self.unrelated_tranches_halted,
+            "global_halt": self.global_halt,
+        }
+
+
+class TrancheGuard:
+    """Per-tranche stop enforcement that never escalates to a global halt.
+
+    It is deliberately *not* a :class:`SiloGuard` subclass: a silo freeze blocks
+    every strategy in that silo, while a tranche halt blocks exactly one mission
+    tranche.  The only shared object is the Tier-0 ``TrancheLatchTable`` (when
+    supplied), whose slots are independent by construction.
+    """
+
+    def __init__(
+        self,
+        ledger: IBORLedger | None = None,
+        *,
+        latch: Any = None,
+        dll_micros: int = 0,
+        stop_fraction: float = TRANCHE_STOP_DLL_FRACTION,
+    ) -> None:
+        self.ledger = ledger
+        self._latch = latch
+        self._dll_micros = int(dll_micros)
+        self._stop_fraction = float(stop_fraction)
+        self._states: dict[str, TrancheRiskState] = {}
+        self._lock = threading.RLock()
+        self._breaches: list[TrancheBreach] = []
+
+    # -- registration -----------------------------------------------------
+    def register(self, tranche: TrancheRiskState) -> TrancheRiskState:
+        with self._lock:
+            self._states[tranche.tranche_id] = tranche
+            return tranche
+
+    def open_tranche(
+        self,
+        tranche_id: str,
+        *,
+        mission_id: str,
+        silo: str,
+        allocated_micros: int,
+        stop_micros: int | None = None,
+        lineage_digest: str = "",
+        side: str = "LONG",
+        now_ns: int | None = None,
+    ) -> TrancheRiskState:
+        stop = (
+            int(stop_micros)
+            if stop_micros is not None
+            else self.stop_threshold(allocated_micros, silo=silo)
+        )
+        state = TrancheRiskState(
+            tranche_id=tranche_id,
+            mission_id=mission_id,
+            silo=silo,
+            allocated_micros=int(allocated_micros),
+            stop_micros=stop,
+            lineage_digest=lineage_digest,
+            side=side,
+            created_at_ns=int(now_ns if now_ns is not None else time.time_ns()),
+        )
+        return self.register(state)
+
+    def stop_threshold(self, allocated_micros: int, *, silo: str = "") -> int:
+        """``0.85 * DLL`` scaled by the tranche's share of silo NAV."""
+        allocated = max(1, int(allocated_micros))
+        dll = int(self._dll_micros)
+        if dll <= 0 or self.ledger is None or not silo:
+            return max(1, allocated // 10)
+        nav = max(1, int(self.ledger.silo_nav_micros(str(silo))))
+        scaled = int(self._stop_fraction * dll * allocated / nav)
+        return max(1, min(allocated, scaled))
+
+    # -- lifecycle --------------------------------------------------------
+    def state(self, tranche_id: str) -> TrancheRiskState | None:
+        with self._lock:
+            return self._states.get(str(tranche_id))
+
+    def states(self) -> tuple[TrancheRiskState, ...]:
+        with self._lock:
+            return tuple(self._states.values())
+
+    def is_halted(self, tranche_id: str) -> bool:
+        with self._lock:
+            state = self._states.get(str(tranche_id))
+            if state is not None and state.status is TrancheStatus.HALTED:
+                return True
+        if self._latch is not None:
+            try:
+                return bool(self._latch.is_halted(str(tranche_id)))
+            except Exception:  # pragma: no cover - a latch must never raise
+                return False
+        return False
+
+    def record_realized(
+        self, tranche_id: str, delta_micros: int, *, reason: str = ""
+    ) -> TrancheBreach:
+        """Book tranche P&L and halt *only this tranche* on a stop breach."""
+        with self._lock:
+            state = self._states.get(str(tranche_id))
+            if state is None:
+                raise KeyError(f"unknown tranche {tranche_id!r}")
+            state.record_realized(int(delta_micros))
+            if state.status is TrancheStatus.HALTED:
+                return TrancheBreach(
+                    tranche_id=state.tranche_id,
+                    silo=state.silo,
+                    reason="ALREADY_HALTED",
+                    giveback_micros=state.giveback_micros,
+                    stop_micros=state.stop_micros,
+                    halted=True,
+                    unrelated_tranches_halted=0,
+                )
+            if not state.stop_breached:
+                return TrancheBreach(
+                    tranche_id=state.tranche_id,
+                    silo=state.silo,
+                    reason=reason or "WITHIN_STOP",
+                    giveback_micros=state.giveback_micros,
+                    stop_micros=state.stop_micros,
+                    halted=False,
+                    unrelated_tranches_halted=0,
+                )
+            state.halt()
+            halted_siblings = sum(
+                1
+                for other in self._states.values()
+                if other.tranche_id != state.tranche_id
+                and other.status is TrancheStatus.HALTED
+            )
+            if self._latch is not None:
+                try:
+                    self._latch.halt(state.tranche_id)
+                except Exception:  # pragma: no cover - latch is best effort
+                    pass
+            breach = TrancheBreach(
+                tranche_id=state.tranche_id,
+                silo=state.silo,
+                reason=(
+                    f"TRANCHE_HALT: giveback {state.giveback_micros} micros >= "
+                    f"stop {state.stop_micros} micros"
+                ),
+                giveback_micros=state.giveback_micros,
+                stop_micros=state.stop_micros,
+                halted=True,
+                unrelated_tranches_halted=halted_siblings,
+                global_halt=False,
+            )
+            self._breaches.append(breach)
+            return breach
+
+    def halt(self, tranche_id: str, *, reason: str = "TRANCHE_HALT") -> bool:
+        with self._lock:
+            state = self._states.get(str(tranche_id))
+            if state is None:
+                raise KeyError(f"unknown tranche {tranche_id!r}")
+            already = state.status is TrancheStatus.HALTED
+            state.halt()
+            if self._latch is not None:
+                try:
+                    self._latch.halt(state.tranche_id)
+                except Exception:  # pragma: no cover
+                    pass
+            if not already:
+                self._breaches.append(
+                    TrancheBreach(
+                        tranche_id=state.tranche_id,
+                        silo=state.silo,
+                        reason=reason,
+                        giveback_micros=state.giveback_micros,
+                        stop_micros=state.stop_micros,
+                        halted=True,
+                        unrelated_tranches_halted=0,
+                    )
+                )
+            return not already
+
+    def rearm(self, tranche_id: str) -> bool:
+        with self._lock:
+            state = self._states.get(str(tranche_id))
+            if state is None:
+                raise KeyError(f"unknown tranche {tranche_id!r}")
+            if state.status is not TrancheStatus.HALTED:
+                return False
+            state.rearm()
+            if self._latch is not None:
+                try:
+                    self._latch.arm(state.tranche_id)
+                except Exception:  # pragma: no cover
+                    pass
+            return True
+
+    def halted_tranches(self) -> tuple[str, ...]:
+        return tuple(
+            state.tranche_id
+            for state in self.states()
+            if state.status is TrancheStatus.HALTED
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "tranches": [state.to_dict() for state in self._states.values()],
+                "halted": list(self.halted_tranches()),
+                "breaches": [breach.to_dict() for breach in self._breaches[-20:]],
+                "dll_micros": self._dll_micros,
+                "stop_fraction": self._stop_fraction,
+                "global_halt": False,
+            }
+
+
+# ---------------------------------------------------------------------------
+# V1.9 -- dynamic profit split (A5)
+# ---------------------------------------------------------------------------
+
+#: ``A5``: the statutory escrow account.  It is not a vault: capital parked here
+#: is reserved for tax and is never available for trading.
+TAX_ESCROW_ACCOUNT: str = "TAX_ESCROW"
+
+
+@dataclass(slots=True)
+class SplitResult:
+    """Outcome of one dynamic profit split."""
+
+    silo: str
+    applied: bool
+    realized_net_micros: int
+    long_term_micros: int
+    reserve_micros: int
+    tax_escrow_micros: int
+    scalper_micros: int
+    reserve_floor_micros: int
+    reserve_pct: int
+    cross_border_wire_bps: float
+    policy: SplitPolicy
+    transfer_ids: tuple[int, ...] = ()
+
+    @property
+    def splits_sum_micros(self) -> int:
+        return (
+            self.long_term_micros
+            + self.reserve_micros
+            + self.tax_escrow_micros
+            + self.scalper_micros
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "silo": self.silo,
+            "applied": self.applied,
+            "realized_net_micros": self.realized_net_micros,
+            "long_term_micros": self.long_term_micros,
+            "reserve_micros": self.reserve_micros,
+            "tax_escrow_micros": self.tax_escrow_micros,
+            "scalper_micros": self.scalper_micros,
+            "splits_sum_micros": self.splits_sum_micros,
+            "reserve_floor_micros": self.reserve_floor_micros,
+            "reserve_pct": self.reserve_pct,
+            "cross_border_wire_bps": self.cross_border_wire_bps,
+            "policy": self.policy.to_dict(),
+            "transfer_ids": list(self.transfer_ids),
+        }
+
+
+class DynamicFundSplitEngine:
+    """Split every realized profit by mission progress, regime and ladder.
+
+    Replaces the fixed ``35 / 15 / 50`` ratchet with a policy-driven split that
+    still satisfies the constitutional invariants:
+
+    * ``sum(splits) == realized`` to the last integer micro;
+    * the reserve share is monotonically non-decreasing across the mission;
+    * ``cross_border_wire_bps == 0`` -- every leg stays inside one silo.
+    """
+
+    def __init__(self, ledger: IBORLedger, *, reserve_floor_micros: int = 0) -> None:
+        self.ledger = ledger
+        self._reserve_floor_micros = max(0, int(reserve_floor_micros))
+        self._reserve_pct_floor = 0
+        self._lock = threading.RLock()
+
+    @property
+    def reserve_floor_micros(self) -> int:
+        return int(self._reserve_floor_micros)
+
+    def _weights(self, policy: SplitPolicy) -> tuple[int, int, int, int]:
+        unlock = policy.unlock_index
+        long_pct = max(10, 35 - 5 * unlock)
+        reserve_pct = max(policy.reserve_floor_pct, 15 + 3 * unlock)
+        tax_pct = policy.tax_escrow_pct
+        if policy.regime == "CONTRACTION":
+            long_pct = max(5, long_pct - 10)
+            reserve_pct += 10
+        elif policy.regime == "EXPANSION":
+            long_pct += 5
+        reserve_pct = max(self._reserve_pct_floor, reserve_pct)
+        if long_pct + reserve_pct + tax_pct > 95:
+            long_pct = max(0, 95 - reserve_pct - tax_pct)
+        scalper_pct = max(0, 100 - long_pct - reserve_pct - tax_pct)
+        return long_pct, reserve_pct, tax_pct, scalper_pct
+
+    def split(
+        self, realized_net_micros: int, policy: SplitPolicy | None = None
+    ) -> dict[str, int]:
+        """Pure integer split; the legs always sum back to ``realized``."""
+        realized = max(0, int(realized_net_micros))
+        active = policy if policy is not None else SplitPolicy()
+        long_pct, reserve_pct, tax_pct, _scalper_pct = self._weights(active)
+        long_term = realized * long_pct // 100
+        reserve = realized * reserve_pct // 100
+        tax = realized * tax_pct // 100
+        scalper = realized - long_term - reserve - tax
+        return {
+            "realized_net_micros": realized,
+            "long_term_micros": long_term,
+            "reserve_micros": reserve,
+            "tax_escrow_micros": tax,
+            "scalper_micros": scalper,
+            "reserve_pct": reserve_pct,
+        }
+
+    def apply(
+        self,
+        silo: str,
+        realized_net_micros: int,
+        *,
+        policy: SplitPolicy | None = None,
+        now_ns: int | None = None,
+    ) -> SplitResult:
+        realized = int(realized_net_micros)
+        active = policy if policy is not None else SplitPolicy()
+        if realized <= 0:
+            return SplitResult(
+                silo=str(silo),
+                applied=False,
+                realized_net_micros=realized,
+                long_term_micros=0,
+                reserve_micros=0,
+                tax_escrow_micros=0,
+                scalper_micros=0,
+                reserve_floor_micros=self._reserve_floor_micros,
+                reserve_pct=self._reserve_pct_floor,
+                cross_border_wire_bps=0.0,
+                policy=active,
+            )
+        with self._lock:
+            legs = self.split(realized, active)
+            self.ledger.fund_cash(str(silo), realized, now_ns=now_ns)
+            long_term_transfer = self.ledger.fund_vault(
+                str(silo), VaultName.LONG_TERM_COMPOUNDER, legs["long_term_micros"], now_ns=now_ns
+            )
+            reserve_transfer = self.ledger.fund_vault(
+                str(silo), VaultName.RESERVE_YIELD, legs["reserve_micros"], now_ns=now_ns
+            )
+            scalper_transfer = self.ledger.fund_vault(
+                str(silo), VaultName.SPINAL_SCALPER, legs["scalper_micros"], now_ns=now_ns
+            )
+            tax_transfer_id = 0
+            if legs["tax_escrow_micros"] > 0:
+                tax_transfer = self.ledger.transfer_now(
+                    str(silo),
+                    debit=str(AccountCode.CASH),
+                    credit=TAX_ESCROW_ACCOUNT,
+                    amount_micros=legs["tax_escrow_micros"],
+                    code=int(TransferCode.PROFIT_RATCHET),
+                    now_ns=now_ns,
+                )
+                tax_transfer_id = int(tax_transfer.transfer_id)
+            self._reserve_floor_micros = max(
+                self._reserve_floor_micros,
+                int(self.ledger.balance(str(silo), str(VaultName.RESERVE_YIELD))),
+            )
+            self._reserve_pct_floor = max(self._reserve_pct_floor, legs["reserve_pct"])
+            return SplitResult(
+                silo=str(silo),
+                applied=True,
+                realized_net_micros=realized,
+                long_term_micros=legs["long_term_micros"],
+                reserve_micros=legs["reserve_micros"],
+                tax_escrow_micros=legs["tax_escrow_micros"],
+                scalper_micros=legs["scalper_micros"],
+                reserve_floor_micros=self._reserve_floor_micros,
+                reserve_pct=legs["reserve_pct"],
+                cross_border_wire_bps=0.0,
+                policy=active,
+                transfer_ids=(
+                    long_term_transfer.transfer_id,
+                    reserve_transfer.transfer_id,
+                    scalper_transfer.transfer_id,
+                    tax_transfer_id,
+                ),
+            )
+
+
+# ---------------------------------------------------------------------------
+# V1.9 -- all-or-none leg groups (E2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class DefinedRiskSpec:
+    """The maximum the whole basket may lose (``E2``)."""
+
+    group_id: str
+    max_loss_micros: int
+    legs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if int(self.max_loss_micros) <= 0:
+            raise ValueError("max_loss_micros must be positive")
+
+
+@dataclass(slots=True, frozen=True)
+class LegGroup:
+    """A multi-leg order that must exist all-or-none."""
+
+    group_id: str
+    silo: str
+    legs: tuple[UnsignedProposal, ...]
+    max_loss_micros: int = 0
+    hedge_leg_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.group_id:
+            raise ValueError("group_id must be non-empty")
+        if not self.legs:
+            raise ValueError("LegGroup must contain at least one leg")
+
+    @property
+    def defined_risk(self) -> DefinedRiskSpec:
+        return DefinedRiskSpec(
+            group_id=self.group_id,
+            max_loss_micros=max(1, int(self.max_loss_micros)),
+            legs=tuple(str(leg.proposal_id) for leg in self.legs),
+        )
+
+
+@dataclass(slots=True)
+class BasketReservation:
+    group_id: str
+    silo: str
+    state: OutboxState
+    reservations: tuple[Reservation, ...]
+    total_notional_micros: int
+    max_loss_micros: int
+    flatten_required: bool
+    failed_leg: str
+    reason: str
+
+    @property
+    def committed(self) -> bool:
+        return self.state is OutboxState.PENDING and not self.flatten_required
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "group_id": self.group_id,
+            "silo": self.silo,
+            "state": str(self.state),
+            "reservations": [r.to_dict() for r in self.reservations],
+            "total_notional_micros": self.total_notional_micros,
+            "max_loss_micros": self.max_loss_micros,
+            "flatten_required": self.flatten_required,
+            "failed_leg": self.failed_leg,
+            "reason": self.reason,
         }

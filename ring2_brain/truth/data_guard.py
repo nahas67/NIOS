@@ -1598,3 +1598,26 @@ class OrderflowNormalizer:
 
     def reset_latencies(self) -> None:
         self._latencies_ms.clear()
+
+# ---------------------------------------------------------------------------
+# V1.9 (F3) -- freshness lower bound on ingested evidence
+# ---------------------------------------------------------------------------
+
+
+def enforce_freshness_lower_bound(
+    packet: Any, *, not_stale_before_utc: int | None = None
+) -> bool:
+    """True when ``knowledge_ts_ns >= not_stale_before_utc`` (``0`` = no bound).
+
+    A stale-but-authentic packet is still stale: the digest proves integrity, not
+    currency.  Callers that need to fail closed should treat ``False`` as
+    ``STALE_EVIDENCE`` rather than silently re-using yesterday's number.
+    """
+    bound = (
+        int(not_stale_before_utc)
+        if not_stale_before_utc is not None
+        else int(getattr(packet, "not_stale_before_utc", 0) or 0)
+    )
+    if bound <= 0:
+        return True
+    return int(getattr(packet, "knowledge_ts_ns", 0)) >= bound

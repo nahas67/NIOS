@@ -312,6 +312,10 @@ class LocalJetStreamBus:
         self._next_seq: dict[str, int] = {s: 0 for s in STREAMS}
         self._consumers: dict[tuple[str, str], _ConsumerState] = {}
         self._dup_count: dict[str, int] = {s: 0 for s in STREAMS}
+        #: ``V1.9`` (``E1``): the highest sequence this process has *published*
+        #: per stream.  A consumer that has applied ``seq`` more than
+        #: ``staleness_budget`` behind this watermark is reading a stale book.
+        self._published_high_water: dict[str, int] = {s: 0 for s in STREAMS}
         self._max_msgs = int(max_msgs_per_stream)
         self._fsync = bool(fsync)
         self._path = Path(path) if path is not None else None
@@ -345,6 +349,7 @@ class LocalJetStreamBus:
                     self._next_seq[stream] = max(
                         self._next_seq[stream], event.sequence
                     )
+            self._published_high_water[stream] = self._next_seq[stream]
 
     def _persist(self, event: StreamEvent) -> None:
         if self._path is None:
@@ -417,6 +422,9 @@ class LocalJetStreamBus:
             self._logs[resolved].append(event)
             self._dedupe[resolved][key] = event
             self._next_seq[resolved] = sequence
+            self._published_high_water[resolved] = max(
+                self._published_high_water.get(resolved, 0), sequence
+            )
             self._persist(event)
             self._trim(resolved)
             return PublishReceipt(
@@ -503,6 +511,26 @@ class LocalJetStreamBus:
 
     def last_sequence(self, stream: str) -> int:
         return self.committed_count(stream)
+
+    # -- V1.9 (E1): staleness watermark ------------------------------------
+    def published_high_water(self, stream: str) -> int:
+        """Highest sequence this bus has published on ``stream``.
+
+        A read model whose ``applied_seq`` trails this by more than the
+        staleness budget is stale, and Ring 0 must refuse to trade on it.
+        """
+        if stream not in STREAMS:
+            raise UnknownStreamError(f"unknown stream {stream!r}")
+        with self._lock:
+            return int(self._published_high_water.get(stream, 0))
+
+    def high_water_all(self) -> dict[str, int]:
+        with self._lock:
+            return {stream: int(seq) for stream, seq in self._published_high_water.items()}
+
+    def staleness(self, stream: str, applied_seq: int) -> int:
+        """``published_high_water - applied_seq``, floored at zero."""
+        return max(0, self.published_high_water(stream) - int(applied_seq))
 
     def dedupe_hits(self, stream: str) -> int:
         """How many publishes were suppressed as duplicates."""
@@ -675,6 +703,16 @@ class JetStreamBus:
 
     def committed_count(self, stream: str) -> int:
         return self._require_local().committed_count(stream)
+
+    # -- V1.9 (E1): staleness watermark passthrough -----------------------
+    def published_high_water(self, stream: str) -> int:
+        return self._require_local().published_high_water(stream)
+
+    def high_water_all(self) -> dict[str, int]:
+        return self._require_local().high_water_all()
+
+    def staleness(self, stream: str, applied_seq: int) -> int:
+        return self._require_local().staleness(stream, applied_seq)
 
     def _require_local(self) -> LocalJetStreamBus:
         if self.backend is None:

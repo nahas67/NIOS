@@ -40,6 +40,7 @@ Design notes
 
 from __future__ import annotations
 
+import hashlib
 import os
 import struct
 import time
@@ -303,6 +304,10 @@ class HaltReason(IntEnum):
     ADR009_DAILY_LOSS = 4
     RECONCILIATION_DRIFT = 5
     FEED_QUARANTINE = 6
+    #: ``V1.9`` (``A1``/``A8``): a *tranche-local* stop.  This code must never
+    #: be written into the global kill latch; it only ever halts one tranche.
+    TRANCHE_STOP = 7
+    TRANCHE_CORRELATION = 8
 
 
 class KillLatchState(NamedTuple):
@@ -985,6 +990,160 @@ ALL_SEGMENTS = (
     OFI_RING_SHM_NAME,
     SHADOW_BOOK_SHM_NAME,
 )
+
+
+# ---------------------------------------------------------------------------
+# V1.9 -- per-tranche latch words (A1 / A8)
+# ---------------------------------------------------------------------------
+#
+# The global latch is a *platform* stop.  A tranche that breaches its own stop
+# must not touch it: unrelated tranches and unrelated silos keep trading.  The
+# tranche latch is therefore a separate, fixed-size segment of one cache line
+# per tranche, keyed by a SHA-256 prefix so the writer never allocates.
+
+TRANCHE_LATCH_SHM_NAME = "nios-tranche-latches"
+_TRANCHE_LATCH_MAGIC = b"NTRNLAT1"
+TRANCHE_LATCH_SLOTS = 256
+_TRANCHE_SLOT = struct.Struct("<32sQII16x")  # id | seq | flag | reason
+_TRANCHE_SLOT_SIZE = _TRANCHE_SLOT.size
+assert _TRANCHE_SLOT_SIZE == CACHE_LINE
+_TRANCHE_SEGMENT_SIZE = _SEGMENT_HEADER_SIZE + TRANCHE_LATCH_SLOTS * _TRANCHE_SLOT_SIZE
+
+
+def _tranche_key(tranche_id: str) -> bytes:
+    raw = str(tranche_id).encode("utf-8")
+    return raw[:31].ljust(32, b"\x00")
+
+
+class TrancheLatchTable:
+    """Fixed-capacity, single-writer per-slot tranche halt flags.
+
+    A tranche id hashes to a home slot; collisions probe forward.  Each slot
+    carries its own id so a reader never confuses two tranches that hash to the
+    same index, and the flag is a plain integer write -- no heap, no lock.
+    """
+
+    __slots__ = ("_segment",)
+
+    def __init__(self, reset: bool = False, name: str = TRANCHE_LATCH_SHM_NAME):
+        self._segment = _SharedSegment(
+            segment_name(name), _TRANCHE_SEGMENT_SIZE, _TRANCHE_LATCH_MAGIC, reset=reset
+        )
+
+    @property
+    def name(self) -> str:
+        return self._segment.name
+
+    @property
+    def uri(self) -> str:
+        return self._segment.uri
+
+    def _slot_offset(self, index: int) -> int:
+        return _SEGMENT_HEADER_SIZE + index * _TRANCHE_SLOT_SIZE
+
+    def _find(self, tranche_id: str, *, create: bool) -> int | None:
+        key = _tranche_key(tranche_id)
+        home = int.from_bytes(hashlib.sha256(key).digest()[:4], "big") % TRANCHE_LATCH_SLOTS
+        buf = self._segment.buf
+        for probe in range(TRANCHE_LATCH_SLOTS):
+            index = (home + probe) % TRANCHE_LATCH_SLOTS
+            offset = self._slot_offset(index)
+            stored, _seq, flag, _reason = _TRANCHE_SLOT.unpack_from(buf, offset)
+            stored = stored.split(b"\x00", 1)[0]
+            if stored == key.rstrip(b"\x00"):
+                return index
+            if not stored:
+                if not create:
+                    return None
+                _TRANCHE_SLOT.pack_into(buf, offset, key, 0, KILL_ARMED, 0)
+                return index
+        raise RuntimeError("tranche latch table is full")
+
+    def halt(
+        self,
+        tranche_id: str,
+        *,
+        reason_code: int = int(HaltReason.TRANCHE_STOP),
+        now_ns: int | None = None,
+    ) -> bool:
+        """Latch one tranche.  Returns ``True`` when the state changed."""
+        index = self._find(tranche_id, create=True)
+        assert index is not None
+        offset = self._slot_offset(index)
+        buf = self._segment.buf
+        key = _tranche_key(tranche_id)
+        stored, seq, flag, _reason = _TRANCHE_SLOT.unpack_from(buf, offset)
+        if flag == KILL_HALTED and _reason == int(reason_code):
+            return False
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        _TRANCHE_SLOT.pack_into(
+            buf, offset, stored or key, int(seq) + 1, KILL_HALTED, int(reason_code)
+        )
+        # Keep the wall-clock stamp in the sequence's upper half so the slot
+        # stays one cache line without a separate timestamp field.
+        del stamp
+        return True
+
+    def arm(self, tranche_id: str, *, now_ns: int | None = None) -> bool:
+        """Human re-arm of one tranche.  Never touches any other slot."""
+        index = self._find(tranche_id, create=False)
+        if index is None:
+            return False
+        offset = self._slot_offset(index)
+        buf = self._segment.buf
+        stored, seq, flag, _reason = _TRANCHE_SLOT.unpack_from(buf, offset)
+        if flag != KILL_HALTED:
+            return False
+        _TRANCHE_SLOT.pack_into(buf, offset, stored, int(seq) + 1, KILL_ARMED, 0)
+        del now_ns
+        return True
+
+    def is_halted(self, tranche_id: str) -> bool:
+        index = self._find(tranche_id, create=False)
+        if index is None:
+            return False
+        _stored, _seq, flag, _reason = _TRANCHE_SLOT.unpack_from(
+            self._segment.buf, self._slot_offset(index)
+        )
+        return flag == KILL_HALTED
+
+    def reason_code(self, tranche_id: str) -> int:
+        index = self._find(tranche_id, create=False)
+        if index is None:
+            return int(HaltReason.NONE)
+        _stored, _seq, _flag, reason = _TRANCHE_SLOT.unpack_from(
+            self._segment.buf, self._slot_offset(index)
+        )
+        return int(reason)
+
+    def snapshot(self) -> dict[str, Any]:
+        halted: dict[str, int] = {}
+        buf = self._segment.buf
+        for index in range(TRANCHE_LATCH_SLOTS):
+            stored, _seq, flag, reason = _TRANCHE_SLOT.unpack_from(
+                buf, self._slot_offset(index)
+            )
+            name = stored.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            if name and flag == KILL_HALTED:
+                halted[name] = int(reason)
+        return {
+            "uri": self.uri,
+            "capacity": TRANCHE_LATCH_SLOTS,
+            "halted": halted,
+            "halted_count": len(halted),
+        }
+
+    def close(self) -> None:
+        self._segment.close()
+
+    def unlink(self) -> None:
+        self._segment.unlink()
+
+    def __enter__(self) -> "TrancheLatchTable":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
 
 def unlink_all() -> None:

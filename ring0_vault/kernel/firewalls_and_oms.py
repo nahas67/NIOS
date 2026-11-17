@@ -45,10 +45,13 @@ from core.instrument_registry import (
 )
 from core.nats_bus import STREAM_RING0_EXECUTION, STREAM_RING3_COCKPIT
 from core.schemas import (
+    CorrelatedTrancheHeatError,
     PlainEnglishCockpitCard,
     UnsignedProposal,
     VAULT_NOTIONAL_CAP_PCT,
     VaultName,
+    canonical_pairs_digest,
+    select_regulatory_rules,
 )
 
 from ring0_vault.ibor.ledger_outbox import (
@@ -92,6 +95,17 @@ __all__ = [
     "TwapIcebergSlicer",
     "DrawdownCircuitBreaker",
     "SmartOMS",
+    # V1.9 order lifecycle + tranche independence
+    "OrderState",
+    "ORDER_TRANSITIONS",
+    "VOIDABLE_ORDER_STATES",
+    "OrderLifecycle",
+    "OrderLifecycleTracker",
+    "OrderLifecycleViolation",
+    "HedgeExitOrderingViolation",
+    "TrancheExposure",
+    "IndependenceVerdict",
+    "TrancheIndependenceGate",
 ]
 
 # ---------------------------------------------------------------------------
@@ -136,13 +150,25 @@ class OrderType(StrEnum):
 
 
 class FirewallStage(IntEnum):
-    """The five ordered stages of the sovereign pre-trade gate."""
+    """The ordered stages of the sovereign pre-trade gate.
+
+    ``V1.9`` appends environment-truth stages *after* the five constitutional
+    ones, so the numeric value of every pre-V1.9 stage is unchanged.
+    """
 
     GROUNDING = 1
     RISK_LIMITS = 2
     PRECISION_GATES = 3
     OUTBOX = 4
     SIGNING = 5
+    TIME_HEALTH = 6
+    MARKET_HOURS = 7
+    EGRESS_IP = 8
+    ALGO_ID = 9
+    OPS_LIMIT = 10
+    STALENESS = 11
+    TRANCHES = 12
+    HEDGE_ORDERING = 13
 
     @property
     def label(self) -> str:
@@ -152,6 +178,14 @@ class FirewallStage(IntEnum):
             FirewallStage.PRECISION_GATES: "CONFORMAL_AND_COPULA",
             FirewallStage.OUTBOX: "TWO_PHASE_OUTBOX",
             FirewallStage.SIGNING: "ED25519_SIGN",
+            FirewallStage.TIME_HEALTH: "TIME_HEALTH",
+            FirewallStage.MARKET_HOURS: "MARKET_HOURS",
+            FirewallStage.EGRESS_IP: "EGRESS_IP_WHITELIST",
+            FirewallStage.ALGO_ID: "EXCHANGE_ALGO_ID",
+            FirewallStage.OPS_LIMIT: "GLOBAL_OPS_BUCKET",
+            FirewallStage.STALENESS: "POSITION_STALENESS",
+            FirewallStage.TRANCHES: "TRANCHE_ISOLATION",
+            FirewallStage.HEDGE_ORDERING: "HEDGE_EXIT_ORDERING",
         }[self]
 
 
@@ -180,10 +214,17 @@ class SignedOrder:
     reduce_only: bool = False
     strategy_id: str = ""
     net_lb_bps: float = 0.0
+    #: ``V1.9`` (``B1``/``C7``/``E8``): exchange algo tag, clock offset used to
+    #: build the signed request and the consensus fencing epoch.  All three are
+    #: inside the signed payload when set, so a tampered tag fails verification.
+    exchange_algo_id: str = "NIOS_GENERIC_ALGO"
+    algo_id_kind: str = "GENERIC"
+    recv_window_offset_ms: int = 0
+    fencing_epoch: int = 0
 
     def payload(self) -> dict[str, Any]:
         """Reconstruct the exact canonical payload that was signed."""
-        return {
+        body: dict[str, Any] = {
             "proposal_id": self.proposal_id,
             "strategy_id": self.strategy_id,
             "silo": self.silo,
@@ -197,6 +238,15 @@ class SignedOrder:
             "order_type": str(self.order_type),
             "signed_at_ns": self.signed_at_ns,
         }
+        if self.exchange_algo_id and self.exchange_algo_id != "NIOS_GENERIC_ALGO":
+            body["exchange_algo_id"] = self.exchange_algo_id
+        if self.algo_id_kind and self.algo_id_kind != "GENERIC":
+            body["algo_id_kind"] = self.algo_id_kind
+        if self.recv_window_offset_ms:
+            body["recv_window_offset_ms"] = int(self.recv_window_offset_ms)
+        if self.fencing_epoch:
+            body["fencing_epoch"] = int(self.fencing_epoch)
+        return body
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -216,6 +266,10 @@ class SignedOrder:
             "signed_at_ns": self.signed_at_ns,
             "net_lb_bps": self.net_lb_bps,
             "reduce_only": self.reduce_only,
+            "exchange_algo_id": self.exchange_algo_id,
+            "algo_id_kind": self.algo_id_kind,
+            "recv_window_offset_ms": self.recv_window_offset_ms,
+            "fencing_epoch": self.fencing_epoch,
         }
 
 
@@ -235,7 +289,7 @@ class OrderSigner:
     material that may legitimately leave Ring 0.
     """
 
-    __slots__ = ("_ed25519", "_fernet", "_public_hex")
+    __slots__ = ("_ed25519", "_fernet", "_public_hex", "_recv_tracker")
 
     def __init__(self, *, ed25519_seed: bytes | None = None, fernet_key: bytes | None = None) -> None:
         from cryptography.fernet import Fernet
@@ -258,11 +312,29 @@ class OrderSigner:
         # measured Ring 0 path (the first primitive call costs ~10 ms cold).
         self._ed25519.sign(b"nios-signer-warmup")
         self._fernet.encrypt(b"nios-signer-warmup")
+        # V1.9 (C7): the venue clock offset is tracked per signer so every
+        # signed request carries the same recvWindow the offset implies.
+        from ring0_vault.silos.binance_microstructure import RecvWindowTracker
+
+        self._recv_tracker = RecvWindowTracker()
 
     # -- identity ---------------------------------------------------------
     @property
     def public_key_hex(self) -> str:
         return self._public_hex
+
+    # -- V1.9 (C7): recvWindow clock offset ------------------------------
+    def observe_server_time(self, server_time_ms: int, local_time_ms: int) -> int:
+        """Record the venue-vs-local clock offset and return the clamped value."""
+        return self._recv_tracker.observe_server_time(int(server_time_ms), int(local_time_ms))
+
+    @property
+    def recv_window_offset_ms(self) -> int:
+        return self._recv_tracker.offset_ms
+
+    @property
+    def recv_window_ms(self) -> int:
+        return self._recv_tracker.recv_window_ms
 
     # -- signing ----------------------------------------------------------
     @staticmethod
@@ -306,8 +378,21 @@ class OrderSigner:
         now_ns: int,
         qty: float | None = None,
         reduce_only: bool | None = None,
+        exchange_algo_id: str | None = None,
+        algo_id_kind: str | None = None,
+        fencing_epoch: int = 0,
     ) -> SignedOrder:
         qty_value = float(proposal.qty if qty is None else qty)
+        algo_id = str(
+            exchange_algo_id
+            if exchange_algo_id is not None
+            else getattr(proposal, "exchange_algo_id", "NIOS_GENERIC_ALGO")
+        )
+        kind = str(
+            algo_id_kind
+            if algo_id_kind is not None
+            else getattr(proposal, "algo_id_kind", "GENERIC")
+        ).upper()
         payload = {
             "proposal_id": str(proposal.proposal_id),
             "strategy_id": str(proposal.strategy_id),
@@ -322,6 +407,15 @@ class OrderSigner:
             "order_type": str(order_type),
             "signed_at_ns": int(now_ns),
         }
+        if algo_id and algo_id != "NIOS_GENERIC_ALGO":
+            payload["exchange_algo_id"] = algo_id
+        if kind and kind != "GENERIC":
+            payload["algo_id_kind"] = kind
+        offset = int(getattr(self, "recv_window_offset_ms", 0))
+        if offset:
+            payload["recv_window_offset_ms"] = offset
+        if int(fencing_epoch):
+            payload["fencing_epoch"] = int(fencing_epoch)
         digest, signature, token = self.sign_payload(payload)
         return SignedOrder(
             proposal_id=str(proposal.proposal_id),
@@ -342,6 +436,10 @@ class OrderSigner:
             ),
             strategy_id=str(proposal.strategy_id),
             net_lb_bps=round(float(net_lb_bps), 6),
+            exchange_algo_id=algo_id,
+            algo_id_kind=kind,
+            recv_window_offset_ms=offset,
+            fencing_epoch=int(fencing_epoch),
         )
 
     def verify_order(self, signed: SignedOrder) -> bool:
@@ -390,12 +488,25 @@ class FirewallVerdict:
             return ""
         return str(self.gate.outcome) if self.gate is not None else self.reason.split(":")[0]
 
+    @property
+    def code(self) -> str:
+        """``V1.9``: the stable error code prefix (``""`` when accepted).
+
+        Every rejection reason is written as ``CODE: detail``, so the code is
+        available without re-parsing the whole sentence at the caller.
+        """
+        if self.accepted:
+            return ""
+        head = str(self.reason).split(":", 1)[0].strip()
+        return head or self.abstain_code
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "accepted": self.accepted,
             "stage_reached": int(self.stage_reached),
             "stage_name": self.stage_name,
             "reason": self.reason,
+            "code": self.code,
             "silo": self.silo,
             "symbol": self.symbol,
             "proposal_id": self.proposal_id,
@@ -462,6 +573,26 @@ class SovereignPreTradeFirewall:
         grounding_store: Any = None,
         require_registered_grounding: bool = False,
         latency_budget_ns: int = FIREWALL_LATENCY_P95_BUDGET_NS,
+        # ---- V1.9 environment-truth and regulatory inputs ----------------
+        calendar: Any = None,
+        egress_ip: str = "",
+        egress_whitelist: Mapping[str, Iterable[str]] | None = None,
+        ops_bucket: Any = None,
+        bus: Any = None,
+        applied_seq: int = 0,
+        staleness_budget: int = 0,
+        clock_health: Any = None,
+        tranche_guard: Any = None,
+        independence_gate: Any = None,
+        require_registered_algo_id: bool = False,
+        ssr_active: bool = False,
+        last_sale_price: float = 0.0,
+        prior_close_price: float = 0.0,
+        extended_hours_spread_cap_bps: float = 0.0,
+        adl_rank_quantile: float = 0.0,
+        funding_bps: float = 0.0,
+        locate_fee_bps: float = 0.0,
+        borrow_confirmed: bool = True,
     ) -> None:
         self.ledger = ledger
         self.outbox = outbox
@@ -472,6 +603,34 @@ class SovereignPreTradeFirewall:
         self.grounding_store = grounding_store
         self.require_registered_grounding = bool(require_registered_grounding)
         self.latency_budget_ns = int(latency_budget_ns)
+
+        # V1.9 (E5/E6/B3/B2/E1): every one of these is optional, so a caller
+        # that does not opt in keeps the exact pre-V1.9 verdict path.
+        self.calendar = calendar
+        self.egress_ip = str(egress_ip or "")
+        self.egress_whitelist: dict[str, frozenset[str]] = {
+            str(silo): frozenset(str(ip) for ip in ips)
+            for silo, ips in (egress_whitelist or {}).items()
+        }
+        self.ops_bucket = ops_bucket
+        self.bus = bus
+        self.applied_seq = int(applied_seq)
+        self.staleness_budget = int(staleness_budget)
+        self.clock_health = clock_health
+        self.tranche_guard = tranche_guard
+        self.independence_gate = independence_gate
+        self.require_registered_algo_id = bool(require_registered_algo_id)
+        self.ssr_active = bool(ssr_active)
+        self.last_sale_price = float(last_sale_price)
+        self.prior_close_price = float(prior_close_price)
+        self.extended_hours_spread_cap_bps = float(extended_hours_spread_cap_bps)
+        self.adl_rank_quantile = float(adl_rank_quantile)
+        self.funding_bps = float(funding_bps)
+        self.locate_fee_bps = float(locate_fee_bps)
+        self.borrow_confirmed = bool(borrow_confirmed)
+        #: ``E8``: consensus fencing epoch stamped into every signed order.
+        self.fencing_epoch = 0
+        self._tranche_exposures: list[Any] = []
 
         self.whitelists: dict[str, frozenset[str]] = {
             str(silo): frozenset(str(s).upper() for s in symbols)
@@ -585,6 +744,175 @@ class SovereignPreTradeFirewall:
 
     # -- main gate --------------------------------------------------------
     @_zero_gc
+    # -- V1.9 environment-truth / regulatory preflight --------------------
+    def _in_regular_session(self, silo: str, now_ns: int) -> bool:
+        if self.calendar is not None:
+            session = self.calendar.session_for(silo, now_ns)
+            if session is None:
+                return False
+            return not session.half_day
+        # Deterministic fallback: US regular hours 13:30-20:00 UTC.
+        seconds = (int(now_ns) // 1_000_000_000) % 86_400
+        return 13 * 3600 + 1800 <= seconds < 20 * 3600
+
+    def preflight_checks(
+        self, proposal: UnsignedProposal, *, now_ns: int
+    ) -> tuple[FirewallStage, str] | None:
+        """Every V1.9 environment/regulatory gate, in one ordered function.
+
+        Returns ``(stage, reason)`` for the first failing check, or ``None``.
+        Keeping this separate from :meth:`evaluate` means each check is unit
+        testable without a ledger, an outbox or a signer.
+        """
+        silo = str(proposal.silo).strip().upper()
+        reduce_only = bool(getattr(proposal, "is_reduce_only", False))
+
+        # E5 -- real clock health (fail closed on a budget breach).
+        if self.clock_health is not None:
+            health = self.clock_health() if callable(self.clock_health) else self.clock_health
+            if isinstance(health, Mapping):
+                healthy = bool(health.get("ok", True))
+                offset_ms = int(health.get("offset_ms", 0) or 0)
+                budget_ms = int(health.get("budget_ms", 0) or 0)
+            else:
+                healthy = bool(health)
+                offset_ms, budget_ms = 0, 0
+            if not healthy:
+                return (
+                    FirewallStage.TIME_HEALTH,
+                    "TIME_HEALTH_BUDGET_BREACH: clock offset "
+                    f"{offset_ms} ms exceeds the {budget_ms} ms budget",
+                )
+
+        # E6 -- DST-aware venue calendar.
+        if self.calendar is not None:
+            session = self.calendar.session_for(silo, now_ns)
+            if session is None:
+                return (
+                    FirewallStage.MARKET_HOURS,
+                    f"VENUE_CLOSED: {silo} has no trading session at {now_ns}",
+                )
+
+        # B3 -- static egress IP allowlist.
+        whitelist = self.egress_whitelist.get(silo)
+        if whitelist is not None:
+            ip = str(self.egress_ip or "").strip()
+            if not ip or ip not in whitelist:
+                return (
+                    FirewallStage.EGRESS_IP,
+                    f"EGRESS_IP_NOT_WHITELISTED: {ip or '<unset>'} is not approved for {silo}",
+                )
+
+        # B1 -- SEBI/NSE algo identification.
+        if silo == "INDIA_ZERODHA_DHAN":
+            algo_id = str(getattr(proposal, "exchange_algo_id", "") or "").strip()
+            kind = str(getattr(proposal, "algo_id_kind", "GENERIC")).strip().upper()
+            if not algo_id:
+                return (
+                    FirewallStage.ALGO_ID,
+                    "ALGO-ID-MISSING: Indian orders require exchange_algo_id",
+                )
+            if self.require_registered_algo_id and kind != "REGISTERED":
+                return (
+                    FirewallStage.ALGO_ID,
+                    f"ALGO-ID-MISSING: {algo_id} is GENERIC but this silo requires a REGISTERED id",
+                )
+
+        # B2 -- global 10 OPS integer-micro token bucket.
+        if self.ops_bucket is not None:
+            try:
+                granted = bool(self.ops_bucket.acquire(now_ns=now_ns))
+            except Exception:  # pragma: no cover - a limiter must fail closed
+                granted = False
+            if not granted:
+                return (
+                    FirewallStage.OPS_LIMIT,
+                    "OPS-LIMIT: global 10 OPS token bucket exhausted for this UTC second",
+                )
+
+        # E1 -- position-state staleness against the published watermark.
+        if self.bus is not None and self.staleness_budget > 0:
+            try:
+                trailing = int(self.bus.staleness(STREAM_RING0_EXECUTION, self.applied_seq))
+            except Exception:  # pragma: no cover - a bus must never raise here
+                trailing = 0
+            if trailing > self.staleness_budget:
+                return (
+                    FirewallStage.STALENESS,
+                    "STALE_POSITION_STATE: applied_seq "
+                    f"{self.applied_seq} trails the published high-water by "
+                    f"{trailing} > {self.staleness_budget}",
+                )
+
+        # A1 / A8 -- a halted tranche blocks only itself.
+        tranche_id = str(getattr(proposal, "tranche_id", "") or "")
+        if tranche_id and self.tranche_guard is not None:
+            if self.tranche_guard.is_halted(tranche_id):
+                return (
+                    FirewallStage.TRANCHES,
+                    f"TRANCHE_HALT: tranche {tranche_id} is halted; unrelated "
+                    "tranches and silos are unaffected",
+                )
+
+        # A2 -- correlated-tranche heat and effective independent bets.
+        if self.independence_gate is not None and self._tranche_exposures:
+            verdict = self.independence_gate.evaluate(self._tranche_exposures)
+            if not verdict.get("allowed", True):
+                return (
+                    FirewallStage.TRANCHES,
+                    f"CORRELATED_TRANCHE_HEAT_EXCEEDED: {verdict.get('reason', '')}",
+                )
+
+        # D2 -- a short sale needs a confirmed borrow and its locate fee.
+        if str(proposal.side).upper() == "SELL" and not reduce_only:
+            if self.locate_fee_bps > 0.0 and not self.borrow_confirmed:
+                return (
+                    FirewallStage.RISK_LIMITS,
+                    "SHORT_BORROW_UNCONFIRMED: locate fee "
+                    f"{self.locate_fee_bps:.2f} bps is priced but the borrow is not confirmed",
+                )
+
+        # D4 -- Reg SHO short-sale-restriction uptick rule.
+        if silo == "US_IBKR" and self.ssr_active and str(proposal.side).upper() == "SELL":
+            uptick_ok = (
+                self.prior_close_price > 0.0
+                and self.last_sale_price > self.prior_close_price
+            )
+            if not uptick_ok:
+                return (
+                    FirewallStage.RISK_LIMITS,
+                    "SSR_UPTICK_VIOLATION: short sale is not on an uptick while SSR is active",
+                )
+
+        # D5 -- extended-hours spread guard.
+        if (
+            silo == "US_IBKR"
+            and self.extended_hours_spread_cap_bps > 0.0
+            and not self._in_regular_session(silo, now_ns)
+            and float(proposal.spread_bps) > self.extended_hours_spread_cap_bps
+        ):
+            return (
+                FirewallStage.RISK_LIMITS,
+                "EXTENDED_HOURS_SPREAD_GUARD: "
+                f"{float(proposal.spread_bps):.1f} bps > "
+                f"{self.extended_hours_spread_cap_bps:.1f} bps cap outside regular hours",
+            )
+
+        # C2 -- Binance ADL risk budget.
+        if silo == "CRYPTO_BINANCE" and self.adl_rank_quantile >= 0.90:
+            return (
+                FirewallStage.RISK_LIMITS,
+                "ADL_RISK_BUDGET_EXCEEDED: adl_rank_quantile "
+                f"{self.adl_rank_quantile:.2f} >= 0.90",
+            )
+
+        return None
+
+    @staticmethod
+    def proposal_digest(proposal: UnsignedProposal) -> str:
+        """``F6``: the immutable input commitment checked either side of signing."""
+        return canonical_pairs_digest(proposal.to_dict().items())
+
     def evaluate(
         self,
         proposal: UnsignedProposal,
@@ -640,6 +968,14 @@ class SovereignPreTradeFirewall:
                 FirewallStage.RISK_LIMITS,
                 f"SILO_HALTED: {self.guard.reason(silo) or 'global kill latch is hot'}",
             )
+
+        # -- stage 0b: V1.9 environment truth + regulatory preflight ------
+        # F6: commit to the exact proposal inputs *before* any stage can touch
+        # the outbox, then prove they did not move before signing.
+        frozen_digest = self.proposal_digest(proposal)
+        preflight = self.preflight_checks(proposal, now_ns=stamp)
+        if preflight is not None:
+            return _reject(preflight[0], preflight[1])
 
         # -- stage 1: grounding digest ------------------------------------
         grounding_ok, grounding_detail = self.verify_grounding(
@@ -771,7 +1107,33 @@ class SovereignPreTradeFirewall:
             order_type=kind,
             now_ns=stamp,
             qty=effective_qty,
+            exchange_algo_id=proposal.exchange_algo_id,
+            algo_id_kind=proposal.algo_id_kind,
+            fencing_epoch=self.fencing_epoch,
         )
+
+        # ``F6``: the inputs are frozen, but a bug (or a hostile holder with
+        # ``object.__setattr__``) could still move them between the gate and the
+        # signature.  If the commitment changed, the reservation is voided and
+        # nothing is signed into the book.
+        if self.proposal_digest(proposal) != frozen_digest:
+            try:
+                self.outbox.void(
+                    reservation.outbox_idempotency_key,
+                    reason="INPUT_MUTATED_BEFORE_SIGNING",
+                    now_ns=stamp,
+                )
+            except LedgerError:  # pragma: no cover - defensive
+                pass
+            return _reject(
+                FirewallStage.SIGNING,
+                "INPUT_MUTATED_BEFORE_SIGNING: proposal inputs changed between "
+                "gate evaluation and signing",
+                gate=gate_decision,
+                shield=shield_decision,
+                net_lb=gate_decision.net_lb_bps,
+                notional=notional_micros,
+            )
 
         latency = time.perf_counter_ns() - started
         return FirewallVerdict(
@@ -1455,6 +1817,9 @@ class SmartOMS:
         self._chasers: dict[str, MakerPegChaser] = {}
         self._events: list[ExecutionEvent] = []
         self._cards: list[PlainEnglishCockpitCard] = []
+        # V1.9 (E4): the strict order lifecycle FSM, with ExecID de-duplication
+        # and the venue-authoritative LeavesQty.
+        self.lifecycle = OrderLifecycleTracker()
 
     # -- contract enforcement ---------------------------------------------
     def validate_proposal(self, proposal: Any) -> InstrumentCheck:
@@ -1598,6 +1963,7 @@ class SmartOMS:
                 created_ns=stamp,
             )
             self._chasers[chaser.order_id] = chaser
+            self.lifecycle.track(chaser.order_id, float(chaser.qty))
             self.publish_execution(
                 ExecutionEvent(
                     event_type="MAKER_PEG_POSTED",
@@ -1707,6 +2073,16 @@ class SmartOMS:
             if chaser is None:
                 raise KeyError(f"unknown order {order_id!r}")
             chaser.mark_filled(price)
+            # E4: ExecID de-duplication and the venue-authoritative LeavesQty.
+            try:
+                self.lifecycle.apply_exec(
+                    str(order_id),
+                    exec_id=f"fill:{chaser.order_id}:{chaser.qty}",
+                    last_qty=float(chaser.qty),
+                    leaves_qty=0.0,
+                )
+            except KeyError:  # pragma: no cover - defensive
+                pass
             reservation = self.outbox.commit(
                 chaser.outbox_key,
                 broker_order_id=chaser.order_id,
@@ -1740,6 +2116,37 @@ class SmartOMS:
     def on_ack(self, ack: BrokerAck) -> Reservation | None:
         """Route a broker ack through the idempotent outbox inbox."""
         result = self.outbox.handle_ack(ack)
+        state = str(getattr(ack, "state", "")).upper()
+        for chaser in list(self._chasers.values()):
+            if chaser.outbox_key == str(ack.outbox_idempotency_key):
+                try:
+                    if state == "FILLED":
+                        self.lifecycle.apply_exec(
+                            chaser.order_id,
+                            exec_id=f"ack:{ack.broker_order_id}",
+                            last_qty=float(chaser.qty),
+                            leaves_qty=0.0,
+                        )
+                    elif state == "PARTIALLY_FILLED":
+                        self.lifecycle.apply_exec(
+                            chaser.order_id,
+                            exec_id=f"ack:{ack.broker_order_id}:{ack.filled_qty_micros}",
+                            last_qty=float(ack.filled_qty_micros) / 1_000_000.0,
+                            leaves_qty=max(
+                                0.0,
+                                float(chaser.qty)
+                                - float(ack.filled_qty_micros) / 1_000_000.0,
+                            ),
+                        )
+                    elif state == "CANCELED":
+                        self.lifecycle.transition(chaser.order_id, OrderState.CANCELED, reason="venue canceled")
+                    elif state == "REJECTED":
+                        self.lifecycle.transition(chaser.order_id, OrderState.REJECTED, reason="venue rejected")
+                    elif state == "WORKING":
+                        self.lifecycle.transition(chaser.order_id, OrderState.ACCEPTED, reason="venue working")
+                except (KeyError, OrderLifecycleViolation):
+                    pass
+                break
         return result.reservation
 
     def cancel(
@@ -1749,8 +2156,17 @@ class SmartOMS:
         chaser = self._chasers.get(str(order_id))
         if chaser is None:
             raise KeyError(f"unknown order {order_id!r}")
+        try:
+            self.lifecycle.transition(str(order_id), OrderState.PENDING_CANCEL, reason=reason)
+        except (KeyError, OrderLifecycleViolation):
+            pass
         chaser.mark_canceled(reason)
-        return self._resolve_cancel(chaser, reason=reason, now_ns=stamp)
+        reservation = self._resolve_cancel(chaser, reason=reason, now_ns=stamp)
+        try:
+            self.lifecycle.transition(str(order_id), OrderState.CANCELED, reason=reason)
+        except (KeyError, OrderLifecycleViolation):
+            pass
+        return reservation
 
     def cancel_all_entries(
         self,
@@ -1885,6 +2301,147 @@ class SmartOMS:
     def cards(self) -> tuple[PlainEnglishCockpitCard, ...]:
         return tuple(self._cards)
 
+    # -- V1.9 (B5/B6/E4): freeze slicing and hedge-leg exit ordering -------
+    def _instrument_spec(self, symbol: str) -> Any:
+        registry = self.instruments
+        for name in ("get", "by_symbol", "lookup", "spec"):
+            getter = getattr(registry, name, None)
+            if callable(getter):
+                try:
+                    spec = getter(str(symbol))
+                except Exception:
+                    continue
+                if spec is not None:
+                    return spec
+        return None
+
+    def freeze_slices(self, symbol: str, qty: float) -> tuple[float, ...]:
+        """Split an F&O order above ``instrument.freeze_quantity`` (``B5``).
+
+        Every child is at or below the exchange freeze quantity and snapped to
+        the lot grid, so a single parent intent becomes a compliant child set
+        under one parent idempotency key.
+        """
+        total = float(qty)
+        if total <= 0.0:
+            raise ValueError("qty must be positive")
+        spec = self._instrument_spec(symbol)
+        if spec is None:
+            return (total,)
+        freeze = int(getattr(spec, "freeze_quantity", 0) or 0)
+        lot = max(1, int(getattr(spec, "lot_size", 1) or 1))
+        if freeze <= 0 or total <= freeze:
+            return (total,)
+        child_cap = max(lot, (freeze // lot) * lot)
+        children: list[float] = []
+        remaining = total
+        while remaining > 0.0:
+            take = min(float(child_cap), remaining)
+            if remaining - take < lot and remaining - take > 0.0:
+                take = remaining
+            children.append(round(take, 8))
+            remaining = round(remaining - take, 8)
+        return tuple(children)
+
+    def submit_frozen_order(
+        self,
+        proposal: UnsignedProposal,
+        *,
+        book: tuple[float, float],
+        now_ns: int | None = None,
+        cost_floor: Any = None,
+    ) -> dict[str, Any]:
+        """Submit a freeze-compliant child set under one parent key."""
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        slices = self.freeze_slices(str(proposal.symbol), float(proposal.qty))
+        parent_key = hashlib.sha256(
+            f"{proposal.proposal_id}:{proposal.symbol}:{proposal.qty}:{stamp}".encode("utf-8")
+        ).hexdigest()
+        children: list[dict[str, Any]] = []
+        for index, child_qty in enumerate(slices):
+            child = replace(
+                proposal,
+                proposal_id=f"{proposal.proposal_id}-c{index}",
+                qty=float(child_qty),
+            )
+            reservation = self.outbox.reserve(child, now_ns=stamp, cost_floor=cost_floor)
+            chaser = self.submit_maker_peg(child, reservation, book, now_ns=stamp)
+            self.lifecycle.track(chaser.order_id, float(chaser.qty))
+            self.lifecycle.transition(
+                chaser.order_id, OrderState.PENDING_NEW, reason="child slice submitted"
+            )
+            children.append(
+                {
+                    "child_id": chaser.order_id,
+                    "qty": float(chaser.qty),
+                    "outbox_key": reservation.outbox_idempotency_key,
+                }
+            )
+        return {
+            "parent_idempotency_key": parent_key,
+            "parent_proposal_id": str(proposal.proposal_id),
+            "freeze_quantity": int(
+                getattr(self._instrument_spec(str(proposal.symbol)), "freeze_quantity", 0) or 0
+            ),
+            "slices": list(slices),
+            "children": children,
+        }
+
+    @staticmethod
+    def _leg_field(leg: Any, name: str, default: Any = None) -> Any:
+        if isinstance(leg, Mapping):
+            return leg.get(name, default)
+        return getattr(leg, name, default)
+
+    def exit_leg_group(
+        self,
+        legs: Any,
+        *,
+        requested_order: Any = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """``B6``: close the high-margin/short leg first, the hedge leg last.
+
+        Reversing the exit (hedge first, naked short last) is exactly how a
+        defined-risk structure becomes undefined-risk mid-exit, so it raises
+        ``HEDGE_EXIT_ORDERING_VIOLATION`` instead of being "fixed" silently.
+        """
+        normalized: list[dict[str, Any]] = []
+        for leg in legs:
+            normalized.append(
+                {
+                    "leg_id": str(self._leg_field(leg, "leg_id", self._leg_field(leg, "id", ""))),
+                    "side": str(self._leg_field(leg, "side", "BUY")).upper(),
+                    "margin_pct": float(self._leg_field(leg, "margin_pct", 0.0) or 0.0),
+                    "is_hedge": bool(self._leg_field(leg, "is_hedge", False)),
+                }
+            )
+        if not normalized:
+            raise ValueError("legs must contain at least one leg")
+        desired = sorted(
+            normalized,
+            key=lambda leg: (1 if leg["is_hedge"] else 0, -leg["margin_pct"], leg["leg_id"]),
+        )
+        if requested_order is not None:
+            requested = [str(item) for item in requested_order]
+            hedge_positions = [
+                index
+                for index, leg_id in enumerate(requested)
+                if any(leg["leg_id"] == leg_id and leg["is_hedge"] for leg in normalized)
+            ]
+            non_hedge_positions = [
+                index
+                for index, leg_id in enumerate(requested)
+                if any(leg["leg_id"] == leg_id and not leg["is_hedge"] for leg in normalized)
+            ]
+            if hedge_positions and non_hedge_positions and min(hedge_positions) < max(
+                non_hedge_positions
+            ):
+                raise HedgeExitOrderingViolation(
+                    "HEDGE_EXIT_ORDERING_VIOLATION: the protective hedge leg must "
+                    "be closed last, after the high-margin/short legs"
+                )
+        return tuple(desired)
+
     def drawdown_snapshot(self) -> dict[str, Any]:
         """Read-only drawdown / circuit-breaker state for the cockpit."""
         return self.drawdown.snapshot()
@@ -1919,3 +2476,407 @@ class SmartOMS:
             "events_cleared": events,
             "drawdown": drawdown,
         }
+
+# ---------------------------------------------------------------------------
+# V1.9 -- strict order lifecycle FSM (E4)
+# ---------------------------------------------------------------------------
+
+class OrderLifecycleViolation(Exception):
+    """``ORDER_FSM_VIOLATION`` -- an illegal lifecycle edge was requested."""
+
+    code = "ORDER_FSM_VIOLATION"
+
+
+class HedgeExitOrderingViolation(Exception):
+    """``422 HEDGE_EXIT_ORDERING_VIOLATION`` -- hedge leg closed too early."""
+
+    code = "HEDGE_EXIT_ORDERING_VIOLATION"
+
+
+class OrderState(StrEnum):
+    NEW = "NEW"
+    PENDING_NEW = "PENDING_NEW"
+    ACCEPTED = "ACCEPTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    PENDING_CANCEL = "PENDING_CANCEL"
+    PENDING_REPLACE = "PENDING_REPLACE"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    REJECTED = "REJECTED"
+
+
+#: Strict allowlist.  Anything not listed is refused rather than "coerced".
+ORDER_TRANSITIONS: Mapping[OrderState, frozenset[OrderState]] = {
+    OrderState.NEW: frozenset({OrderState.PENDING_NEW, OrderState.REJECTED}),
+    OrderState.PENDING_NEW: frozenset(
+        {OrderState.ACCEPTED, OrderState.REJECTED, OrderState.PENDING_CANCEL}
+    ),
+    OrderState.ACCEPTED: frozenset(
+        {
+            OrderState.PARTIALLY_FILLED,
+            OrderState.PENDING_CANCEL,
+            OrderState.PENDING_REPLACE,
+            OrderState.FILLED,
+            OrderState.REJECTED,
+        }
+    ),
+    OrderState.PARTIALLY_FILLED: frozenset(
+        {
+            OrderState.PARTIALLY_FILLED,
+            OrderState.PENDING_CANCEL,
+            OrderState.PENDING_REPLACE,
+            OrderState.FILLED,
+        }
+    ),
+    OrderState.PENDING_CANCEL: frozenset({OrderState.CANCELED, OrderState.REJECTED}),
+    OrderState.PENDING_REPLACE: frozenset(
+        {OrderState.ACCEPTED, OrderState.PENDING_CANCEL, OrderState.REJECTED}
+    ),
+    OrderState.FILLED: frozenset(),
+    OrderState.CANCELED: frozenset(),
+    OrderState.REJECTED: frozenset(),
+}
+
+#: ``E4``: only a confirmed terminal cancel/reject may void a reservation.
+VOIDABLE_ORDER_STATES: frozenset[OrderState] = frozenset(
+    {OrderState.CANCELED, OrderState.REJECTED}
+)
+
+
+@dataclass(slots=True)
+class OrderLifecycle:
+    """One order's state, ExecID set, fill quantities and audit history."""
+
+    order_id: str
+    qty: float
+    state: OrderState = OrderState.NEW
+    leaves_qty: float = 0.0
+    filled_qty: float = 0.0
+    exec_ids: set[str] = field(default_factory=set)
+    history: list[dict[str, Any]] = field(default_factory=list)
+    created_ns: int = field(default_factory=time.time_ns)
+
+    def __post_init__(self) -> None:
+        self.qty = float(self.qty)
+        if self.qty <= 0.0:
+            raise ValueError("qty must be positive")
+        self.leaves_qty = float(self.qty)
+        self.history.append({"state": str(self.state), "reason": "created", "at_ns": self.created_ns})
+
+    def transition(
+        self, new_state: OrderState | str, *, reason: str = "", now_ns: int | None = None
+    ) -> OrderState:
+        target = new_state if isinstance(new_state, OrderState) else OrderState(str(new_state).upper())
+        allowed = ORDER_TRANSITIONS.get(self.state, frozenset())
+        if target not in allowed:
+            raise OrderLifecycleViolation(
+                f"ORDER_FSM_VIOLATION: {self.order_id} cannot move "
+                f"{self.state} -> {target}"
+            )
+        self.state = target
+        self.history.append(
+            {
+                "state": str(target),
+                "reason": str(reason),
+                "at_ns": int(now_ns if now_ns is not None else time.time_ns()),
+            }
+        )
+        return self.state
+
+    def apply_exec(
+        self,
+        *,
+        exec_id: str,
+        last_qty: float,
+        leaves_qty: float,
+        now_ns: int | None = None,
+    ) -> dict[str, Any]:
+        """Apply one execution report, de-duplicating by ``ExecID``.
+
+        The venue's ``LeavesQty`` is authoritative: a local subtraction can
+        drift when a partial fill races a cancel, and the venue is the only
+        party that actually knows what is still working.
+        """
+        token = str(exec_id or "").strip()
+        if not token:
+            raise ValueError("exec_id must be non-empty")
+        if token in self.exec_ids:
+            return {
+                "applied": False,
+                "duplicate": True,
+                "exec_id": token,
+                "state": str(self.state),
+                "leaves_qty": float(self.leaves_qty),
+                "filled_qty": float(self.filled_qty),
+            }
+        self.exec_ids.add(token)
+        qty = max(0.0, float(last_qty))
+        self.filled_qty = min(self.qty, round(self.filled_qty + qty, 8))
+        authoritative = max(0.0, float(leaves_qty))
+        self.leaves_qty = min(self.qty, authoritative)
+        if self.leaves_qty <= 0.0 and self.state in (
+            OrderState.ACCEPTED,
+            OrderState.PARTIALLY_FILLED,
+            OrderState.PENDING_NEW,
+        ):
+            self.state = OrderState.FILLED
+            self.history.append(
+                {
+                    "state": str(OrderState.FILLED),
+                    "reason": f"exec {token}",
+                    "at_ns": int(now_ns if now_ns is not None else time.time_ns()),
+                }
+            )
+        elif self.state is OrderState.ACCEPTED and self.filled_qty > 0.0:
+            self.state = OrderState.PARTIALLY_FILLED
+            self.history.append(
+                {
+                    "state": str(OrderState.PARTIALLY_FILLED),
+                    "reason": f"exec {token}",
+                    "at_ns": int(now_ns if now_ns is not None else time.time_ns()),
+                }
+            )
+        return {
+            "applied": True,
+            "duplicate": False,
+            "exec_id": token,
+            "state": str(self.state),
+            "leaves_qty": float(self.leaves_qty),
+            "filled_qty": float(self.filled_qty),
+        }
+
+    @property
+    def void_allowed(self) -> bool:
+        return self.state in VOIDABLE_ORDER_STATES
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "order_id": self.order_id,
+            "qty": self.qty,
+            "state": str(self.state),
+            "leaves_qty": self.leaves_qty,
+            "filled_qty": self.filled_qty,
+            "exec_ids": sorted(self.exec_ids),
+            "void_allowed": self.void_allowed,
+            "history": list(self.history),
+        }
+
+
+class OrderLifecycleTracker:
+    """Registry of :class:`OrderLifecycle` objects, one per order id."""
+
+    def __init__(self) -> None:
+        self._orders: dict[str, OrderLifecycle] = {}
+        self._lock = threading.RLock()
+
+    def track(self, order_id: str, qty: float) -> OrderLifecycle:
+        with self._lock:
+            key = str(order_id)
+            lifecycle = self._orders.get(key)
+            if lifecycle is None:
+                lifecycle = OrderLifecycle(order_id=key, qty=float(qty))
+                self._orders[key] = lifecycle
+            return lifecycle
+
+    def lifecycle(self, order_id: str) -> OrderLifecycle | None:
+        with self._lock:
+            return self._orders.get(str(order_id))
+
+    def transition(
+        self, order_id: str, state: OrderState | str, *, reason: str = ""
+    ) -> OrderState:
+        with self._lock:
+            lifecycle = self._orders.get(str(order_id))
+            if lifecycle is None:
+                raise KeyError(f"unknown order {order_id!r}")
+            return lifecycle.transition(state, reason=reason)
+
+    def apply_exec(
+        self, order_id: str, *, exec_id: str, last_qty: float, leaves_qty: float
+    ) -> dict[str, Any]:
+        with self._lock:
+            lifecycle = self._orders.get(str(order_id))
+            if lifecycle is None:
+                raise KeyError(f"unknown order {order_id!r}")
+            return lifecycle.apply_exec(
+                exec_id=exec_id, last_qty=last_qty, leaves_qty=leaves_qty
+            )
+
+    def void_allowed(self, order_id: str) -> bool:
+        with self._lock:
+            lifecycle = self._orders.get(str(order_id))
+            return bool(lifecycle is not None and lifecycle.void_allowed)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "orders": [lifecycle.to_dict() for lifecycle in self._orders.values()],
+                "count": len(self._orders),
+            }
+
+
+# ---------------------------------------------------------------------------
+# V1.9 -- tranche correlation independence gate (A2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class TrancheExposure:
+    """One tranche's portfolio weight and its pairwise correlations."""
+
+    tranche_id: str
+    silo: str
+    side: str
+    weight: float
+    correlations: Mapping[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        weight = float(self.weight)
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError("weight must be finite and non-negative")
+        object.__setattr__(self, "weight", weight)
+        side = str(self.side or "LONG").strip().upper()
+        if side not in ("LONG", "SHORT"):
+            raise ValueError("side must be LONG or SHORT")
+        object.__setattr__(self, "side", side)
+        object.__setattr__(
+            self,
+            "correlations",
+            {str(key): float(value) for key, value in dict(self.correlations).items()},
+        )
+
+    def correlation(self, other_id: str) -> float:
+        return float(self.correlations.get(str(other_id), 0.0))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tranche_id": self.tranche_id,
+            "silo": self.silo,
+            "side": self.side,
+            "weight": self.weight,
+            "correlations": dict(self.correlations),
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class IndependenceVerdict:
+    allowed: bool
+    code: str
+    n_eff: float
+    total_heat_pct: float
+    buckets: tuple[dict[str, Any], ...]
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "code": self.code,
+            "n_eff": self.n_eff,
+            "total_heat_pct": self.total_heat_pct,
+            "buckets": list(self.buckets),
+            "reason": self.reason,
+        }
+
+
+class TrancheIndependenceGate:
+    """``N_eff`` and the 2% correlated bucket / 6% total heat caps (``A2``).
+
+    ``N_eff = (sum w)^2 / sum(w_i * w_j * rho_ij)`` counts how many genuinely
+    independent bets the book is holding.  Same-side tranches with
+    ``|rho| > 0.7`` are one bet, so they share a single 2% bucket; the whole
+    portfolio may not carry more than 6% heat.
+    """
+
+    def __init__(
+        self,
+        *,
+        bucket_cap_pct: float = 0.02,
+        heat_cap_pct: float = 0.06,
+        correlation_threshold: float = 0.7,
+    ) -> None:
+        self.bucket_cap_pct = float(bucket_cap_pct)
+        self.heat_cap_pct = float(heat_cap_pct)
+        self.correlation_threshold = float(correlation_threshold)
+
+    def evaluate(self, tranches: Iterable[TrancheExposure]) -> IndependenceVerdict:
+        items = list(tranches)
+        if not items:
+            return IndependenceVerdict(True, "OK", 0.0, 0.0, (), "no tranche exposure")
+        total = sum(item.weight for item in items)
+        denominator = 0.0
+        for left in items:
+            for right in items:
+                rho = 1.0 if left.tranche_id == right.tranche_id else left.correlation(
+                    right.tranche_id
+                )
+                denominator += left.weight * right.weight * rho
+        n_eff = (total * total / denominator) if denominator > 0.0 else 0.0
+
+        parent = {item.tranche_id: item.tranche_id for item in items}
+
+        def find(node: str) -> str:
+            while parent[node] != node:
+                parent[node] = parent[parent[node]]
+                node = parent[node]
+            return node
+
+        def union(a: str, b: str) -> None:
+            root_a, root_b = find(a), find(b)
+            if root_a != root_b:
+                parent[root_b] = root_a
+
+        for index, left in enumerate(items):
+            for right in items[index + 1 :]:
+                if left.side != right.side:
+                    continue
+                rho = max(abs(left.correlation(right.tranche_id)), abs(right.correlation(left.tranche_id)))
+                if rho > self.correlation_threshold:
+                    union(left.tranche_id, right.tranche_id)
+
+        buckets: dict[str, list[TrancheExposure]] = {}
+        for item in items:
+            buckets.setdefault(find(item.tranche_id), []).append(item)
+
+        bucket_rows: list[dict[str, Any]] = []
+        breached_bucket = ""
+        for members in buckets.values():
+            weight = sum(member.weight for member in members)
+            row = {
+                "bucket_id": "+".join(sorted(member.tranche_id for member in members)),
+                "side": members[0].side,
+                "weight": round(weight, 8),
+                "cap": self.bucket_cap_pct,
+                "within_cap": weight <= self.bucket_cap_pct + 1e-12,
+            }
+            bucket_rows.append(row)
+            if not row["within_cap"] and not breached_bucket:
+                breached_bucket = row["bucket_id"]
+
+        if breached_bucket:
+            return IndependenceVerdict(
+                False,
+                "CORRELATED_TRANCHE_HEAT_EXCEEDED",
+                round(n_eff, 6),
+                round(total, 8),
+                tuple(bucket_rows),
+                f"bucket {breached_bucket} exceeds the "
+                f"{self.bucket_cap_pct * 100:.0f}% correlated-risk cap",
+            )
+        if total > self.heat_cap_pct + 1e-12:
+            return IndependenceVerdict(
+                False,
+                "CORRELATED_TRANCHE_HEAT_EXCEEDED",
+                round(n_eff, 6),
+                round(total, 8),
+                tuple(bucket_rows),
+                f"total heat {total * 100:.2f}% exceeds the "
+                f"{self.heat_cap_pct * 100:.0f}% portfolio cap",
+            )
+        return IndependenceVerdict(
+            True,
+            "OK",
+            round(n_eff, 6),
+            round(total, 8),
+            tuple(bucket_rows),
+            f"N_eff={n_eff:.2f}, heat={total * 100:.2f}%",
+        )

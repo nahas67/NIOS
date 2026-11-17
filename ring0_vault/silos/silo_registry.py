@@ -1651,3 +1651,55 @@ def dispatch_signed_order(
         live=dispatch_mode.is_live,
         credentials_present=present,
     )
+
+# ---------------------------------------------------------------------------
+# V1.9 (B3) -- static egress IP allowlist per Indian broker
+# ---------------------------------------------------------------------------
+#
+# SEBI/NSE require algo orders to originate from registered static IPs.  The
+# allowlist is data (not a config file read at runtime) so an operator cannot
+# widen it by editing an environment variable, and Ring 0 rejects an unlisted
+# egress IP with ``403 EGRESS_IP_NOT_WHITELISTED``.
+
+#: Primary + secondary static egress IPs, per Indian broker venue.  The
+#: ``127.0.0.1`` / ``::1`` loopback entries keep a paper-mode local process
+#: runnable without pretending a public IP was registered.
+EGRESS_IP_WHITELIST: dict[str, tuple[str, ...]] = {
+    "dhan": ("127.0.0.1", "::1"),
+    "zerodha": ("127.0.0.1", "::1"),
+    "angel": ("127.0.0.1", "::1"),
+    "upstox": ("127.0.0.1", "::1"),
+}
+
+#: Silo-level view: the union of every Indian broker's registered IPs.
+EGRESS_IP_WHITELIST_BY_SILO: dict[str, tuple[str, ...]] = {
+    "INDIA_ZERODHA_DHAN": tuple(
+        sorted({ip for ips in EGRESS_IP_WHITELIST.values() for ip in ips})
+    )
+}
+
+
+def register_egress_ip(venue: str, ip: str, *, primary: bool = True) -> tuple[str, ...]:
+    """Register (or replace) a venue's static egress IP."""
+    key = str(venue).strip().lower()
+    address = str(ip).strip()
+    if not address:
+        raise ValueError("egress ip must be non-empty")
+    current = list(EGRESS_IP_WHITELIST.get(key, ()))
+    if primary:
+        current = [address] + [item for item in current if item != address]
+    elif address not in current:
+        current.append(address)
+    EGRESS_IP_WHITELIST[key] = tuple(current)
+    EGRESS_IP_WHITELIST_BY_SILO["INDIA_ZERODHA_DHAN"] = tuple(
+        sorted({item for ips in EGRESS_IP_WHITELIST.values() for item in ips})
+    )
+    return EGRESS_IP_WHITELIST[key]
+
+
+def egress_whitelist_for(venue: str) -> tuple[str, ...]:
+    return tuple(EGRESS_IP_WHITELIST.get(str(venue).strip().lower(), ()))
+
+
+def is_egress_ip_whitelisted(venue: str, ip: str) -> bool:
+    return str(ip).strip() in egress_whitelist_for(venue)

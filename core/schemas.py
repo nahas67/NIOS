@@ -68,6 +68,21 @@ __all__ = [
     "ContagionFeatures",
     "UnsignedProposal",
     "PlainEnglishCockpitCard",
+    # V1.9 mission / tranche / regulatory contracts
+    "MissionAuthorization",
+    "MissionAuthorizationError",
+    "MissionInfeasibleError",
+    "MissionSpec",
+    "TrancheRiskState",
+    "TrancheStatus",
+    "TrancheHaltedError",
+    "CorrelatedTrancheHeatError",
+    "SplitPolicy",
+    "RegulatoryRuleSet",
+    "REGULATORY_RULES",
+    "select_regulatory_rules",
+    "MAX_KELLY_FRACTION_CAP",
+    "MONEY_CEILING_MICROS",
     # helpers / constants
     "LEASE_TTL_NS",
     "SYSTEM1_LEASE_SIZE",
@@ -203,12 +218,25 @@ def net_lower_bound_bps(
     fee_bps: float,
     tax_bps: float,
     q98_residual_bps: float,
+    funding_bps: float = 0.0,
+    locate_fee_bps: float = 0.0,
 ) -> float:
     """``Net_LB = E[r] - (Spread + 2 * Fee + Tax + Q_0.98(Residuals))``.
 
     ``sec_003`` Pillar 2: capital deploys only when this is strictly ``> 0``.
+
+    ``V1.9`` adds two statutory/venue frictions that a pre-V1.9 caller never
+    passed: perpetual ``funding_bps`` (``C3``) and the short-borrow
+    ``locate_fee_bps`` (``D2``).  Both default to ``0.0``, so every historical
+    call site keeps its exact arithmetic.
     """
-    friction = float(spread_bps) + 2.0 * float(fee_bps) + float(tax_bps)
+    friction = (
+        float(spread_bps)
+        + 2.0 * float(fee_bps)
+        + float(tax_bps)
+        + float(funding_bps)
+        + float(locate_fee_bps)
+    )
     return float(expected_gross_bps) - friction - float(q98_residual_bps)
 
 
@@ -552,6 +580,18 @@ class GroundedFactPacket:
     as_of_ns: int
     metrics: Mapping[str, float]
     sha256_digest: str = ""
+    #: ``V1.9`` (``D2``): short-borrow economics.  A short thesis whose locate
+    #: fee is not carried in the net lower bound is a hallucinated edge.
+    locate_fee_bps: float = 0.0
+    borrow_confirmed: bool = False
+    #: ``V1.9`` (``F3``): freshness lower bound.  ``0`` means "no claim"; a
+    #: non-zero value is the oldest acceptable ``knowledge_ts_ns`` and a packet
+    #: older than it is stale, not merely old.
+    not_stale_before_utc: int = 0
+    #: ``V1.9`` (``F1``): provenance.  ``source_id`` must be on the allowlist and
+    #: ``retrieval_attestation`` is the SHA-256 the retrieval adapter returned.
+    source_id: str = ""
+    retrieval_attestation: str = ""
 
     def __post_init__(self) -> None:
         valid_time_ns = int(self.valid_time_ns)
@@ -588,6 +628,23 @@ class GroundedFactPacket:
         object.__setattr__(self, "knowledge_ts_ns", knowledge_ts_ns)
         object.__setattr__(self, "as_of_ns", as_of_ns)
 
+        locate_fee = float(self.locate_fee_bps)
+        if not math.isfinite(locate_fee) or locate_fee < 0.0:
+            raise ValueError("locate_fee_bps must be finite and non-negative")
+        object.__setattr__(self, "locate_fee_bps", locate_fee)
+        object.__setattr__(self, "borrow_confirmed", bool(self.borrow_confirmed))
+        not_stale_before = int(self.not_stale_before_utc)
+        if not_stale_before < 0:
+            raise ValueError("not_stale_before_utc must be non-negative")
+        object.__setattr__(self, "not_stale_before_utc", not_stale_before)
+        object.__setattr__(self, "source_id", str(self.source_id or "").strip())
+        attestation = str(self.retrieval_attestation or "").strip().lower()
+        if attestation and (
+            len(attestation) != 64 or any(c not in "0123456789abcdef" for c in attestation)
+        ):
+            raise ValueError("retrieval_attestation must be a 64-char SHA-256 hex digest")
+        object.__setattr__(self, "retrieval_attestation", attestation)
+
         computed = self.compute_digest()
         supplied = str(self.sha256_digest or "").strip().lower()
         if supplied and supplied != computed:
@@ -599,13 +656,29 @@ class GroundedFactPacket:
 
     # -- hashing ----------------------------------------------------------
     def canonical_pairs(self) -> list[tuple[str, Any]]:
-        """Header fields plus every metric, as ``(key, value)`` pairs."""
+        """Header fields plus every metric, as ``(key, value)`` pairs.
+
+        ``V1.9`` provenance fields only enter the digest when a caller actually
+        set them.  A pre-V1.9 packet therefore keeps the exact digest it had
+        before the fields existed, which is what lets historical receipts stay
+        verifiable.
+        """
         pairs: list[tuple[str, Any]] = [
             ("symbol", self.symbol),
             ("valid_time_ns", self.valid_time_ns),
             ("knowledge_ts_ns", self.knowledge_ts_ns),
             ("as_of_ns", self.as_of_ns),
         ]
+        if self.locate_fee_bps:
+            pairs.append(("locate_fee_bps", self.locate_fee_bps))
+        if self.borrow_confirmed:
+            pairs.append(("borrow_confirmed", True))
+        if self.not_stale_before_utc:
+            pairs.append(("not_stale_before_utc", self.not_stale_before_utc))
+        if self.source_id:
+            pairs.append(("source_id", self.source_id))
+        if self.retrieval_attestation:
+            pairs.append(("retrieval_attestation", self.retrieval_attestation))
         pairs.extend(self.metrics.items())
         return pairs
 
@@ -629,6 +702,18 @@ class GroundedFactPacket:
                 f"grounding ledger for {self.symbol}"
             ) from exc
 
+    # -- V1.9 provenance / freshness --------------------------------------
+    @property
+    def is_provenance_complete(self) -> bool:
+        """``F1``: a named source *and* a retrieval attestation must exist."""
+        return bool(self.source_id) and len(self.retrieval_attestation) == 64
+
+    def is_fresh(self) -> bool:
+        """``F3``: ``knowledge_ts_ns >= not_stale_before_utc`` (``0`` = no bound)."""
+        if self.not_stale_before_utc <= 0:
+            return True
+        return int(self.knowledge_ts_ns) >= int(self.not_stale_before_utc)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
@@ -637,6 +722,11 @@ class GroundedFactPacket:
             "as_of_ns": self.as_of_ns,
             "metrics": dict(self.metrics),
             "sha256_digest": self.sha256_digest,
+            "locate_fee_bps": self.locate_fee_bps,
+            "borrow_confirmed": self.borrow_confirmed,
+            "not_stale_before_utc": self.not_stale_before_utc,
+            "source_id": self.source_id,
+            "retrieval_attestation": self.retrieval_attestation,
         }
 
 
@@ -667,6 +757,10 @@ class ContagionFeatures:
     crowd_asymmetry_score: float
     cascade_fragility_index: float
     narrative_exhaustion_divergence: float
+    #: ``V1.9`` (``C2``): Binance auto-deleveraging rank in ``[0, 1]``.  A high
+    #: quantile means the venue is close to forcing profitable positions flat,
+    #: so the position budget shrinks before the venue does it for us.
+    adl_rank_quantile: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -693,6 +787,11 @@ class ContagionFeatures:
                 1.0,
             ),
         )
+        object.__setattr__(
+            self,
+            "adl_rank_quantile",
+            _validate_unit_interval("adl_rank_quantile", self.adl_rank_quantile, 0.0, 1.0),
+        )
         object.__setattr__(self, "as_of_ns", int(self.as_of_ns))
 
     @property
@@ -715,6 +814,7 @@ class ContagionFeatures:
             "crowd_asymmetry_score": self.crowd_asymmetry_score,
             "cascade_fragility_index": self.cascade_fragility_index,
             "narrative_exhaustion_divergence": self.narrative_exhaustion_divergence,
+            "adl_rank_quantile": self.adl_rank_quantile,
             "requires_ring1_halt": self.requires_ring1_halt,
         }
 
@@ -777,6 +877,15 @@ class UnsignedProposal:
     spread_bps: float
     grounding_hash: str
     is_reduce_only: bool = False
+    #: ``V1.9`` (``B1``): SEBI/NSE algo identification.  A live Indian order
+    #: without a registered exchange algo id is refused by Ring 0; paper mode
+    #: defaults to the generic tag so the paper tape stays byte-identical.
+    exchange_algo_id: str = "NIOS_GENERIC_ALGO"
+    algo_id_kind: str = "GENERIC"
+    #: ``V1.9`` (``A1``/``A8``): optional tranche attribution.  An empty value
+    #: means the proposal belongs to no mission tranche (legacy path).
+    mission_id: str = ""
+    tranche_id: str = ""
     created_at_ns: int = field(default_factory=time.time_ns)
 
     def __post_init__(self) -> None:
@@ -819,6 +928,17 @@ class UnsignedProposal:
         object.__setattr__(self, "is_reduce_only", bool(self.is_reduce_only))
         object.__setattr__(self, "created_at_ns", int(self.created_at_ns))
 
+        algo_id = str(self.exchange_algo_id or "").strip()
+        if not algo_id:
+            raise ValueError("exchange_algo_id must be a non-empty string")
+        object.__setattr__(self, "exchange_algo_id", algo_id)
+        kind = str(self.algo_id_kind or "GENERIC").strip().upper()
+        if kind not in ("GENERIC", "REGISTERED"):
+            raise ValueError("algo_id_kind must be GENERIC or REGISTERED")
+        object.__setattr__(self, "algo_id_kind", kind)
+        object.__setattr__(self, "mission_id", str(self.mission_id or "").strip())
+        object.__setattr__(self, "tranche_id", str(self.tranche_id or "").strip())
+
     @property
     def notional(self) -> float:
         return self.qty * self.limit_price
@@ -845,6 +965,10 @@ class UnsignedProposal:
             "spread_bps": self.spread_bps,
             "grounding_hash": self.grounding_hash,
             "is_reduce_only": self.is_reduce_only,
+            "exchange_algo_id": self.exchange_algo_id,
+            "algo_id_kind": self.algo_id_kind,
+            "mission_id": self.mission_id,
+            "tranche_id": self.tranche_id,
             "created_at_ns": self.created_at_ns,
         }
 
@@ -921,3 +1045,616 @@ class PlainEnglishCockpitCard:
             "timestamp_ns": self.timestamp_ns,
             "proof_line": self.format_proof_line(),
         }
+
+
+# ---------------------------------------------------------------------------
+# V1.9 -- Multi-tranche mission, tranche isolation and effective-dated rules
+# ---------------------------------------------------------------------------
+#
+# ``A1``-``A8``: a mission is a goal with a deadline and a risk budget, split
+# into per-tranche risk units that fail independently.  ``D1``-``D5``: a
+# regulatory rule is a *versioned* object, selected by UTC date, so the same
+# order is judged by the rule that was in force on that date.
+
+
+class MissionAuthorizationError(NiosError):
+    """Raised when a mission approval does not cover the action it authorizes."""
+
+
+class MissionInfeasibleError(NiosError):
+    """``422 INFEASIBLE_MISSION`` -- the target cannot be reached before ruin."""
+
+    code = "INFEASIBLE_MISSION"
+
+
+class TrancheHaltedError(NiosError):
+    """``TRANCHE_HALT`` -- one tranche breached its stop, the rest keep trading."""
+
+    code = "TRANCHE_HALT"
+
+
+class CorrelatedTrancheHeatError(NiosError):
+    """``422 CORRELATED_TRANCHE_HEAT_EXCEEDED`` -- correlated tranches over 6%."""
+
+    code = "CORRELATED_TRANCHE_HEAT_EXCEEDED"
+
+
+MISSION_AUTHORIZATION_STATES: tuple[str, ...] = ("APPROVE", "OVERRIDE", "REVOKE")
+
+
+def _require_digest(name: str, value: str, *, allow_empty: bool = False) -> str:
+    digest = str(value or "").strip().lower()
+    if not digest and allow_empty:
+        return ""
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError(f"{name} must be a 64-char SHA-256 hex digest")
+    return digest
+
+
+@dataclass(slots=True, frozen=True)
+class MissionAuthorization:
+    """A signed, scoped, time-boxed operator approval (``A3``).
+
+    The three-state workflow is explicit: ``APPROVE`` authorizes the mission as
+    specified, ``OVERRIDE`` authorizes a different notional cap (the operator
+    accepted the feasibility warning), and ``REVOKE`` withdraws the approval and
+    is always honored immediately.  The signature is a SHA-256 commitment over
+    the scope fields, so a tampered cap or TTL no longer verifies.
+    """
+
+    operator: str
+    silos: tuple[str, ...]
+    notional_cap_micros: int
+    ttl_seconds: int
+    state: str = "APPROVE"
+    issued_at_ns: int = field(default_factory=time.time_ns)
+    signature: str = ""
+
+    def __post_init__(self) -> None:
+        operator = str(self.operator or "").strip()
+        if not operator:
+            raise ValueError("MissionAuthorization.operator must be non-empty")
+        object.__setattr__(self, "operator", operator)
+
+        silos = tuple(sorted({str(s).strip().upper() for s in self.silos if str(s).strip()}))
+        if not silos:
+            raise ValueError("MissionAuthorization.silos must name at least one silo")
+        object.__setattr__(self, "silos", silos)
+
+        cap = int(self.notional_cap_micros)
+        if cap <= 0 or cap > MONEY_CEILING_MICROS:
+            raise ValueError("notional_cap_micros must be a positive bounded integer")
+        object.__setattr__(self, "notional_cap_micros", cap)
+
+        ttl = int(self.ttl_seconds)
+        if ttl < 60 or ttl > 7 * 24 * 3600:
+            raise ValueError("ttl_seconds must be within [60, 604800]")
+        object.__setattr__(self, "ttl_seconds", ttl)
+
+        state = str(self.state or "APPROVE").strip().upper()
+        if state not in MISSION_AUTHORIZATION_STATES:
+            raise ValueError(
+                f"state must be one of {MISSION_AUTHORIZATION_STATES}, got {state!r}"
+            )
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "issued_at_ns", int(self.issued_at_ns))
+
+        computed = self.compute_signature()
+        supplied = str(self.signature or "").strip().lower()
+        if supplied and supplied != computed:
+            raise ValueError("MissionAuthorization signature does not match its scope")
+        object.__setattr__(self, "signature", computed)
+
+    def canonical_pairs(self) -> list[tuple[str, Any]]:
+        return [
+            ("operator", self.operator),
+            ("silos", ",".join(self.silos)),
+            ("notional_cap_micros", self.notional_cap_micros),
+            ("ttl_seconds", self.ttl_seconds),
+            ("state", self.state),
+            ("issued_at_ns", self.issued_at_ns),
+        ]
+
+    def compute_signature(self) -> str:
+        return canonical_pairs_digest(self.canonical_pairs())
+
+    @property
+    def expires_at_ns(self) -> int:
+        return int(self.issued_at_ns) + int(self.ttl_seconds) * 1_000_000_000
+
+    def is_live(self, now_ns: int | None = None) -> bool:
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        return self.state != "REVOKE" and stamp < self.expires_at_ns
+
+    def covers(self, silo: str) -> bool:
+        return str(silo).strip().upper() in self.silos
+
+    def authorizes(
+        self,
+        silo: str,
+        notional_micros: int,
+        *,
+        now_ns: int | None = None,
+    ) -> bool:
+        return (
+            self.is_live(now_ns)
+            and self.covers(silo)
+            and 0 < int(notional_micros) <= self.notional_cap_micros
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operator": self.operator,
+            "silos": list(self.silos),
+            "notional_cap_micros": self.notional_cap_micros,
+            "ttl_seconds": self.ttl_seconds,
+            "state": self.state,
+            "issued_at_ns": self.issued_at_ns,
+            "expires_at_ns": self.expires_at_ns,
+            "signature": self.signature,
+        }
+
+    @classmethod
+    def mint(
+        cls,
+        operator: str,
+        silos: Iterable[str],
+        notional_cap_micros: int,
+        *,
+        ttl_seconds: int = 3600,
+        state: str = "APPROVE",
+        now_ns: int | None = None,
+    ) -> "MissionAuthorization":
+        return cls(
+            operator=operator,
+            silos=tuple(silos),
+            notional_cap_micros=int(notional_cap_micros),
+            ttl_seconds=int(ttl_seconds),
+            state=state,
+            issued_at_ns=int(now_ns if now_ns is not None else time.time_ns()),
+        )
+
+    def revoked(self) -> "MissionAuthorization":
+        return MissionAuthorization(
+            operator=self.operator,
+            silos=self.silos,
+            notional_cap_micros=self.notional_cap_micros,
+            ttl_seconds=self.ttl_seconds,
+            state="REVOKE",
+            issued_at_ns=self.issued_at_ns,
+        )
+
+
+#: ``A3``: bounded integer money ceiling for mission fields (u127, same as IBOR).
+MONEY_CEILING_MICROS: int = (1 << 127) - 1
+
+#: ``A3``: the only Kelly cap the constitution permits.
+MAX_KELLY_FRACTION_CAP: float = 0.5
+
+
+@dataclass(slots=True, frozen=True)
+class MissionSpec:
+    """A goal-driven capital mission (``A3`` / ``F4``).
+
+    ``target_micros`` is the profit goal, ``deadline_utc`` the UTC nanosecond
+    deadline, and ``risk_budget_micros`` the maximum the mission may lose.  The
+    feasibility engine -- not the operator -- decides whether the goal is
+    reachable; Ring 0 refuses an infeasible mission with
+    ``422 INFEASIBLE_MISSION`` rather than letting hope size a position.
+    """
+
+    mission_id: str
+    target_micros: int
+    deadline_utc: int
+    risk_budget_micros: int
+    kelly_fraction_cap: float = MAX_KELLY_FRACTION_CAP
+    strategy_lineage_digests: tuple[str, ...] = ()
+    unlock_ladder: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+    approval: MissionAuthorization | None = None
+    created_at_ns: int = field(default_factory=time.time_ns)
+
+    def __post_init__(self) -> None:
+        mission_id = str(self.mission_id or "").strip()
+        if not mission_id:
+            raise ValueError("mission_id must be non-empty")
+        if any(token in mission_id for token in ("/", "\\", "\x00", "..")):
+            raise ValueError("mission_id must not contain path separators or '..'")
+        object.__setattr__(self, "mission_id", mission_id)
+
+        target = int(self.target_micros)
+        if target <= 0 or target > MONEY_CEILING_MICROS:
+            raise ValueError("target_micros must be a positive bounded integer")
+        object.__setattr__(self, "target_micros", target)
+
+        risk = int(self.risk_budget_micros)
+        if risk <= 0 or risk > target:
+            raise ValueError("risk_budget_micros must be positive and <= target_micros")
+        object.__setattr__(self, "risk_budget_micros", risk)
+
+        created = int(self.created_at_ns)
+        deadline = int(self.deadline_utc)
+        if deadline <= created:
+            raise ValueError("deadline_utc must be strictly after created_at_ns")
+        object.__setattr__(self, "created_at_ns", created)
+        object.__setattr__(self, "deadline_utc", deadline)
+
+        cap = float(self.kelly_fraction_cap)
+        if not math.isfinite(cap) or cap <= 0.0 or cap > MAX_KELLY_FRACTION_CAP:
+            raise ValueError(
+                f"kelly_fraction_cap must be in (0, {MAX_KELLY_FRACTION_CAP}]"
+            )
+        object.__setattr__(self, "kelly_fraction_cap", cap)
+
+        lineage = tuple(
+            _require_digest("strategy_lineage_digest", digest)
+            for digest in self.strategy_lineage_digests
+        )
+        object.__setattr__(self, "strategy_lineage_digests", lineage)
+
+        ladder = tuple(float(step) for step in self.unlock_ladder)
+        if not ladder:
+            raise ValueError("unlock_ladder must contain at least one step")
+        if any(not math.isfinite(step) or step < 0.0 or step > 1.0 for step in ladder):
+            raise ValueError("unlock_ladder steps must lie in [0, 1]")
+        if any(b <= a for a, b in zip(ladder, ladder[1:])):
+            raise ValueError("unlock_ladder must be strictly ascending")
+        object.__setattr__(self, "unlock_ladder", ladder)
+
+        if self.approval is not None and not isinstance(
+            self.approval, MissionAuthorization
+        ):
+            raise TypeError("approval must be a MissionAuthorization")
+
+    # -- time / progress ---------------------------------------------------
+    def days_remaining(self, now_ns: int | None = None) -> float:
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        remaining_ns = max(0, int(self.deadline_utc) - stamp)
+        return remaining_ns / 86_400_000_000_000.0
+
+    def daily_velocity_target_micros(self, now_ns: int | None = None) -> int:
+        """``target / days_remaining``, floored at one micro (``A3``)."""
+        days = self.days_remaining(now_ns)
+        if days <= 0.0:
+            return int(self.target_micros)
+        return max(1, int(self.target_micros / days))
+
+    def progress(self, realized_locked_micros: int) -> float:
+        return max(0.0, float(realized_locked_micros) / float(self.target_micros))
+
+    def is_expired(self, now_ns: int | None = None) -> bool:
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        return stamp >= int(self.deadline_utc)
+
+    def unlock_index(self, progress: float) -> int:
+        index = 0
+        for position, step in enumerate(self.unlock_ladder):
+            if progress + 1e-12 >= step:
+                index = position
+        return index
+
+    def authorized(self, silo: str, notional_micros: int, *, now_ns: int | None = None) -> bool:
+        if self.approval is None:
+            return False
+        return self.approval.authorizes(silo, notional_micros, now_ns=now_ns)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mission_id": self.mission_id,
+            "target_micros": self.target_micros,
+            "deadline_utc": self.deadline_utc,
+            "risk_budget_micros": self.risk_budget_micros,
+            "kelly_fraction_cap": self.kelly_fraction_cap,
+            "strategy_lineage_digests": list(self.strategy_lineage_digests),
+            "unlock_ladder": list(self.unlock_ladder),
+            "approval": self.approval.to_dict() if self.approval else None,
+            "created_at_ns": self.created_at_ns,
+        }
+
+
+class TrancheStatus(StrEnum):
+    """Lifecycle of one mission tranche (``A1``/``A8``)."""
+
+    ACTIVE = "ACTIVE"
+    THROTTLED = "THROTTLED"
+    HALTED = "HALTED"
+    TARGET_LOCKED = "TARGET_LOCKED"
+    CLOSED = "CLOSED"
+
+
+@dataclass(slots=True)
+class TrancheRiskState:
+    """Per-tranche risk isolation record (``A1`` / ``A2`` / ``A8``).
+
+    One tranche breaching its stop must never halt a sibling tranche or an
+    unrelated silo, so every field needed to decide *that* -- allocation, stop,
+    high-water mark, heat and lineage -- lives on the tranche itself.
+    """
+
+    tranche_id: str
+    mission_id: str
+    silo: str
+    allocated_micros: int
+    stop_micros: int
+    trailing_hwm_micros: int = 0
+    heat_micros: int = 0
+    lineage_digest: str = ""
+    status: TrancheStatus = TrancheStatus.ACTIVE
+    side: str = "LONG"
+    realized_micros: int = 0
+    created_at_ns: int = field(default_factory=time.time_ns)
+
+    def __post_init__(self) -> None:
+        tranche_id = str(self.tranche_id or "").strip()
+        if not tranche_id:
+            raise ValueError("tranche_id must be non-empty")
+        if any(token in tranche_id for token in ("/", "\\", "\x00", "..")):
+            raise ValueError("tranche_id must not contain path separators or '..'")
+        self.tranche_id = tranche_id
+        self.mission_id = str(self.mission_id or "").strip()
+        self.silo = str(self.silo or "").strip().upper()
+        self.allocated_micros = int(self.allocated_micros)
+        if self.allocated_micros <= 0:
+            raise ValueError("allocated_micros must be positive")
+        self.stop_micros = int(self.stop_micros)
+        if self.stop_micros <= 0:
+            raise ValueError("stop_micros must be positive")
+        self.trailing_hwm_micros = int(self.trailing_hwm_micros)
+        self.heat_micros = max(0, int(self.heat_micros))
+        self.lineage_digest = _require_digest(
+            "lineage_digest", self.lineage_digest, allow_empty=True
+        )
+        if not isinstance(self.status, TrancheStatus):
+            self.status = TrancheStatus(str(self.status).strip().upper())
+        side = str(self.side or "LONG").strip().upper()
+        if side not in ("LONG", "SHORT"):
+            raise ValueError("side must be LONG or SHORT")
+        self.side = side
+        self.realized_micros = int(self.realized_micros)
+        self.created_at_ns = int(self.created_at_ns)
+
+    # -- risk maths --------------------------------------------------------
+    @property
+    def equity_micros(self) -> int:
+        """Realized P&L attributed to this tranche (never unrealized)."""
+        return int(self.realized_micros)
+
+    @property
+    def giveback_micros(self) -> int:
+        """How much of the high-water mark has been given back."""
+        return max(0, int(self.trailing_hwm_micros) - int(self.realized_micros))
+
+    @property
+    def stop_breached(self) -> bool:
+        return self.status is TrancheStatus.HALTED or (
+            self.giveback_micros >= int(self.stop_micros)
+        )
+
+    def record_realized(self, delta_micros: int) -> "TrancheRiskState":
+        """Book realized P&L and lift the high-water mark on new highs."""
+        self.realized_micros = int(self.realized_micros) + int(delta_micros)
+        if self.realized_micros > self.trailing_hwm_micros:
+            self.trailing_hwm_micros = self.realized_micros
+        return self
+
+    def halt(self) -> "TrancheRiskState":
+        self.status = TrancheStatus.HALTED
+        return self
+
+    def rearm(self) -> "TrancheRiskState":
+        """Human re-arm: resets the giveback baseline, not the realized P&L."""
+        if self.status is TrancheStatus.HALTED:
+            self.status = TrancheStatus.ACTIVE
+            self.trailing_hwm_micros = self.realized_micros
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tranche_id": self.tranche_id,
+            "mission_id": self.mission_id,
+            "silo": self.silo,
+            "allocated_micros": self.allocated_micros,
+            "stop_micros": self.stop_micros,
+            "trailing_hwm_micros": self.trailing_hwm_micros,
+            "heat_micros": self.heat_micros,
+            "lineage_digest": self.lineage_digest,
+            "status": str(self.status),
+            "side": self.side,
+            "realized_micros": self.realized_micros,
+            "giveback_micros": self.giveback_micros,
+            "created_at_ns": self.created_at_ns,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class SplitPolicy:
+    """Inputs to :class:`DynamicFundSplitEngine` (``A5``).
+
+    ``mission_progress`` is ``realized_locked / target``; ``regime`` is the
+    Ring 2 regime label; ``unlock_ladder`` is the mission's ascending ladder.
+    The policy is data, never a callback, so a split is reproducible.
+    """
+
+    mission_progress: float = 0.0
+    regime: str = "NEUTRAL"
+    unlock_ladder: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+    reserve_floor_pct: int = 15
+    tax_escrow_pct: int = 20
+
+    def __post_init__(self) -> None:
+        progress = float(self.mission_progress)
+        if not math.isfinite(progress):
+            raise ValueError("mission_progress must be finite")
+        object.__setattr__(self, "mission_progress", min(1.0, max(0.0, progress)))
+        regime = str(self.regime or "NEUTRAL").strip().upper()
+        if regime not in ("EXPANSION", "NEUTRAL", "CONTRACTION"):
+            raise ValueError("regime must be EXPANSION, NEUTRAL or CONTRACTION")
+        object.__setattr__(self, "regime", regime)
+        ladder = tuple(float(step) for step in self.unlock_ladder)
+        if not ladder or any(step < 0.0 or step > 1.0 for step in ladder):
+            raise ValueError("unlock_ladder steps must lie in [0, 1]")
+        object.__setattr__(self, "unlock_ladder", ladder)
+        floor = int(self.reserve_floor_pct)
+        tax = int(self.tax_escrow_pct)
+        if not 0 <= floor <= 100 or not 0 <= tax <= 100 or floor + tax > 90:
+            raise ValueError("reserve_floor_pct + tax_escrow_pct must be <= 90")
+        object.__setattr__(self, "reserve_floor_pct", floor)
+        object.__setattr__(self, "tax_escrow_pct", tax)
+
+    @property
+    def unlock_index(self) -> int:
+        index = 0
+        for position, step in enumerate(self.unlock_ladder):
+            if self.mission_progress + 1e-12 >= step:
+                index = position
+        return index
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mission_progress": self.mission_progress,
+            "regime": self.regime,
+            "unlock_ladder": list(self.unlock_ladder),
+            "reserve_floor_pct": self.reserve_floor_pct,
+            "tax_escrow_pct": self.tax_escrow_pct,
+            "unlock_index": self.unlock_index,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class RegulatoryRuleSet:
+    """An effective-dated regulatory regime for one silo (``D1``).
+
+    ``effective_from_utc`` is inclusive and ``effective_to_utc`` exclusive, both
+    in UTC nanoseconds.  ``0`` for ``effective_to_utc`` means "still in force".
+    """
+
+    rule_id: str
+    silo: str
+    effective_from_utc: int
+    effective_to_utc: int
+    maintenance_model: str
+    pdt_equity_floor_micros: int
+    intraday_margin_model: str
+    ssr_enforced: bool = False
+
+    def __post_init__(self) -> None:
+        rule_id = str(self.rule_id or "").strip()
+        if not rule_id:
+            raise ValueError("rule_id must be non-empty")
+        object.__setattr__(self, "rule_id", rule_id)
+        object.__setattr__(self, "silo", str(self.silo or "").strip().upper())
+        start = int(self.effective_from_utc)
+        end = int(self.effective_to_utc)
+        if start <= 0:
+            raise ValueError("effective_from_utc must be a positive UTC ns stamp")
+        if end and end <= start:
+            raise ValueError("effective_to_utc must be after effective_from_utc")
+        object.__setattr__(self, "effective_from_utc", start)
+        object.__setattr__(self, "effective_to_utc", end)
+        floor = int(self.pdt_equity_floor_micros)
+        if floor < 0:
+            raise ValueError("pdt_equity_floor_micros must be non-negative")
+        object.__setattr__(self, "pdt_equity_floor_micros", floor)
+        object.__setattr__(self, "maintenance_model", str(self.maintenance_model))
+        object.__setattr__(self, "intraday_margin_model", str(self.intraday_margin_model))
+        object.__setattr__(self, "ssr_enforced", bool(self.ssr_enforced))
+
+    def is_effective(self, as_of_utc_ns: int) -> bool:
+        stamp = int(as_of_utc_ns)
+        if stamp < self.effective_from_utc:
+            return False
+        return not self.effective_to_utc or stamp < self.effective_to_utc
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "silo": self.silo,
+            "effective_from_utc": self.effective_from_utc,
+            "effective_to_utc": self.effective_to_utc,
+            "maintenance_model": self.maintenance_model,
+            "pdt_equity_floor_micros": self.pdt_equity_floor_micros,
+            "intraday_margin_model": self.intraday_margin_model,
+            "ssr_enforced": self.ssr_enforced,
+        }
+
+
+def _utc_ns(year: int, month: int, day: int) -> int:
+    import calendar as _calendar
+
+    return _calendar.timegm((year, month, day, 0, 0, 0, 0, 0, 0)) * 1_000_000_000
+
+
+#: ``D1``: the versioned rule book.  FINRA Rule 4210's intraday margin level
+#: replaces the legacy ``$25,000`` PDT minimum on ``2026-06-04``; the legacy row
+#: is kept (not deleted) so a historical backtest is judged by the rule that
+#: actually applied on that date.
+REGULATORY_RULES: tuple[RegulatoryRuleSet, ...] = (
+    RegulatoryRuleSet(
+        rule_id="US.PDT_25K.2020",
+        silo="US_IBKR",
+        effective_from_utc=_utc_ns(2020, 1, 1),
+        effective_to_utc=_utc_ns(2026, 6, 4),
+        maintenance_model="REG_T",
+        pdt_equity_floor_micros=25_000_000_000,
+        intraday_margin_model="PDT_25K",
+        ssr_enforced=True,
+    ),
+    RegulatoryRuleSet(
+        rule_id="US.FINRA_4210_INTRADAY.2026",
+        silo="US_IBKR",
+        effective_from_utc=_utc_ns(2026, 6, 4),
+        effective_to_utc=0,
+        maintenance_model="FINRA_4210",
+        pdt_equity_floor_micros=2_000_000_000,
+        intraday_margin_model="FINRA_4210_INTRADAY_MARGIN",
+        ssr_enforced=True,
+    ),
+    RegulatoryRuleSet(
+        rule_id="FX.RETAIL_LEVERAGE.2020",
+        silo="FX_MT5",
+        effective_from_utc=_utc_ns(2020, 1, 1),
+        effective_to_utc=0,
+        maintenance_model="RETAIL_FX",
+        pdt_equity_floor_micros=0,
+        intraday_margin_model="FX_50_TO_1",
+        ssr_enforced=False,
+    ),
+    RegulatoryRuleSet(
+        rule_id="IN.SEBI_ALGO.2024",
+        silo="INDIA_ZERODHA_DHAN",
+        effective_from_utc=_utc_ns(2024, 4, 1),
+        effective_to_utc=0,
+        maintenance_model="SEBI_MARGIN",
+        pdt_equity_floor_micros=0,
+        intraday_margin_model="SEBI_VAR_PLUS_ELM",
+        ssr_enforced=False,
+    ),
+    RegulatoryRuleSet(
+        rule_id="CRYPTO.VENUE_RISK.2020",
+        silo="CRYPTO_BINANCE",
+        effective_from_utc=_utc_ns(2020, 1, 1),
+        effective_to_utc=0,
+        maintenance_model="TIERED_MAINTENANCE_MARGIN",
+        pdt_equity_floor_micros=0,
+        intraday_margin_model="ISOLATED_CROSS",
+        ssr_enforced=False,
+    ),
+)
+
+
+def select_regulatory_rules(silo: str, as_of_utc_ns: int) -> RegulatoryRuleSet:
+    """Return the rule in force for ``silo`` at ``as_of_utc_ns`` (``D1``).
+
+    Selection is by UTC date only -- never by "latest" -- so replaying a
+    historical order cannot accidentally apply today's margin model.
+    """
+    key = str(silo or "").strip().upper()
+    matches = [
+        rule
+        for rule in REGULATORY_RULES
+        if rule.silo == key and rule.is_effective(as_of_utc_ns)
+    ]
+    if not matches:
+        raise KeyError(f"no regulatory rule set is effective for {key} at {as_of_utc_ns}")
+    # The most recently effective rule wins when windows overlap.
+    matches.sort(key=lambda rule: rule.effective_from_utc)
+    return matches[-1]

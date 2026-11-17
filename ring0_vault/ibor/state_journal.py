@@ -381,3 +381,140 @@ def default_journal() -> AtomicStateJournal:
         if _DEFAULT_JOURNAL is None or _DEFAULT_JOURNAL.path != target:
             _DEFAULT_JOURNAL = AtomicStateJournal(target)
         return _DEFAULT_JOURNAL
+
+# ---------------------------------------------------------------------------
+# V1.9 (E9) -- SHA-256 replay checkpoints at event boundaries
+# ---------------------------------------------------------------------------
+#
+# A journal that cannot prove it was replayed to a specific event boundary is
+# only "probably" the same book.  A checkpoint binds the canonical state digest
+# to the boundary digest, so a replay that stops early (or continues past the
+# boundary) is detected instead of silently trusted.
+
+CHECKPOINT_SECTION = "checkpoints"
+
+
+def _canonical_json(payload: Any) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
+        "utf-8"
+    )
+
+
+def state_digest(state: Mapping[str, Any]) -> str:
+    """SHA-256 over the canonical JSON of a journal state document.
+
+    Derived and volatile keys are excluded: ``saved_at_ns`` changes on every
+    write, ``counts`` / ``clean_slate_active`` are recomputed, and the
+    checkpoint list itself would make the digest self-referential.
+    """
+    import hashlib
+
+    volatile = {
+        "schema_version",
+        "saved_at_ns",
+        "counts",
+        "clean_slate_active",
+        CHECKPOINT_SECTION,
+    }
+    payload = {key: value for key, value in dict(state).items() if key not in volatile}
+    return hashlib.sha256(_canonical_json(payload)).hexdigest()
+
+
+def boundary_digest(event_boundary: Any) -> str:
+    """SHA-256 over the event-boundary descriptor (sequence, cursor, event id)."""
+    import hashlib
+
+    return hashlib.sha256(_canonical_json(event_boundary)).hexdigest()
+
+
+class ReplayCheckpoint:
+    """One immutable replay checkpoint record."""
+
+    __slots__ = ("sequence", "state_sha256", "boundary_sha256", "created_at_ns", "label")
+
+    def __init__(
+        self,
+        *,
+        sequence: int,
+        state_sha256: str,
+        boundary_sha256: str,
+        created_at_ns: int,
+        label: str = "",
+    ) -> None:
+        self.sequence = int(sequence)
+        self.state_sha256 = str(state_sha256)
+        self.boundary_sha256 = str(boundary_sha256)
+        self.created_at_ns = int(created_at_ns)
+        self.label = str(label)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "state_sha256": self.state_sha256,
+            "boundary_sha256": self.boundary_sha256,
+            "created_at_ns": self.created_at_ns,
+            "label": self.label,
+        }
+
+
+def _journal_checkpoint(
+    journal: "AtomicStateJournal",
+    state: Mapping[str, Any],
+    *,
+    event_boundary: Any,
+    label: str = "",
+    now_ns: int | None = None,
+) -> dict[str, Any]:
+    existing = journal.snapshot().get(CHECKPOINT_SECTION) or []
+    rows = list(existing) if isinstance(existing, (list, tuple)) else []
+    record = ReplayCheckpoint(
+        sequence=len(rows) + 1,
+        state_sha256=state_digest(state),
+        boundary_sha256=boundary_digest(event_boundary),
+        created_at_ns=int(now_ns if now_ns is not None else time.time_ns()),
+        label=label,
+    ).to_dict()
+    rows.append(record)
+    journal.update(**{CHECKPOINT_SECTION: rows})
+    return record
+
+
+def _journal_checkpoints(journal: "AtomicStateJournal") -> list[dict[str, Any]]:
+    rows = journal.snapshot().get(CHECKPOINT_SECTION) or []
+    return [dict(row) for row in rows] if isinstance(rows, (list, tuple)) else []
+
+
+def _journal_verify_checkpoint(
+    journal: "AtomicStateJournal",
+    checkpoint: Mapping[str, Any],
+    *,
+    state: Mapping[str, Any] | None = None,
+    event_boundary: Any = None,
+) -> bool:
+    target = state if state is not None else journal.snapshot()
+    if state_digest(target) != str(checkpoint.get("state_sha256", "")):
+        return False
+    if event_boundary is not None:
+        return boundary_digest(event_boundary) == str(
+            checkpoint.get("boundary_sha256", "")
+        )
+    return True
+
+
+def _journal_replay_checkpoint(
+    journal: "AtomicStateJournal",
+    state: Mapping[str, Any],
+    checkpoint: Mapping[str, Any],
+    *,
+    event_boundary: Any = None,
+) -> bool:
+    """True only when ``state`` reproduces the checkpointed digest."""
+    return _journal_verify_checkpoint(
+        journal, checkpoint, state=state, event_boundary=event_boundary
+    )
+
+
+AtomicStateJournal.write_checkpoint = _journal_checkpoint  # type: ignore[attr-defined]
+AtomicStateJournal.checkpoints = _journal_checkpoints  # type: ignore[attr-defined]
+AtomicStateJournal.verify_checkpoint = _journal_verify_checkpoint  # type: ignore[attr-defined]
+AtomicStateJournal.replay_checkpoint = _journal_replay_checkpoint  # type: ignore[attr-defined]

@@ -1,6 +1,6 @@
 """Print the NIOS Section 4.3 Latency Scorecard from live measurements.
 
-Every row is measured in this process (or read from the signed 22-gate
+Every row is measured in this process (or read from the signed 23-gate
 certificate) on the commit at HEAD.  Status glyphs: PASS / WARN / FAIL.
 """
 
@@ -182,7 +182,7 @@ add(
 )
 
 # ---------------------------------------------------------------------------
-# 3. Signed 22-gate certificate rows
+# 3. Signed 23-gate certificate rows
 # ---------------------------------------------------------------------------
 def _load_certificate() -> dict | None:
     """Read the signed gate certificate, failing closed without a traceback.
