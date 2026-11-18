@@ -303,14 +303,14 @@ def test_gate3_preflight_golive_cli_certifies_release() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate4_regression_inventory_is_thirty_six_suites() -> None:
-    """Twenty pre-existing suites plus this one; the release tag stays annotated."""
+def test_gate4_regression_inventory_is_thirty_seven_suites() -> None:
+    """Every historical suite plus this one; the release tag stays annotated."""
     suites = sorted(
         path.name
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 36, suites
+    assert len(suites) == 37, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"

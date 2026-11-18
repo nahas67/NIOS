@@ -449,9 +449,9 @@ def test_gate3_runbook_documents_all_sops_and_endpoints() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate4_test_inventory_is_thirty_six_files() -> None:
+def test_gate4_test_inventory_is_thirty_seven_files() -> None:
     test_files = sorted(TESTS_DIR.glob("test_*.py"))
-    assert len(test_files) == 36, [path.name for path in test_files]
+    assert len(test_files) == 37, [path.name for path in test_files]
     assert "test_phase3_step5_os_tuning_key_rotation_and_runbook.py" in {
         path.name for path in test_files
     }
