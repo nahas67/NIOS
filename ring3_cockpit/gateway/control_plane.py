@@ -8225,6 +8225,14 @@ class ControlPlane(V21ControlPlaneMixin):
         self._card_sequence = 0
         self._kill_report = {}
         logbook = self.logbook_clear()
+        # V2.1: zero the lazily-built closed-loop components *before* the journal
+        # is wiped, otherwise their in-memory rows would be written straight back
+        # into the fresh journal on the next mutation.
+        v21_reset = getattr(self, "reset_v21_state", None)
+        if callable(v21_reset):
+            v21_report = dict(v21_reset())
+        else:  # pragma: no cover - a ControlPlane without the V2.1 mixin
+            v21_report = {}
         # V1.8: the whole durable journal returns to the Clean-Slate shape.
         journal = self._journal_reset()
         try:  # pragma: no cover - depends on the kernel build
@@ -8239,6 +8247,7 @@ class ControlPlane(V21ControlPlaneMixin):
             "clean_slate_active": True,
             "journal": journal,
             "workspace": "paper",
+            "v21": v21_report,
             "agents": self.task_dispatcher.reset_to_clean_slate(),
             "backtest": self.backtest_engine.reset_to_clean_slate(),
             "logbook": logbook,

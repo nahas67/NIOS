@@ -100,7 +100,15 @@ class PerformanceAnalytics:
     """Deterministic performance math over handed-in rows (``G8``)."""
 
     def __init__(self, *, risk_free_annual: float = 0.0) -> None:
-        self.risk_free_annual = float(risk_free_annual)
+        # A risk-free rate at or below -100% would make ``(1 + rf) ** k`` a complex
+        # number (or a ZeroDivision), so it is clamped to something annualisable.
+        try:
+            rate = float(risk_free_annual)
+        except (TypeError, ValueError):
+            rate = 0.0
+        if not math.isfinite(rate) or rate <= -1.0:
+            rate = 0.0
+        self.risk_free_annual = rate
 
     # ------------------------------------------------------------------
     # Normalisation
@@ -189,8 +197,12 @@ class PerformanceAnalytics:
         for previous, current in zip(curve, curve[1:]):
             base = float(previous["nav_micros"])
             if base == 0.0:
+                # A wiped-out bucket has no percentage base; skipping it keeps the
+                # series finite instead of injecting an inf into Sharpe/Sortino.
                 continue
-            returns.append((float(current["nav_micros"]) - base) / base)
+            value = (float(current["nav_micros"]) - base) / base
+            if math.isfinite(value):
+                returns.append(value)
         return returns
 
     @staticmethod

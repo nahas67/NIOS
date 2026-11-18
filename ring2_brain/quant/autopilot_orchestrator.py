@@ -147,6 +147,8 @@ class MultiTrancheAutopilot:
         feasibility: Any = None,
         memory: Any = None,
         calendar: Any = None,
+        kill_latch: Any = None,
+        pacing: Any = None,
         heat_cap_pct: float = AUTOPILOT_HEAT_CAP_PCT,
         bucket_cap_pct: float = AUTOPILOT_BUCKET_CAP_PCT,
         max_candidates: int = 8,
@@ -159,6 +161,10 @@ class MultiTrancheAutopilot:
         self.feasibility = feasibility
         self.memory = memory
         self.calendar = calendar
+        #: Injected Ring 0 kill latch and mission pacer.  Both are duck-typed so
+        #: this Ring 2 module never imports Ring 0 signing or capital code.
+        self.kill_latch = kill_latch
+        self.pacing = pacing
         self.heat_cap_pct = max(0.0, float(heat_cap_pct))
         self.bucket_cap_pct = max(0.0, float(bucket_cap_pct))
         self.max_candidates = max(1, int(max_candidates))
@@ -190,6 +196,43 @@ class MultiTrancheAutopilot:
         own headroom.
         """
         stamp = int(now_ns if now_ns is not None else time.time_ns())
+        halt = self._halt_verdict()
+        if halt:
+            # Defence in depth.  The route refuses a halted book too, but a Ring 2
+            # cycle must not depend on its caller remembering to check: an armed
+            # kill latch means no new tranche exists, full stop.
+            return {
+                "page": "autopilot.cycle",
+                "cycle": int(self._cycles) + 1,
+                "halted": True,
+                "reason": halt,
+                "dispatched_count": 0,
+                "candidates": [],
+                "skipped_blocked": [],
+                "skipped_blocked_count": 0,
+                "skipped_closed": [],
+                "skipped_closed_count": 0,
+                "heat_used_pct": 0.0,
+                "heat_cap_pct": round(self.heat_cap_pct, 8),
+                "as_of_utc_ns": stamp,
+            }
+        paced = self._pacing_verdict(mission_id)
+        if paced:
+            return {
+                "page": "autopilot.cycle",
+                "cycle": int(self._cycles) + 1,
+                "halted": False,
+                "reason": paced,
+                "dispatched_count": 0,
+                "candidates": [],
+                "skipped_blocked": [],
+                "skipped_blocked_count": 0,
+                "skipped_closed": [],
+                "skipped_closed_count": 0,
+                "heat_used_pct": 0.0,
+                "heat_cap_pct": round(self.heat_cap_pct, 8),
+                "as_of_utc_ns": stamp,
+            }
         with self._lock:
             self._cycles += 1
             existing = self._normalise_tranches(tranches)
@@ -373,6 +416,46 @@ class MultiTrancheAutopilot:
     # ------------------------------------------------------------------
     # Stage 2: memory
     # ------------------------------------------------------------------
+    def _halt_verdict(self) -> str:
+        """Return a reason when the global kill latch is armed, else ``""``."""
+        latch = self.kill_latch
+        if latch is None:
+            return ""
+        for name in ("is_armed", "armed", "is_halted"):
+            probe = getattr(latch, name, None)
+            try:
+                value = probe() if callable(probe) else probe
+            except Exception:  # noqa: BLE001 - an unreadable latch fails closed
+                return "GLOBAL_HALTED:latch_unreadable"
+            if value is None:
+                continue
+            if bool(value):
+                return "GLOBAL_HALTED"
+            return ""
+        return ""
+
+    def _pacing_verdict(self, mission_id: str) -> str:
+        """Return a reason when the mission has already hit its target lock."""
+        pacing = self.pacing
+        if pacing is None or not mission_id:
+            return ""
+        try:
+            state = pacing.state(mission_id)
+        except Exception:  # noqa: BLE001 - pacing is advisory here
+            return ""
+        if state is None:
+            return ""
+        locked = getattr(state, "target_locked", None)
+        if locked is None:
+            locked = getattr(state, "target_lock", None)
+        progress = getattr(state, "progress", None)
+        try:
+            if locked is None and progress is not None:
+                locked = float(progress) >= 1.0
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            locked = False
+        return "MISSION_TARGET_LOCK" if bool(locked) else ""
+
     def _memory_view(self, silo: str, symbol: str) -> tuple[float, str]:
         memory = self.memory
         if memory is None:

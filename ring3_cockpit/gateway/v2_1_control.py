@@ -32,6 +32,7 @@ Design notes worth keeping:
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 import time
 from datetime import datetime, timezone
@@ -39,12 +40,13 @@ from typing import Any, Mapping, Sequence
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.lifecycle_worker import NiosLifecycleWorker
 from core.runtime_settings import RuntimeSettingsStore
 from ring0_vault.ibor.alert_center import AlertCenter
 from ring0_vault.ibor.ledger_outbox import (
+    MONEY_MAX as _LEDGER_MONEY_MAX,
     DynamicFundSplitEngine,
     TrancheGuard,
 )
@@ -71,19 +73,35 @@ CSRF_HEADER: str = "X-NIOS-CSRF"
 #: ``G11``: safe methods never need a CSRF token.
 CSRF_SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 
-#: ``G11``: exact paths exempt because they bootstrap or destroy the session.
+#: ``G11``: exact paths exempt because they are the *unauthenticated* bootstrap.
+#:
+#: Only the three pre-session entry points belong here: ``setup`` creates the
+#: first operator, and the two ``login`` routes mint the session the CSRF token is
+#: derived from.  Every other session-transitioning path -- ``logout``,
+#: ``reset`` and ``elevate-live`` -- is reached *with* a live ``nios_session``
+#: cookie, so exempting them would leave three state-destroying/privilage-rising
+#: POSTs open to a cross-site form submission.  They are guarded instead.
 CSRF_EXEMPT_PATHS: frozenset[str] = frozenset(
     {
         "/api/v2/auth/setup",
         "/api/v2/auth/login",
         "/api/v2/auth/login/paper",
         "/api/v2/auth/login/live",
-        "/api/v2/auth/elevate-live",
+        # Documented read-only MCP bridge: it reads a tool's output and mutates
+        # nothing in Ring 0, so there is no state for CSRF to protect.  The route
+        # itself still demands an operator session once a vault exists.
+        "/api/v2/mcp/call",
+    }
+)
+
+#: Paths that *do* transition a session and therefore must echo the CSRF header
+#: whenever they are authenticated by the ``nios_session`` cookie.  Kept as an
+#: explicit, auditable set so a future exemption cannot swallow them by accident.
+CSRF_GUARDED_SESSION_PATHS: frozenset[str] = frozenset(
+    {
         "/api/v2/auth/logout",
         "/api/v2/auth/reset",
-        # Documented read-only MCP bridge: it reads a tool's output and mutates
-        # nothing in Ring 0, so there is no state for CSRF to protect.
-        "/api/v2/mcp/call",
+        "/api/v2/auth/elevate-live",
     }
 )
 
@@ -94,6 +112,12 @@ CSRF_EXEMPT_PREFIXES: tuple[str, ...] = ()
 def csrf_token_for(session_token: str) -> str:
     """The deterministic double-submit value for one session token."""
     return hashlib.sha256(f"nios-csrf-v1:{session_token}".encode("utf-8")).hexdigest()[:32]
+
+
+#: ``sec_009``: the signed integer-micro envelope an ingress payload may not leave.
+#: ``MONEY_MAX`` is the u128 ledger ceiling measured in micros.
+MONEY_MAX: int = int(_LEDGER_MONEY_MAX)
+MONEY_MIN: int = -MONEY_MAX
 
 
 def _iso_utc(ns: int | None) -> str | None:
@@ -165,13 +189,25 @@ class TradeCloseRequest(BaseModel):
 
     silo: str = Field(..., min_length=1, max_length=32)
     symbol: str = Field(default="", max_length=64)
-    gross_pnl_micros: int
-    notional_micros: int = Field(default=0, ge=0)
+    #: ``sec_009``: a signed integer micro amount bounded by the 128-bit ceiling
+    #: divided by the micro scale, so a hostile payload cannot overflow the ledger.
+    gross_pnl_micros: int = Field(..., ge=MONEY_MIN, le=MONEY_MAX)
+    notional_micros: int = Field(default=0, ge=0, le=MONEY_MAX)
     side: str = Field(default="SELL", max_length=8)
     mission_id: str = Field(default="", max_length=64)
     tranche_id: str = Field(default="", max_length=64)
     regime: str = Field(default="NEUTRAL", max_length=16)
     slippage_bps: float = Field(default=0.0, ge=-10_000.0, le=10_000.0)
+    #: Optional operator-supplied idempotency token.  A replay of the same close
+    #: returns the original sealed saga instead of booking the P&L twice.
+    idempotency_key: str = Field(default="", max_length=128)
+
+    @field_validator("slippage_bps")
+    @classmethod
+    def _finite_slippage(cls, value: float) -> float:
+        if not math.isfinite(float(value)):
+            raise ValueError("slippage_bps must be finite")
+        return float(value)
 
 
 class CompensateRequest(BaseModel):
@@ -190,6 +226,22 @@ class TickIngestRequest(BaseModel):
     bid: float | None = Field(default=None, gt=0.0)
     ask: float | None = Field(default=None, gt=0.0)
     now_ns: int | None = Field(default=None, ge=0)
+
+    @field_validator("price", "size", "bid", "ask")
+    @classmethod
+    def _finite_numeric(cls, value: float | None) -> float | None:
+        """Reject ``NaN``/``inf`` at the HTTP boundary.
+
+        ``gt=0.0`` alone lets ``inf`` through (``inf > 0`` is true) and the
+        downstream ``math.floor(inf * 1e6)`` would raise ``OverflowError`` as an
+        unhandled 500.  A non-finite price is a malformed tick, so it is a 422.
+        """
+        if value is None:
+            return None
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("price/size/bid/ask must be finite")
+        return number
 
 
 class ReconciliationRunRequest(BaseModel):
@@ -342,6 +394,8 @@ class V21ControlPlaneMixin:
                 feasibility=getattr(self, "_mission_feasibility", None),
                 memory=getattr(self, "entity_memory", None),
                 calendar=self._exchange_calendar_v21(),
+                kill_latch=getattr(self, "kill_latch", None),
+                pacing=getattr(getattr(self, "missions", None), "pacing", None),
                 max_symbols=int(self.runtime_settings.settings.autopilot_max_symbols),
             )
             self._multi_tranche_autopilot = autopilot
@@ -359,6 +413,63 @@ class V21ControlPlaneMixin:
                 return ExchangeCalendar()
             except Exception:
                 return None
+
+    def reset_v21_state(self) -> dict[str, Any]:
+        """Clean-slate hook: zero every V2.1 component *and* its journal section.
+
+        ``ControlPlane._journal_reset`` wipes the durable journal, but a lazily
+        built component keeps its rows in memory and would write them straight
+        back on the next mutation -- a factory reset that silently un-resets
+        itself.  This drops the in-memory state first, restores the offline
+        runtime defaults (so a reset can never leave ``connector_mode`` at
+        ``LIVE_VENUE``), and detaches the connector runtime so the next access
+        rebuilds it from the restored document.
+        """
+        report: dict[str, Any] = {}
+
+        saga = getattr(self, "_profit_split_saga", None)
+        if saga is not None:
+            try:
+                report["profit_split_saga"] = saga.reset()
+            except Exception:  # pragma: no cover - a reset never raises
+                report["profit_split_saga"] = {"reset": False}
+
+        center = getattr(self, "_alert_center", None)
+        if center is not None:
+            try:
+                report["alert_center"] = center.reset()
+            except Exception:  # pragma: no cover - defensive
+                report["alert_center"] = {"reset": False}
+
+        settings = getattr(self, "_runtime_settings_store", None)
+        if settings is not None:
+            try:
+                report["runtime_settings"] = settings.reset(operator="workspace-reset")
+            except Exception:  # pragma: no cover - defensive
+                report["runtime_settings"] = {"reset": False}
+
+        bars = getattr(self, "_bar_aggregator", None)
+        if bars is not None:
+            try:
+                report["bar_aggregator"] = bars.reset()
+            except Exception:  # pragma: no cover - defensive
+                report["bar_aggregator"] = {"reset": False}
+
+        analytics = getattr(self, "_performance_analytics", None)
+        if analytics is not None and hasattr(analytics, "reset"):
+            try:
+                report["performance_analytics"] = analytics.reset()
+            except Exception:  # pragma: no cover - defensive
+                report["performance_analytics"] = {"reset": False}
+
+        # The connector runtime caches the mode it was built with, so a reset has
+        # to drop it rather than leave a LIVE socket in a clean-slate workspace.
+        self._connector_runtime = None
+        self._stream_events = []
+        self._stream_event_sequence = 0
+        report["connector_runtime"] = "REBUILT_ON_NEXT_USE"
+        report["stream_events"] = 0
+        return report
 
     def _get_cold_start_reconciler(self) -> Any:
         reconciler = getattr(self, "_cold_start_reconciler", None)
@@ -796,9 +907,10 @@ class V21ControlPlaneMixin:
         timeframe: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
+        bounded = None if limit is None else max(1, min(int(limit), 5_000))
         try:
             rows = self.bar_aggregator.bars(
-                silo=silo, symbol=symbol, timeframe=timeframe, limit=limit
+                silo=silo, symbol=symbol, timeframe=timeframe, limit=bounded
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
@@ -888,9 +1000,15 @@ class V21ControlPlaneMixin:
             reserve_floor_pct=int(self.runtime_settings.settings.default_reserve_floor_pct),
             tax_escrow_pct=int(self.runtime_settings.settings.default_tax_escrow_pct),
             slippage_bps=float(request.slippage_bps),
+            # An explicit operator close quotes a *gross* P&L, so the statutory
+            # drag is escrowed inside the saga exactly once.
+            apply_statutory=True,
+            idempotency_key=str(request.idempotency_key or ""),
         )
         self._after_trade_close(saga)
-        return self._envelope({"page": "trades.close", "saga": saga})
+        return self._envelope(
+            {"page": "trades.close", "saga": saga, "deduplicated": bool(saga.get("deduplicated"))}
+        )
 
     def _after_trade_close(self, saga: Mapping[str, Any]) -> None:
         """Emit the SSE frame and the post-mortem a trade close deserves."""
@@ -923,11 +1041,12 @@ class V21ControlPlaneMixin:
 
     def v21_sagas(self, *, limit: int | None = None) -> dict[str, Any]:
         saga = self.profit_split_saga
+        bounded = None if limit is None else max(1, min(int(limit), 1_000))
         return self._envelope(
             {
                 "page": "trades.sagas",
                 "status": saga.status(),
-                "records": list(saga.records(limit=limit)),
+                "records": list(saga.records(limit=bounded)),
                 "recovery": saga.recover(),
             }
         )
@@ -963,6 +1082,9 @@ class V21ControlPlaneMixin:
         regime = str(getattr(request, "regime", "NEUTRAL") or "NEUTRAL")
         out: dict[str, Any] = {"saga": None, "post_mortem": None}
         if bool(getattr(request, "close_position", False)):
+            # A filled paper order already carries a *net* P&L: the venue fee is
+            # inside ``net_micros``.  Applying the statutory breakdown again here
+            # would tax an already-taxed number, so the saga books it verbatim.
             saga = self.profit_split_saga.run_trade_close(
                 silo=silo,
                 symbol=symbol,
@@ -976,12 +1098,15 @@ class V21ControlPlaneMixin:
                     self.runtime_settings.settings.default_reserve_floor_pct
                 ),
                 tax_escrow_pct=int(self.runtime_settings.settings.default_tax_escrow_pct),
+                apply_statutory=False,
+                idempotency_key=str(getattr(request, "client_order_id", "") or ""),
             )
             out["saga"] = saga
+            # ``_after_trade_close`` already writes the post-mortem for a losing
+            # close, so this hook must not write a second one for the same event.
             self._after_trade_close(saga)
-            net_for_memory = int(saga.get("realized_net_micros", 0))
-        else:
-            net_for_memory = int(net_micros)
+            return out
+        net_for_memory = int(net_micros)
         if net_for_memory < 0:
             out["post_mortem"] = self.v21_record_post_mortem(
                 symbol=symbol,
@@ -1181,12 +1306,13 @@ def register_v2_1_routes(
     def settings_read() -> dict[str, Any]:
         return control.v21_settings_document()
 
-    @app.post("/api/v2/settings")
+    @app.post("/api/v2/settings", dependencies=[Depends(session_guard)])
     def settings_write(payload: SettingsUpdateRequest, request: Request) -> dict[str, Any]:
         patch = payload.patch()
         if control.live_critical_patch(patch):
             # A live-risk knob costs a LIVE-elevated session, exactly like a
-            # broker hot-swap does.
+            # broker hot-swap does.  ``session_guard`` is already attached as a
+            # dependency; the LIVE check is the additional rung.
             control.live_tier_guard(session_token(request))
         else:
             control.session_guard(session_token(request))

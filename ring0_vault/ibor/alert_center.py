@@ -80,6 +80,13 @@ class AlertCenter:
             record = dict(row)
             self._rows.append(record)
             self._by_id[alert_id] = record
+        # A journal written by an older build (or by hand) may carry more rows than
+        # the retention policy allows; bound it on the way in, not only on write.
+        if len(self._rows) > self.max_records:
+            dropped = self._rows[: len(self._rows) - self.max_records]
+            self._rows = self._rows[-self.max_records :]
+            for gone in dropped:
+                self._by_id.pop(str(gone.get("alert_id", "")), None)
 
     def _persist(self) -> None:
         rows = self._rows[-self.max_records :]

@@ -329,8 +329,8 @@ def test_gate_23_is_registered_and_passes() -> None:
 def test_release_documents_advertise_31_suites_and_23_gates() -> None:
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "36 suites" in runbook
-    assert "36 suites" in readme
+    assert "37 suites" in runbook
+    assert "37 suites" in readme
     assert "23/23" in runbook
     assert "23-gate" in readme
     for name in (

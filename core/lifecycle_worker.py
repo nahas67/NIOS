@@ -41,6 +41,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
     "DEFAULT_JOBS",
+    "MANUAL_INTERVENTION_REQUIRED",
     "RETRY_DELAYS_S",
     "NiosLifecycleWorker",
     "UnknownOrderQueue",
@@ -48,6 +49,12 @@ __all__ = [
 
 #: ``G4``: the tiered delay ladder for a ``5xx UNKNOWN`` order reconciliation.
 RETRY_DELAYS_S: tuple[int, ...] = (1, 5, 10, 30, 60)
+
+#: ``G4``: the terminal escalation state once the ladder's ceiling is reached.
+#:
+#: An order in this state is never retried again and never silently dropped: it is
+#: pinned to a human and carries a CRITICAL incident in the alert centre.
+MANUAL_INTERVENTION_REQUIRED: str = "MANUAL_INTERVENTION_REQUIRED"
 
 _NS_PER_SECOND = 1_000_000_000
 _NS_PER_MINUTE = 60 * _NS_PER_SECOND
@@ -84,17 +91,26 @@ class UnknownOrderQueue:
         delays_s: Sequence[int] = RETRY_DELAYS_S,
         jitter_s: float = 0.0,
         max_attempts: int | None = None,
+        alert_sink: Any = None,
     ) -> None:
         self.connector = connector
         self.delays_s = tuple(int(max(1, int(value))) for value in delays_s) or RETRY_DELAYS_S
         self.jitter_s = max(0.0, float(jitter_s))
-        self.max_attempts = int(max_attempts if max_attempts is not None else len(self.delays_s))
+        # The ceiling is the ladder length by default: five probes over 1/5/10/30/60
+        # seconds, after which the order is a human decision, never a loop.
+        self.max_attempts = max(
+            1, int(max_attempts if max_attempts is not None else len(self.delays_s))
+        )
+        #: Optional :class:`ring0_vault.ibor.alert_center.AlertCenter`.  Duck-typed
+        #: on purpose so this Ring 3 substrate never imports a Ring 0 module.
+        self.alert_sink = alert_sink
         self._rows: dict[str, dict[str, Any]] = {}
         self._order: list[str] = []
         self._lock = threading.RLock()
         self._attempts = 0
         self._resolved = 0
         self._escalated = 0
+        self._alert_failures = 0
 
     # -- enqueue ----------------------------------------------------------
     def enqueue(
@@ -156,7 +172,15 @@ class UnknownOrderQueue:
             self._attempts += 1
             live["attempts"] = int(live["attempts"]) + 1
             attempt = int(live["attempts"])
-            resolution = self._query(live)
+            # The probe is a read-only venue call, so it must not run under the
+            # queue mutex: a slow or hanging transport would block every other
+            # order, the shutdown path and the status reader behind it.
+            snapshot = dict(live)
+        resolution = self._query(snapshot)
+        with self._lock:
+            live = self._rows.get(key)
+            if live is None or live["state"] != "PENDING":
+                return {"order_id": key, "state": "IGNORED"}
             live["history"].append(
                 {
                     "attempt": attempt,
@@ -174,11 +198,16 @@ class UnknownOrderQueue:
                 self._resolved += 1
                 return dict(live)
             if attempt >= self.max_attempts:
+                # Hard ceiling.  The ladder is bounded, so an order whose outcome a
+                # venue never clarifies can never spin forever: it becomes a human
+                # decision and a CRITICAL incident in one step.
                 live["state"] = "ESCALATED"
+                live["escalation_state"] = MANUAL_INTERVENTION_REQUIRED
                 live["resolution"] = "AWAITING_OPERATOR"
                 live["resolved_at_utc_ns"] = int(now_utc)
                 self._escalated += 1
-                return dict(live)
+                snapshot = dict(live)
+                return self._escalate(snapshot, now_utc=now_utc)
             delay = self.delays_s[min(attempt, len(self.delays_s) - 1)]
             jitter = 0.0
             if self.jitter_s > 0.0:
@@ -187,6 +216,35 @@ class UnknownOrderQueue:
                 now_utc + (delay + jitter) * _NS_PER_SECOND
             )
             return dict(live)
+
+    def _escalate(self, row: dict[str, Any], *, now_utc: int) -> dict[str, Any]:
+        """Publish one CRITICAL incident for an order the ladder gave up on."""
+        sink = self.alert_sink
+        if sink is None:
+            return row
+        try:
+            sink.raise_alert(
+                code="UNKNOWN_ORDER_MANUAL_INTERVENTION",
+                severity="CRITICAL",
+                source="lifecycle.transaction_state_checker",
+                silo=str(row.get("silo", "")),
+                message=(
+                    f"order {row.get('order_id')} is unresolved after "
+                    f"{row.get('attempts')} attempts; operator reconciliation required"
+                ),
+                detail={
+                    "order_id": str(row.get("order_id", "")),
+                    "symbol": str(row.get("symbol", "")),
+                    "attempts": int(row.get("attempts", 0)),
+                    "escalation_state": MANUAL_INTERVENTION_REQUIRED,
+                    "reason": str(row.get("reason", "")),
+                    "at_utc_ns": int(now_utc),
+                },
+                now_ns=int(now_utc),
+            )
+        except Exception:  # noqa: BLE001 - alerting must never break the ladder
+            self._alert_failures += 1
+        return row
 
     def _query(self, row: Mapping[str, Any]) -> dict[str, Any]:
         """Ask the venue, read-only, what happened to ``order_id``."""
@@ -233,6 +291,9 @@ class UnknownOrderQueue:
                 "escalated": int(self._escalated),
                 "delays_s": list(self.delays_s),
                 "max_attempts": int(self.max_attempts),
+                "escalation_state": MANUAL_INTERVENTION_REQUIRED,
+                "alert_sink_attached": self.alert_sink is not None,
+                "alert_failures": int(self._alert_failures),
                 "query_before_retry": True,
                 "never_resubmits": True,
             }
@@ -271,8 +332,19 @@ class NiosLifecycleWorker:
         self.enabled = bool(enabled)
         self.totp_warn_hours = int(totp_warn_hours)
         self.unknown_orders = (
-            unknown_orders if unknown_orders is not None else UnknownOrderQueue(connector=connector)
+            unknown_orders
+            if unknown_orders is not None
+            else UnknownOrderQueue(connector=connector, alert_sink=alert_center)
         )
+        if unknown_orders is not None and getattr(
+            self.unknown_orders, "alert_sink", None
+        ) is None:
+            # An injected queue with no incident sink still has to be able to
+            # escalate a CRITICAL, or an unresolvable order dies silently.
+            try:
+                self.unknown_orders.alert_sink = alert_center
+            except Exception:  # pragma: no cover - a frozen queue keeps its shape
+                pass
         self._lock = threading.RLock()
         self._last_run: dict[str, int] = {}
         self._runs: dict[str, int] = {job: 0 for job in DEFAULT_JOBS}

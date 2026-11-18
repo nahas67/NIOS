@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**834 tests · 36 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**940 tests · 37 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -214,6 +214,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 34 | `test_v2_1_lifecycle_worker_connectors_and_bars.py` | **V2.1** `G4` lifecycle worker (TOTP window, `listenKey`, tiered `5xx UNKNOWN` retry, quota TTL, drift), `G5` `ConnectorRuntime` float-to-micros boundary, `G6` `LiveBarAggregator` tick-to-bar + IV/GEX |
 | 35 | `test_v2_1_analytics_alerts_settings_and_sse.py` | **V2.1** `G7` closed-loop SSE topics, `G8` performance analytics, `G9` alert center, `G10` journal-backed runtime settings |
 | 36 | `test_v2_1_unified_session_csrf_and_reconciliation.py` | **V2.1** `G11` cookie + header session with CSRF double-submit and session telemetry, `G12` reconciliation status / run / clear-freeze |
+| 37 | `test_v2_1_deep_audit_and_hardening.py` | **V2.1** deep security / saga / concurrency audit closure: CSRF-guarded session transitions, LIVE-tier knobs, `PENDING_SWEEP_VERIFICATION`, idempotent closes, `to_micros` parity, symbol aliasing, bounded bar/lifecycle state |
 
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
@@ -557,7 +558,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     834 tests across 36 suites
+tests/                     940 tests across 37 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 23-gate go-live readiness certificate (--strict / --fast)

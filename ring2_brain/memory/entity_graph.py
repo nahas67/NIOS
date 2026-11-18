@@ -159,6 +159,59 @@ def _split_entity(entity_id: str) -> tuple[str, str]:
     return kind, value
 
 
+#: Characters a venue may use to separate a base from a quote.
+_SYMBOL_SEPARATORS: tuple[str, ...] = ("/", "\\", "-", "_", " ", ".", ":", "\x00")
+
+
+def canonical_symbol_key(value: Any) -> str:
+    """Fold every venue spelling of one instrument into a single comparable key.
+
+    ``BTC/USDT``, ``BTC-USDT``, ``btc_usdt`` and ``BTCUSDT`` all denote the same
+    instrument, but they are four different strings.  A post-mortem written under
+    one spelling was therefore invisible to a consumer asking with another -- and
+    because "no memory" reads as "no penalty", the sizing gate failed *open* on a
+    symbol it had already been burned by.
+
+    The canonical key drops every separator and uppercases, so the four spellings
+    above all become ``BTCUSDT``.  It is a *key*, never a display ticker: the
+    lesson sentence and the entity payload keep the operator's original spelling.
+    """
+    token = str(value or "").strip().upper()
+    if token.startswith("SYMBOL:"):
+        token = token[len("SYMBOL:") :]
+    for separator in _SYMBOL_SEPARATORS:
+        token = token.replace(separator, "")
+    return token
+
+
+def canonical_entity_alias(entity_id: Any) -> str:
+    """Return the alias a ``symbol:`` entity id is looked up under.
+
+    Non-symbol arms (``silo:``, ``strategy:``, ``macro:``, ``regime:``) are
+    returned unchanged: a silo id is not an instrument and must never be folded.
+    """
+    token = str(entity_id or "").strip()
+    kind, _, value = token.partition(":")
+    if kind.strip().lower() != "symbol":
+        return token
+    return f"symbol:{canonical_symbol_key(value)}"
+
+
+def _fold_symbol(value: Any) -> str:
+    """Fold a venue ticker into the folder-safe arm this graph stores.
+
+    The entity graph forbids path tokens (``BTC/USDT`` would read as a directory
+    traversal), so ``BASE/QUOTE`` becomes ``BASE-QUOTE`` -- the exact same stored
+    shape :class:`PostMortemRecorder` writes.  Lookup then goes through
+    :func:`canonical_entity_alias`, so the stored spelling never has to match the
+    caller's spelling.
+    """
+    token = str(value or "").strip().upper()
+    for separator in _SYMBOL_SEPARATORS:
+        token = token.replace(separator, "-")
+    return token
+
+
 # ---------------------------------------------------------------------------
 # layer 1 -- append-only post-mortem timeline
 # ---------------------------------------------------------------------------
@@ -439,7 +492,7 @@ class EntityMemoryGraph:
             self._sequence += 1
             arms: list[str] = []
             for kind, value in (
-                ("symbol", str(symbol or "").strip().upper()),
+                ("symbol", _fold_symbol(symbol)),
                 ("silo", str(silo or "").strip().upper()),
                 ("strategy", str(strategy_id or "").strip()),
                 ("macro", str(macro_event_id or "").strip().upper()),
@@ -494,7 +547,19 @@ class EntityMemoryGraph:
     def truth(self, entity_id: str) -> CompiledEntityTruth | None:
         key = str(entity_id or "").strip()
         with self._lock:
-            return self._truths.get(key)
+            found = self._truths.get(key)
+            if found is not None:
+                return found
+            # A caller may ask with any spelling of the same instrument.  Resolve
+            # through the canonical alias so ``symbol:BTCUSDT`` finds a truth that
+            # was compiled under ``symbol:BTC-USDT`` and vice versa.
+            alias = canonical_entity_alias(key)
+            if not alias.startswith("symbol:"):
+                return None
+            for candidate, truth in self._truths.items():
+                if canonical_entity_alias(candidate) == alias:
+                    return truth
+            return None
 
     def _recompile(
         self,
@@ -503,24 +568,60 @@ class EntityMemoryGraph:
         fallback_stamp: int,
     ) -> dict[str, CompiledEntityTruth]:
         if entity_ids is None:
-            targets = sorted(
-                {arm for event in self._events for arm in event.entity_ids} | set(self._truths)
-            )
+            candidates = {
+                arm for event in self._events for arm in event.entity_ids
+            } | set(self._truths)
         else:
-            targets = sorted({str(row) for row in entity_ids})
+            # Fold against the *existing* truths too, not just the new arms: that
+            # is what stops a second spelling of an instrument from opening a
+            # parallel truth whose sample count nobody else can see.
+            candidates = {str(row) for row in entity_ids} | set(self._truths)
+        # One instrument, one truth: every spelling of the same symbol folds onto a
+        # single representative (the folder-safe hyphen form sorts first) so the
+        # sample count cannot be split across two arms that never see each other.
+        representatives: dict[str, str] = {}
+        for entity_id in sorted(candidates):
+            alias = canonical_entity_alias(entity_id)
+            if alias.startswith("symbol:"):
+                representatives.setdefault(alias, entity_id)
         touched: dict[str, CompiledEntityTruth] = {}
-        for entity_id in targets:
+        for entity_id in sorted(set(representatives.values()) | {
+            row for row in candidates if not canonical_entity_alias(row).startswith("symbol:")
+        }):
             truth = self._compile(entity_id, fallback_stamp=fallback_stamp)
             if truth.sample_count <= 0:
                 self._truths.pop(entity_id, None)
                 continue
             self._truths[entity_id] = truth
             touched[entity_id] = truth
+        # Drop any folded alias that is no longer the representative: its samples
+        # are now counted by the representative, so keeping it would double-count.
+        for stale in [
+            key
+            for key in self._truths
+            if canonical_entity_alias(key).startswith("symbol:")
+            and representatives.get(canonical_entity_alias(key), key) != key
+        ]:
+            self._truths.pop(stale, None)
         return touched
 
     def _compile(self, entity_id: str, *, fallback_stamp: int) -> CompiledEntityTruth:
+        alias = canonical_entity_alias(entity_id)
+        is_symbol = alias.startswith("symbol:")
+
+        def _belongs(event: PostMortemEvent) -> bool:
+            if entity_id in event.entity_ids:
+                return True
+            if not is_symbol:
+                return False
+            # Fold every spelling of the same instrument into one sample set, so a
+            # loss booked under ``BTC/USDT`` counts for ``BTCUSDT`` too.
+            return any(
+                canonical_entity_alias(arm) == alias for arm in event.entity_ids
+            )
+
         rows = sorted(
-            (event for event in self._events if entity_id in event.entity_ids),
+            (event for event in self._events if _belongs(event)),
             key=lambda event: (event.ts_utc, event.event_id),
         )
         samples = len(rows)
@@ -603,7 +704,17 @@ class EntityMemoryGraph:
         }
         active = {kind: value for kind, value in features.items() if value}
         total_weight = sum(KIND_WEIGHTS[kind] for kind in active) or 1.0
-        target_ids = {_entity_id(kind, value) for kind, value in active.items()}
+        # Aliases, not raw ids: a query for ``BTCUSDT`` must match a truth compiled
+        # under ``BTC-USDT`` or it silently scores the instrument at zero -- which
+        # is exactly how a sizing gate fails open on a symbol it already lost on.
+        # Built from the alias directly so a slash ticker never reaches the
+        # path-token sanitizer (which would reject ``BTC/USDT`` as a traversal).
+        target_ids: set[str] = set()
+        for kind, value in active.items():
+            if kind == "symbol":
+                target_ids.add(canonical_entity_alias(f"symbol:{value}"))
+            else:
+                target_ids.add(_entity_id(kind, value))
 
         with self._lock:
             truth_rows = list(self._truths.values())
@@ -616,7 +727,7 @@ class EntityMemoryGraph:
         for truth in truth_rows:
             feature_score = (
                 KIND_WEIGHTS[_split_entity(truth.entity_id)[0]] / total_weight
-                if truth.entity_id in target_ids
+                if canonical_entity_alias(truth.entity_id) in target_ids
                 else 0.0
             )
             lexical_score = (lexical.get(truth.entity_id, 0.0) / ceiling) if ceiling > 0 else 0.0

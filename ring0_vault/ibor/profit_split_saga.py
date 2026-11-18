@@ -58,6 +58,7 @@ from ring0_vault.silos.virtual_margin_quota import (
 )
 
 __all__ = [
+    "PENDING_STATES",
     "SAGA_STAGES",
     "SAGA_JOURNAL_KEY",
     "TradeCloseSaga",
@@ -71,6 +72,31 @@ SAGA_STAGES: tuple[str, ...] = (
     "CUSTODY_SWEEP",
     "RESERVE_LOCK",
     "COMPLETED",
+)
+
+#: ``G1``: non-terminal states that a restart must surface, never swallow.
+#:
+#: ``PENDING_SWEEP_VERIFICATION`` is the state a venue call lands in when the
+#: transport answers with an unknown outcome (a timeout, a 5xx, a dropped
+#: socket).  It is deliberately *not* a failure: the transfer may have been
+#: accepted, so compensating blind could strand or double-book capital.  Only the
+#: read-only :class:`core.lifecycle_worker.TransactionStateChecker` may resolve it.
+PENDING_STATES: tuple[str, ...] = (
+    "IN_PROGRESS",
+    "RECOVERED_INCOMPLETE",
+    "COMPENSATION_REQUIRED",
+    "PENDING_SWEEP_VERIFICATION",
+    "PENDING_REVERSAL",
+)
+
+#: ``G1``: states a *stage* parks the saga in, which must not be sealed COMPLETED.
+#:
+#: Distinct from :data:`PENDING_STATES` on purpose: ``IN_PROGRESS`` is the normal
+#: running state, so sealing on it would make every saga stop one step early.
+PARKED_STATES: tuple[str, ...] = (
+    "PENDING_SWEEP_VERIFICATION",
+    "COMPENSATION_REQUIRED",
+    "PENDING_REVERSAL",
 )
 
 #: ``G1``: the journal section holding durable saga records.
@@ -114,6 +140,12 @@ class TradeCloseSaga:
     created_at_utc_ns: int = 0
     updated_at_utc_ns: int = 0
     reason: str = ""
+    #: Idempotency token (operator supplied or ``client_order_id``).  Two closes
+    #: that carry the same token are the same close, and only one may book.
+    idempotency_key: str = ""
+    #: ``True`` when the caller supplied an already-net P&L (a filled paper order)
+    #: so no statutory breakdown was escrowed a second time.
+    statutory_prepaid: bool = False
 
     # -- checkpointing ----------------------------------------------------
     def checkpoint(
@@ -165,6 +197,8 @@ class TradeCloseSaga:
             "created_at_utc_ns": int(self.created_at_utc_ns),
             "updated_at_utc_ns": int(self.updated_at_utc_ns),
             "reason": self.reason,
+            "idempotency_key": self.idempotency_key,
+            "statutory_prepaid": bool(self.statutory_prepaid),
         }
         payload["saga_sha256"] = _seal(
             {key: value for key, value in payload.items() if key != "saga_sha256"}
@@ -205,6 +239,8 @@ class TradeCloseSaga:
             created_at_utc_ns=int(row.get("created_at_utc_ns", 0)),
             updated_at_utc_ns=int(row.get("updated_at_utc_ns", 0)),
             reason=str(row.get("reason", "")),
+            idempotency_key=str(row.get("idempotency_key", "") or ""),
+            statutory_prepaid=bool(row.get("statutory_prepaid", False)),
         )
 
 
@@ -322,12 +358,22 @@ class ProfitSplitSagaCoordinator:
         tax_escrow_pct: int = 20,
         slippage_bps: float = 0.0,
         now_ns: int | None = None,
+        apply_statutory: bool = True,
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
         """Run the full trade-close saga and return its sealed record.
 
         ``gross_pnl_micros`` is the pre-tax realized P&L of the closed position
         in integer micros.  The statutory drag for ``(silo, side, notional)`` is
         escrowed first, so ``realized_net_micros`` is what actually compounds.
+
+        ``apply_statutory=False`` is for a caller that already holds a *net*
+        figure (a filled paper order whose venue fee is inside the number).
+        Escrowing the breakdown again would tax an already-taxed amount.
+
+        ``idempotency_key`` makes the close replay-safe: a second call carrying a
+        token that already produced a saga returns the *original* sealed record
+        instead of booking the same P&L twice.
         """
         stamp = int(now_ns if now_ns is not None else time.time_ns())
         token = str(silo).strip().upper()
@@ -349,11 +395,25 @@ class ProfitSplitSagaCoordinator:
         if not (slippage == slippage):  # NaN guard
             slippage = 0.0
 
-        cost = self.cost_engine.breakdown(token, notional, side=str(side or "SELL").upper() or "SELL")
-        statutory = int(cost.total_micros)
+        dedupe = str(idempotency_key or "").strip()
+        with self._lock:
+            if dedupe:
+                for existing in self._records.values():
+                    if existing.idempotency_key == dedupe:
+                        replay = existing.to_dict()
+                        replay["deduplicated"] = True
+                        return replay
+        if apply_statutory:
+            cost = self.cost_engine.breakdown(
+                token, notional, side=str(side or "SELL").upper() or "SELL"
+            )
+            statutory = int(cost.total_micros)
+        else:
+            cost = None
+            statutory = 0
         realized = gross - statutory
         saga_id = hashlib.sha256(
-            f"{token}:{str(symbol).upper()}:{gross}:{notional}:{stamp}".encode("utf-8")
+            f"{token}:{str(symbol).upper()}:{gross}:{notional}:{stamp}:{dedupe}".encode("utf-8")
         ).hexdigest()[:24]
         record = TradeCloseSaga(
             saga_id=saga_id,
@@ -371,6 +431,8 @@ class ProfitSplitSagaCoordinator:
             stage="COST_ESCROW",
             created_at_utc_ns=stamp,
             updated_at_utc_ns=stamp,
+            idempotency_key=dedupe,
+            statutory_prepaid=not apply_statutory,
         )
 
         with self._lock:
@@ -378,15 +440,24 @@ class ProfitSplitSagaCoordinator:
             self._order.append(saga_id)
             record.checkpoint(
                 "COST_ESCROW",
-                "BOOKED",
+                "PREPAID" if cost is None else "BOOKED",
                 now_ns=stamp,
-                detail={
-                    "floor_bps": float(cost.floor_bps),
-                    "statutory_cost_micros": statutory,
-                    "components": {item.key: int(item.micros) for item in cost.components},
-                    "account": TAX_ESCROW_ACCOUNT,
-                    "slippage_bps": round(slippage, 6),
-                },
+                detail=(
+                    {
+                        "statutory_cost_micros": 0,
+                        "statutory_prepaid": True,
+                        "reason": "CALLER_SUPPLIED_NET_PNL",
+                        "slippage_bps": round(slippage, 6),
+                    }
+                    if cost is None
+                    else {
+                        "floor_bps": float(cost.floor_bps),
+                        "statutory_cost_micros": statutory,
+                        "components": {item.key: int(item.micros) for item in cost.components},
+                        "account": TAX_ESCROW_ACCOUNT,
+                        "slippage_bps": round(slippage, 6),
+                    }
+                ),
             )
             self._persist()
 
@@ -455,6 +526,12 @@ class ProfitSplitSagaCoordinator:
                     now_ns=stamp,
                     detail={"reason": "SILO_HAS_NO_VIRTUAL_MARGIN_SURFACE"},
                 )
+
+            if record.state in PARKED_STATES:
+                # A stage parked the saga for out-of-band verification.  Sealing it
+                # COMPLETED here would erase the evidence the resolver needs.
+                self._persist()
+                return record.to_dict()
 
             record.state = "COMPLETED"
             record.reason = "TRADE_CLOSE_SAGA_SEALED"
@@ -528,6 +605,33 @@ class ProfitSplitSagaCoordinator:
             )
             self._persist()
             return
+        except Exception as exc:  # noqa: BLE001 - an unknown outcome is not a failure
+            # A timeout, a dropped socket or a 5xx means the venue *may* have
+            # accepted the transfer.  Compensating blind could strand or
+            # double-book capital, and letting the exception escape would leave
+            # the saga IN_PROGRESS with the caller holding a 500.  Park it for the
+            # read-only TransactionStateChecker instead.
+            record.state = "PENDING_SWEEP_VERIFICATION"
+            record.reason = "SWEEP_OUTCOME_UNKNOWN"
+            record.sweep = {
+                "accepted": None,
+                "state": "PENDING_SWEEP_VERIFICATION",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "amount_micros": int(amount),
+                "verification": "TransactionStateChecker",
+            }
+            record.checkpoint(
+                "CUSTODY_SWEEP",
+                "PENDING_SWEEP_VERIFICATION",
+                now_ns=stamp,
+                detail={
+                    "reason": "SWEEP_OUTCOME_UNKNOWN",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "amount_micros": int(amount),
+                },
+            )
+            self._persist()
+            return
         record.sweep = {
             "accepted": bool(receipt.accepted),
             "state": str(receipt.state),
@@ -588,6 +692,26 @@ class ProfitSplitSagaCoordinator:
             )
             self._persist()
             return
+        except Exception as exc:  # noqa: BLE001 - a quota failure is recoverable
+            # The reservation is an in-process ledger write, so an unexpected
+            # exception here is a *deterministic* failure: nothing left the silo.
+            # Record it and keep the saga terminal-but-flagged instead of raising
+            # a 500 out of a money path.
+            record.reserve_lock = {
+                "issued": False,
+                "reason": "QUOTA_ENGINE_ERROR",
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+            record.state = "COMPENSATION_REQUIRED"
+            record.reason = "RESERVE_LOCK_FAILED"
+            record.checkpoint(
+                "RESERVE_LOCK",
+                "FAILED",
+                now_ns=stamp,
+                detail={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            self._persist()
+            return
         payload = quota.to_dict()
         record.reserve_lock = {
             "issued": True,
@@ -617,6 +741,10 @@ class ProfitSplitSagaCoordinator:
         virtual margin quota is revoked, and a committed sweep's transfer is left
         to the venue reconciler (its rollback marker is recorded, never executed
         blind).  The ledger's double-entry conservation is never violated.
+
+        A reversal that fails leaves the saga in ``COMPENSATION_PARTIAL`` rather
+        than claiming ``COMPENSATED``: an operator who is told a saga is undone
+        must be told the truth.
         """
         stamp = int(now_ns if now_ns is not None else time.time_ns())
         with self._lock:
@@ -626,26 +754,106 @@ class ProfitSplitSagaCoordinator:
             if record.state == "COMPENSATED":
                 return record.to_dict()
             applied: list[str] = []
+            failures: list[str] = []
             for marker in reversed(list(record.rollbacks)):
                 if marker.startswith("REVOKE_QUOTA:") and self.quota_engine is not None:
                     quota_id = marker.split(":", 1)[1]
                     try:
                         if self.quota_engine.revoke(quota_id, reason=str(reason)):
                             applied.append(marker)
-                    except Exception:  # pragma: no cover - defensive
-                        record.reason = "COMPENSATION_PARTIAL"
+                        else:
+                            failures.append(f"REVOKE_NOOP:{marker}")
+                    except Exception as exc:  # noqa: BLE001 - record, never swallow
+                        failures.append(f"REVOKE_FAILED:{marker}:{type(exc).__name__}")
                 elif marker.startswith("VOID_SWEEP_TRANSFER:"):
                     applied.append(f"RECORDED_NOT_EXECUTED:{marker}")
                 else:
                     applied.append(f"RECORDED:{marker}")
-            record.state = "COMPENSATED"
-            record.reason = f"COMPENSATED:{reason}"
+            partial = bool(failures)
+            record.state = "COMPENSATION_PARTIAL" if partial else "COMPENSATED"
+            record.reason = (
+                f"COMPENSATION_PARTIAL:{reason}" if partial else f"COMPENSATED:{reason}"
+            )
             record.checkpoint(
                 "COMPLETED",
-                "COMPENSATED",
+                "COMPENSATION_PARTIAL" if partial else "COMPENSATED",
                 now_ns=stamp,
-                detail={"applied": applied, "reason": str(reason)},
+                detail={
+                    "applied": applied,
+                    "failures": failures,
+                    "reason": str(reason),
+                },
             )
+            self._persist()
+            return record.to_dict()
+
+    def resolve_pending_sweep(
+        self,
+        saga_id: str,
+        *,
+        resolved_state: str,
+        transfer_id: int | None = None,
+        reason: str = "TRANSACTION_STATE_CHECKER",
+        now_ns: int | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a saga parked in ``PENDING_SWEEP_VERIFICATION``.
+
+        ``resolved_state`` is the verdict of the read-only checker:
+
+        ``COMMITTED``
+            the venue did accept the transfer; the sweep is recorded and the saga
+            runs its remaining stages.
+        ``VOIDED``
+            the venue never saw it; nothing moved, and the saga becomes
+            ``COMPENSATED`` with a recorded void marker.
+
+        Any other value is refused: a resolver must not invent an outcome.
+        """
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        verdict = str(resolved_state or "").strip().upper()
+        if verdict not in ("COMMITTED", "VOIDED"):
+            raise ValueError(f"UNRESOLVABLE_STATE:{resolved_state!r}")
+        with self._lock:
+            record = self._records.get(str(saga_id))
+            if record is None:
+                raise KeyError(f"unknown saga {saga_id!r}")
+            if record.state != "PENDING_SWEEP_VERIFICATION":
+                return record.to_dict()
+            sweep = dict(record.sweep or {})
+            sweep["state"] = verdict
+            sweep["resolved_by"] = str(reason)
+            sweep["resolved_at_utc_ns"] = stamp
+            if transfer_id is not None:
+                sweep["transfer_id"] = int(transfer_id)
+            sweep["accepted"] = verdict == "COMMITTED"
+            record.sweep = sweep
+            if verdict == "COMMITTED":
+                record.state = "IN_PROGRESS"
+                record.reason = "SWEEP_VERIFIED_COMMITTED"
+                record.rollbacks.append(
+                    f"VOID_SWEEP_TRANSFER:{sweep.get('sweep_id', '')}:{sweep.get('transfer_id', 0)}"
+                )
+                record.checkpoint(
+                    "CUSTODY_SWEEP",
+                    "COMMITTED_AFTER_VERIFICATION",
+                    now_ns=stamp,
+                    detail={
+                        "transfer_id": int(sweep.get("transfer_id", 0) or 0),
+                        "resolved_by": str(reason),
+                    },
+                )
+                record.state = "COMPLETED"
+                record.reason = "TRADE_CLOSE_SAGA_SEALED_AFTER_VERIFICATION"
+                record.checkpoint("COMPLETED", "SEALED", now_ns=stamp)
+            else:
+                record.state = "COMPENSATED"
+                record.reason = "SWEEP_VERIFIED_VOIDED"
+                record.checkpoint(
+                    "COMPLETED",
+                    "COMPENSATED",
+                    now_ns=stamp,
+                    detail={"reason": "SWEEP_VERIFIED_VOIDED", "resolved_by": str(reason)},
+                )
             self._persist()
             return record.to_dict()
 
@@ -655,14 +863,27 @@ class ProfitSplitSagaCoordinator:
             pending = [
                 record.to_dict()
                 for record in self._records.values()
-                if record.state in ("IN_PROGRESS", "RECOVERED_INCOMPLETE", "COMPENSATION_REQUIRED")
+                if record.state in PENDING_STATES
             ]
+            awaits_verification = sum(
+                1 for record in self._records.values() if record.state == "PENDING_SWEEP_VERIFICATION"
+            )
             return {
                 "pending_count": len(pending),
                 "pending": pending,
+                "awaiting_sweep_verification": awaits_verification,
                 "policy": "INSPECT_THEN_COMPENSATE_OR_REPLAY",
                 "as_of_utc_ns": time.time_ns(),
             }
+
+    def reset(self) -> dict[str, Any]:
+        """Clean-slate hook: drop every record and persist the empty section."""
+        with self._lock:
+            dropped = len(self._records)
+            self._records = {}
+            self._order = []
+            self._persist()
+            return {"dropped": dropped, "saga_count": 0}
 
     # -- helpers ----------------------------------------------------------
     @staticmethod

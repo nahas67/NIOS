@@ -39,14 +39,50 @@ __all__ = [
 
 #: Micro-units per unit.  Declared locally (Rule 4) so this Ring 2 module never
 #: imports a Ring 0 ledger symbol; the value is the ``sec_009`` constant and the
-#: conversion below is the same half-up rule ``to_micros`` applies.
+#: conversion below is byte-for-byte the same arithmetic ``ring0_vault`` applies.
 MICROS_PER_UNIT: int = 1_000_000
+
+#: The Ring 0 epsilon.  ``to_micros`` adds it *before* flooring so a value that is
+#: mathematically integral cannot be lost to a binary-float representation error
+#: one ULP below the integer (``1.0000005 * 1e6`` is ``1000000.4999999999``).
+_MICROS_EPSILON: float = 1e-9
+
+#: ``sec_009``/``u128``: the largest amount the ledger can hold, in micros.
+MICROS_MAX: int = (1 << 128) - 1
 
 
 def to_micros(value: float) -> int:
-    """Half-up ``units -> integer micros`` conversion (Ring 2 local copy)."""
-    scaled = float(value) * MICROS_PER_UNIT
-    return int(math.floor(abs(scaled) + 0.5)) * (1 if scaled >= 0 else -1)
+    """``units -> integer micros``, bit-for-bit identical to Ring 0.
+
+    ``ring0_vault.ibor.ledger_outbox.to_micros`` is the single source of truth
+    for this conversion, and its rule is **floor with an epsilon**, not half-up:
+
+    .. code-block:: python
+
+        int(math.floor(number * MICROS_PER_UNIT + 1e-9))
+
+    Rounding a debit *up* would mint a micro-unit of value the silo does not own,
+    which is why the rule floors.  A Ring 2 copy that half-upped instead disagreed
+    with the ledger at every half-micro boundary (``0.0000025`` became ``3`` here
+    and ``2`` there), so a bar price and the resulting fill could differ by one
+    micro.  This function therefore mirrors the ledger rule exactly and refuses
+    anything the ledger refuses: a non-finite value, a negative value, and a
+    magnitude above the 128-bit ceiling.
+    """
+    if isinstance(value, bool):
+        raise ValueError("a boolean is not a money amount")
+    if isinstance(value, int):
+        micros = int(value) * MICROS_PER_UNIT
+    else:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"value must be finite, got {value!r}")
+        micros = int(math.floor(number * MICROS_PER_UNIT + _MICROS_EPSILON))
+    if micros < 0:
+        raise ValueError(f"value must be non-negative, got {value!r}")
+    if micros > MICROS_MAX:
+        raise ValueError(f"value {value!r} exceeds the 128-bit ceiling")
+    return micros
 
 #: ``G6``: the bar set the cockpit and the bridge both consume.
 TIMEFRAMES: tuple[str, ...] = ("1m", "5m", "15m", "1D")
@@ -59,6 +95,9 @@ _NS_PER_SECOND = 1_000_000_000
 #: Default L2 ladder depth kept per instrument.
 DEFAULT_DEPTH_LEVELS: int = 10
 
+#: Hard ceiling on the number of distinct ``(silo, symbol)`` states retained.
+DEFAULT_MAX_INSTRUMENTS: int = 1_024
+
 
 def _seal(payload: Mapping[str, Any]) -> str:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -66,12 +105,17 @@ def _seal(payload: Mapping[str, Any]) -> str:
 
 
 def _micros(value: Any, *, name: str) -> int:
-    """Quantize one ingress number; ``None`` and empty strings mean zero."""
+    """Quantize one ingress number; ``None`` and blank strings mean zero."""
     if value is None:
         return 0
-    if isinstance(value, str) and not value.strip():
-        return 0
-    return int(to_micros(float(value)))
+    if isinstance(value, str):
+        if not value.strip():
+            return 0
+        value = float(value)
+    try:
+        return int(to_micros(value))
+    except ValueError as exc:
+        raise ValueError(f"{name}: {exc}") from None
 
 
 @dataclass(slots=True)
@@ -136,16 +180,24 @@ class LiveBarAggregator:
         features_sink: Any = None,
         depth_levels: int = DEFAULT_DEPTH_LEVELS,
         max_bars: int = 240,
+        max_instruments: int = DEFAULT_MAX_INSTRUMENTS,
     ) -> None:
         self.features_sink = features_sink
         self.depth_levels = max(1, int(depth_levels))
         self.max_bars = max(8, int(max_bars))
+        # ``_state`` is keyed by an attacker-influenced ``(silo, symbol)`` pair, so
+        # it needs a ceiling: a caller that posts a fresh symbol on every tick must
+        # not be able to grow the process heap without bound.
+        self.max_instruments = max(8, int(max_instruments))
         self._state: dict[tuple[str, str], _InstrumentState] = {}
         self._lock = threading.RLock()
         self._ticks = 0
         self._bars_closed = 0
         self._surfaces = 0
         self._sink_errors: list[str] = []
+        self._evictions = 0
+        self._stale_rejected = 0
+        self._crossed_rejected = 0
 
     # ------------------------------------------------------------------
     # Ingress
@@ -177,18 +229,45 @@ class LiveBarAggregator:
         price_micros = _micros(price, name="price")
         if price_micros <= 0:
             raise ValueError("price must be positive")
-        size_micros = max(0, _micros(size, name="size"))
+        # Clamp before the conversion: a negative size is a no-fill, not a crash.
+        try:
+            size_units = max(0.0, float(size or 0.0))
+        except (TypeError, ValueError):
+            raise ValueError(f"size must be numeric, got {size!r}") from None
+        size_micros = _micros(size_units, name="size")
 
         with self._lock:
-            self._ticks += 1
-            state = self._state.setdefault((token, key_symbol), _InstrumentState())
-            state.spot_micros = price_micros
-            state.last_update_utc_ns = stamp
+            state = self._state.get((token, key_symbol))
+            if state is not None and state.last_update_utc_ns and stamp < state.last_update_utc_ns:
+                # A late tick must never rewind a live bucket: doing so would close
+                # the current bar early and overwrite history with an older one.
+                self._stale_rejected += 1
+                raise ValueError(
+                    f"STALE_TICK: {stamp} precedes {state.last_update_utc_ns} "
+                    f"for {token}:{key_symbol}"
+                )
+            # Validate the whole tick *before* mutating anything: a rejected book
+            # must not leave a spot price, an opened bucket or a tick counter
+            # behind, or the next reader sees a quote that never existed.
+            bid_micros = 0
+            ask_micros = 0
             if bid is not None or ask is not None:
                 bid_micros = _micros(bid, name="bid") if bid is not None else price_micros
                 ask_micros = _micros(ask, name="ask") if ask is not None else price_micros
-                if bid_micros > 0 and ask_micros > 0:
-                    self._apply_ladder_state(state, [(bid_micros, 0)], [(ask_micros, 0)])
+                if bid_micros > 0 and ask_micros > 0 and bid_micros >= ask_micros:
+                    # A crossed or locked book is not a quote: no buyer and seller
+                    # ever met there, so it must not price a bar.
+                    self._crossed_rejected += 1
+                    raise ValueError(
+                        f"CROSSED_BOOK: best_bid {bid_micros} >= best_ask {ask_micros}"
+                    )
+            if state is None:
+                state = self._open_instrument((token, key_symbol))
+            self._ticks += 1
+            state.spot_micros = price_micros
+            state.last_update_utc_ns = stamp
+            if bid_micros > 0 and ask_micros > 0:
+                self._apply_ladder_state(state, [(bid_micros, 0)], [(ask_micros, 0)])
             if bids or asks:
                 self._apply_ladder(state, bids, asks)
 
@@ -224,6 +303,19 @@ class LiveBarAggregator:
             "closed_count": len(closed),
             "ts_utc_ns": stamp,
         }
+
+    def _open_instrument(self, key: tuple[str, str]) -> _InstrumentState:
+        """Return a state slot for ``key``, evicting the coldest one if full."""
+        if len(self._state) >= self.max_instruments:
+            oldest = min(
+                self._state.items(),
+                key=lambda item: (item[1].last_update_utc_ns, item[0]),
+            )[0]
+            self._state.pop(oldest, None)
+            self._evictions += 1
+        state = _InstrumentState()
+        self._state[key] = state
+        return state
 
     def _roll(
         self,
@@ -502,9 +594,28 @@ class LiveBarAggregator:
                 "surfaces_folded": int(self._surfaces),
                 "sink_attached": self.features_sink is not None,
                 "sink_errors": list(self._sink_errors[-5:]),
+                "max_instruments": int(self.max_instruments),
+                "max_bars_per_timeframe": int(self.max_bars),
+                "instruments_evicted": int(self._evictions),
+                "stale_ticks_rejected": int(self._stale_rejected),
+                "crossed_books_rejected": int(self._crossed_rejected),
                 "as_of_utc_ns": int(now_ns if now_ns is not None else time.time_ns()),
                 "law": "sec_009 - a bar is a deterministic projection of observed ticks",
             }
+
+    def reset(self) -> dict[str, Any]:
+        """Clean-slate hook: drop every instrument, bar and ladder."""
+        with self._lock:
+            dropped = len(self._state)
+            self._state = {}
+            self._ticks = 0
+            self._bars_closed = 0
+            self._surfaces = 0
+            self._sink_errors = []
+            self._evictions = 0
+            self._stale_rejected = 0
+            self._crossed_rejected = 0
+            return {"dropped": dropped, "instrument_count": 0}
 
     # ------------------------------------------------------------------
     # Internals

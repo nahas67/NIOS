@@ -482,7 +482,7 @@ event.
 ### 1F.7 Release verification for `v3.10.0-V1.9`
 
 ```bash
-python -m pytest tests -q                 # 36 suites, 834 passed, 0 failed, 0 warnings
+python -m pytest tests -q                 # 37 suites, 940 passed, 0 failed, 0 warnings
 python scripts/run_nios.py --smoke-test   # ROWS=23, EXIT=0
 python scripts/preflight_golive.py --fast # 23/23 PASS, EXIT=0
 ```
@@ -585,16 +585,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 36 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 37 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 23/23
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 23/23
 ```
 
-Release seal for `v4.1.0-V2.1`: `pytest tests -q` must report **100% pass across all 36 suites, 0 failed, 0 warnings**
+Release seal for `v4.1.0-V2.1`: `pytest tests -q` must report **100% pass across all 37 suites, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **23/23 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 36-suite inventory
+### 3.2a The 37-suite inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -634,6 +634,7 @@ prerequisites for re-tagging; neither may be waived.
 | 34 | `tests/test_v2_1_lifecycle_worker_connectors_and_bars.py` | **V2.1** `G4` `NiosLifecycleWorker` (03:00 UTC TOTP window, 30-minute `listenKey` keepalive, tiered `1s -> 5s -> 10s -> 30s -> 1m` read-only `5xx UNKNOWN` ladder with escalation, `VirtualMarginQuota` TTL sweep, concept-drift sizing cut, one failing job never stops the rest), `G5` `ConnectorRuntime` (three explicit modes, float-to-micros boundary with `NaN`/`inf`/`None` rejection, mandatory SEBI `algo_id`, `X-MBX-USED-WEIGHT` budget, crypto-only wallet sweep), `G6` `LiveBarAggregator` (`1m`/`5m`/`15m`/`1D` OHLCV, L2 ladder, IV/GEX surface) |
 | 35 | `tests/test_v2_1_analytics_alerts_settings_and_sse.py` | **V2.1** `G7` multiplexed SSE stream (seven closed-loop frames additive to the five V1.8 tape frames, `?topic=` / `?silo=` filtering, unknown-topic `422`, out-of-band event precedence), `G8` `/api/v2/analytics/performance` (equity curve, underwater drawdown, Sharpe / Sortino / Calmar, win rate, profit factor, per-silo / per-tranche / per-mission attribution), `G9` persistent alert and incident center (raise, de-duplicate, filter, acknowledge, `404`), `G10` journal-backed runtime settings (offline default, validated patch, revision history, live-critical tier carve-out, typed rejections) |
 | 36 | `tests/test_v2_1_unified_session_csrf_and_reconciliation.py` | **V2.1** `G11` unified cookie + header session (cookie-auth mutation costs a signed double-submit `X-NIOS-CSRF`, safe methods and the read-only MCP bridge stay exempt, `/api/v2/auth/session` tier + TTL + expiry + CSRF telemetry), `G12` cold-start reconciliation control (rogue venue position freezes the silo, status/run/dry-run, LIVE-elevated clear-freeze with operator note, ADR-009 loss stop refused) |
+| 37 | `tests/test_v2_1_deep_audit_and_hardening.py` | **V2.1** all-out multi-lens backend audit closure. Lens 1: `logout`/`reset`/`elevate-live` pulled out of the CSRF bootstrap exemption (`CSRF_GUARDED_SESSION_PATHS`), `POST /api/v2/settings` promoted to a `session_guard` dependency, `LIVE` tier enforcement on every live-risk knob and on `clear-freeze`, `NaN`/`inf`/overflow/unknown-id `4xx` boundaries across the whole `V2.1` surface, `OFFLINE_REPLAY` socket-proof connector. Lens 2: `PENDING_SWEEP_VERIFICATION` for a `5xx UNKNOWN` sweep outcome, `resolve_pending_sweep` resolver, `apply_statutory=False` for an already-net fill, idempotency-keyed closes, honest `COMPENSATION_PARTIAL`, single post-mortem per close, clean-slate reset of saga/alert/settings/bars. Lens 3: Ring 2 `to_micros` bit-for-bit parity with Ring 0, crossed-book and stale-tick rejection, bounded instrument map, `BTC/USDT` `<->` `BTCUSDT` `<->` `BTC-USDT` entity aliasing across `EntityMemoryGraph` / `PostMortemRecorder` / autopilot sizing, analytics zero-division and `NaN` safety, autopilot kill-latch / `TARGET_LOCK` / closed-venue interlocks. Lens 4: `TransactionStateChecker` probe outside the mutex, `MANUAL_INTERVENTION_REQUIRED` ceiling with a `CRITICAL` alert, 15-cycle `create_app()` thread flatness |
 
 
 ### 3.3 Chaos / crash injection

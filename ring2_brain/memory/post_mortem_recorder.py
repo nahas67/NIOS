@@ -62,6 +62,11 @@ def _entity_symbol(value: str) -> str:
     The entity graph forbids path tokens in identifiers (``BTC/USDT`` reads as a
     directory traversal), so the venue convention ``BASE/QUOTE`` folds to
     ``BASE-QUOTE``.  The lesson sentence keeps the original ticker.
+
+    This is the *stored* arm.  ``ring2_brain.memory.entity_graph`` folds every
+    spelling of the same instrument to one canonical alias, so a memory written
+    here as ``symbol:BTC-USDT`` is still retrieved by a ``BTCUSDT`` query -- the
+    sanitizer must not also be the lookup key, or the two would silently diverge.
     """
     token = str(value or "").strip().upper()
     for bad in ("/", "\\", ":", ".."):

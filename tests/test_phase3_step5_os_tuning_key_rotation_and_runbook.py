@@ -467,7 +467,7 @@ def test_gate4_headless_document_contains_rotation_controls() -> None:
     assert "/assets/" not in document
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
     assert "/api/v2/control/vault/rotate-keys" in runbook
-    assert "36 suites" in runbook
+    assert "37 suites" in runbook
 
 
 def test_gate4_release_tag_is_annotated_when_present() -> None:
