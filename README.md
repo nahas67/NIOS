@@ -162,7 +162,7 @@ premium 247.0 bps.
 
 ## Test suite
 
-**940 tests · 37 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**954 tests · 38 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -558,7 +558,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     940 tests across 37 suites
+tests/                     954 tests across 38 suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 23-gate go-live readiness certificate (--strict / --fast)

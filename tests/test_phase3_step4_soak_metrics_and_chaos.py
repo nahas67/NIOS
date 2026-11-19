@@ -14,6 +14,7 @@ Governing sections: ``sec_004`` (ring isolation + heartbeat SHM), ``sec_009``
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -306,9 +307,9 @@ def test_gate3_chaos_sigkill_lease_and_tick_recovery(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate4_test_inventory_is_thirty_seven_files() -> None:
+def test_gate4_test_inventory_is_thirty_eight_files() -> None:
     test_files = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 37, test_files
+    assert len(test_files) == 38, test_files
     for expected in (
         "test_phase3_step1_multiprocess_and_live_daemons.py",
         "test_phase3_step2_live_cutover_and_cockpit.py",
@@ -320,13 +321,20 @@ def test_gate4_test_inventory_is_thirty_seven_files() -> None:
 
 def test_gate4_headless_document_exposes_metrics_telemetry() -> None:
     index = BUNDLE_DIR / "index.html"
-    assert index.exists(), "headless status document is missing"
+    assert index.exists(), "terminal document is missing"
     document = index.read_text(encoding="utf-8")
-    assert "payload_sha256" in document
-    assert "gross_exposure_micros" in document
-    assert "total_tax_paid_micros" in document
-    assert "<script" not in document.lower()
-    assert "/assets/" not in document
+    assert "nios-frontend" in document
+    assert '<script type="module"' in document
+    assert "/assets/" in document
+    assert "backdrop-filter" not in document.lower()
+
+    manifest = json.loads((BUNDLE_DIR / "headless-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["frontend"] == "V2.2-INSTITUTIONAL-TERMINAL"
+    assert manifest["javascript"] >= 1
+    telemetry = manifest["contracts"]["risk_telemetry"]
+    assert "gross_exposure_micros" in telemetry
+    assert "total_tax_paid_micros" in telemetry
+    assert "payload_sha256" in manifest["contracts"]["envelope"]
 
 
 def test_gate4_release_tag_is_annotated_when_present() -> None:

@@ -598,12 +598,13 @@ def test_gate3_real_probe_never_raises_and_stays_bounded():
 
 
 def test_gate3_served_document_declares_the_phase3_surfaces(client):
-    """V1.6: the headless document names the Phase 3 control surfaces."""
+    """V2.2: the terminal document is served and the Phase 3 surfaces answer."""
     root = client.get("/")
     assert root.status_code == 200, root.text
     assert "text/html" in root.headers["content-type"]
-    assert "<script" not in root.text.lower()
-    assert "HEADLESS_API" in root.text
+    assert '<script type="module"' in root.text
+    assert "nios-frontend" in root.text
+    assert "V2.2-INSTITUTIONAL-TERMINAL" in root.text
 
     for control in (
         "/api/v2/control/supervisor",

@@ -145,12 +145,12 @@ def test_v1_6_fifty_routes_serve_the_headless_document(client) -> None:
         assert response.content == index_bytes, route
 
 
-def test_v1_6_document_has_no_style_framework() -> None:
+def test_v2_2_document_is_flat_matte_terminal() -> None:
     text = (DIST_ROOT / "index.html").read_text(encoding="utf-8")
     lowered = text.lower()
-    for forbidden in ("tailwind", "react", "vite", "styled-components", "emotion"):
+    for forbidden in ("styled-components", "emotion"):
         assert forbidden not in lowered, forbidden
-    assert "<script" not in lowered
+    assert "<script" in lowered
     assert "backdrop-filter" not in lowered
 
 

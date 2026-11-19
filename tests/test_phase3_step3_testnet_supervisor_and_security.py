@@ -1049,15 +1049,15 @@ def test_gate4_control_endpoint_dispatches_a_sandbox_order(
 
 def test_gate5_test_inventory_and_rebuilt_headless_document() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 37, [path.name for path in test_files]
+    assert len(test_files) == 38, [path.name for path in test_files]
 
     index = BUNDLE_DIR / "index.html"
     assert index.exists(), "the headless status document was not rebuilt"
     document = index.read_text(encoding="utf-8")
-    assert "headless-backend" in document
-    assert "HEADLESS_API" in document
-    assert "<script" not in document.lower()
-    assert "/assets/" not in document
+    assert "nios-release" in document
+    assert "nios-frontend" in document
+    assert "<script" in document.lower()
+    assert "/assets/" in document
 
     for control in (
         "/api/v2/control/supervisor",
@@ -1065,7 +1065,7 @@ def test_gate5_test_inventory_and_rebuilt_headless_document() -> None:
         "/api/v2/control/brokers/credentials",
     ):
         assert control not in document or control.startswith("/api")
-    assert "javascript" in document.lower()
+    assert ".js" in document.lower()
 
 
 def test_gate5_release_tag_is_annotated_when_present() -> None:

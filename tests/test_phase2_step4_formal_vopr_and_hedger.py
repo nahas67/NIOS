@@ -308,9 +308,9 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
     assert violations == [], violations
 
 
-def test_gate5_full_test_inventory_is_thirty_seven_files() -> None:
+def test_gate5_full_test_inventory_is_thirty_eight_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 37, [path.name for path in test_files]
+    assert len(test_files) == 38, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
     assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
     assert (ROOT / "tests" / "test_v2_1_deep_audit_and_hardening.py") in test_files
@@ -372,21 +372,22 @@ def certified_client(tmp_path_factory: pytest.TempPathFactory):
 
 
 def test_gate6_headless_status_document_exists_and_is_served(certified_client) -> None:
-    """V1.6: no React bundle; every client route serves the headless manifest."""
+    """V2.2: every client route serves the compiled institutional terminal."""
     index = DIST_ROOT / "index.html"
-    assert index.is_file(), "the headless status document is missing"
+    assert index.is_file(), "the terminal document is missing"
     html = index.read_text(encoding="utf-8")
-    assert "headless-backend" in html
-    assert "<script" not in html.lower()
-    assert "/assets/" not in html
-    assert "HEADLESS_API" in html
+    assert "nios-frontend" in html
+    assert "V2.2-INSTITUTIONAL-TERMINAL" in html
+    assert '<script type="module"' in html
+    assert "/assets/" in html
+    assert "backdrop-filter" not in html.lower()
 
     for route in ("/", "/dashboard", "/orders", "/paper/dashboard", "/live/control"):
         served = certified_client.get(route)
         assert served.status_code == 200, route
         assert "text/html" in served.headers.get("content-type", "")
-        assert "headless-backend" in served.text
-        assert "<script" not in served.text.lower()
+        assert "nios-frontend" in served.text
+        assert '<script type="module"' in served.text
 
 
 def test_gate6_formal_proofs_endpoint_certifies_phase2_step4(certified_client) -> None:

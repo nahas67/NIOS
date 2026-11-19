@@ -482,7 +482,7 @@ event.
 ### 1F.7 Release verification for `v3.10.0-V1.9`
 
 ```bash
-python -m pytest tests -q                 # 37 suites, 940 passed, 0 failed, 0 warnings
+python -m pytest tests -q                 # 38 suites, 954 passed, 0 failed, 0 warnings
 python scripts/run_nios.py --smoke-test   # ROWS=23, EXIT=0
 python scripts/preflight_golive.py --fast # 23/23 PASS, EXIT=0
 ```
@@ -585,12 +585,12 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 37 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 38 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 23/23
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 23/23
 ```
 
-Release seal for `v4.1.0-V2.1`: `pytest tests -q` must report **100% pass across all 37 suites, 0 failed, 0 warnings**
+Release seal for `v4.2.0-V2.2`: `pytest tests -q` must report **100% pass across all 38 suites, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **23/23 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 

@@ -492,13 +492,24 @@ def run_smoke(
             assert index.exists(), f"missing {index}"
             response = client.get("/")
             assert response.status_code == 200, response.text
-            assert "<script" not in response.text.lower(), "a script tag leaked into the headless document"
-            assert "HEADLESS_API" in response.text, "headless manifest marker missing"
-            assets = list((SMOKE_UI_ROOT / "assets").glob("*"))
-            assert not assets, "a compiled frontend bundle is still present"
-            return "headless status document served at / (0 JavaScript assets)"
+            document = response.text
+            assert '<script type="module"' in document, "the V2.2 module bundle is not referenced"
+            assert "nios-frontend" in document, "V2.2 terminal marker missing"
+            assert "V2.2-INSTITUTIONAL-TERMINAL" in document, "V2.2 terminal identity missing"
+            assert "/assets/" in document, "the compiled asset bundle is not linked"
+            assert "backdrop-filter" not in document.lower(), "glass effect leaked into the document"
+            assets = sorted((SMOKE_UI_ROOT / "assets").glob("*"))
+            assert assets, "the compiled frontend bundle is missing"
+            scripts = [path for path in assets if path.suffix == ".js"]
+            sheets = [path for path in assets if path.suffix == ".css"]
+            assert scripts, "no compiled JavaScript asset"
+            assert sheets, "no compiled stylesheet asset"
+            return (
+                "V2.2 institutional terminal served at / "
+                f"({len(scripts)} JavaScript, {len(sheets)} stylesheet asset)"
+            )
 
-        table.check("Unified server headless status document", ring3_static)
+        table.check("Unified server V2.2 terminal document", ring3_static)
 
         def ring3_mcp_jsonrpc() -> str:
             response = client.post(

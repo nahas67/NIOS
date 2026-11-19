@@ -481,9 +481,9 @@ def test_gate4_unified_app_serves_api_and_headless_document(client: TestClient) 
     index = client.get("/")
     assert index.status_code == 200, index.text
     assert "text/html" in index.headers.get("content-type", "")
-    assert "headless-backend" in index.text
-    assert "<script" not in index.text.lower()
-    assert "/assets/" not in index.text
+    assert "nios-frontend" in index.text
+    assert '<script type="module"' in index.text
+    assert "/assets/" in index.text
     assert (DIST_ROOT / "index.html").exists()
 
     health = client.get("/api/v2/cockpit/health")
@@ -551,16 +551,16 @@ def test_gate4_smoke_script_exits_zero() -> None:
     assert "SMOKE TEST PASSED" in completed.stdout, combined[-4000:]
     assert "Ring 0 sovereign vault / IBOR" in completed.stdout
     assert "Ring 3 read-only MCP bridge" in completed.stdout
-    assert "Unified server headless status document" in completed.stdout
+    assert "Unified server V2.2 terminal document" in completed.stdout
 
 
-def test_gate4_no_frontend_build_is_required() -> None:
-    """V1.6: the React/Vite build was removed; the document is checked in."""
-    assert not (UI_ROOT / "package.json").exists()
-    assert not (UI_ROOT / "vite.config.ts").exists()
+def test_gate4_v2_2_frontend_build_is_checked_in() -> None:
+    """V2.2: the React 19 terminal build ships inside dist/."""
+    assert (UI_ROOT / "package.json").exists()
+    assert (UI_ROOT / "vite.config.ts").exists()
     index = DIST_ROOT / "index.html"
     assert index.exists()
     document = index.read_text(encoding="utf-8")
-    assert "HEADLESS_API" in document
-    assert "<script" not in document.lower()
-    assert not (DIST_ROOT / "assets").exists()
+    assert "nios-frontend" in document
+    assert "<script" in document.lower()
+    assert (DIST_ROOT / "assets").exists()

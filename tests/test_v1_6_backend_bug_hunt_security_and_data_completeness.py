@@ -805,15 +805,15 @@ def test_gate5_no_api_payload_leaks_a_secret(client, headers) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_manifest_is_headless_zero_javascript() -> None:
+def test_manifest_ships_v2_2_institutional_terminal() -> None:
     index = DIST_ROOT / "index.html"
     assert index.is_file()
     text = index.read_text(encoding="utf-8")
-    assert "HEADLESS_API" in text
-    assert "<script" not in text.lower()
-    assert "/assets/" not in text
-    assert not (UI_ROOT / "src").exists()
-    assert not (UI_ROOT / "package.json").exists()
+    assert "nios-frontend" in text
+    assert "<script" in text.lower()
+    assert "/assets/" in text
+    assert (UI_ROOT / "src").is_dir()
+    assert (UI_ROOT / "package.json").is_file()
 
 
 def test_quant_catalog_is_complete() -> None:

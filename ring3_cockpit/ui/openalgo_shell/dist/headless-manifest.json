@@ -1,11 +1,25 @@
 {
-  "schema_version": "v1.6.headless-backend",
-  "generated_by": "ring3_cockpit/gateway/control_plane.py",
-  "frontend": "NONE",
-  "javascript": 0,
-  "css_framework": "NONE",
-  "runtime": "FastAPI REST + SSE",
+  "schema_version": "v4.2.0.terminal",
+  "generated_by": "ring3_cockpit/ui/openalgo_shell/vite.config.ts",
+  "release": "v4.2.0-V2.2",
+  "frontend": "V2.2-INSTITUTIONAL-TERMINAL",
+  "javascript": 1,
+  "stylesheets": 1,
+  "css_framework": "Tailwind CSS v4",
+  "runtime": "React 19 + Vite",
   "api_root": "/api/v2",
+  "shells": [
+    "PaperShell",
+    "LiveShell"
+  ],
+  "routes": 56,
+  "workstations": 17,
+  "surfaces": {
+    "canvas": "#0D0E10",
+    "card": "#16181C",
+    "elevated": "#22242A",
+    "hairline": "#27292E"
+  },
   "contracts": {
     "envelope": [
       "schema_version",
@@ -28,7 +42,7 @@
     ],
     "statutory_floors_bps": {
       "INDIA_ZERODHA_DHAN": 8.5,
-      "CRYPTO_BINANCE": 16.0,
+      "CRYPTO_BINANCE": 16,
       "US_IBKR": 2.8,
       "FX_MT5": 1.6
     }

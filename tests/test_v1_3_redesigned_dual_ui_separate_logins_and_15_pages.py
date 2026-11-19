@@ -889,11 +889,11 @@ def test_gate4_pages_api_carries_every_workstation() -> None:
     ):
         assert group in source, group
 
-    # The headless document is the only client asset.
+    # The terminal document is the only client asset served by the gateway.
     document = (UI_ROOT / "dist" / "index.html").read_text(encoding="utf-8")
-    assert "HEADLESS_API" in document
-    assert "<script" not in document.lower()
-    assert not (SRC_ROOT).exists()
+    assert "nios-frontend" in document
+    assert '<script type="module"' in document
+    assert (SRC_ROOT / "App.tsx").is_file()
 
 
 def test_gate4_auth_portals_are_api_routes(client) -> None:
@@ -914,29 +914,28 @@ def test_gate4_auth_portals_are_api_routes(client) -> None:
 
 
 
-def test_gate4_no_frontend_toolchain_remains() -> None:
-    """V1.6 removed React/Vite/Biome: there is nothing to lint."""
-    assert not (UI_ROOT / "package.json").exists()
-    assert not (UI_ROOT / "package-lock.json").exists()
-    assert not (UI_ROOT / "vite.config.ts").exists()
-    assert not (UI_ROOT / "biome.json").exists()
-    assert not (UI_ROOT / "tsconfig.json").exists()
-    assert not (SRC_ROOT).exists()
-    assert not (UI_ROOT / "node_modules").exists()
-    assert not (UI_ROOT / "public").exists()
+def test_gate4_v2_2_frontend_toolchain_present() -> None:
+    """V2.2 ships React 19 + Vite + Tailwind v4 + Biome."""
+    assert (UI_ROOT / "package.json").exists()
+    assert (UI_ROOT / "package-lock.json").exists()
+    assert (UI_ROOT / "vite.config.ts").exists()
+    assert (UI_ROOT / "biome.json").exists()
+    assert (UI_ROOT / "tsconfig.json").exists()
+    assert (SRC_ROOT).is_dir()
+    assert (UI_ROOT / "public").is_dir()
 
 
 
 
-def test_gate4_headless_document_is_built() -> None:
+def test_gate4_terminal_document_is_built() -> None:
     index_html = UI_ROOT / "dist" / "index.html"
-    assert index_html.exists(), "the headless status document is missing"
+    assert index_html.exists(), "the terminal bundle document is missing"
     text = index_html.read_text(encoding="utf-8")
-    assert "headless-backend" in text
-    assert "HEADLESS_API" in text
-    assert "payload_sha256" in text
-    assert "<script" not in text.lower()
-    assert "/assets/" not in text
-    assert not (UI_ROOT / "dist" / "assets").exists()
+    assert "nios-release" in text
+    assert "nios-frontend" in text
+    assert "v4.2.0-V2.2" in text
+    assert "<script" in text.lower()
+    assert "/assets/" in text
+    assert (UI_ROOT / "dist" / "assets").is_dir()
 
 
