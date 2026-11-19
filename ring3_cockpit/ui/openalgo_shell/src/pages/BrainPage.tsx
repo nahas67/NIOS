@@ -78,7 +78,7 @@ function stampNs(value: unknown): string {
 export function BrainPage({ mode }: PageProps) {
   const [state, setState] = useState<Record<string, unknown>>({});
   const [lifecycle, setLifecycle] = useState<Record<string, unknown>>({});
-  const [seed, setSeed] = useState<Record<string, unknown>>({});
+  const [seed] = useState<Record<string, unknown>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
@@ -99,10 +99,9 @@ export function BrainPage({ mode }: PageProps) {
   const now = useTicker(1000);
 
   const load = useCallback(async () => {
-    const [stateResult, lifecycleResult, brainResult] = await Promise.allSettled([
+    const [stateResult, lifecycleResult] = await Promise.allSettled([
       api.get<unknown>("/cockpit/state"),
       api.get<unknown>("/lifecycle/status"),
-      api.get<unknown>("/cockpit/brain"),
     ]);
     if (stateResult.status === "fulfilled") {
       setState(asRecord(stateResult.value));
@@ -111,7 +110,6 @@ export function BrainPage({ mode }: PageProps) {
       setError(errorMessage(stateResult.reason));
     }
     if (lifecycleResult.status === "fulfilled") setLifecycle(asRecord(lifecycleResult.value));
-    if (brainResult.status === "fulfilled") setSeed(asRecord(brainResult.value));
     setLoading(false);
   }, []);
 
@@ -585,7 +583,7 @@ export function BrainPage({ mode }: PageProps) {
           <div className="mt-2">
             <EmptyState
               title="No debate yet"
-              hint="The committee seeds from GET /cockpit/brain when available; run a debate to fill the transcript."
+              hint="Run a committee debate to fill the transcript."
             />
           </div>
         ) : (

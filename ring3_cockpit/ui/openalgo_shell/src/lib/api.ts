@@ -149,6 +149,19 @@ function unwrap<T>(json: unknown): T {
 
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
+/**
+ * Auth bootstrap endpoints are CSRF-exempt on the gateway and must never carry a
+ * cached (possibly stale) session/CSRF header. After a PAPER login a stale CSRF
+ * token remains in sessionStorage; replaying it on /auth/login/live makes the
+ * gateway hang. These endpoints rely on the HttpOnly cookie transport instead.
+ */
+const TOKEN_EXEMPT_PATHS = new Set([
+  "/auth/setup",
+  "/auth/login/paper",
+  "/auth/login/live",
+  "/auth/session",
+]);
+
 interface RequestOptions {
   params?: QueryParams;
   body?: unknown;
@@ -161,8 +174,9 @@ async function request<T>(method: string, path: string, options: RequestOptions 
   const headers: Record<string, string> = { Accept: "application/json" };
 
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
-  if (sessionToken) headers["X-NIOS-Session"] = sessionToken;
-  if (MUTATING_METHODS.has(method) && csrfToken) headers["X-NIOS-CSRF"] = csrfToken;
+  const tokenExempt = TOKEN_EXEMPT_PATHS.has(path);
+  if (sessionToken && !tokenExempt) headers["X-NIOS-Session"] = sessionToken;
+  if (MUTATING_METHODS.has(method) && csrfToken && !tokenExempt) headers["X-NIOS-CSRF"] = csrfToken;
 
   const controller = new AbortController();
   const timeout = options.timeoutMs ?? 30_000;

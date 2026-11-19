@@ -110,9 +110,6 @@ export function ForgePage({ mode }: PageProps) {
   const [verdict, setVerdict] = useState<Record<string, unknown> | null>(null);
 
   const [module, setModule] = useState(SKILL_MODULES[0].name);
-  const [skillDoc, setSkillDoc] = useState<Record<string, unknown> | null>(null);
-  const [skillLoading, setSkillLoading] = useState(false);
-  const [skillError, setSkillError] = useState<string | null>(null);
 
   const now = useTicker(1000);
 
@@ -204,31 +201,9 @@ export function ForgePage({ mode }: PageProps) {
     }
   }, [candidateSharpe, pluginName, shadowFills, silo, load]);
 
-  useEffect(() => {
-    let cancelled = false;
-    setSkillLoading(true);
-    setSkillError(null);
-    const run = async () => {
-      try {
-        const payload = await api.get<unknown>(`/cockpit/skills/${encodeURIComponent(module)}`);
-        if (!cancelled) setSkillDoc(asRecord(payload));
-      } catch (caught) {
-        if (!cancelled) {
-          setSkillDoc(null);
-          setSkillError(errorMessage(caught));
-        }
-      } finally {
-        if (!cancelled) setSkillLoading(false);
-      }
-    };
-    void run();
-    return () => {
-      cancelled = true;
-    };
-  }, [module]);
-
+  // SKILL.md bodies are deferred (sec_007): no body probe is issued. The declared
+  // contract below is authoritative and rendered directly, without a 404 round trip.
   const selectedModule = SKILL_MODULES.find((entry) => entry.name === module) ?? SKILL_MODULES[0];
-  const skillMarkdown = text(skillDoc?.markdown ?? skillDoc?.body, "");
 
   return (
     <div className="flex flex-col gap-3">
@@ -539,11 +514,7 @@ export function ForgePage({ mode }: PageProps) {
               </button>
             ))}
             <span className="mt-1 text-[10px] uppercase tracking-[0.08em] text-ink-3">
-              {skillLoading
-                ? "LOADING SKILL.md…"
-                : skillDoc === null
-                  ? "LOCAL CONTRACT"
-                  : `FOUND · ${int(skillDoc.bytes)} BYTES`}
+              DEFERRED · LOCAL CONTRACT
             </span>
           </div>
           <div className="flex min-w-0 flex-col gap-1.5">
@@ -554,33 +525,16 @@ export function ForgePage({ mode }: PageProps) {
               <Badge tone="muted" mono>
                 RING 2
               </Badge>
-              {skillError ? (
-                <Badge tone="neutral" mono>
-                  404 · LOCAL CONTRACT
-                </Badge>
-              ) : null}
-              {skillDoc !== null ? (
-                <Badge tone="bull" mono>
-                  SKILL.md
-                </Badge>
-              ) : null}
+              <Badge tone="neutral" mono>
+                DEFERRED
+              </Badge>
             </div>
-            {skillLoading ? (
-              <div className="flex items-center gap-2 text-[11px] text-ink-3">
-                <Spinner /> fetching module body…
-              </div>
-            ) : skillMarkdown.length > 0 ? (
-              <pre className="nios-scroll max-h-72 rounded-[4px] border border-hairline bg-canvas p-2 font-mono text-[10px] leading-relaxed text-ink-2">
-                {skillMarkdown}
-              </pre>
-            ) : (
-              <JsonBlock value={selectedModule.contract} />
-            )}
+            <JsonBlock value={selectedModule.contract} />
           </div>
         </div>
         <p className="mt-2 text-[10px] uppercase tracking-[0.1em] text-ink-3">
-          GET /cockpit/skills/&#123;skill_name&#125; IS ATTEMPTED FIRST · THE DECLARED CONTRACT IS THE
-          FALLBACK, NEVER A SUBSTITUTE CLAIM
+          SKILL.md BODIES ARE DEFERRED (sec_007) · THE DECLARED CONTRACT IS AUTHORITATIVE, NEVER A
+          SUBSTITUTE CLAIM
         </p>
       </Card>
     </div>

@@ -258,18 +258,13 @@ export default function TerminalPage({ mode }: PageProps) {
 
   const loadQuote = useCallback(async () => {
     try {
-      try {
-        const direct = await api.get<unknown>("/control/terminal/quote", { symbol, silo: streamSilo });
-        setQuote(asRecord(direct));
-      } catch {
-        const posted = await api.post<unknown>("/control/terminal/quote", {
-          symbol,
-          silo: streamSilo,
-          bars: BAR_LIMIT,
-          depth: 10,
-        });
-        setQuote(asRecord(posted));
-      }
+      const posted = await api.post<unknown>("/control/terminal/quote", {
+        symbol,
+        silo: streamSilo,
+        bars: BAR_LIMIT,
+        depth: 10,
+      });
+      setQuote(asRecord(posted));
     } catch (caught) {
       setQuote({});
       setNote({ tone: "bear", message: `quote: ${errorMessage(caught)}` });
