@@ -87,6 +87,7 @@ from core.schemas import (
     VaultName,
     PlainEnglishCockpitCard,
 )
+from core.telemetry import gateway_telemetry
 from ring0_vault.kernel.firewalls_and_oms import (
     ADR009ReduceOnlyFastPath,
     ExecutionEvent,
@@ -134,6 +135,12 @@ from ring3_cockpit.gateway.payload_envelope import (
     risk_telemetry,
     silo_risk_telemetry,
     workspace_mode_of,
+)
+from ring3_cockpit.gateway.telemetry_views import (
+    adwin_drift_payload,
+    latency_already_recorded,
+    request_started_ns_of,
+    telemetry_fields,
 )
 from ring3_cockpit.gateway.v2_1_control import (
     V21ControlPlaneMixin,
@@ -1594,6 +1601,18 @@ class MissionRevokeRequest(StrictRequest):
     reason: str = Field(default="", max_length=512)
 
 
+class MemoryCompactRequest(StrictRequest):
+    """``POST /api/v2/memory/compact`` -- seal a tier-2 memory checkpoint.
+
+    ``keep_recent`` is how many raw events stay hot after the seal; the server
+    clamps it to ``0..4096`` so an operator typo can never archive the whole
+    timeline in one call.
+    """
+
+    keep_recent: int = Field(default=200, ge=0, le=4096)
+    operator: str = Field(default="operator", min_length=1, max_length=128)
+
+
 class MissionTrancheRequest(StrictRequest):
     silo: str = Field(min_length=1, max_length=32)
     allocated_units: float = Field(gt=0)
@@ -1838,9 +1857,17 @@ class ControlPlane(V21ControlPlaneMixin):
         # ``entity_memory`` key so a clean slate zeroes both layers at once.
         # ------------------------------------------------------------------
         from ring2_brain.memory.entity_graph import EntityMemoryGraph
+        from ring2_brain.memory.episodic_memory import EpisodicMemoryStore
 
-        self.entity_memory = EntityMemoryGraph()
+        self.entity_memory = EntityMemoryGraph(
+            archive_path=_entity_memory_archive_path(self.state_journal)
+        )
+        # V2.3 (PART 2.3): episodic operator memory -- what the desk decided, not
+        # just what the market did.  Ring 2 compute; the durable copy rides the
+        # same atomic journal under an ``episodic_memory`` key.
+        self.episodic_memory = EpisodicMemoryStore()
         self._entity_memory_lock = threading.RLock()
+        self._episodic_memory_lock = threading.RLock()
         self._restore_journal()
         # V1.8 (PART 2.2): wire the portfolio-margin provider into the OMS so
         # ``SmartOMS.validate_proposal`` can reject over-committed orders.
@@ -1972,6 +1999,7 @@ class ControlPlane(V21ControlPlaneMixin):
             token_ledger=self.token_ledger,
             journal=self.state_journal,
             entity_memory=getattr(self, "entity_memory", None),
+            episodic_memory=getattr(self, "episodic_memory", None),
         )
         self.task_dispatcher.attach(contagion_factory=self._contagion_engine_for)
 
@@ -2060,6 +2088,8 @@ class ControlPlane(V21ControlPlaneMixin):
         table = self.lease_table
         if table is None:
             return []
+        # V2.3: a real Ring 1 measurement -- this reads the SHM lease table.
+        started_ns = time.perf_counter_ns()
         now = time.monotonic_ns()
         rows: list[dict[str, Any]] = []
         for lease in table.iter_active_leases(now):
@@ -2077,6 +2107,9 @@ class ControlPlane(V21ControlPlaneMixin):
                     "strategy_id_hash": lease.strategy_id_hash,
                 }
             )
+        gateway_telemetry().record(
+            1, time.perf_counter_ns() - started_ns, metric="lease_table_read"
+        )
         return rows
 
     def _contagion(self) -> dict[str, Any]:
@@ -2195,7 +2228,13 @@ class ControlPlane(V21ControlPlaneMixin):
         }
 
     def system_status(self) -> dict[str, Any]:
+        # V2.3: the kill latch is a Tier 0 SHM read (Ring 1).  Time the read
+        # itself, not a modelled latency.
+        latch_started_ns = time.perf_counter_ns()
         latch_hot = bool(self.kill_latch is not None and self.kill_latch.is_halted)
+        gateway_telemetry().record(
+            1, time.perf_counter_ns() - latch_started_ns, metric="kill_latch_read"
+        )
         frozen = bool(self.guard.frozen_silos) if self.guard is not None else False
         halted = latch_hot or frozen
         reason = ""
@@ -2393,7 +2432,14 @@ class ControlPlane(V21ControlPlaneMixin):
                 "pids": {},
                 "distinct_os_processes": 0,
             }
-        return ring_process_snapshot(self.process_supervisor)
+        # V2.3: the four-ring heartbeat table lives in Tier 0 shared memory, so
+        # reading it is a Ring 1 IPC measurement.
+        started_ns = time.perf_counter_ns()
+        report = ring_process_snapshot(self.process_supervisor)
+        gateway_telemetry().record(
+            1, time.perf_counter_ns() - started_ns, metric="shm_heartbeat_read"
+        )
+        return report
 
     # -- Phase 3 Step 3: live 4-ring supervisor control -------------------
     def supervisor_state(self) -> dict[str, Any]:
@@ -2402,6 +2448,7 @@ class ControlPlane(V21ControlPlaneMixin):
         rings = self.ring_processes()
         attached = self.process_supervisor is not None
         distinct = int(rings.get("distinct_os_processes", 0) or 0)
+        tracker = gateway_telemetry().snapshot(overall_ring=3)
         return {
             "available": bool(rings.get("available", False)),
             "attached": attached,
@@ -2416,6 +2463,16 @@ class ControlPlane(V21ControlPlaneMixin):
             "symbol": rings.get("symbol"),
             "feed_mode": rings.get("feed_mode") or self.feed_state()["feed_mode"],
             "reason": rings.get("reason"),
+            # V2.3 PART 3: the supervisor answers "are the four rings alive?" and
+            # "how fast is each one?" in the same payload.
+            "latency_ms": tracker["latency_ms"],
+            "ring0_p99_ms": tracker["ring0_p99_ms"],
+            "ring1_p99_ms": tracker["ring1_p99_ms"],
+            "ring2_p99_ms": tracker["ring2_p99_ms"],
+            "ring3_p99_ms": tracker["ring3_p99_ms"],
+            "latency_p50_ms": tracker["latency_p50_ms"],
+            "latency_p95_ms": tracker["latency_p95_ms"],
+            "latency_ring_samples": tracker["ring_samples"],
             "actions": ["start", "stop", "restart_ring", "status"],
             "workers": [
                 "ring0-vault-worker",
@@ -3100,12 +3157,22 @@ class ControlPlane(V21ControlPlaneMixin):
                 }
             except Exception:
                 restored_memory = {"events": 0, "entities": 0}
+        # V2.3 (PART 2.3): restore the episodic operator log alongside the graph.
+        episodes = state.get("episodic_memory")
+        restored_episodes = 0
+        if isinstance(episodes, Mapping):
+            try:
+                episode_report = self.episodic_memory.load_state(episodes)
+                restored_episodes = int(episode_report.get("episode_count", 0) or 0)
+            except Exception:
+                restored_episodes = 0
         self._journal_restored = {
             "logbook": len(self._logbook_entries),
             "backtests": len(self._journal_backtests),
             "agent_tasks": len(tasks) if isinstance(tasks, list) else 0,
             "entity_memory_events": restored_memory["events"],
             "entity_memory_entities": restored_memory["entities"],
+            "episodic_episodes": restored_episodes,
         }
 
     def _journal_save_entity_memory(self) -> None:
@@ -3131,6 +3198,33 @@ class ControlPlane(V21ControlPlaneMixin):
                     journal.update(entity_memory=state)
             else:
                 journal.update(entity_memory=state)
+        except Exception:
+            return
+
+    def _journal_save_episodic_memory(self) -> None:
+        """Persist the episodic operator log through the atomic journal.
+
+        Same contract as the entity graph: an unknown top-level key carried
+        verbatim, so the clean-slate derivation and ``SECTIONS`` counts are
+        untouched.
+        """
+
+        journal = getattr(self, "state_journal", None)
+        store = getattr(self, "episodic_memory", None)
+        if journal is None or store is None:
+            return
+        lock = getattr(self, "_episodic_memory_lock", None)
+        try:
+            state = store.to_state()
+        except Exception:
+            return
+        try:
+            if lock is not None:
+                with lock:
+                    journal.update(episodic_memory=state)
+            else:
+                journal.update(episodic_memory=state)
+            store.mark_clean()
         except Exception:
             return
 
@@ -3164,12 +3258,20 @@ class ControlPlane(V21ControlPlaneMixin):
             }
         except Exception:
             memory = {"events": 0, "entities": 0}
+        episodes = 0
+        try:
+            episode_store = getattr(self, "episodic_memory", None)
+            if episode_store is not None:
+                episodes = int(episode_store.reset().get("episode_count", 0) or 0)
+        except Exception:
+            episodes = 0
         if journal is None:
             return {
                 "journal": False,
                 "journal_path": "",
                 "clean_slate": True,
                 "entity_memory": memory,
+                "episodic_memory": {"episodes": episodes},
             }
         try:
             state = journal.reset()
@@ -3179,12 +3281,14 @@ class ControlPlane(V21ControlPlaneMixin):
                 "journal_path": "",
                 "clean_slate": True,
                 "entity_memory": memory,
+                "episodic_memory": {"episodes": episodes},
             }
         return {
             "journal": True,
             "journal_path": str(getattr(journal, "path", "")),
             "clean_slate": bool(state.get("clean_slate_active", True)),
             "entity_memory": memory,
+            "episodic_memory": {"episodes": episodes},
         }
 
     def journal_snapshot(self) -> dict[str, Any]:
@@ -3193,13 +3297,21 @@ class ControlPlane(V21ControlPlaneMixin):
         journal = getattr(self, "state_journal", None)
         state = self._journal_load()
         path = getattr(journal, "path", None) if journal is not None else None
+        # V2.3: the journal lives in a SQLite WAL database derived from ``path``.
+        # Both locations are reported so a caller can check presence truthfully
+        # without assuming the pre-V2.3 monolithic JSON file still exists.
+        database_path = getattr(journal, "database_path", None) if journal is not None else None
         try:
-            exists = bool(path is not None and path.exists())
+            exists = bool(path is not None and path.exists()) or bool(
+                database_path is not None and database_path.exists()
+            )
         except Exception:
             exists = False
         return {
             "enabled": journal is not None,
             "journal_path": str(path) if path is not None else "",
+            "database_path": str(database_path) if database_path is not None else "",
+            "storage": "sqlite-wal",
             "exists": exists,
             "logbook": len(state.get("logbook") or []),
             "backtests": len(state.get("backtests") or []),
@@ -3321,6 +3433,169 @@ class ControlPlane(V21ControlPlaneMixin):
         payload["journal_entities"] = int(
             self._journal_restored.get("entity_memory_entities", 0)
         )
+        return self._envelope(payload)
+
+    # ------------------------------------------------------------------
+    # V2.3 (PART 2.2 / 2.3): tier-2 compaction + episodic operator memory
+    # ------------------------------------------------------------------
+    def record_episodic_decision(
+        self,
+        action_kind: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Record one operator intervention.  Never raises into a control path.
+
+        The mission surface, the reconciliation `clear-freeze` approval and the
+        autopilot toggle all call this; a memory fault is swallowed so a
+        decision endpoint can never fail because its audit trail could not be
+        written.  The episode is durably mirrored through the atomic journal.
+        """
+
+        store = getattr(self, "episodic_memory", None)
+        if store is None:
+            return None
+        data = dict(payload or {})
+        kind = str(action_kind or "").strip().upper()
+        actor = str(data.get("actor") or data.get("operator") or "operator")
+        regime = str(data.get("regime") or "")
+        try:
+            if kind == "MISSION_OVERRIDE":
+                episode = store.record_mission_override(
+                    mission_id=str(data.get("mission_id") or ""),
+                    actor=actor,
+                    tranche_caps_micros=data.get("tranche_caps_micros") or {},
+                    excluded_symbols=data.get("excluded_symbols") or (),
+                    reserve_split_override_bps=data.get("reserve_split_override_bps"),
+                    operator_note=str(data.get("operator_note") or ""),
+                    revision=data.get("revision"),
+                    approval_state=str(data.get("approval_state") or ""),
+                    regime=regime,
+                )
+            elif kind == "MISSION_REVOKE":
+                episode = store.record_mission_revoke(
+                    mission_id=str(data.get("mission_id") or ""),
+                    actor=actor,
+                    reason=str(data.get("reason") or ""),
+                    regime=regime,
+                )
+            elif kind == "TRANCHE_REARM":
+                episode = store.record_tranche_rearm(
+                    tranche_id=str(data.get("tranche_id") or ""),
+                    actor=actor,
+                    mission_id=str(data.get("mission_id") or ""),
+                    rearmed=bool(data.get("rearmed", True)),
+                    regime=regime,
+                )
+            elif kind == "CLEAR_FREEZE":
+                episode = store.record_clear_freeze(
+                    silo=str(data.get("silo") or ""),
+                    actor=actor,
+                    note=str(data.get("note") or ""),
+                    previous_reason=str(data.get("previous_reason") or ""),
+                    cleared=bool(data.get("cleared", True)),
+                    regime=regime,
+                )
+            elif kind in {"AUTOPILOT_PAUSE", "AUTOPILOT_PLAY"}:
+                episode = store.record_autopilot(
+                    enabled=kind == "AUTOPILOT_PLAY",
+                    actor=actor,
+                    regime=regime,
+                )
+            else:
+                episode = store.record(
+                    action_kind=kind,
+                    actor=actor,
+                    decision_summary=str(data.get("decision_summary") or ""),
+                    regime=regime,
+                    context_tags=data.get("context_tags") or {},
+                )
+        except Exception:  # noqa: BLE001 - memory must never break a control endpoint
+            return None
+        self._journal_save_episodic_memory()
+        return episode
+
+    def memory_episodes(
+        self,
+        *,
+        action_kind: str = "",
+        query: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """``GET /api/v2/memory/episodes`` -- episodic operator decisions.
+
+        Always answers an envelope, including the empty case: a desk that has not
+        intervened yet gets ``episodes: []`` and ``count: 0``, never a 500.
+        """
+
+        store = getattr(self, "episodic_memory", None)
+        if store is None:
+            payload: dict[str, Any] = {
+                "episodes": [],
+                "count": 0,
+                "total": 0,
+                "action_kind": str(action_kind or ""),
+                "query": str(query or ""),
+                "limit": int(max(1, min(int(limit or 50), 500))),
+                "counts_by_action": {},
+                "action_kinds": [],
+                "episode_schema_version": "v2.3.episodic-memory",
+            }
+        else:
+            payload = store.describe(
+                action_kind=action_kind, query=query, limit=limit
+            )
+        payload["journal_episodes"] = int(
+            self._journal_restored.get("episodic_episodes", 0)
+        )
+        return self._envelope(payload)
+
+    def compact_memory(self, *, keep_recent: int = 200) -> dict[str, Any]:
+        """``POST /api/v2/memory/compact`` -- seal a tier-2 checkpoint.
+
+        Compacts the post-mortem timeline into a verified ``MemoryCheckpoint``
+        (moving the sealed events into the cold archive) and trims the episodic
+        log to its bounded window.  The summary is what the operator sees.
+        """
+
+        keep = max(0, min(int(keep_recent), 4_096))
+        graph = getattr(self, "entity_memory", None)
+        report: dict[str, Any] = {}
+        seal: dict[str, Any] = {}
+        if graph is not None:
+            report = graph.compact_timeline(keep)
+            seal = graph.seal_summary()
+        store = getattr(self, "episodic_memory", None)
+        episodes = (
+            store.compact()
+            if store is not None
+            else {"compacted": False, "trimmed_episodes": 0, "remaining_episodes": 0}
+        )
+        self._journal_save_entity_memory()
+        self._journal_save_episodic_memory()
+        payload = {
+            "page": "memory.compact",
+            "compacted": bool(report.get("compacted", False)),
+            "reason": str(report.get("reason") or ""),
+            "checkpoint": report.get("checkpoint"),
+            "checkpoint_sha256": str(
+                report.get("checkpoint_sha256") or seal.get("checkpoint_sha256") or ""
+            ),
+            "checkpoint_seq": int(
+                report.get("checkpoint_seq") or seal.get("checkpoint_seq") or 0
+            ),
+            "cutoff_ts_utc": int(report.get("cutoff_ts_utc") or 0),
+            "event_count_compacted": int(report.get("event_count_compacted") or 0),
+            "active_events": int(seal.get("active_events", 0)),
+            "event_count": int(seal.get("event_count", 0)),
+            "archive_events": int(seal.get("archive_events", 0)),
+            "archive_path": str(seal.get("archive_path") or ""),
+            "entity_count": int(seal.get("entity_count", 0)),
+            "compact_threshold": int(seal.get("compact_threshold", 0)),
+            "keep_recent": int(keep),
+            "keep_recent_default": int(seal.get("keep_recent", keep)),
+            "episodic_memory": episodes,
+            "as_of_utc_ns": time.time_ns(),
+        }
         return self._envelope(payload)
 
     def free_margin_micros(self, silo: str) -> int | None:
@@ -3505,8 +3780,12 @@ class ControlPlane(V21ControlPlaneMixin):
         ) // _bps_denominator
 
         try:
+            reserve_started_ns = time.perf_counter_ns()
             reservation = self.outbox.reserve(
                 proposal, cost_floor=self.cost_floor(request.silo), now_ns=now
+            )
+            gateway_telemetry().record(
+                0, time.perf_counter_ns() - reserve_started_ns, metric="outbox_reserve"
             )
             if getattr(reservation, "duplicate", False):
                 duplicate_row = _jsonable(
@@ -3548,6 +3827,7 @@ class ControlPlane(V21ControlPlaneMixin):
             order_row: dict[str, Any]
             order_id: str
             filled = False
+            oms_started_ns = time.perf_counter_ns()
             if request.order_style == "MAKER_PEG":
                 chaser = self.oms.submit_maker_peg(
                     proposal, reservation, book, now_ns=now
@@ -3601,6 +3881,9 @@ class ControlPlane(V21ControlPlaneMixin):
                                 timestamp_ns=now + 1,
                             )
                         )
+            gateway_telemetry().record(
+                0, time.perf_counter_ns() - oms_started_ns, metric="oms_order_path"
+            )
             receipt = self.outbox.get(reservation.outbox_idempotency_key)
         except HTTPException:
             raise
@@ -4043,6 +4326,10 @@ class ControlPlane(V21ControlPlaneMixin):
                 detail=f"factor scan failed: {type(exc).__name__}: {exc}",
             ) from None
         latency_ms = (time.perf_counter() - started) * 1000.0
+        # V2.3: the same measured span, published on the Ring 2 ring buffer.
+        gateway_telemetry().record(
+            2, int(latency_ms * 1_000_000.0), metric="quant_scan"
+        )
         payload = _jsonable(result)
         if not isinstance(payload, dict):
             payload = {"result": payload}
@@ -5418,14 +5705,15 @@ class ControlPlane(V21ControlPlaneMixin):
 
     def assign_agent_task(self, request: AgentAssignRequest) -> dict[str, Any]:
         """Dispatch one grounded Ring 2 agent task and return its report."""
-        task = self.task_dispatcher.assign(
-            agent_id=request.agent_id,
-            silo=request.silo,
-            symbols=list(request.symbols or []),
-            strategy_id=request.strategy_id,
-            prompt=request.prompt,
-            priority=request.priority,
-        )
+        with gateway_telemetry().measure(2, "agent_dispatch"):
+            task = self.task_dispatcher.assign(
+                agent_id=request.agent_id,
+                silo=request.silo,
+                symbols=list(request.symbols or []),
+                strategy_id=request.strategy_id,
+                prompt=request.prompt,
+                priority=request.priority,
+            )
         task["token"] = self.task_dispatcher.token_usage()
         return task
 
@@ -5910,6 +6198,21 @@ class ControlPlane(V21ControlPlaneMixin):
         surface_pcr = float(spec.get("pcr_oi") or 0.0)
         surface_max_pain = float(spec.get("max_pain_strike") or 0.0)
 
+        # V2.3 PART 3: IV Rank in bps from the *measured* trailing ATM-IV window
+        # the Ring 2 bar aggregator retains.  ``surface_iv_rank`` above is the
+        # reference profile's 0..100 field; this is the real min-max rank of
+        # this chain's ATM IV inside its own 52-week window, and it is ``None``
+        # (never a midpoint) until that window holds enough observations.
+        # The chain just priced is itself one observation in that window.
+        self._record_option_iv(
+            silo=str(spec.get("silo", "")), symbol=symbol, atm_iv=atm_iv
+        )
+        iv_rank = self._options_iv_rank(
+            silo=str(spec.get("silo", "")),
+            symbol=symbol,
+            current_iv=atm_iv,
+        )
+
         metrics: dict[str, float] = {
             "spot": resolved_spot,
             "volatility": base_vol,
@@ -5957,6 +6260,8 @@ class ControlPlane(V21ControlPlaneMixin):
             "chain": rows,
             "asset_class": str(spec.get("asset_class", "")),
             "surface": dict(spec.get("surface") or {}),
+            "iv_rank_bps": iv_rank["iv_rank_bps"],
+            "iv_rank_detail": iv_rank,
             "summary": {
                 "atm_strike": atm_strike,
                 "atm_iv": atm_iv,
@@ -5970,6 +6275,9 @@ class ControlPlane(V21ControlPlaneMixin):
                 "total_put_oi": total_put_oi,
                 "strike_count": len(rows),
                 "iv_rank": surface_iv_rank,
+                "iv_rank_bps": iv_rank["iv_rank_bps"],
+                "iv_rank_status": iv_rank["iv_rank_status"],
+                "iv_window_samples": iv_rank["iv_window_samples"],
                 "net_gamma_exposure_usd": surface_gex,
                 "pcr_oi": surface_pcr,
                 "surface_max_pain_strike": surface_max_pain,
@@ -6068,6 +6376,48 @@ class ControlPlane(V21ControlPlaneMixin):
             strike_count=request.strike_count,
             risk_free_rate=request.risk_free_rate,
         )
+
+    def _record_option_iv(self, *, silo: str, symbol: str, atm_iv: Any) -> None:
+        """Fold one priced chain's ATM IV into the trailing Ring 2 IV window."""
+        try:
+            aggregator = self.bar_aggregator
+        except Exception:  # pragma: no cover - optional component
+            return
+        record = getattr(aggregator, "record_option_iv", None)
+        if not callable(record):
+            return
+        try:
+            record(silo=silo, symbol=symbol, atm_iv=atm_iv)
+        except Exception:  # pragma: no cover - telemetry is non-fatal
+            return
+
+    def _options_iv_rank(
+        self, *, silo: str, symbol: str, current_iv: Any
+    ) -> dict[str, Any]:
+        """Trailing 52-week IV Rank (bps) from the retained Ring 2 IV window.
+
+        The window is the set of real ATM-IV observations the
+        :class:`LiveBarAggregator` folded from previous chain snapshots for this
+        ``(silo, symbol)``.  A process that has never folded a chain reports
+        ``iv_rank_bps = None`` with a named status -- there is no history to
+        rank against, and inventing a midpoint would be a fabricated metric.
+        """
+        from ring2_brain.quant.options_iv_rank import iv_rank_payload
+
+        aggregator = None
+        try:
+            aggregator = self.bar_aggregator
+        except Exception:  # pragma: no cover - optional component
+            aggregator = None
+        describe = getattr(aggregator, "option_iv_rank", None)
+        if callable(describe):
+            try:
+                return dict(
+                    describe(silo=silo, symbol=symbol, current_iv=current_iv) or {}
+                )
+            except Exception:  # pragma: no cover - telemetry is non-fatal
+                pass
+        return iv_rank_payload(current_iv, ())
 
     @staticmethod
     def _strategy_legs(
@@ -6842,6 +7192,14 @@ class ControlPlane(V21ControlPlaneMixin):
         check = instrument_registry.validate_order(
             contract.silo, contract.symbol, contract.lot_size, spot
         )
+        # V2.3 PART 3: IV Rank in bps from the measured trailing ATM-IV window.
+        # ``surface["iv_rank"]`` above is the reference profile's 0..100 field;
+        # this is the real min-max rank and is ``None`` until history exists.
+        iv_rank = self._options_iv_rank(
+            silo=contract.silo,
+            symbol=contract.symbol,
+            current_iv=float(surface.get("atm_iv_pct", 0.0) or 0.0) / 100.0,
+        )
         return self._envelope(
             {
                 "schema_version": instrument_registry.SCHEMA_VERSION,
@@ -6850,6 +7208,8 @@ class ControlPlane(V21ControlPlaneMixin):
                 "contract": contract.to_dict(),
                 "feature_profile": profile.to_dict(),
                 "options_surface": surface,
+                "iv_rank_bps": iv_rank["iv_rank_bps"],
+                "iv_rank_detail": iv_rank,
                 "statutory_cost": statutory,
                 "decision_score": decision,
                 "one_lot_check": check.to_dict(),
@@ -7707,7 +8067,8 @@ class ControlPlane(V21ControlPlaneMixin):
             panel = FactorPanel.generate(n_symbols=24, n_periods=64)
             with contextlib.suppress(Exception):
                 self.scanner.warmup()
-            result = self.scanner.scan(panel, commit=False)
+            with gateway_telemetry().measure(2, "quant_scan"):
+                result = self.scanner.scan(panel, commit=False)
             payload = _jsonable(result)
             if not isinstance(payload, dict):
                 payload = {"result": payload}
@@ -7815,17 +8176,30 @@ class ControlPlane(V21ControlPlaneMixin):
                 item = row if isinstance(row, dict) else {"value": row}
                 dsr = float(item.get("deflated_sharpe", 0.0) or 0.0)
                 net = float(item.get("net_edge_bps", 0.0) or 0.0)
+                strategy_token = str(item.get("strategy_id", sid))
                 leaderboard.append(
                     {
                         **item,
-                        "strategy_id": str(item.get("strategy_id", sid)),
+                        "strategy_id": strategy_token,
                         "role": kind,
                         "deflated_sharpe": dsr,
                         "net_edge_bps": net,
                         "promotion_ready": dsr >= promote_dsr,
                         "above_floor": net > floor_bps,
+                        # V2.3 PART 3: this row's own ADWIN block, read straight
+                        # off its ConceptDriftMonitor (empty window => zeros).
+                        "adwin_drift": self._adwin_drift_row(strategy_token),
                     }
                 )
+        drift_by_strategy = {
+            str(row["strategy_id"]): dict(row["adwin_drift"])
+            for row in leaderboard
+            if isinstance(row.get("adwin_drift"), dict)
+        }
+        if self.strategy_id not in drift_by_strategy:
+            drift_by_strategy[str(self.strategy_id)] = self._adwin_drift_row(
+                str(self.strategy_id)
+            )
         return {
             "page": "forge",
             "title": "Alpha Forge & Plugins",
@@ -7834,6 +8208,11 @@ class ControlPlane(V21ControlPlaneMixin):
             "forge": snapshot,
             "thresholds": thresholds,
             "leaderboard": leaderboard,
+            # V2.3 PART 3: real ADWIN / concept-drift telemetry.  The scalar
+            # ``adwin_drift`` is the house strategy (the shape every V2.3 client
+            # renders); ``adwin_drift_by_strategy`` carries the full map.
+            "adwin_drift": drift_by_strategy[str(self.strategy_id)],
+            "adwin_drift_by_strategy": drift_by_strategy,
             "next_run": {
                 "seconds_until_next_run": int(
                     _read(forge, "seconds_until_next_run", 0) or 0
@@ -7844,6 +8223,22 @@ class ControlPlane(V21ControlPlaneMixin):
             "plugins": _jsonable(_read(self.plugins, "snapshot", {"count": 0, "plugins": []})),
             "skills": _jsonable(_read(self.skills, "describe", {"count": 0, "skills": []})),
             "generated_at_ns": time.time_ns(),
+        }
+
+    def _adwin_drift_row(self, strategy_id: str) -> dict[str, Any]:
+        """One strategy's ``adwin_drift`` block (``{state, drift_score, ...}``)."""
+        blocks = adwin_drift_payload(self, [str(strategy_id)])
+        block = blocks.get(str(strategy_id))
+        if block is not None:
+            return block
+        return {
+            "state": "STABLE",
+            "drift_score": 0.0,
+            "window_size": 0,
+            "last_checked_utc": None,
+            "severity": "NONE",
+            "drift_detected": False,
+            "missing_fields": ["monitor_unavailable"],
         }
 
     def ledger_page(self) -> dict[str, Any]:
@@ -8233,6 +8628,12 @@ class ControlPlane(V21ControlPlaneMixin):
             v21_report = dict(v21_reset())
         else:  # pragma: no cover - a ControlPlane without the V2.1 mixin
             v21_report = {}
+        # V2.3: the agent-task and backtest resets also clear their journal
+        # sections, so they run *before* the wipe.  A section cleared afterwards
+        # would recreate the document the reset just truncated, leaving rows in
+        # ``nios_kv_sections`` in a workspace that is supposed to be zeroed.
+        agents_cleared = self.task_dispatcher.reset_to_clean_slate()
+        backtest_cleared = self.backtest_engine.reset_to_clean_slate()
         # V1.8: the whole durable journal returns to the Clean-Slate shape.
         journal = self._journal_reset()
         try:  # pragma: no cover - depends on the kernel build
@@ -8248,8 +8649,8 @@ class ControlPlane(V21ControlPlaneMixin):
             "journal": journal,
             "workspace": "paper",
             "v21": v21_report,
-            "agents": self.task_dispatcher.reset_to_clean_slate(),
-            "backtest": self.backtest_engine.reset_to_clean_slate(),
+            "agents": agents_cleared,
+            "backtest": backtest_cleared,
             "logbook": logbook,
             **report,
         }
@@ -8293,6 +8694,15 @@ class ControlPlane(V21ControlPlaneMixin):
         else:  # pragma: no cover - ControlPlane without an orchestrator
             raise HTTPException(status_code=400, detail="AUTOPILOT_UNAVAILABLE")
         self._autopilot_override = bool(request.enabled)
+        # V2.3 (PART 2.3): pausing or resuming the tape is an operator decision
+        # with real risk consequences, so it is recorded like any other.
+        self.record_episodic_decision(
+            "AUTOPILOT_PLAY" if request.enabled else "AUTOPILOT_PAUSE",
+            {
+                "actor": "operator",
+                "regime": str(getattr(self, "active_regime", "") or ""),
+            },
+        )
         return {"ok": True, "autopilot": dict(snapshot)}
 
     def workspace_state(
@@ -8390,7 +8800,12 @@ class ControlPlane(V21ControlPlaneMixin):
             "generated_at_ns": time.time_ns(),
         }
 
-    def state(self) -> dict[str, Any]:
+    def state(self, *, telemetry: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        # V2.3: two real Ring 0 / Ring 2 measurements are taken while the
+        # payload is assembled -- the IBOR/vault snapshot (Ring 0 ledger reads)
+        # and the MiroFish contagion snapshot (Ring 2 compute).  Neither is a
+        # modelled number: both are ``perf_counter_ns`` spans around real work.
+        silos_started_ns = time.perf_counter_ns()
         silos = {
             silo_id: {
                 **self.broker_state(silo_id),
@@ -8398,7 +8813,15 @@ class ControlPlane(V21ControlPlaneMixin):
             }
             for silo_id in self.registry.silo_ids()
         }
-        return {
+        gateway_telemetry().record(
+            0, time.perf_counter_ns() - silos_started_ns, metric="ibor_state_read"
+        )
+        contagion_started_ns = time.perf_counter_ns()
+        contagion = self._contagion()
+        gateway_telemetry().record(
+            2, time.perf_counter_ns() - contagion_started_ns, metric="contagion_snapshot"
+        )
+        payload: dict[str, Any] = {
             "version": PLATFORM_VERSION,
             "document_id": DOCUMENT_ID,
             "system": self.system_status(),
@@ -8406,7 +8829,7 @@ class ControlPlane(V21ControlPlaneMixin):
             "silos": silos,
             "brokers": self.brokers(),
             "leases": self._leases(),
-            "contagion": self._contagion(),
+            "contagion": contagion,
             "llm": self._llm_state(),
             "cards": self.recent_cards(limit=20),
             "kill_switch": self._kill_report,
@@ -8426,6 +8849,9 @@ class ControlPlane(V21ControlPlaneMixin):
                 "fps": 60,
             },
         }
+        for key, value in (telemetry or {}).items():
+            payload.setdefault(str(key), value)
+        return payload
 
     def autopilot_state(self) -> dict[str, Any]:
         """Paper-shadow autopilot telemetry (``sec_013`` lifecycle)."""
@@ -9525,6 +9951,14 @@ class ControlPlane(V21ControlPlaneMixin):
                 split_engine=split_engine,
             )
             self._mission_surface = surface
+        # V2.3 (PART 2.3): every mission decision flows into the episodic log.
+        # The hook is optional by design -- the surface works unchanged when no
+        # store is attached (unit tests, stand-alone surfaces).
+        if getattr(surface, "decision_hook", None) is None:
+            try:
+                surface.decision_hook = self.record_episodic_decision
+            except Exception:  # pragma: no cover - a stand-in surface may refuse
+                pass
         return surface
 
     def clock_health(self) -> dict[str, Any]:
@@ -9790,6 +10224,31 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     )
     app.state.control = control
 
+    #: V2.3 PART 3: every HTTP request is one real Ring 3 latency sample.  The
+    #: span is opened before the route runs and closed when the response is
+    #: produced; a handler that already recorded the in-flight span (the
+    #: telemetry surfaces, so their own payload carries a real number) sets
+    #: ``request.state.nios_latency_recorded`` and is not double-counted.
+    @app.middleware("http")
+    async def _latency_middleware(request: Request, call_next: Any) -> Any:
+        started_ns = time.perf_counter_ns()
+        request.state.nios_telemetry_started_ns = started_ns
+        try:
+            response = await call_next(request)
+        except Exception:
+            gateway_telemetry().record(
+                3,
+                time.perf_counter_ns() - started_ns,
+                metric="http_request_error",
+            )
+            raise
+        if not latency_already_recorded(request):
+            gateway_telemetry().record(
+                3, time.perf_counter_ns() - started_ns, metric="http_request"
+            )
+            request.state.nios_latency_recorded = True
+        return response
+
     #: V1.6: every cockpit/workspace payload carries the deterministic
     #: envelope (schema_version, generated_at_ns, clean_slate_active,
     #: workspace_mode, payload_sha256) plus the per-silo risk telemetry.  The
@@ -9798,6 +10257,8 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     envelope_paths = frozenset(
         {
             "/api/v2/cockpit/state",
+            "/api/v2/cockpit/overview",
+            "/api/v2/status",
             "/api/v2/cockpit/pages",
             "/api/v2/cockpit/orders",
             "/api/v2/cockpit/options",
@@ -9928,8 +10389,71 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         }
 
     @app.get("/api/v2/cockpit/state")
-    def state() -> dict[str, Any]:
-        return control.state()
+    def state(request: Request) -> dict[str, Any]:
+        return control.state(
+            telemetry=telemetry_fields(
+                control,
+                request=request,
+                request_started_ns=request_started_ns_of(request),
+            )
+        )
+
+    #: V2.3 PART 3: the compact status surface.  Every one of the six previously
+    #: missing telemetry fields is published here from real recorded state.
+    @app.get("/api/v2/status")
+    def gateway_status(request: Request) -> dict[str, Any]:
+        feed = control.feed_state()
+        # V2.3: reading the MiroFish cascade result IS Ring 2 work, so the
+        # status payload measures it instead of reporting a modelled number.
+        contagion_started_ns = time.perf_counter_ns()
+        contagion = control._contagion()
+        if control.contagion_provider is not None:
+            gateway_telemetry().record(
+                2,
+                time.perf_counter_ns() - contagion_started_ns,
+                metric="contagion_snapshot",
+            )
+        return {
+            "page": "status",
+            "version": PLATFORM_VERSION,
+            "document_id": DOCUMENT_ID,
+            "system": control.system_status(),
+            "contagion": contagion,
+            "workspace_mode": workspace_mode_of(
+                getattr(control, "_workspace_mode", "PAPER")
+            ),
+            "feed_mode": feed.get("feed_mode"),
+            "ring_processes": control.ring_processes(),
+            **telemetry_fields(
+                control,
+                request=request,
+                request_started_ns=request_started_ns_of(request),
+            ),
+            "law": "sec_010 / sec_016 - every latency is measured, never modelled",
+            "generated_at_ns": time.time_ns(),
+        }
+
+    @app.get("/api/v2/cockpit/overview")
+    def cockpit_overview(request: Request) -> dict[str, Any]:
+        """One-screen summary: ring health, abstention funnel and telemetry."""
+        return {
+            "page": "overview",
+            "title": "Cockpit Overview",
+            "version": PLATFORM_VERSION,
+            "document_id": DOCUMENT_ID,
+            "system": control.system_status(),
+            "abstention": control._abstention(),
+            "autopilot": control.autopilot_state(),
+            "feed_mode": control.feed_state()["feed_mode"],
+            "supervisor": control.supervisor_state(),
+            **telemetry_fields(
+                control,
+                request=request,
+                request_started_ns=request_started_ns_of(request),
+            ),
+            "law": "sec_018 Law 4 - the default answer is no trade",
+            "generated_at_ns": time.time_ns(),
+        }
 
     @app.get("/api/v2/cockpit/formal-proofs")
     def formal_proofs(refresh: bool = Query(False)) -> dict[str, Any]:
@@ -10178,6 +10702,22 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return control.memory_entities(
             entity_id=entity_id or "", query=q or "", limit=limit
         )
+
+    # ---- V2.3 (PART 2.3): episodic operator memory ----------------------
+    @app.get("/api/v2/memory/episodes")
+    def memory_episodes(
+        action_kind: str | None = Query(None),
+        q: str | None = Query(None),
+        limit: int = Query(50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        return control.memory_episodes(
+            action_kind=action_kind or "", query=q or "", limit=limit
+        )
+
+    @app.post("/api/v2/memory/compact", dependencies=[SESSION_GUARD])
+    def memory_compact(payload: MemoryCompactRequest | None = None) -> dict[str, Any]:
+        request = payload or MemoryCompactRequest()
+        return control.compact_memory(keep_recent=int(request.keep_recent))
 
     @app.post("/api/v2/memory/entities", dependencies=[SESSION_GUARD])
     def record_memory_event(payload: MemoryOutcomeRequest) -> dict[str, Any]:
@@ -10878,6 +11418,24 @@ def _default_state_journal() -> Any:
         return None
     try:
         return AtomicStateJournal()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _entity_memory_archive_path(journal: Any) -> Path | None:
+    """Cold-archive JSONL path beside the state journal.
+
+    V2.3 PART 2.2 moves compacted post-mortem events out of the hot timeline and
+    into an append-only archive.  It lives next to the journal so it belongs to
+    the same workspace and disappears with it; ``None`` keeps the archive
+    memory-only when the journal is absent or unwritable.
+    """
+
+    try:
+        base = getattr(journal, "database_path", None) or getattr(journal, "path", None)
+        if base is None:
+            return None
+        return Path(base).parent / "entity_memory_cold_archive.jsonl"
     except Exception:  # pragma: no cover - defensive
         return None
 

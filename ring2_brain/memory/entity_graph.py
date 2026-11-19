@@ -33,22 +33,34 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from core.schemas import GroundedFactPacket
 
 __all__ = [
     "ADVERSE_OUTCOME_KINDS",
+    "COMPACT_THRESHOLD",
+    "EMBED_DIMS",
     "ENTITY_KINDS",
+    "FEATURE_WEIGHT",
+    "KEEP_RECENT",
+    "LEXICAL_WEIGHT",
+    "MAX_COLD_ARCHIVE_EVENTS",
     "OUTCOME_KINDS",
+    "SEMANTIC_WEIGHT",
     "CompiledEntityTruth",
     "EntityMemoryGraph",
+    "MemoryCheckpoint",
     "PostMortemEvent",
     "PostMortemPenalty",
+    "cosine_similarity",
+    "hashed_embedding",
 ]
 
 #: Entity namespaces an outcome event may reference.
@@ -93,12 +105,28 @@ MAX_TOP_K = 25
 MAX_LESSON_CHARS = 512
 MONEY_CEILING_MICROS = 10**18
 
+#: V2.3 (PART 2.2) -- tier-2 compaction.  The active raw timeline is compacted
+#: automatically once it grows past ``COMPACT_THRESHOLD`` events; the tail is
+#: kept hot (``KEEP_RECENT``) so a live query never has to touch the archive.
+COMPACT_THRESHOLD = 500
+KEEP_RECENT = 200
+MAX_COLD_ARCHIVE_EVENTS = 20_000
+#: How much of the cold archive rides the atomic journal state.  The durable
+#: record is the append-only JSONL file (``read_archive_file``); this is the
+#: crash-recovery tail so an in-process restart still sees what it just sealed.
+STATE_ARCHIVE_TAIL = 512
+CHECKPOINT_SCHEMA_VERSION = "v2.3.memory-checkpoint"
+
 ENTITY_SCHEMA_VERSION = "v1.9.entity-memory"
 
 _FORBIDDEN_TOKENS = ("/", "\\", "\x00", "..")
 
-#: Retrieval fusion. Feature overlap dominates because "this is the symbol I am
-#: about to trade" is a stronger signal than a word appearing in a lesson.
+#: Retrieval fusion (V2.3 PART 2.3).  Three signals, summing to one:
+#: ``0.25`` BM25 lexical + ``0.45`` canonical entity-feature + ``0.30``
+#: deterministic 384-dim hashed n-gram cosine.  Feature overlap still dominates
+#: because "this is the symbol I am about to trade" is a stronger signal than a
+#: word appearing in a lesson, but a morphological or regime-near lesson now
+#: outranks a coincidental token hit instead of tying with it.
 KIND_WEIGHTS: Mapping[str, float] = {
     "symbol": 0.35,
     "silo": 0.20,
@@ -106,8 +134,22 @@ KIND_WEIGHTS: Mapping[str, float] = {
     "regime": 0.15,
     "macro": 0.10,
 }
-FEATURE_WEIGHT = 0.70
-LEXICAL_WEIGHT = 0.30
+FEATURE_WEIGHT = 0.45
+LEXICAL_WEIGHT = 0.25
+SEMANTIC_WEIGHT = 0.30
+
+#: Deterministic local embedding width (no model download, no network).
+EMBED_DIMS = 384
+EMBED_NGRAM = 3
+
+#: Optional pluggable embedder.  Dormant unless the operator opts in; a single
+#: bounded probe decides, and a failure disables the hook for the process so a
+#: dead daemon can never become a retry storm.
+OLLAMA_EMBED_ENV = "NIOS_OLLAMA_EMBED_MODEL"
+OLLAMA_BASE_URL_ENV = "NIOS_OLLAMA_BASE_URL"
+OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434"
+OLLAMA_TIMEOUT_S = 2.0
+
 BM25_K1 = 1.5
 BM25_B = 0.75
 
@@ -440,6 +482,332 @@ class PostMortemPenalty:
 
 
 # ---------------------------------------------------------------------------
+# layer 2b -- verified snapshot checkpoints (V2.3 PART 2.2)
+# ---------------------------------------------------------------------------
+
+
+def _canonical_truth_row(row: Any) -> dict[str, Any]:
+    """Normalise one sealed truth into its canonical, hash-stable dictionary."""
+
+    if isinstance(row, CompiledEntityTruth):
+        return row.to_dict()
+    if isinstance(row, Mapping):
+        return CompiledEntityTruth.from_dict(row).to_dict()
+    raise TypeError("compiled truth rows must be CompiledEntityTruth or mappings")
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryCheckpoint:
+    """A verified snapshot sealed over a prefix of the post-mortem timeline.
+
+    ``checkpoint_seq`` is the *cumulative* number of raw events the checkpoint
+    covers, so the canonical replay rule is simply ``seq > checkpoint_seq``.
+    ``event_count_compacted`` is the size of the batch this checkpoint sealed
+    (a later checkpoint over the remaining tail reports its own batch size).
+
+    ``checkpoint_sha256`` commits to the sequence, the cutoff and the compiled
+    truths in canonical JSON -- the digest is what makes a checkpoint verifiable
+    rather than merely cached, so a tampered snapshot is detected at load time
+    instead of silently redefining the entity's history.
+    """
+
+    checkpoint_seq: int
+    cutoff_ts_utc: int
+    event_count_compacted: int
+    compiled_truths: tuple[dict[str, Any], ...] = ()
+    checkpoint_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        seq = int(self.checkpoint_seq)
+        if seq < 0:
+            raise ValueError("checkpoint_seq must be non-negative")
+        object.__setattr__(self, "checkpoint_seq", seq)
+
+        cutoff = int(self.cutoff_ts_utc)
+        if cutoff < 0:
+            raise ValueError("cutoff_ts_utc must be non-negative")
+        object.__setattr__(self, "cutoff_ts_utc", cutoff)
+
+        count = int(self.event_count_compacted)
+        if count < 0:
+            raise ValueError("event_count_compacted must be non-negative")
+        object.__setattr__(self, "event_count_compacted", count)
+
+        truths = tuple(
+            sorted(
+                (_canonical_truth_row(row) for row in self.compiled_truths),
+                key=lambda row: str(row.get("entity_id", "")),
+            )
+        )
+        object.__setattr__(self, "compiled_truths", truths)
+
+        digest = _sha256(self._canonical_payload())
+        supplied = str(self.checkpoint_sha256 or "").strip()
+        if supplied and supplied != digest:
+            raise ValueError("checkpoint_sha256 does not match the sealed snapshot")
+        object.__setattr__(self, "checkpoint_sha256", digest)
+
+    def _canonical_payload(self) -> dict[str, Any]:
+        """Exactly the sealed inputs: sequence, cutoff and compiled truths.
+
+        ``event_count_compacted`` is bookkeeping for the operator and is
+        deliberately excluded, so a third party can re-derive the digest from
+        the three things the checkpoint actually claims.
+        """
+
+        return {
+            "checkpoint_seq": self.checkpoint_seq,
+            "cutoff_ts_utc": self.cutoff_ts_utc,
+            "compiled_truths": [dict(row) for row in self.compiled_truths],
+        }
+
+    def truth_sha256s(self) -> tuple[str, ...]:
+        return tuple(
+            str(row.get("truth_sha256", "")) for row in self.compiled_truths
+        )
+
+    def verify(self) -> bool:
+        return self.checkpoint_sha256 == _sha256(self._canonical_payload())
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self._canonical_payload()
+        payload["event_count_compacted"] = self.event_count_compacted
+        payload["checkpoint_sha256"] = self.checkpoint_sha256
+        return payload
+
+    @classmethod
+    def from_dict(cls, row: Mapping[str, Any]) -> "MemoryCheckpoint":
+        if not isinstance(row, Mapping):
+            raise TypeError("checkpoint row must be a mapping")
+        return cls(
+            checkpoint_seq=int(row.get("checkpoint_seq") or 0),
+            cutoff_ts_utc=int(row.get("cutoff_ts_utc") or 0),
+            event_count_compacted=int(row.get("event_count_compacted") or 0),
+            compiled_truths=tuple(row.get("compiled_truths") or ()),
+            checkpoint_sha256=str(row.get("checkpoint_sha256") or ""),
+        )
+
+
+@dataclass(slots=True)
+class _FoldState:
+    """Exact incremental fold of one entity's canonical event order.
+
+    The fold carries every quantity ``_compile`` needs -- sample count, wins,
+    the running slippage sum, and the four drawdown accumulators -- so a
+    checkpoint can be *continued* instead of recomputed.  The arithmetic is the
+    identical left-to-right sequence the full replay performs, which is what
+    makes ``truth_sha256`` byte-identical across the two paths.
+    """
+
+    entity_id: str
+    samples: int = 0
+    wins: int = 0
+    slippage_sum: float = 0.0
+    running: int = 0
+    peak: int = 0
+    trough: int = 0
+    worst: int = 0
+    last_ts: int = 0
+    modes: set[str] = field(default_factory=set)
+    regimes: set[str] = field(default_factory=set)
+
+    def copy(self) -> "_FoldState":
+        return _FoldState(
+            entity_id=self.entity_id,
+            samples=self.samples,
+            wins=self.wins,
+            slippage_sum=self.slippage_sum,
+            running=self.running,
+            peak=self.peak,
+            trough=self.trough,
+            worst=self.worst,
+            last_ts=self.last_ts,
+            modes=set(self.modes),
+            regimes=set(self.regimes),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entity_id": self.entity_id,
+            "samples": int(self.samples),
+            "wins": int(self.wins),
+            "slippage_sum": float(self.slippage_sum),
+            "running": int(self.running),
+            "peak": int(self.peak),
+            "trough": int(self.trough),
+            "worst": int(self.worst),
+            "last_ts": int(self.last_ts),
+            "modes": sorted(self.modes),
+            "regimes": sorted(self.regimes),
+        }
+
+    @classmethod
+    def from_dict(cls, row: Mapping[str, Any]) -> "_FoldState":
+        if not isinstance(row, Mapping):
+            raise TypeError("fold row must be a mapping")
+        state = cls(entity_id=str(row.get("entity_id") or ""))
+        state.samples = int(row.get("samples") or 0)
+        state.wins = int(row.get("wins") or 0)
+        state.slippage_sum = float(row.get("slippage_sum") or 0.0)
+        state.running = int(row.get("running") or 0)
+        state.peak = int(row.get("peak") or 0)
+        state.trough = int(row.get("trough") or 0)
+        state.worst = int(row.get("worst") or 0)
+        state.last_ts = int(row.get("last_ts") or 0)
+        state.modes = {str(item) for item in (row.get("modes") or ())}
+        state.regimes = {str(item) for item in (row.get("regimes") or ())}
+        return state
+
+
+# ---------------------------------------------------------------------------
+# deterministic local embeddings (V2.3 PART 2.3)
+# ---------------------------------------------------------------------------
+
+_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _embedding_features(text: str) -> list[str]:
+    """Word unigrams plus character trigrams, lowercased and namespace-tagged."""
+
+    features: list[str] = []
+    for token in _WORD_RE.findall(str(text or "").lower()):
+        if len(token) >= 2:
+            features.append(f"w:{token}")
+        padded = f"^{token}$"
+        span = len(padded) - EMBED_NGRAM + 1
+        for index in range(span if span > 0 else 1):
+            features.append(f"c:{padded[index : index + EMBED_NGRAM]}")
+    return features
+
+
+def _feature_bucket(feature: str, dims: int) -> tuple[int, float]:
+    """Stable (bucket, sign) from ``hashlib`` -- never Python's salted ``hash``."""
+
+    bucket_digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
+    sign_digest = hashlib.blake2b(
+        b"sign:" + feature.encode("utf-8"), digest_size=2
+    ).digest()
+    bucket = int.from_bytes(bucket_digest, "big") % max(1, int(dims))
+    sign = 1.0 if (sign_digest[0] & 1) else -1.0
+    return bucket, sign
+
+
+def hashed_embedding(text: str, dims: int = EMBED_DIMS) -> tuple[float, ...]:
+    """Deterministic 384-dim hashed n-gram embedding, L2-normalised.
+
+    Zero model download, zero network: every feature is hashed with
+    ``hashlib.blake2b`` so the vector is identical across processes and across
+    restarts.  ``PYTHONHASHSEED`` cannot perturb it because ``hash()`` is never
+    used.
+    """
+
+    width = max(1, int(dims))
+    vector = [0.0] * width
+    for feature in _embedding_features(text):
+        bucket, sign = _feature_bucket(feature, width)
+        vector[bucket] += sign
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm <= 0.0:
+        return tuple(vector)
+    return tuple(value / norm for value in vector)
+
+
+def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    """Cosine of two vectors already L2-normalised by the embedder."""
+
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = 0.0
+    for a, b in zip(left, right):
+        dot += float(a) * float(b)
+    return max(-1.0, min(1.0, dot))
+
+
+#: Bounded memo so a large truth set does not re-embed identical corpora.
+_EMBED_CACHE: dict[str, tuple[float, ...]] = {}
+_EMBED_CACHE_LIMIT = 4096
+
+
+def _cached_hashed_embedding(text: str) -> tuple[float, ...]:
+    key = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+    cached = _EMBED_CACHE.get(key)
+    if cached is not None:
+        return cached
+    vector = hashed_embedding(text)
+    if len(_EMBED_CACHE) >= _EMBED_CACHE_LIMIT:
+        _EMBED_CACHE.clear()
+    _EMBED_CACHE[key] = vector
+    return vector
+
+
+#: One bounded probe per process; a dead daemon disables the hook for good.
+_OLLAMA_STATE: dict[str, Any] = {"model": "", "enabled": False, "probed": False}
+
+
+def _ollama_embedding(text: str, model: str, base_url: str) -> tuple[float, ...] | None:
+    """Opt-in Ollama embedding.  Bounded, silent, and never retried on failure."""
+
+    try:  # imported lazily: the default path must not even load the module
+        import urllib.request
+
+        payload = json.dumps({"model": model, "prompt": text}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/api/embeddings",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_S) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        raw = body.get("embedding")
+        if not isinstance(raw, list) or not raw:
+            return None
+        values = [float(item) for item in raw]
+    except Exception:  # noqa: BLE001 - an unreachable model degrades silently
+        return None
+    norm = math.sqrt(sum(value * value for value in values))
+    if not math.isfinite(norm) or norm <= 0.0:
+        return None
+    return tuple(value / norm for value in values)
+
+
+def ollama_embedder() -> Any:
+    """Return a live Ollama embedder, or ``None`` when the hook is unavailable.
+
+    Dormant unless ``NIOS_OLLAMA_EMBED_MODEL`` is explicitly set.  The probe is
+    performed once, with a bounded timeout, and any failure (missing binary,
+    refused connection, malformed reply) permanently disables the hook for this
+    process so a dead daemon can never become a retry storm.
+    """
+
+    model = str(os.environ.get(OLLAMA_EMBED_ENV) or "").strip()
+    if not model:
+        return None
+    state = _OLLAMA_STATE
+    if state["model"] == model and state["probed"]:
+        return (
+            (lambda text: _ollama_embedding(text, model, _ollama_base_url()))
+            if state["enabled"]
+            else None
+        )
+    state["model"] = model
+    state["probed"] = True
+    state["enabled"] = False
+    # One warm-up vector decides; the result is discarded.
+    if _ollama_embedding("nios embedding probe", model, _ollama_base_url()) is None:
+        return None
+    state["enabled"] = True
+    return lambda text: _ollama_embedding(text, model, _ollama_base_url())
+
+
+def _ollama_base_url() -> str:
+    return (
+        str(os.environ.get(OLLAMA_BASE_URL_ENV) or "").strip()
+        or OLLAMA_DEFAULT_BASE_URL
+    )
+
+
+# ---------------------------------------------------------------------------
 # the graph
 # ---------------------------------------------------------------------------
 
@@ -458,13 +826,32 @@ class EntityMemoryGraph:
         state: Mapping[str, Any] | None = None,
         *,
         max_events: int = MAX_TIMELINE_EVENTS,
+        compact_threshold: int = COMPACT_THRESHOLD,
+        keep_recent: int = KEEP_RECENT,
+        archive_path: str | Path | None = None,
+        max_archive_events: int = MAX_COLD_ARCHIVE_EVENTS,
     ) -> None:
         self._lock = threading.RLock()
         self._max_events = max(64, int(max_events))
+        self._compact_threshold = max(1, int(compact_threshold))
+        self._keep_recent = max(0, int(keep_recent))
         self._events: list[PostMortemEvent] = []
         self._truths: dict[str, CompiledEntityTruth] = {}
+        #: Sealed prefix fold, keyed by ``canonical_entity_alias``.
+        self._folds: dict[str, _FoldState] = {}
+        self._checkpoint: MemoryCheckpoint | None = None
+        self._sealed_seq = 0
         self._sequence = 0
         self._dirty = False
+        #: Cold archive: the raw events a checkpoint removed from the hot
+        #: timeline.  Kept in a bounded in-memory list *and*, when a workspace
+        #: path is supplied, mirrored into an append-only JSONL file so the
+        #: sealed history survives a restart and stays readable.
+        self._cold_archive: list[PostMortemEvent] = []
+        self._max_archive_events = max(0, int(max_archive_events))
+        self._archive_path: Path | None = (
+            Path(archive_path) if archive_path is not None else None
+        )
         if isinstance(state, Mapping):
             self.load_state(state)
 
@@ -513,15 +900,33 @@ class EntityMemoryGraph:
                 lesson_summary=lesson_summary,
             )
             self._events.append(event)
+            # Canonical order is ``(ts_utc, event_id)``.  Keeping the hot list
+            # sorted means a checkpoint fold can never observe a different
+            # sequence than a full replay of the same events.
+            self._events.sort(key=lambda row: (row.ts_utc, row.event_id))
             if len(self._events) > self._max_events:
                 self._events = self._events[-self._max_events :]
             self._dirty = True
+            # V2.3 PART 2.2: seal a checkpoint the moment the active timeline
+            # outgrows the threshold so startup replay is bounded by
+            # ``keep_recent`` instead of growing without limit.
+            compacted: dict[str, Any] | None = None
+            if len(self._events) > self._compact_threshold:
+                compacted = self.compact_timeline(self._keep_recent)
             touched = self._recompile(event.entity_ids, fallback_stamp=stamp)
             return {
                 "event": event.to_dict(),
                 "compiled": {key: truth.to_dict() for key, truth in sorted(touched.items())},
                 "timeline_size": len(self._events),
+                "event_count": len(self._events) + int(self._sealed_seq),
                 "entity_count": len(self._truths),
+                "checkpoint_seq": int(self._sealed_seq),
+                "checkpoint_sha256": (
+                    self._checkpoint.checkpoint_sha256
+                    if self._checkpoint is not None
+                    else ""
+                ),
+                "compacted": bool(compacted and compacted.get("compacted")),
             }
 
     def timeline(self, *, limit: int | None = None) -> tuple[dict[str, Any], ...]:
@@ -568,9 +973,11 @@ class EntityMemoryGraph:
         fallback_stamp: int,
     ) -> dict[str, CompiledEntityTruth]:
         if entity_ids is None:
-            candidates = {
-                arm for event in self._events for arm in event.entity_ids
-            } | set(self._truths)
+            candidates = (
+                {arm for event in self._events for arm in event.entity_ids}
+                | set(self._truths)
+                | {state.entity_id for state in self._folds.values()}
+            )
         else:
             # Fold against the *existing* truths too, not just the new arms: that
             # is what stops a second spelling of an instrument from opening a
@@ -606,58 +1013,92 @@ class EntityMemoryGraph:
         return touched
 
     def _compile(self, entity_id: str, *, fallback_stamp: int) -> CompiledEntityTruth:
+        """Compile one entity: sealed checkpoint fold + hot delta, in order.
+
+        The fold state carries the sealed prefix (``checkpoint_seq`` events),
+        so only ``seq > checkpoint_seq`` -- the hot timeline -- is walked here.
+        """
+
         alias = canonical_entity_alias(entity_id)
         is_symbol = alias.startswith("symbol:")
+        sealed = self._folds.get(alias)
+        state = sealed.copy() if sealed is not None else _FoldState(entity_id=entity_id)
+        state.entity_id = entity_id
+        for event in self._ordered_events():
+            if self._event_belongs(event, entity_id, alias=alias, is_symbol=is_symbol):
+                self._apply_event(state, event)
+        return self._truth_from_state(entity_id, state, fallback_stamp=fallback_stamp)
 
-        def _belongs(event: PostMortemEvent) -> bool:
-            if entity_id in event.entity_ids:
-                return True
-            if not is_symbol:
-                return False
-            # Fold every spelling of the same instrument into one sample set, so a
-            # loss booked under ``BTC/USDT`` counts for ``BTCUSDT`` too.
-            return any(
-                canonical_entity_alias(arm) == alias for arm in event.entity_ids
-            )
+    @staticmethod
+    def _event_belongs(
+        event: PostMortemEvent,
+        entity_id: str,
+        *,
+        alias: str,
+        is_symbol: bool,
+    ) -> bool:
+        if entity_id in event.entity_ids:
+            return True
+        if not is_symbol:
+            return False
+        # Fold every spelling of the same instrument into one sample set, so a
+        # loss booked under ``BTC/USDT`` counts for ``BTCUSDT`` too.
+        return any(canonical_entity_alias(arm) == alias for arm in event.entity_ids)
 
-        rows = sorted(
-            (event for event in self._events if _belongs(event)),
-            key=lambda event: (event.ts_utc, event.event_id),
+    def _ordered_events(self) -> list[PostMortemEvent]:
+        """The canonical order: ``(ts_utc, event_id)``, never append order."""
+
+        return sorted(self._events, key=lambda event: (event.ts_utc, event.event_id))
+
+    def _apply_event(self, state: _FoldState, event: PostMortemEvent) -> None:
+        """Fold one event into a state with the exact full-replay arithmetic.
+
+        ``state.slippage_sum = state.slippage_sum + slip`` is the same
+        left-to-right float addition ``sum(...)`` performs, and the drawdown
+        accumulators are the same four integers the linear scan maintains.  Two
+        folds that see the same ordered events therefore produce bit-identical
+        metrics.
+        """
+
+        state.samples += 1
+        if event.outcome_kind == "WIN":
+            state.wins += 1
+        state.slippage_sum = state.slippage_sum + float(event.slippage_bps)
+        state.running += int(event.net_pnl_micros)
+        state.trough = min(state.trough, state.running)
+        state.peak = max(state.peak, state.running)
+        state.worst = max(state.worst, state.peak - state.running)
+        mode = FAILURE_MODE_BY_OUTCOME.get(event.outcome_kind)
+        if mode:
+            state.modes.add(mode)
+        if abs(event.slippage_bps) >= HIGH_SLIPPAGE_BPS:
+            state.modes.add(HIGH_SLIPPAGE_MODE)
+        if event.outcome_kind in ADVERSE_OUTCOME_KINDS:
+            for arm in event.entity_ids:
+                kind, value = _split_entity(arm)
+                if kind == "regime" and value:
+                    state.regimes.add(value.upper())
+        state.last_ts = max(state.last_ts, int(event.ts_utc))
+
+    def _truth_from_state(
+        self,
+        entity_id: str,
+        state: _FoldState,
+        *,
+        fallback_stamp: int,
+    ) -> CompiledEntityTruth:
+        samples = int(state.samples)
+        if samples:
+            win_rate_bps = (state.wins / samples) * 10_000.0
+            avg_slippage_bps = state.slippage_sum / samples
+        else:
+            win_rate_bps = 0.0
+            avg_slippage_bps = 0.0
+        reference = max(int(state.peak), abs(int(state.trough)), 1)
+        worst_drawdown_bps = max(
+            0.0, min(10_000.0, (int(state.worst) / reference) * 10_000.0)
         )
-        samples = len(rows)
-        wins = sum(1 for event in rows if event.outcome_kind == "WIN")
-        win_rate_bps = (wins / samples) * 10_000.0 if samples else 0.0
-        avg_slippage_bps = (
-            sum(event.slippage_bps for event in rows) / samples if samples else 0.0
-        )
-
-        running = 0
-        peak = 0
-        trough = 0
-        worst = 0
-        for event in rows:
-            running += event.net_pnl_micros
-            trough = min(trough, running)
-            peak = max(peak, running)
-            worst = max(worst, peak - running)
-        reference = max(peak, abs(trough), 1)
-        worst_drawdown_bps = max(0.0, min(10_000.0, (worst / reference) * 10_000.0))
-
-        modes: set[str] = set()
-        regimes: set[str] = set()
-        for event in rows:
-            mode = FAILURE_MODE_BY_OUTCOME.get(event.outcome_kind)
-            if mode:
-                modes.add(mode)
-            if abs(event.slippage_bps) >= HIGH_SLIPPAGE_BPS:
-                modes.add(HIGH_SLIPPAGE_MODE)
-            if event.outcome_kind in ADVERSE_OUTCOME_KINDS:
-                for arm in event.entity_ids:
-                    kind, value = _split_entity(arm)
-                    if kind == "regime" and value:
-                        regimes.add(value.upper())
-
-        watermark = max((event.ts_utc for event in rows), default=int(fallback_stamp))
+        watermark = int(state.last_ts) if samples else int(fallback_stamp)
         return CompiledEntityTruth(
             entity_id=entity_id,
             entity_type=ENTITY_TYPE_BY_KIND.get(_split_entity(entity_id)[0], "UNKNOWN"),
@@ -665,10 +1106,198 @@ class EntityMemoryGraph:
             win_rate_bps=round(win_rate_bps, 6),
             avg_slippage_bps=round(avg_slippage_bps, 6),
             worst_drawdown_bps=round(worst_drawdown_bps, 6),
-            known_failure_modes=tuple(sorted(modes)[:MAX_FAILURE_MODES]),
-            caution_regimes=tuple(sorted(regimes)[:MAX_CAUTION_REGIMES]),
+            known_failure_modes=tuple(sorted(state.modes)[:MAX_FAILURE_MODES]),
+            caution_regimes=tuple(sorted(state.regimes)[:MAX_CAUTION_REGIMES]),
             last_compiled_utc=int(watermark),
         )
+
+    # -- tier-2 compaction -----------------------------------------------
+
+    def _fold_event_into_entities(self, event: PostMortemEvent) -> None:
+        seen: set[str] = set()
+        for arm in event.entity_ids:
+            alias = canonical_entity_alias(arm)
+            if alias in seen:  # two spellings of one instrument must fold once
+                continue
+            seen.add(alias)
+            state = self._folds.get(alias)
+            if state is None:
+                state = _FoldState(entity_id=arm)
+                self._folds[alias] = state
+            self._apply_event(state, event)
+
+    def _truths_from_folds(self, *, fallback_stamp: int) -> dict[str, CompiledEntityTruth]:
+        out: dict[str, CompiledEntityTruth] = {}
+        for state in self._folds.values():
+            truth = self._truth_from_state(
+                state.entity_id, state, fallback_stamp=fallback_stamp
+            )
+            if truth.sample_count > 0:
+                out[truth.entity_id] = truth
+        return dict(sorted(out.items()))
+
+    def compact_timeline(
+        self,
+        keep_recent: int = KEEP_RECENT,
+        *,
+        now_ns: int | None = None,
+    ) -> dict[str, Any]:
+        """Seal the oldest events into a verified checkpoint and archive them.
+
+        Everything that sorts at or before ``cutoff_ts_utc`` leaves the hot
+        timeline: its contribution is folded into a per-entity state, the
+        compiled truths are sealed inside a ``MemoryCheckpoint``, and the raw
+        events move to the cold archive (bounded list + append-only JSONL when a
+        workspace path is configured).  Startup then replays only
+        ``seq > checkpoint_seq``.
+        """
+
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        with self._lock:
+            keep = max(0, int(keep_recent))
+            if len(self._events) <= keep:
+                return {
+                    "compacted": False,
+                    "reason": "TIMELINE_WITHIN_HOT_BOUND",
+                    "checkpoint": (
+                        self._checkpoint.to_dict()
+                        if self._checkpoint is not None
+                        else None
+                    ),
+                    "active_events": len(self._events),
+                    "sealed_events": int(self._sealed_seq),
+                    "archive_events": len(self._cold_archive),
+                    "entity_count": len(self._truths),
+                    "as_of_utc_ns": stamp,
+                }
+            ordered = self._ordered_events()
+            cut = len(ordered) - keep
+            sealed = ordered[:cut]
+            first_seq = int(self._sealed_seq) + 1
+            for event in sealed:
+                self._fold_event_into_entities(event)
+            self._sealed_seq += len(sealed)
+            self._events = ordered[cut:]
+            self._archive_events(sealed, first_seq=first_seq)
+            # The checkpoint freezes the *sealed prefix* truths ...
+            sealed_truths = self._truths_from_folds(fallback_stamp=stamp)
+            checkpoint = MemoryCheckpoint(
+                checkpoint_seq=int(self._sealed_seq),
+                cutoff_ts_utc=int(sealed[-1].ts_utc),
+                event_count_compacted=len(sealed),
+                compiled_truths=tuple(
+                    truth.to_dict() for truth in sealed_truths.values()
+                ),
+            )
+            self._checkpoint = checkpoint
+            # ... while the graph's live truths must also carry the hot delta.
+            # Recompiling here (bounded by ``keep_recent``) keeps ``truths()``
+            # correct even when compaction is invoked explicitly by an operator.
+            self._recompile(None, fallback_stamp=stamp)
+            self._dirty = True
+            return {
+                "compacted": True,
+                "reason": "CHECKPOINT_SEALED",
+                "checkpoint": checkpoint.to_dict(),
+                "checkpoint_sha256": checkpoint.checkpoint_sha256,
+                "checkpoint_seq": checkpoint.checkpoint_seq,
+                "cutoff_ts_utc": checkpoint.cutoff_ts_utc,
+                "event_count_compacted": checkpoint.event_count_compacted,
+                "active_events": len(self._events),
+                "sealed_events": int(self._sealed_seq),
+                "archived_events": len(sealed),
+                "archive_events": len(self._cold_archive),
+                "archive_path": str(self._archive_path) if self._archive_path else "",
+                "entity_count": len(self._truths),
+                "as_of_utc_ns": stamp,
+            }
+
+    def _archive_events(
+        self, events: Sequence[PostMortemEvent], *, first_seq: int = 1
+    ) -> None:
+        self._cold_archive.extend(events)
+        if self._max_archive_events and len(self._cold_archive) > self._max_archive_events:
+            self._cold_archive = self._cold_archive[-self._max_archive_events :]
+        path = self._archive_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                for offset, event in enumerate(events):
+                    handle.write(
+                        json.dumps(
+                            {"seq": int(first_seq) + offset, "event": event.to_dict()},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+        except OSError:  # pragma: no cover - a read-only workspace keeps memory-only
+            return
+
+    def cold_archive(self, *, limit: int | None = None) -> tuple[dict[str, Any], ...]:
+        """The in-memory cold archive tail (newest last).
+
+        The bounded list holds what this process sealed; the durable, complete
+        record is the append-only JSONL file read by :meth:`read_archive_file`.
+        """
+
+        with self._lock:
+            rows = list(self._cold_archive)
+        if limit is not None and int(limit) > 0:
+            rows = rows[-int(limit) :]
+        return tuple(row.to_dict() for row in rows)
+
+    def read_archive_file(self, *, limit: int | None = None) -> tuple[dict[str, Any], ...]:
+        """Read the durable JSONL cold archive (complete, across restarts)."""
+
+        path = self._archive_path
+        if path is None:
+            return ()
+        try:
+            if not path.is_file():
+                return ()
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:  # pragma: no cover - defensive
+            return ()
+        rows: list[dict[str, Any]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except (TypeError, ValueError):
+                continue
+        if limit is not None and int(limit) > 0:
+            rows = rows[-int(limit) :]
+        return tuple(rows)
+
+    def checkpoint(self) -> MemoryCheckpoint | None:
+        with self._lock:
+            return self._checkpoint
+
+    def seal_summary(self) -> dict[str, Any]:
+        """Compact description of the sealed prefix, for the REST surface."""
+
+        with self._lock:
+            checkpoint = self._checkpoint
+            return {
+                "checkpoint_seq": int(self._sealed_seq),
+                "active_events": len(self._events),
+                "event_count": len(self._events) + int(self._sealed_seq),
+                "archive_events": len(self._cold_archive),
+                "archive_path": str(self._archive_path) if self._archive_path else "",
+                "entity_count": len(self._truths),
+                "compact_threshold": int(self._compact_threshold),
+                "keep_recent": int(self._keep_recent),
+                "checkpoint": (
+                    checkpoint.to_dict() if checkpoint is not None else None
+                ),
+                "checkpoint_sha256": (
+                    checkpoint.checkpoint_sha256 if checkpoint is not None else ""
+                ),
+            }
 
     # -- hybrid retrieval ------------------------------------------------
 
@@ -683,13 +1312,21 @@ class EntityMemoryGraph:
         top_k: int = 5,
         *,
         now_ns: int | None = None,
+        use_semantic: bool = True,
+        embedder: Any = None,
     ) -> dict[str, Any]:
-        """Hybrid lexical + feature retrieval that seals its numbers.
+        """3-signal hybrid retrieval that seals its numbers.
 
-        Returns the ranked compiled truths, the past lessons that produced them,
-        the deterministic penalty implied by the match, and a verified
-        ``GroundedFactPacket`` carrying the four retrieved metrics plus the
-        confidence multiplier.
+        Fusion (V2.3 PART 2.3): ``0.25`` BM25 lexical + ``0.45`` canonical
+        entity-feature + ``0.30`` deterministic 384-dim hashed n-gram cosine.
+        The semantic arm is offline by construction; an Ollama embedder is used
+        only when the operator sets ``NIOS_OLLAMA_EMBED_MODEL`` and the daemon
+        answers the single bounded probe.
+
+        Returns the ranked compiled truths (each with its per-signal breakdown),
+        the past lessons that produced them, the deterministic penalty implied
+        by the match, and a verified ``GroundedFactPacket`` carrying the four
+        retrieved metrics, the fusion weights and the confidence multiplier.
         """
 
         stamp = int(now_ns if now_ns is not None else time.time_ns())
@@ -719,34 +1356,82 @@ class EntityMemoryGraph:
         with self._lock:
             truth_rows = list(self._truths.values())
             events = list(self._events)
+            sealed_seq = int(self._sealed_seq)
 
-        lexical = self._bm25(self._corpus(truth_rows, events), _tokens(query_text))
+        corpus = self._corpus(truth_rows, events)
+        lexical = self._bm25(corpus, _tokens(query_text))
         ceiling = max(lexical.values()) if lexical else 0.0
+        semantic = (
+            self._semantic_scores(
+                corpus, features=features, query_text=query_text, embedder=embedder
+            )
+            if use_semantic
+            else {}
+        )
 
-        scored: list[tuple[float, CompiledEntityTruth]] = []
+        scored: list[dict[str, Any]] = []
         for truth in truth_rows:
+            matched_feature = canonical_entity_alias(truth.entity_id) in target_ids
+            if active and not matched_feature:
+                # A structured query is a *scoped* question -- "this symbol, this
+                # silo, this strategy".  The similarity signals rank within that
+                # scope; they must never widen it, or a BTC loss would surface as
+                # context for an ETH trade and an isolated instrument would lose
+                # its isolation.
+                continue
             feature_score = (
                 KIND_WEIGHTS[_split_entity(truth.entity_id)[0]] / total_weight
-                if canonical_entity_alias(truth.entity_id) in target_ids
+                if matched_feature
                 else 0.0
             )
             lexical_score = (lexical.get(truth.entity_id, 0.0) / ceiling) if ceiling > 0 else 0.0
-            score = FEATURE_WEIGHT * feature_score + LEXICAL_WEIGHT * lexical_score
+            semantic_score = float(semantic.get(truth.entity_id, 0.0))
+            blended = (
+                FEATURE_WEIGHT * feature_score
+                + LEXICAL_WEIGHT * lexical_score
+                + SEMANTIC_WEIGHT * semantic_score
+            )
             if not active and not query_text.strip():
-                score = 1.0
-            elif score <= 0.0:
+                blended = 1.0
+            elif blended <= 0.0:
                 continue
-            scored.append((score, truth))
+            scored.append(
+                {
+                    "score": blended,
+                    "truth": truth,
+                    "signals": {
+                        "lexical": round(lexical_score, 6),
+                        "feature": round(feature_score, 6),
+                        "semantic": round(semantic_score, 6),
+                        "fused": round(blended, 6),
+                    },
+                }
+            )
 
-        scored.sort(key=lambda row: (-row[0], -row[1].sample_count, row[1].entity_id))
+        scored.sort(
+            key=lambda row: (
+                -row["score"],
+                -row["truth"].sample_count,
+                row["truth"].entity_id,
+            )
+        )
         selected = scored[:limit]
-        truths = [truth for _, truth in selected]
+        truths: list[CompiledEntityTruth] = [row["truth"] for row in selected]
         entity_ids = [truth.entity_id for truth in truths]
 
         lessons = self._lessons(entity_ids, events, limit)
         penalty = self._penalty(truths, features["regime"])
         metrics = self._aggregate(truths)
         metrics["post_mortem_confidence_multiplier"] = penalty.confidence_multiplier
+        # Every number that survives retrieval is sealed: the three signal
+        # maxima ride the packet instead of leaking as bare prose.
+        for name in ("lexical", "feature", "semantic"):
+            metrics[f"retrieval_{name}_max"] = (
+                round(max((row["signals"][name] for row in selected), default=0.0), 6)
+            )
+        metrics["retrieval_weight_lexical"] = LEXICAL_WEIGHT
+        metrics["retrieval_weight_feature"] = FEATURE_WEIGHT
+        metrics["retrieval_weight_semantic"] = SEMANTIC_WEIGHT
 
         packet = self._seal(
             symbol=features["symbol"] or "UNIVERSE",
@@ -760,7 +1445,8 @@ class EntityMemoryGraph:
             "query_text": str(query_text or ""),
             "entity_ids": entity_ids,
             "truths": [
-                {**truth.to_dict(), "score": round(score, 6)} for score, truth in selected
+                {**row["truth"].to_dict(), "score": round(row["score"], 6), "signals": dict(row["signals"])}
+                for row in selected
             ],
             "lessons": lessons,
             "metrics": dict(metrics),
@@ -770,6 +1456,14 @@ class EntityMemoryGraph:
             "packet_sha256": packet.sha256_digest,
             "as_of_utc_ns": stamp,
             "timeline_size": len(events),
+            "checkpoint_seq": sealed_seq,
+            "weights": {
+                "lexical": LEXICAL_WEIGHT,
+                "feature": FEATURE_WEIGHT,
+                "semantic": SEMANTIC_WEIGHT,
+            },
+            "semantic_dim": EMBED_DIMS,
+            "semantic_enabled": bool(use_semantic),
         }
 
     def penalty_for(
@@ -848,6 +1542,59 @@ class EntityMemoryGraph:
                 score += idf * (frequency * (BM25_K1 + 1.0)) / denominator
             scores[key] = score
         return scores
+
+    def _semantic_scores(
+        self,
+        corpus: Mapping[str, str],
+        *,
+        features: Mapping[str, str],
+        query_text: str,
+        embedder: Any = None,
+    ) -> dict[str, float]:
+        """Signal 3: cosine of the query and each entity corpus in embed space.
+
+        The default embedder is the deterministic 384-dim hashed n-gram vector,
+        so this arm is offline, reproducible and identical across processes.  An
+        injected callable (or the opt-in Ollama hook) may replace it; a failing
+        callable degrades to a zero score rather than raising.
+        """
+
+        query = " ".join(
+            part
+            for part in (str(query_text or ""), *(str(value) for value in features.values()))
+            if part
+        ).strip()
+        if not query or not corpus:
+            return {}
+        embed = embedder if callable(embedder) else ollama_embedder()
+        if embed is None:
+            embed = _cached_hashed_embedding
+        query_vector = self._embed(embed, query)
+        if query_vector is None:
+            return {}
+        scores: dict[str, float] = {}
+        for entity_id, document in corpus.items():
+            vector = self._embed(embed, document)
+            if vector is None or len(vector) != len(query_vector):
+                scores[entity_id] = 0.0
+                continue
+            scores[entity_id] = round(
+                max(0.0, min(1.0, cosine_similarity(query_vector, vector))), 6
+            )
+        return scores
+
+    @staticmethod
+    def _embed(embed: Any, text: str) -> tuple[float, ...] | None:
+        try:
+            vector = embed(text)
+        except Exception:  # noqa: BLE001 - an embedder failure is never fatal
+            return None
+        if not vector:
+            return None
+        try:
+            return tuple(float(value) for value in vector)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return None
 
     def _lessons(
         self,
@@ -953,7 +1700,8 @@ class EntityMemoryGraph:
             return {
                 "schema_version": ENTITY_SCHEMA_VERSION,
                 "sequence": self._sequence,
-                "event_count": len(self._events),
+                "event_count": len(self._events) + int(self._sealed_seq),
+                "active_event_count": len(self._events),
                 "entity_count": len(self._truths),
                 "timeline": [event.to_dict() for event in self._events],
                 "truths": [truth.to_dict() for _, truth in sorted(self._truths.items())],
@@ -963,6 +1711,23 @@ class EntityMemoryGraph:
                 "caution_regimes": sorted(
                     {row for truth in self._truths.values() for row in truth.caution_regimes}
                 ),
+                # -- V2.3 PART 2.2: tier-2 checkpoint state -------------------
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "checkpoint": (
+                    self._checkpoint.to_dict() if self._checkpoint is not None else None
+                ),
+                "checkpoint_seq": int(self._sealed_seq),
+                "checkpoint_folds": {
+                    alias: state.to_dict()
+                    for alias, state in sorted(self._folds.items())
+                },
+                "cold_archive_tail": [
+                    event.to_dict() for event in self._cold_archive[-STATE_ARCHIVE_TAIL:]
+                ],
+                "archive_events": len(self._cold_archive),
+                "archive_path": str(self._archive_path) if self._archive_path else "",
+                "compact_threshold": int(self._compact_threshold),
+                "keep_recent": int(self._keep_recent),
             }
 
     def to_state(self) -> dict[str, Any]:
@@ -991,24 +1756,77 @@ class EntityMemoryGraph:
                 continue
             truths[truth.entity_id] = truth
 
+        # -- V2.3 PART 2.2: restore the sealed snapshot before the delta -----
+        checkpoint: MemoryCheckpoint | None = None
+        raw_checkpoint = state.get("checkpoint")
+        if isinstance(raw_checkpoint, Mapping):
+            try:
+                candidate = MemoryCheckpoint.from_dict(raw_checkpoint)
+                if candidate.verify():
+                    checkpoint = candidate
+            except (TypeError, ValueError):
+                checkpoint = None
+
+        folds: dict[str, _FoldState] = {}
+        if checkpoint is not None:
+            for alias, row in dict(state.get("checkpoint_folds") or {}).items():
+                if not isinstance(row, Mapping):
+                    continue
+                try:
+                    folds[str(alias)] = _FoldState.from_dict(row)
+                except (TypeError, ValueError):
+                    continue
+            if not folds:
+                # A checkpoint whose fold state is missing cannot be continued;
+                # the hot tail is the only honest source left, so the seal is
+                # dropped rather than silently redefining the entity's history.
+                checkpoint = None
+
+        archive: list[PostMortemEvent] = []
+        for row in state.get("cold_archive_tail") or ():
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                archive.append(PostMortemEvent.from_dict(row))
+            except (TypeError, ValueError):
+                continue
+
         with self._lock:
             self._events = events[-self._max_events :]
-            self._truths = truths
+            self._truths = truths if checkpoint is None else {}
+            self._checkpoint = checkpoint
+            self._folds = folds if checkpoint is not None else {}
+            self._sealed_seq = int(
+                state.get("checkpoint_seq")
+                or (checkpoint.checkpoint_seq if checkpoint is not None else 0)
+            )
+            self._cold_archive = archive
             self._sequence = int(state.get("sequence") or len(self._events))
             # The timeline is the source of truth; replay it so a tampered or
-            # truncated cache can never outvote the raw events.
+            # truncated cache can never outvote the raw events.  With a verified
+            # checkpoint this walks only ``seq > checkpoint_seq``.
             self._recompile(None, fallback_stamp=time.time_ns())
             self._dirty = False
             return self.snapshot()
 
     def reset(self) -> dict[str, Any]:
-        """Zero both layers. Used by the clean-slate reset funnel."""
+        """Zero both layers and the sealed checkpoint. Used by clean slate."""
 
         with self._lock:
             self._events = []
             self._truths = {}
+            self._folds = {}
+            self._checkpoint = None
+            self._sealed_seq = 0
+            self._cold_archive = []
             self._sequence = 0
             self._dirty = True
+            if self._archive_path is not None:
+                try:
+                    if self._archive_path.is_file():
+                        self._archive_path.unlink()
+                except OSError:  # pragma: no cover - defensive
+                    pass
             return self.snapshot()
 
     # -- read-only surface ------------------------------------------------
@@ -1047,8 +1865,17 @@ class EntityMemoryGraph:
             "count": len(rows),
             "entity_id": key,
             "query": str(query or ""),
-            "event_count": len(self._events),
+            "event_count": len(self._events) + int(self._sealed_seq),
+            "active_event_count": len(self._events),
             "entity_count": len(self._truths),
+            "checkpoint_seq": int(self._sealed_seq),
+            "checkpoint_sha256": (
+                self._checkpoint.checkpoint_sha256
+                if self._checkpoint is not None
+                else ""
+            ),
+            "archive_events": len(self._cold_archive),
+            "archive_path": str(self._archive_path) if self._archive_path else "",
         }
 
 

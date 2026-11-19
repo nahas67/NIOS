@@ -1,6 +1,6 @@
 """NIOS V2.2 -- Suite 38: final institutional financial terminal (frontend seal).
 
-``v4.2.0-V2.2`` ships the React 19 / TypeScript / Tailwind v4 terminal that the
+``v4.3.0-V2.3`` ships the React 19 / TypeScript / Tailwind v4 terminal that the
 headless ``V1.6``..``V2.1`` releases deliberately withheld.  This suite is the
 executable form of the visual and routing contract:
 
@@ -208,7 +208,7 @@ def test_gate1_document_is_the_v2_2_institutional_terminal() -> None:
     assert "nios-frontend" in text
     assert "V2.2-INSTITUTIONAL-TERMINAL" in text
     assert "nios-release" in text
-    assert "v4.2.0-V2.2" in text
+    assert "v4.3.0-V2.3" in text
     assert "#0D0E10" in text
     assert "<script" in text.lower()
     assert "/assets/" in text

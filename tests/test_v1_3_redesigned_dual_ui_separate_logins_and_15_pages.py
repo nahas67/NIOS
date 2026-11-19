@@ -933,7 +933,7 @@ def test_gate4_terminal_document_is_built() -> None:
     text = index_html.read_text(encoding="utf-8")
     assert "nios-release" in text
     assert "nios-frontend" in text
-    assert "v4.2.0-V2.2" in text
+    assert "v4.3.0-V2.3" in text
     assert "<script" in text.lower()
     assert "/assets/" in text
     assert (UI_ROOT / "dist" / "assets").is_dir()

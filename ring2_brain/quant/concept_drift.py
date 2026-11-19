@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import math
 import time
+from datetime import datetime, timezone
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -396,6 +397,71 @@ class ConceptDriftMonitor:
             "baseline_sharpe": self._baseline_sharpe,
             "last_observe_ns": self._last_observe_ns,
         }
+
+    def _adwin_score(self) -> float:
+        """Strongest standardised ADWIN mean-shift in the window (``0.0`` if none).
+
+        The detector itself is a strict inequality (``mean_left - mean_right >
+        bound``).  The gateway needs a *magnitude*, so this returns the largest
+        ``(mean_left - mean_right) / bound`` ratio over the same admissible
+        splits: ``>= 1.0`` is exactly the point where ``_adwin_drift`` fires.
+        """
+        values = list(self._pnl)
+        count = len(values)
+        if count < 2 * self._min_samples:
+            return 0.0
+        prefix = [0.0]
+        for value in values:
+            prefix.append(prefix[-1] + value)
+        total = prefix[-1]
+        log_term = math.log(4.0 / self._delta)
+        worst = 0.0
+        for split in range(self._min_samples, count - self._min_samples + 1):
+            mean_left = prefix[split] / split
+            mean_right = (total - prefix[split]) / (count - split)
+            bound = math.sqrt(0.5 * (1.0 / split + 1.0 / (count - split)) * log_term)
+            if bound <= 0.0:  # pragma: no cover - delta is bounded by config
+                continue
+            worst = max(worst, (mean_left - mean_right) / bound)
+        return worst
+
+    def telemetry(self) -> dict[str, Any]:
+        """V2.3 ``adwin_drift`` block: ``state``/``drift_score``/window/stamp.
+
+        The three states the cockpit renders are the monitor's own de-risking
+        ladder mapped one-to-one: ``NONE -> STABLE``, ``HALVE -> HALVED``,
+        ``PAUSE -> PAUSED``.  Nothing is inferred from a sample the monitor has
+        not actually observed: a fresh monitor reports ``window_size = 0``,
+        ``drift_score = 0.0`` and ``last_checked_utc = None``.
+        """
+        severity = str(self._last_severity)
+        state = {
+            str(DriftSeverity.HALVE): "HALVED",
+            str(DriftSeverity.PAUSE): "PAUSED",
+        }.get(severity, "STABLE")
+        score = self._adwin_score()
+        return {
+            "state": state,
+            "drift_score": round(max(0.0, float(score)), 6),
+            "window_size": len(self._pnl),
+            "window_capacity": int(self._window),
+            "last_checked_utc": (
+                datetime.fromtimestamp(
+                    self._last_observe_ns / 1_000_000_000.0, tz=timezone.utc
+                )
+                .isoformat()
+                .replace("+00:00", "Z")
+                if self._last_observe_ns
+                else None
+            ),
+            "severity": severity,
+            "drift_detected": bool(self._last_drift),
+            "drift_episodes": int(self._drift_episodes),
+            "allocation_multiplier": self.allocation_multiplier(),
+            "martingale": round(self._martingale(), 6),
+            "missing_fields": [],
+        }
+
 
 
 class AgentBehaviorMonitor:

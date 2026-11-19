@@ -30,7 +30,12 @@ import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from core.schemas import VaultName
-from core.telemetry import TICK_LATENCY, TickLatencyRecorder, tick_latency_snapshot
+from core.telemetry import (
+    TICK_LATENCY,
+    TickLatencyRecorder,
+    gateway_telemetry,
+    tick_latency_snapshot,
+)
 
 __all__ = [
     "CONTENT_TYPE_PROMETHEUS",
@@ -429,6 +434,10 @@ class MetricsExporter:
                 "ring0_rejects": int(engine.get("ring0_rejects") or 0),
                 "breaker_trips": int(engine.get("breaker_trips") or 0),
             },
+            # V2.3 PART 3: the same per-ring quantiles the cockpit renders, on
+            # the machine-readable scrape.  Additive: the Prometheus text
+            # exposition is unchanged.
+            "gateway_telemetry": gateway_telemetry().snapshot(),
             "scrape_duration_seconds": max(
                 0.0, (time.perf_counter_ns() - started) / 1e9
             ),

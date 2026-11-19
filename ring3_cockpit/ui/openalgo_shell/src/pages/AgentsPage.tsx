@@ -22,7 +22,7 @@ import {
   Toolbar,
 } from "../components/ui";
 import { SILOS } from "../config/nav";
-import { api, errorMessage } from "../lib/api";
+import { ApiError, api, errorMessage } from "../lib/api";
 import {
   asArray,
   asRecord,
@@ -83,6 +83,29 @@ function stampNs(value: unknown): string {
   return new Date(ns / 1e6).toISOString().replace("T", " ").slice(0, 19);
 }
 
+/** `MM-DD HH:MM:SS` UTC for episodic rows (date matters, second precision). */
+function episodeWhen(value: unknown): string {
+  if (typeof value === "string" && value.length > 0) {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().replace("T", " ").slice(5, 19);
+    return value;
+  }
+  const ns = safeNumber(value, Number.NaN);
+  if (!Number.isFinite(ns) || ns <= 0) return "—";
+  return new Date(ns / 1e6).toISOString().replace("T", " ").slice(5, 19);
+}
+
+/** Action kinds the episodic store records for operator interventions. */
+const EPISODE_KINDS = [
+  { value: "ALL", label: "ALL ACTIONS" },
+  { value: "mission_override", label: "MISSION_OVERRIDE" },
+  { value: "mission_revoke", label: "MISSION_REVOKE" },
+  { value: "tranche_rearm", label: "TRANCHE_REARM" },
+  { value: "clear_freeze", label: "CLEAR_FREEZE" },
+  { value: "autopilot_pause", label: "AUTOPILOT_PAUSE" },
+  { value: "autopilot_play", label: "AUTOPILOT_PLAY" },
+];
+
 function ScoreDial({ score }: { score: number }) {
   const known = Number.isFinite(score);
   const clamped = known ? Math.max(0, Math.min(100, score)) : 0;
@@ -142,6 +165,15 @@ export function AgentsPage({ mode }: PageProps) {
   const [memoryError, setMemoryError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState("");
 
+  const [episodes, setEpisodes] = useState<Record<string, unknown>[]>([]);
+  const [episodeLoading, setEpisodeLoading] = useState(true);
+  const [episodeError, setEpisodeError] = useState<string | null>(null);
+  const [episodeMissing, setEpisodeMissing] = useState(false);
+  const [episodeKind, setEpisodeKind] = useState("ALL");
+  const [episodeQuery, setEpisodeQuery] = useState("");
+  const [episodeNonce, setEpisodeNonce] = useState(0);
+  const [compactNote, setCompactNote] = useState<Note | null>(null);
+
   const now = useTicker(1000);
 
   const loadRoster = useCallback(async () => {
@@ -176,6 +208,65 @@ export function AgentsPage({ mode }: PageProps) {
     const timer = globalThis.setInterval(() => void loadRoster(), 10_000);
     return () => globalThis.clearInterval(timer);
   }, [loadRoster, loadMemory]);
+
+  const loadEpisodes = useCallback(async () => {
+    if (episodeMissing) {
+      setEpisodeLoading(false);
+      return;
+    }
+    setEpisodeLoading(true);
+    try {
+      const payload = await api.get<unknown>("/memory/episodes", {
+        limit: 50,
+        action_kind: episodeKind === "ALL" ? undefined : episodeKind,
+        q: episodeQuery.trim().length > 0 ? episodeQuery.trim() : undefined,
+      });
+      setEpisodes(rowsOf(payload, ["episodes", "items", "rows", "entries", "events"]));
+      setEpisodeMissing(false);
+      setEpisodeError(null);
+    } catch (caught) {
+      setEpisodes([]);
+      // A gateway without the episodic store answers 404. That is an empty
+      // state for the operator, never a console error and never a red banner.
+      if (caught instanceof ApiError && caught.status === 404) {
+        setEpisodeMissing(true);
+        setEpisodeError(null);
+      } else {
+        setEpisodeError(errorMessage(caught));
+      }
+    } finally {
+      setEpisodeLoading(false);
+    }
+  }, [episodeKind, episodeQuery, episodeMissing]);
+
+  useEffect(() => {
+    void loadEpisodes();
+  }, [loadEpisodes, episodeNonce]);
+
+  const compactMemory = useCallback(async () => {
+    setBusy(true);
+    setCompactNote(null);
+    try {
+      const payload = asRecord(await api.post<unknown>("/memory/compact", {}));
+      const compacted = safeNumber(
+        payload.event_count_compacted ?? payload.compacted_events ?? payload.compacted,
+        Number.NaN,
+      );
+      setCompactNote({
+        tone: "bull",
+        message: `MEMORY COMPACTED · ${Number.isFinite(compacted) ? int(compacted) : "—"} events sealed · checkpoint ${shortHash(
+          payload.checkpoint_sha256,
+          12,
+        )}`,
+      });
+      setEpisodeNonce((value) => value + 1);
+      void loadMemory();
+    } catch (caught) {
+      setCompactNote({ tone: "bear", message: errorMessage(caught) });
+    } finally {
+      setBusy(false);
+    }
+  }, [loadMemory]);
 
   const tasks = useMemo(() => rowsOf(roster, ["tasks"]), [roster]);
   const token = useMemo(() => asRecord(asRecord(roster).token), [roster]);
@@ -908,6 +999,103 @@ export function AgentsPage({ mode }: PageProps) {
         <p className="px-3 py-2 text-[10px] uppercase tracking-[0.1em] text-ink-3">
           CONFIDENCE = 1 − capped caution haircut (0.05 per failure mode, 0.10 per regime, cap 0.40)
         </p>
+      </Card>
+
+      <Card
+        title="Episodic operator decisions"
+        subtitle="GET /memory/episodes · overrides, revocations, rearms and freeze approvals"
+        icon="logbook"
+        dense
+        actions={
+          <div className="flex items-center gap-1.5">
+            <Button icon="refresh" variant="subtle" size="sm" onClick={() => setEpisodeNonce((value) => value + 1)}>
+              Reload
+            </Button>
+            <Button icon="database" variant="primary" size="sm" disabled={busy} onClick={() => void compactMemory()}>
+              Compact Memory
+            </Button>
+          </div>
+        }
+      >
+        <div className="flex flex-wrap items-end gap-2 border-b border-hairline px-3 py-2">
+          <Field label="Action kind" className="w-[190px]">
+            <SelectInput value={episodeKind} onChange={setEpisodeKind} options={EPISODE_KINDS} />
+          </Field>
+          <Field label="Search" className="min-w-[220px] flex-1">
+            <TextInput
+              value={episodeQuery}
+              placeholder="symbol, actor or regime"
+              onChange={(event) => setEpisodeQuery(event.target.value)}
+            />
+          </Field>
+          <span className="pb-1 text-[10px] uppercase tracking-[0.1em] text-ink-3 tabular-nums">
+            {int(episodes.length)} EPISODES · LIMIT 50
+          </span>
+        </div>
+        {compactNote !== null ? (
+          <div className="px-3 pt-2">
+            <Banner tone={compactNote.tone}>{compactNote.message}</Banner>
+          </div>
+        ) : null}
+        {episodeError !== null ? (
+          <div className="p-3">
+            <Banner tone="bear">{episodeError}</Banner>
+          </div>
+        ) : null}
+        {episodeLoading ? (
+          <div className="flex items-center gap-2 p-3 text-[11px] text-ink-3">
+            <Spinner /> loading operator episodes…
+          </div>
+        ) : episodeMissing ? (
+          <div className="p-3">
+            <EmptyState
+              title="Episodic store not mounted"
+              hint="This gateway did not serve GET /memory/episodes; V2.3 gateways mount it."
+            />
+          </div>
+        ) : episodes.length === 0 ? (
+          <div className="p-3">
+            <EmptyState
+              title="No operator episodes yet"
+              hint="Inline mission overrides, revocations, tranche rearms and clear-freeze approvals land here automatically."
+            />
+          </div>
+        ) : (
+          <Table columns={["WHEN", "ACTOR", "ACTION", "REGIME", "DECISION"]}>
+            {episodes.slice(0, 50).map((row) => {
+              const id = text(row.episode_id ?? row.id, "episode");
+              const kind = text(row.action_kind ?? row.kind ?? row.action, "—").toUpperCase();
+              return (
+                <Row key={id}>
+                  <Cell mono tone="muted">
+                    {episodeWhen(row.ts_utc ?? row.timestamp_utc ?? row.at_utc ?? row.ts_ns)}
+                  </Cell>
+                  <Cell mono>{text(row.actor ?? row.operator, "—")}</Cell>
+                  <Cell>
+                    <Badge
+                      tone={
+                        kind.includes("REVOKE") || kind.includes("PAUSE")
+                          ? "bear"
+                          : kind.includes("OVERRIDE") || kind.includes("REARM")
+                            ? "accent"
+                            : "neutral"
+                      }
+                      mono
+                    >
+                      {kind}
+                    </Badge>
+                  </Cell>
+                  <Cell mono tone="muted">
+                    {text(row.regime, "—")}
+                  </Cell>
+                  <Cell className="max-w-[420px] truncate">
+                    {text(row.decision_summary ?? row.summary ?? row.decision, "—")}
+                  </Cell>
+                </Row>
+              );
+            })}
+          </Table>
+        )}
       </Card>
 
       <Card

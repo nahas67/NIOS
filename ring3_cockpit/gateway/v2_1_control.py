@@ -44,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.lifecycle_worker import NiosLifecycleWorker
 from core.runtime_settings import RuntimeSettingsStore
+from core.telemetry import gateway_telemetry
 from ring0_vault.ibor.alert_center import AlertCenter
 from ring0_vault.ibor.ledger_outbox import (
     MONEY_MAX as _LEDGER_MONEY_MAX,
@@ -357,7 +358,25 @@ class V21ControlPlaneMixin:
     def bar_aggregator(self) -> LiveBarAggregator:
         aggregator = getattr(self, "_bar_aggregator", None)
         if aggregator is None:
-            aggregator = LiveBarAggregator(features_sink=getattr(self, "feature_store", None))
+            working_memory = getattr(self, "working_memory", None)
+            features_sink = getattr(self, "feature_store", None)
+            if working_memory is not None:
+                # V2.3 (PART 2.1): persist closed bars into Tier-1 working memory
+                # while forwarding every hook to the market feature store.
+                try:
+                    from ring2_brain.memory.working_memory import BarPersistenceSink
+
+                    features_sink = BarPersistenceSink(features_sink, working_memory)
+                except Exception:  # pragma: no cover - Ring 2 optional in isolation
+                    features_sink = getattr(self, "feature_store", None)
+            aggregator = LiveBarAggregator(features_sink=features_sink)
+            if working_memory is not None:
+                # A restart must not reopen yesterday's buckets: rehydrate the
+                # persisted closed/live bars before the first new tick arrives.
+                try:
+                    working_memory.restore_into_aggregator(aggregator)
+                except Exception:  # pragma: no cover - restore is best effort
+                    pass
             self._bar_aggregator = aggregator
         return aggregator
 
@@ -368,6 +387,58 @@ class V21ControlPlaneMixin:
             analytics = PerformanceAnalytics()
             self._performance_analytics = analytics
         return analytics
+
+    # ------------------------------------------------------------------
+    # V2.3 PART 3: concept-drift telemetry (Ring 2, ADWIN-lite)
+    # ------------------------------------------------------------------
+    def concept_drift_monitor(self, strategy_id: str = "global") -> Any:
+        """Lazy per-strategy :class:`ConceptDriftMonitor` (one per strategy).
+
+        The registry doubles as the ``adwin_drift`` telemetry source, so the
+        payload can never describe a monitor nobody is actually feeding.
+        """
+        monitors = getattr(self, "_drift_monitors", None)
+        if monitors is None:
+            monitors = {}
+            self._drift_monitors = monitors
+        key = str(strategy_id or "global")
+        monitor = monitors.get(key)
+        if monitor is None:
+            from ring2_brain.quant.concept_drift import ConceptDriftMonitor
+
+            monitor = ConceptDriftMonitor()
+            monitors[key] = monitor
+        return monitor
+
+    def observe_drift(
+        self,
+        *,
+        strategy_id: str = "global",
+        net_micros: int,
+        notional_micros: int,
+        now_ns: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Record one real closed-trade net edge (bps) into its drift monitor.
+
+        The observed value is ``net_micros / notional_micros * 10_000`` -- the
+        same net-edge figure ``sec_018`` Law 4 promotes and demotes on, so the
+        ADWIN window is fed the metric it is supposed to police.
+        """
+        notional = int(notional_micros)
+        if notional <= 0:
+            return None
+        try:
+            monitor = self.concept_drift_monitor(strategy_id)
+        except Exception:  # pragma: no cover - telemetry is non-fatal
+            return None
+        net_bps = float(int(net_micros)) * 10_000.0 / float(notional)
+        try:
+            verdict = monitor.observe(
+                pnl_bps=net_bps, now_ns=int(now_ns) if now_ns else None
+            )
+        except Exception:  # pragma: no cover - telemetry is non-fatal
+            return None
+        return verdict.to_dict() if hasattr(verdict, "to_dict") else None
 
     @property
     def post_mortem(self) -> PostMortemRecorder:
@@ -462,6 +533,23 @@ class V21ControlPlaneMixin:
             except Exception:  # pragma: no cover - defensive
                 report["performance_analytics"] = {"reset": False}
 
+        # V2.3 (PART 2.1): Tier-1 working memory (retry ladder, bar snapshots,
+        # agent Q&A threads) is volatile context, so a workspace reset must zero
+        # it and checkpoint the WAL -- otherwise a restart resurrects rows from a
+        # workspace the operator already wiped.
+        working_memory = getattr(self, "working_memory", None)
+        if working_memory is not None and hasattr(working_memory, "reset"):
+            try:
+                report["working_memory"] = working_memory.reset()
+            except Exception:  # pragma: no cover - defensive
+                report["working_memory"] = {"reset": False}
+            checkpoint = getattr(working_memory.backend, "wal_checkpoint", None)
+            if callable(checkpoint):
+                try:
+                    checkpoint("TRUNCATE")
+                except Exception:  # pragma: no cover - checkpoint is best effort
+                    pass
+
         # The connector runtime caches the mode it was built with, so a reset has
         # to drop it rather than leave a LIVE socket in a clean-slate workspace.
         self._connector_runtime = None
@@ -508,7 +596,16 @@ class V21ControlPlaneMixin:
                 reconciliation=None,
                 enabled=bool(self.runtime_settings.settings.lifecycle_enabled),
                 totp_warn_hours=int(self.runtime_settings.settings.alert_totp_warn_hours),
+                working_memory=getattr(self, "working_memory", None),
             )
+            # V2.3 (PART 2.1): a restart must resume the unresolved 5xx-UNKNOWN
+            # queries it was tracking, not start with an empty ladder.
+            working_memory = getattr(self, "working_memory", None)
+            if working_memory is not None:
+                try:
+                    working_memory.restore_into_unknown_queue(worker.unknown_orders)
+                except Exception:  # pragma: no cover - restore is best effort
+                    pass
             self._lifecycle_worker = worker
         return worker
 
@@ -847,6 +944,23 @@ class V21ControlPlaneMixin:
             )
         except Exception:  # pragma: no cover - best effort
             pass
+        # V2.3 (PART 2.3): a cleared reconciliation freeze is a human risk
+        # decision; record it in the episodic operator log (best effort).
+        recorder = getattr(self, "record_episodic_decision", None)
+        if callable(recorder):
+            try:
+                recorder(
+                    "CLEAR_FREEZE",
+                    {
+                        "silo": silo,
+                        "actor": str(request.operator),
+                        "note": str(request.note),
+                        "previous_reason": reason,
+                        "cleared": cleared,
+                    },
+                )
+            except Exception:  # pragma: no cover - memory never blocks a control
+                pass
         return self._envelope(
             {
                 "page": "reconciliation.clear-freeze",
@@ -935,15 +1049,16 @@ class V21ControlPlaneMixin:
         if known and silo not in known:
             raise HTTPException(status_code=422, detail=f"UNKNOWN_SILO:{silo}")
         try:
-            payload = self.bar_aggregator.ingest(
-                silo=silo,
-                symbol=request.symbol,
-                price=request.price,
-                size=request.size,
-                bid=request.bid,
-                ask=request.ask,
-                now_ns=request.now_ns,
-            )
+            with gateway_telemetry().measure(2, "tick_ingest"):
+                payload = self.bar_aggregator.ingest(
+                    silo=silo,
+                    symbol=request.symbol,
+                    price=request.price,
+                    size=request.size,
+                    bid=request.bid,
+                    ask=request.ask,
+                    now_ns=request.now_ns,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
         return self._envelope({"page": "market.tick", **payload})
@@ -988,22 +1103,34 @@ class V21ControlPlaneMixin:
         silo = str(request.silo).strip().upper()
         if known and silo not in known:
             raise HTTPException(status_code=422, detail=f"UNKNOWN_SILO:{silo}")
-        saga = self.profit_split_saga.run_trade_close(
-            silo=silo,
-            symbol=request.symbol,
-            gross_pnl_micros=int(request.gross_pnl_micros),
+        with gateway_telemetry().measure(0, "profit_split_saga"):
+            saga = self.profit_split_saga.run_trade_close(
+                silo=silo,
+                symbol=request.symbol,
+                gross_pnl_micros=int(request.gross_pnl_micros),
+                notional_micros=int(request.notional_micros),
+                side=request.side,
+                mission_id=request.mission_id,
+                tranche_id=request.tranche_id,
+                regime=request.regime,
+                reserve_floor_pct=int(
+                    self.runtime_settings.settings.default_reserve_floor_pct
+                ),
+                tax_escrow_pct=int(
+                    self.runtime_settings.settings.default_tax_escrow_pct
+                ),
+                slippage_bps=float(request.slippage_bps),
+                # An explicit operator close quotes a *gross* P&L, so the
+                # statutory drag is escrowed inside the saga exactly once.
+                apply_statutory=True,
+                idempotency_key=str(request.idempotency_key or ""),
+            )
+        # V2.3: feed the real net edge into the Ring 2 concept-drift monitor so
+        # ``adwin_drift`` updates on actual closes, not on a timer.
+        self.observe_drift(
+            strategy_id=str(getattr(request, "strategy_id", "") or self.strategy_id),
+            net_micros=int(saga.get("realized_net_micros", 0) or 0),
             notional_micros=int(request.notional_micros),
-            side=request.side,
-            mission_id=request.mission_id,
-            tranche_id=request.tranche_id,
-            regime=request.regime,
-            reserve_floor_pct=int(self.runtime_settings.settings.default_reserve_floor_pct),
-            tax_escrow_pct=int(self.runtime_settings.settings.default_tax_escrow_pct),
-            slippage_bps=float(request.slippage_bps),
-            # An explicit operator close quotes a *gross* P&L, so the statutory
-            # drag is escrowed inside the saga exactly once.
-            apply_statutory=True,
-            idempotency_key=str(request.idempotency_key or ""),
         )
         self._after_trade_close(saga)
         return self._envelope(
@@ -1102,6 +1229,12 @@ class V21ControlPlaneMixin:
                 idempotency_key=str(getattr(request, "client_order_id", "") or ""),
             )
             out["saga"] = saga
+            # V2.3: a real closed trade is one real ADWIN observation.
+            self.observe_drift(
+                strategy_id=str(getattr(request, "strategy_id", "") or self.strategy_id),
+                net_micros=int(net_micros),
+                notional_micros=int(notional_micros),
+            )
             # ``_after_trade_close`` already writes the post-mortem for a losing
             # close, so this hook must not write a second one for the same event.
             self._after_trade_close(saga)

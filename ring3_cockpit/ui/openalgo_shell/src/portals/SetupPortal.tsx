@@ -1,5 +1,5 @@
 ﻿/**
- * `/setup` â€” first-run sovereign operator provisioning.
+ * `/setup` — first-run sovereign operator provisioning.
  */
 
 import { useState } from "react";
@@ -47,7 +47,7 @@ export function SetupPortal() {
 
   return (
     <PortalFrame
-      eyebrow="First Run Â· Ring 0 Key Vault"
+      eyebrow="First Run · Ring 0 Key Vault"
       title="Provision the sovereign operator"
       subtitle="One operator owns this install. Credentials are sealed with scrypt and a PBKDF2 live PIN; the vault never returns them in plaintext."
       mode="neutral"
@@ -66,7 +66,7 @@ export function SetupPortal() {
           <TextInput value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="sovereign.operator" />
         </Field>
         <Field label="Password" hint="Minimum 8 characters. Ring 0 stores only the scrypt digest.">
-          <TextInput type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢" />
+          <TextInput type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="••••••••" />
         </Field>
         <Field label="6-Digit Live PIN" hint="Second factor for the LIVE vault. Digits only, 4 to 12.">
           <TextInput value={pin} onChange={(event) => setPin(event.target.value.replace(/[^0-9]/g, ""))} inputMode="numeric" maxLength={12} mono placeholder="000000" />
@@ -84,10 +84,10 @@ export function SetupPortal() {
           />
           <div className="mt-2 flex items-center gap-1.5 text-[9.5px] uppercase tracking-[0.1em] text-ink-3">
             <Icon name="info" size={11} />
-            IBOR opens at 0 Â· no tax lots Â· no phantom fills
+            IBOR opens at 0 · no tax lots · no phantom fills
           </div>
         </div>
-        <PortalSubmit label={busy ? "Provisioningâ€¦" : "Provision Operator"} onClick={submit} disabled={busy} />
+        <PortalSubmit label={busy ? "Provisioning…" : "Provision Operator"} onClick={submit} disabled={busy} />
       </div>
     </PortalFrame>
   );

@@ -187,16 +187,19 @@ export default function AnalyzerPage({ mode }: PageProps) {
             <Button icon="refresh" variant="subtle" size="sm" onClick={() => void load()}>
               Refresh
             </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              icon="zap"
-              disabled={mode === "LIVE" || busy}
-              title={mode === "LIVE" ? "Shadow burst is PAPER-only" : "Queue 10 synthetic shadow fills"}
-              onClick={() => void burst()}
-            >
-              +10 Shadow Fills Burst
-            </Button>
+            {/* PAPER-only control: the LIVE DOM never contains a shadow-burst button. */}
+            {mode === "PAPER" ? (
+              <Button
+                variant="primary"
+                size="sm"
+                icon="zap"
+                disabled={busy}
+                title="Queue 10 synthetic shadow fills"
+                onClick={() => void burst()}
+              >
+                +10 Shadow Fills Burst
+              </Button>
+            ) : null}
           </div>
         }
       />
@@ -204,7 +207,8 @@ export default function AnalyzerPage({ mode }: PageProps) {
       {note ? <Banner tone={note.tone}>{note.message}</Banner> : null}
       {mode === "LIVE" ? (
         <Banner tone="neutral" icon="lock">
-          Shadow burst is PAPER-only. The LIVE workspace never injects synthetic fills into the graduation ladder.
+          Synthetic fill injection is a PAPER-only control and is absent from this workspace. The LIVE vault never
+          writes into the graduation ladder.
         </Banner>
       ) : null}
 
@@ -271,7 +275,14 @@ export default function AnalyzerPage({ mode }: PageProps) {
           actions={<Badge tone="muted">{`${fills.length} PTS`}</Badge>}
         >
           {cumulative.length === 0 ? (
-            <EmptyState title="No shadow fills" hint="Run a shadow burst in PAPER to seed the curve." />
+            <EmptyState
+              title="No shadow fills"
+              hint={
+                mode === "PAPER"
+                  ? "Run a shadow burst in PAPER to seed the curve."
+                  : "The LIVE vault never injects synthetic fills into the graduation ladder."
+              }
+            />
           ) : (
             <>
               <LineChart
@@ -295,16 +306,18 @@ export default function AnalyzerPage({ mode }: PageProps) {
         title="Shadow Fill Ledger"
         subtitle="shadow price vs live mark · signed net edge"
         actions={
-          <Button
-            variant="ghost"
-            size="sm"
-            icon="play"
-            disabled={mode === "LIVE" || busy}
-            title={mode === "LIVE" ? "PAPER-only" : "Queue 10 shadow fills"}
-            onClick={() => void burst()}
-          >
-            Burst
-          </Button>
+          mode === "PAPER" ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              icon="play"
+              disabled={busy}
+              title="Queue 10 shadow fills"
+              onClick={() => void burst()}
+            >
+              Burst
+            </Button>
+          ) : null
         }
         dense
       >

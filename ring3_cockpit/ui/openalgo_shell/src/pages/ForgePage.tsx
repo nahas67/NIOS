@@ -23,6 +23,8 @@ import { SILOS } from "../config/nav";
 import { api, assertFinite, errorMessage } from "../lib/api";
 import { asArray, asRecord, duration, int, num, safeNumber, text, upper } from "../lib/format";
 import { rowsOf } from "../lib/payload";
+import { adwinOf, mergeDrift } from "../lib/telemetry";
+import { AdwinDriftRow } from "../components/telemetry";
 import { useTicker } from "../state/session";
 import type { PageProps } from "./types";
 
@@ -147,15 +149,20 @@ export function ForgePage({ mode }: PageProps) {
   const driftRows = useMemo(
     () =>
       leaderboard.map((row) => {
-        const raw = row.adwin_drift ?? row.drift_score ?? row.concept_drift;
-        const score = safeNumber(raw, Number.NaN);
+        // V2.3 ships `adwin_drift` as `{state, drift_score, window_size, last_checked_utc}`.
+        const drift = mergeDrift(adwinOf(row.adwin_drift), adwinOf(row.concept_drift ?? row.drift_score));
+        const score = drift?.driftScore ?? Number.NaN;
+        const state = drift?.state ?? null;
         const detected =
           row.drift_detected === true ||
           row.concept_drift_alert === true ||
+          (state ?? "").toUpperCase().includes("HALVED") ||
           (Number.isFinite(score) && score > DRIFT_CEILING);
         return {
           id: text(row.strategy_id ?? row.genome_id, "PLUGIN"),
           score,
+          state,
+          drift,
           detected,
         };
       }),
@@ -317,7 +324,8 @@ export function ForgePage({ mode }: PageProps) {
               const net = safeNumber(row.net_edge_bps ?? row.rolling_net_bps, Number.NaN);
               const sharpe = safeNumber(row.sharpe ?? row.sharpe_ratio ?? row.observed_sharpe, Number.NaN);
               const fills = safeNumber(row.shadow_fills ?? row.fills, Number.NaN);
-              const drift = safeNumber(row.adwin_drift ?? row.drift_score ?? row.concept_drift, Number.NaN);
+              const drift = driftRows[index]?.score ?? Number.NaN;
+              const driftState = driftRows[index]?.state ?? null;
               const driftKnown = Number.isFinite(drift);
               const driftOk = driftKnown ? drift <= DRIFT_CEILING : null;
               const fillsOk = Number.isFinite(fills) ? fills >= FILL_FLOOR : null;
@@ -363,6 +371,9 @@ export function ForgePage({ mode }: PageProps) {
                   </Cell>
                   <Cell align="right" mono tone={driftKnown ? (driftOk ? "bull" : "bear") : "muted"}>
                     {driftKnown ? num(drift, 3) : "—"}
+                    {driftState === null ? null : (
+                      <span className="ml-1 text-[9px] uppercase tracking-[0.06em] text-ink-3">{driftState}</span>
+                    )}
                   </Cell>
                   <Cell align="right">
                     <Badge
@@ -455,7 +466,7 @@ export function ForgePage({ mode }: PageProps) {
 
         <Card
           title="ADWIN concept drift"
-          subtitle="per-plugin drift score 0…1 · alert above 0.50"
+          subtitle="state · drift score 0…1 · window size · last checked · alert above 0.50"
           icon="activity"
         >
           {driftRows.length === 0 ? (
@@ -467,13 +478,7 @@ export function ForgePage({ mode }: PageProps) {
             <div className="flex flex-col gap-2">
               {driftRows.map((row) => (
                 <div key={row.id} className="flex flex-col gap-1">
-                  <div className="flex items-center justify-between text-[11px]">
-                    <span className="truncate text-ink-2">{row.id}</span>
-                    <span className={`tabular-nums ${row.detected ? "text-bear" : "text-ink-3"}`}>
-                      {Number.isFinite(row.score) ? num(row.score, 3) : "—"}
-                      {row.detected ? " · CONCEPT_DRIFT_ALERT" : ""}
-                    </span>
-                  </div>
+                  <AdwinDriftRow drift={row.drift} label={row.id} />
                   <ProgressBar
                     value={Number.isFinite(row.score) ? row.score : 0}
                     max={1}

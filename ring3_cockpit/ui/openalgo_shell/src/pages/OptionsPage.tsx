@@ -21,6 +21,7 @@ import {
 import { api, assertFinite, errorMessage } from "../lib/api";
 import { asArray, asRecord, compact, num, safeBool, safeNumber, text } from "../lib/format";
 import { rowsOf } from "../lib/payload";
+import { IvRankStat } from "../components/telemetry";
 import { useTicker } from "../state/session";
 import type { ApiNote, PageProps } from "./types";
 
@@ -280,7 +281,11 @@ export default function OptionsPage({ mode }: PageProps) {
   const backendMaxPain = safeNumber(record.max_pain, Number.NaN);
   const computedMaxPain = useMemo(() => maxPainStrike(chainRows), [chainRows]);
   const maxPain = Number.isFinite(backendMaxPain) ? backendMaxPain : computedMaxPain;
-  const ivRank = safeNumber(record.iv_rank ?? record.iv_rank_pct, Number.NaN);
+  // V2.3 emits a deterministic `iv_rank_bps` (0…10000) on the chain response.
+  const ivRankBpsRaw = safeNumber(record.iv_rank_bps, Number.NaN);
+  const ivRankBps = Number.isFinite(ivRankBpsRaw) ? ivRankBpsRaw : null;
+  const legacyIvRankRaw = safeNumber(record.iv_rank ?? record.iv_rank_pct, Number.NaN);
+  const legacyIvRank = Number.isFinite(legacyIvRankRaw) ? legacyIvRankRaw : null;
   const gex = safeNumber(record.gex ?? record.net_gex, Number.NaN);
 
   const priceOf = (strike: number, type: OptionType): number => {
@@ -395,12 +400,7 @@ export default function OptionsPage({ mode }: PageProps) {
       {note ? <Banner tone={note.tone}>{note.message}</Banner> : null}
 
       <StatGrid columns={4}>
-        <Stat
-          label="IV Rank"
-          value={Number.isFinite(ivRank) ? num(ivRank, 1) : "—"}
-          hint={Number.isFinite(ivRank) ? "backend percentile" : "not in payload"}
-          tone={Number.isFinite(ivRank) && ivRank > 70 ? "bear" : "neutral"}
-        />
+        <IvRankStat ivRankBps={ivRankBps} legacyPercentile={legacyIvRank} />
         <Stat
           label="Net GEX"
           value={Number.isFinite(gex) ? compact(gex) : "—"}

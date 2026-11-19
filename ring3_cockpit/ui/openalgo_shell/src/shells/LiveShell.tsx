@@ -1,5 +1,5 @@
 ﻿/**
- * LIVE workspace shell â€” real capital.
+ * LIVE workspace shell — real capital.
  *
  * Contains zero paper-workspace controls.  The only write paths are the
  * two-step emergency kill switch and the vault lock that drops the operator
@@ -73,7 +73,7 @@ export function LiveShell({ children }: { children: ReactNode }) {
     setBusy(true);
     try {
       await api.post("/control/killswitch", { reason: "operator emergency kill switch", flatten: true, confirm: true });
-      setNotice("GLOBAL HALT ACCEPTED â€” ALL SILOS FLATTENING");
+      setNotice("GLOBAL HALT ACCEPTED — ALL SILOS FLATTENING");
     } catch (error) {
       setNotice(errorMessage(error));
     } finally {
@@ -100,7 +100,7 @@ export function LiveShell({ children }: { children: ReactNode }) {
   const topBar = (
     <TopBarShell tone="bear">
       <div className="flex items-center gap-2">
-        <Badge tone="bear">ðŸ”’ LIVE PRODUCTION â€” REAL CAPITAL</Badge>
+        <Badge tone="bear">🔒 LIVE PRODUCTION — REAL CAPITAL</Badge>
       </div>
       <TopBarDivider />
       <TopBarLabel label="LIVE NAV" value={usd(nav)} />
@@ -110,7 +110,7 @@ export function LiveShell({ children }: { children: ReactNode }) {
           "flex items-center gap-1.5 rounded-[4px] border px-1.5 py-[3px] text-[9px] font-semibold uppercase tracking-[0.1em]",
           gatesReady ? "border-bull-border bg-bull-tint text-bull" : "border-bear-border bg-bear-tint text-bear",
         )}
-        title={preflight ? `Release ${preflight.release} Â· ${gatesPassed}/${gatesTotal} gates` : "pre-flight unavailable"}
+        title={preflight ? `Release ${preflight.release} · ${gatesPassed}/${gatesTotal} gates` : "pre-flight unavailable"}
       >
         <Icon name="verification" size={12} />
         23-GATE PRE-FLIGHT
@@ -137,7 +137,7 @@ export function LiveShell({ children }: { children: ReactNode }) {
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-[4px] border border-bear-border bg-bear-tint px-2.5 py-1.5">
           <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-bear">
             <Icon name="lock" size={12} />
-            LIVE PRODUCTION â€” ORDER SIGNING ARMED â€” REAL CAPITAL AT RISK
+            LIVE PRODUCTION — ORDER SIGNING ARMED — REAL CAPITAL AT RISK
           </div>
           <div className="flex items-center gap-3 text-[9.5px] uppercase tracking-[0.1em] text-ink-2">
             <span>
@@ -147,7 +147,7 @@ export function LiveShell({ children }: { children: ReactNode }) {
               TIER <span className={cx("font-semibold", session?.mode === "LIVE" ? "text-bear" : "text-ink")}>{session?.mode ?? "NONE"}</span>
             </span>
             <span>
-              EXPIRES <span className="tabular-nums text-ink">{session?.expiresAtUtc ?? "â€”"}</span>
+              EXPIRES <span className="tabular-nums text-ink">{session?.expiresAtUtc ?? "—"}</span>
             </span>
           </div>
         </div>
@@ -172,7 +172,7 @@ export function LiveShell({ children }: { children: ReactNode }) {
               Cancel
             </Button>
             <Button size="sm" variant="danger" onClick={fireKillSwitch} disabled={busy}>
-              {armed ? "CONFIRM HALT â€” FLATTEN EVERYTHING" : "ARM KILL SWITCH"}
+              {armed ? "CONFIRM HALT — FLATTEN EVERYTHING" : "ARM KILL SWITCH"}
             </Button>
           </>
         }
@@ -187,7 +187,7 @@ export function LiveShell({ children }: { children: ReactNode }) {
             <br />
             {`{ "reason": "operator emergency kill switch", "flatten": true, "confirm": true }`}
           </div>
-          {armed ? <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-bear">ARMED â€” SECOND CLICK FIRES</div> : null}
+          {armed ? <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-bear">ARMED — SECOND CLICK FIRES</div> : null}
         </div>
       </Modal>
     </ShellFrame>

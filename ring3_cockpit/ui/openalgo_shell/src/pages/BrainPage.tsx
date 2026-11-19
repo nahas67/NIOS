@@ -34,6 +34,8 @@ import {
   upper,
 } from "../lib/format";
 import { rowsOf } from "../lib/payload";
+import { mergeTelemetry, telemetryOf, useGatewayTelemetry } from "../lib/telemetry";
+import { GatewayHealthStats, RingP99Stats } from "../components/telemetry";
 import { useTicker } from "../state/session";
 import type { PageProps } from "./types";
 
@@ -77,6 +79,7 @@ function stampNs(value: unknown): string {
 
 export function BrainPage({ mode }: PageProps) {
   const [state, setState] = useState<Record<string, unknown>>({});
+  const gatewayTelemetry = useGatewayTelemetry();
   const [lifecycle, setLifecycle] = useState<Record<string, unknown>>({});
   const [seed] = useState<Record<string, unknown>>({});
   const [loading, setLoading] = useState(true);
@@ -120,6 +123,10 @@ export function BrainPage({ mode }: PageProps) {
   }, [load]);
 
   const supervisor = asRecord(state.supervisor);
+  const telemetry = useMemo(
+    () => mergeTelemetry(telemetryOf(state), gatewayTelemetry),
+    [state, gatewayTelemetry],
+  );
   const ringRows = useMemo(() => {
     const primary = rowsOf(supervisor, ["rings"]);
     const fromState = primary.length > 0 ? primary : rowsOf(asRecord(state.ring_processes), ["rings"]);
@@ -363,6 +370,22 @@ export function BrainPage({ mode }: PageProps) {
           RING 1 SPINAL p99 &lt;0.05 ms TARGET · NO LLM IN THE MICROSECOND LOOP ·{" "}
           {text(supervisor.law, "sec_004")}
         </p>
+      </Card>
+
+      <Card
+        title="Gateway latency"
+        subtitle="per-ring p99 and the request round trip · core.telemetry"
+        icon="activity"
+        actions={
+          <Badge tone="neutral" mono>
+            p50 · p95 · p99
+          </Badge>
+        }
+      >
+        <GatewayHealthStats telemetry={telemetry} />
+        <div className="mt-3 border-t border-hairline pt-2">
+          <RingP99Stats telemetry={telemetry} />
+        </div>
       </Card>
 
       <Card

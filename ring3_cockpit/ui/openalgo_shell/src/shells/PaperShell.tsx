@@ -1,5 +1,5 @@
 ﻿/**
- * PAPER workspace shell â€” simulated execution only.
+ * PAPER workspace shell — simulated execution only.
  *
  * Permitted: deposit paper capital, reset the sandbox, drive the autopilot.
  * Forbidden: any real-capital control.  The kill switch lives exclusively in
@@ -18,7 +18,7 @@ import { useMarketStream } from "../lib/stream";
 import { useSession } from "../state/session";
 import { AlertsButton, ShellFrame, StreamIndicator, TopBarDivider, TopBarLabel, TopBarShell } from "./ShellFrame";
 
-const SILO_OPTIONS = SILOS.map((silo) => ({ value: silo.id, label: `${silo.short} Â· ${silo.id}` }));
+const SILO_OPTIONS = SILOS.map((silo) => ({ value: silo.id, label: `${silo.short} · ${silo.id}` }));
 
 export function PaperShell({ children }: { children: ReactNode }) {
   const { session, unacknowledged, critical } = useSession();
@@ -58,11 +58,11 @@ export function PaperShell({ children }: { children: ReactNode }) {
       setNotice(null);
       try {
         await run();
-        setNotice(`${label} Â· ${success}`);
+        setNotice(`${label} · ${success}`);
         setNoticeTone("bull");
         await load();
       } catch (error) {
-        setNotice(`${label} Â· ${errorMessage(error)}`);
+        setNotice(`${label} · ${errorMessage(error)}`);
         setNoticeTone("bear");
       } finally {
         setBusy(null);
@@ -79,7 +79,7 @@ export function PaperShell({ children }: { children: ReactNode }) {
   const submitDeposit = () => {
     const units = Number(amount);
     if (!Number.isFinite(units) || units <= 0) {
-      setNotice("DEPOSIT Â· amount must be a positive finite number");
+      setNotice("DEPOSIT · amount must be a positive finite number");
       setNoticeTone("bear");
       return;
     }
@@ -141,7 +141,7 @@ export function PaperShell({ children }: { children: ReactNode }) {
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-[4px] border border-[#3A2A1E] bg-[#1E1712] px-2.5 py-1.5">
           <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-accent">
             <Icon name="info" size={12} />
-            PAPER SANDBOX â€” SIMULATED EXECUTION ONLY
+            PAPER SANDBOX — SIMULATED EXECUTION ONLY
           </div>
           <div className="flex items-center gap-3 text-[9.5px] uppercase tracking-[0.1em] text-ink-3">
             <span>

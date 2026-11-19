@@ -164,7 +164,7 @@ def test_gate3_pg16_schema_executes_all_seven_tables_and_constraints() -> None:
     assert validation.valid is True, payload
     assert validation.sqlite_executed is True
     assert validation.serializable is True
-    assert len(validation.tables) == 9
+    assert len(validation.tables) == 12
     assert set(validation.tables) == set(EXPECTED_TABLES)
     assert validation.checks >= 25
     assert validation.indexes >= 7
@@ -310,7 +310,7 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
 
 def test_gate5_full_test_inventory_is_thirty_eight_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 38, [path.name for path in test_files]
+    assert len(test_files) == 40, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
     assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
     assert (ROOT / "tests" / "test_v2_1_deep_audit_and_hardening.py") in test_files

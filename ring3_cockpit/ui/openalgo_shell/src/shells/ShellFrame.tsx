@@ -8,6 +8,7 @@
 import type { ReactNode } from "react";
 import { Badge, StatusDot, cx } from "../components/ui";
 import { Icon } from "../components/Icon";
+import { TelemetryStrip } from "../components/telemetry";
 import { GROUPS, WORKSTATIONS, type Workspace, workspacePath } from "../config/nav";
 import { Link, usePathname } from "../lib/router";
 import { sessionFingerprint } from "../lib/api";
@@ -86,6 +87,7 @@ export function ShellFrame({
 
       <div className="flex min-w-0 flex-1 flex-col">
         {topBar}
+        <TelemetryStrip />
         <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-hairline bg-surface px-2 py-1 lg:hidden">
           {WORKSTATIONS.map((station) => {
             const href = workspacePath(workspace, station.key);
@@ -106,7 +108,7 @@ export function ShellFrame({
         <main className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3">{children}</main>
         <footer className="flex h-6 shrink-0 items-center justify-between gap-3 border-t border-hairline bg-surface px-3 text-[9px] uppercase tracking-[0.14em] text-ink-3">
           <span className="truncate">
-            NIOS v4.2.0-V2.2 · {workspace.toUpperCase()} WORKSPACE · 17 WORKSTATIONS
+            NIOS v4.3.0-V2.3 · {workspace.toUpperCase()} WORKSPACE · 17 WORKSTATIONS
           </span>
           <span className="flex items-center gap-2 tabular-nums">
             <StatusDot tone={live ? "bear" : "accent"} />

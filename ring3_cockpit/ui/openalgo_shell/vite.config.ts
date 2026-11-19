@@ -68,9 +68,9 @@ function terminalManifest(): Plugin {
       mkdirSync(assetsDir, { recursive: true });
       const files = readdirSync(assetsDir);
       const manifest = {
-        schema_version: "v4.2.0.terminal",
+        schema_version: "v4.3.0.terminal",
         generated_by: "ring3_cockpit/ui/openalgo_shell/vite.config.ts",
-        release: "v4.2.0-V2.2",
+        release: "v4.3.0-V2.3",
         frontend: "V2.2-INSTITUTIONAL-TERMINAL",
         javascript: files.filter((file) => file.endsWith(".js")).length,
         stylesheets: files.filter((file) => file.endsWith(".css")).length,
@@ -132,6 +132,16 @@ export default defineConfig({
     target: "es2022",
     cssMinify: false,
     sourcemap: false,
+    // `App.tsx` lazy-loads all 17 workstations and the 5 portals, so Rollup
+    // emits one chunk per route.  React itself is pinned into a single vendor
+    // chunk shared by every route: no chunk may cross the 500 kB ceiling.
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vendor-react": ["react", "react-dom", "react-dom/client"],
+        },
+      },
+    },
   },
   server: {
     port: 5173,

@@ -1,5 +1,5 @@
 ﻿/**
- * `/live-unlock` â€” elevate an existing PAPER session to LIVE with the PIN.
+ * `/live-unlock` — elevate an existing PAPER session to LIVE with the PIN.
  */
 
 import { useState } from "react";
@@ -42,7 +42,7 @@ export function LiveUnlockModal() {
 
   return (
     <PortalFrame
-      eyebrow="Elevation Â· Live Sovereignty"
+      eyebrow="Elevation · Live Sovereignty"
       title="Raise this session to LIVE"
       subtitle="You already hold a PAPER session. Elevation does not re-key the operator; it adds the live PIN factor and re-verifies the 23-gate certificate against the live venue set."
       mode="live"
@@ -80,7 +80,7 @@ export function LiveUnlockModal() {
           />
         </Field>
         <Checkbox checked={acknowledged} onChange={setAcknowledged} label="I understand that elevation arms real-capital order signing for this session." />
-        <PortalSubmit label={busy ? "Elevatingâ€¦" : "Elevate to Live"} onClick={submit} disabled={busy} />
+        <PortalSubmit label={busy ? "Elevating…" : "Elevate to Live"} onClick={submit} disabled={busy} />
       </div>
     </PortalFrame>
   );

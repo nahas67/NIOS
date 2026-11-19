@@ -28,6 +28,7 @@ import json
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -198,6 +199,10 @@ class LiveBarAggregator:
         self._evictions = 0
         self._stale_rejected = 0
         self._crossed_rejected = 0
+        #: V2.3: retained ATM-IV observations per ``(silo, symbol)`` so the
+        #: gateway can publish a real 52-week IV Rank instead of a constant.
+        self._iv_history: dict[tuple[str, str], deque[tuple[int, float]]] = {}
+        self._max_iv_samples = 512
 
     # ------------------------------------------------------------------
     # Ingress
@@ -289,9 +294,13 @@ class LiveBarAggregator:
                 asks=[{"price_micros": p, "size_micros": s} for p, s in state.asks],
                 now_ns=stamp,
             )
-            for row in touched:
-                if row["closed"]:
-                    self._call_sink("ingest_bar", bar=row)
+            # V2.3 fix: dispatch the *finished* bar, not the freshly-opened one.
+            # ``touched`` holds the new live bar (``closed=False`` always), so the
+            # sink hook below could never fire and no consumer ever received a
+            # completed bar through it.  A closed bar is final and cheap to fan
+            # out; a live one is re-derived by the next tick.
+            for row in closed:
+                self._call_sink("ingest_bar", bar=row)
 
         return {
             "silo": token,
@@ -488,6 +497,12 @@ class LiveBarAggregator:
             }
             surface["surface_sha256"] = _seal(surface)
             state.surface = surface
+            if atm_iv is not None and float(atm_iv) > 0.0:
+                # V2.3: keep the real ATM-IV observation so ``iv_rank_bps`` can
+                # be a trailing min-max rank instead of a constant.
+                self._iv_history.setdefault(
+                    (token, key_symbol), deque(maxlen=self._max_iv_samples)
+                ).append((stamp, float(atm_iv)))
             self._surfaces += 1
             self._call_sink("update_option_surface", surface=surface, now_ns=stamp)
             return surface
@@ -608,6 +623,7 @@ class LiveBarAggregator:
         with self._lock:
             dropped = len(self._state)
             self._state = {}
+            self._iv_history = {}
             self._ticks = 0
             self._bars_closed = 0
             self._surfaces = 0
@@ -616,6 +632,215 @@ class LiveBarAggregator:
             self._stale_rejected = 0
             self._crossed_rejected = 0
             return {"dropped": dropped, "instrument_count": 0}
+
+    def restore(self, bars: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Rehydrate closed **and** live bars from a persisted snapshot (V2.3).
+
+        Bars are the only state a restart cannot recompute: the next ``1m`` bucket
+        closes on the next tick, but the previous 250 do not come back on their
+        own, so a rolling ``MA``/``VWAP`` would silently restart from zero.
+
+        Restoration is strictly defensive: a row without ``silo``/``symbol``, an
+        unknown timeframe, a non-positive close or an unparseable integer is
+        skipped rather than trusted.  ``last_update_utc_ns`` is seeded from the
+        bar's **start** (never its bucket end, which is in the future) so the
+        first real tick after a restart is not rejected as ``STALE_TICK``.
+        """
+        restored_closed = 0
+        restored_live = 0
+        seen: set[tuple[str, str]] = set()
+        with self._lock:
+            for row in bars or ():
+                if not isinstance(row, Mapping):
+                    continue
+                silo = str(row.get("silo") or "").strip().upper()
+                symbol = str(row.get("symbol") or "").strip().upper()
+                timeframe = str(row.get("timeframe") or "").strip()
+                if not silo or not symbol or timeframe not in TF_SECONDS:
+                    continue
+                try:
+                    start_ns = int(row.get("start_utc_ns") or 0)
+                    open_micros = int(row.get("open_micros") or 0)
+                    high_micros = int(row.get("high_micros") or 0)
+                    low_micros = int(row.get("low_micros") or 0)
+                    close_micros = int(row.get("close_micros") or 0)
+                    volume_micros = max(0, int(row.get("volume_micros") or 0))
+                    trades = max(0, int(row.get("trades") or 0))
+                except (TypeError, ValueError):
+                    continue
+                if close_micros <= 0 or start_ns < 0:
+                    continue
+                key = (silo, symbol)
+                state = self._state.get(key)
+                if state is None:
+                    state = self._open_instrument(key)
+                seen.add(key)
+                bar = Bar(
+                    silo=silo,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_micros=open_micros or close_micros,
+                    high_micros=max(high_micros, close_micros),
+                    low_micros=min(low_micros or close_micros, close_micros),
+                    close_micros=close_micros,
+                    volume_micros=volume_micros,
+                    trades=trades,
+                    start_utc_ns=start_ns,
+                    end_utc_ns=int(
+                        row.get("end_utc_ns")
+                        or start_ns + TF_SECONDS[timeframe] * _NS_PER_SECOND
+                    ),
+                    closed=bool(row.get("closed")),
+                )
+                if start_ns >= state.last_update_utc_ns:
+                    state.last_update_utc_ns = start_ns
+                    state.spot_micros = close_micros
+                if bar.closed:
+                    history = state.history.setdefault(timeframe, [])
+                    history.append(bar.to_dict())
+                    history.sort(key=lambda item: int(item.get("start_utc_ns") or 0))
+                    if len(history) > self.max_bars:
+                        state.history[timeframe] = history[-self.max_bars :]
+                    restored_closed += 1
+                else:
+                    existing = state.bars.get(timeframe)
+                    if existing is None or start_ns >= existing.start_utc_ns:
+                        state.bars[timeframe] = bar
+                        restored_live += 1
+        return {
+            "restored": restored_closed + restored_live,
+            "closed": restored_closed,
+            "live": restored_live,
+            "instruments": len(seen),
+        }
+
+    # ------------------------------------------------------------------
+    # V2.3 telemetry accessors (read-only, bounded, never raise)
+    # ------------------------------------------------------------------
+    def feed_telemetry(self, *, now_ns: int | None = None) -> dict[str, Any]:
+        """Real per-feed tick age for ``feed_lag_ms`` (never a placeholder).
+
+        ``feed_lag_ms`` is ``max(0, (now_utc - last_tick_utc) * 1000)`` for the
+        stale/quietest active feed, aggregated per silo.  Before any tick has
+        been folded the payload is ``None`` + ``feed_lag_status="IDLE"``: a
+        process that has never seen a tick is idle, not zero-lag.
+        """
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        with self._lock:
+            raws = [
+                (silo, symbol, int(state.last_update_utc_ns))
+                for (silo, symbol), state in sorted(self._state.items())
+                if int(state.last_update_utc_ns) > 0
+            ]
+            instruments = len(self._state)
+            ticks = int(self._ticks)
+        payload: dict[str, Any] = {
+            "feed_lag_ms": None,
+            "feed_lag_status": "IDLE",
+            "feed_lag_by_silo": {},
+            "feeds": [],
+            "feed_instruments": instruments,
+            "feed_ticks_ingested": ticks,
+            "feed_as_of_utc_ns": stamp,
+        }
+        if not raws:
+            return payload
+        feeds: list[dict[str, Any]] = []
+        by_silo: dict[str, float] = {}
+        for silo, symbol, last_ns in raws:
+            lag_ms = round(max(0.0, (stamp - last_ns) / 1_000_000.0), 3)
+            feeds.append(
+                {
+                    "silo": silo,
+                    "symbol": symbol,
+                    "last_tick_utc_ns": last_ns,
+                    "feed_lag_ms": lag_ms,
+                }
+            )
+            current = by_silo.get(silo)
+            if current is None or lag_ms > current:
+                by_silo[silo] = lag_ms
+        payload["feeds"] = feeds
+        payload["feed_lag_by_silo"] = dict(sorted(by_silo.items()))
+        payload["feed_lag_ms"] = max(by_silo.values())
+        payload["feed_lag_status"] = "LIVE"
+        return payload
+
+    def record_option_iv(
+        self,
+        *,
+        silo: str,
+        symbol: str,
+        atm_iv: Any,
+        now_ns: int | None = None,
+    ) -> int:
+        """Append one observed ATM IV to the trailing window; returns the size.
+
+        Called by the gateway after it prices a chain snapshot, and by
+        :meth:`on_option_chain` when a venue chain is folded.  A non-positive or
+        non-finite value is ignored: an unquoted IV is not a zero.
+        """
+        token = str(silo or "").strip().upper()
+        key_symbol = str(symbol or "").strip().upper()
+        try:
+            value = float(atm_iv)
+        except (TypeError, ValueError):
+            return 0
+        if not token or not key_symbol or not math.isfinite(value) or value <= 0.0:
+            return 0
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        with self._lock:
+            series = self._iv_history.setdefault(
+                (token, key_symbol), deque(maxlen=self._max_iv_samples)
+            )
+            series.append((stamp, value))
+            return len(series)
+
+    def iv_history(
+        self,
+        *,
+        silo: str,
+        symbol: str,
+        window_seconds: int = 52 * 7 * 86_400,
+        now_ns: int | None = None,
+    ) -> tuple[tuple[int, float], ...]:
+        """Retained ``(ts_utc_ns, atm_iv)`` observations inside the window."""
+        token = str(silo or "").strip().upper()
+        key_symbol = str(symbol or "").strip().upper()
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        horizon = stamp - int(window_seconds) * 1_000_000_000
+        with self._lock:
+            samples = tuple(self._iv_history.get((token, key_symbol), ()))
+        return tuple(
+            (int(ts_ns), float(iv))
+            for ts_ns, iv in samples
+            if int(ts_ns) >= horizon and float(iv) > 0.0
+        )
+
+    def option_iv_rank(
+        self,
+        *,
+        silo: str,
+        symbol: str,
+        current_iv: Any = None,
+        now_ns: int | None = None,
+        window_seconds: int = 52 * 7 * 86_400,
+    ) -> dict[str, Any]:
+        """Trailing 52-week IV Rank in bps for one instrument (``None`` if thin)."""
+        from ring2_brain.quant.options_iv_rank import iv_rank_payload
+
+        stamp = int(now_ns if now_ns is not None else time.time_ns())
+        history = self.iv_history(
+            silo=silo, symbol=symbol, window_seconds=window_seconds, now_ns=stamp
+        )
+        if current_iv is None and history:
+            current_iv = history[-1][1]
+        return iv_rank_payload(
+            current_iv,
+            history,
+            now_ns=stamp,
+            window_seconds=window_seconds,
+        )
 
     # ------------------------------------------------------------------
     # Internals

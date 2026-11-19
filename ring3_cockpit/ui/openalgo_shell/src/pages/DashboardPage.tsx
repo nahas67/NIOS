@@ -34,7 +34,9 @@ import {
   usdSigned,
 } from "../lib/format";
 import { drawdownBps, navMicros, pnlMicros, preflightOf, rowsOf } from "../lib/payload";
+import { fetchCockpitOverview, mergeTelemetry, telemetryOf, useGatewayTelemetry } from "../lib/telemetry";
 import { SSE_TYPES, useMarketStream } from "../lib/stream";
+import { GatewayHealthStats, RingP99Stats } from "../components/telemetry";
 import { useTicker } from "../state/session";
 import type { PageProps } from "./types";
 
@@ -95,8 +97,10 @@ function streamTone(type: string): "neutral" | "accent" | "bull" | "bear" | "mut
 export default function DashboardPage({ mode }: PageProps) {
   const tick = useTicker(1000);
   const stream = useMarketStream({ max: 60 });
+  const gatewayTelemetry = useGatewayTelemetry();
   const [workspace, setWorkspace] = useState<unknown>({});
   const [cockpit, setCockpit] = useState<unknown>({});
+  const [overview, setOverview] = useState<unknown>(null);
   const [performance, setPerformance] = useState<unknown>({});
   const [missions, setMissions] = useState<unknown>({});
   const [preflight, setPreflight] = useState<unknown>({});
@@ -105,12 +109,13 @@ export default function DashboardPage({ mode }: PageProps) {
   const [note, setNote] = useState<Note | null>(null);
 
   const load = useCallback(async () => {
-    const [state, rings, perf, missionRows, gates] = await Promise.allSettled([
+    const [state, rings, perf, missionRows, gates, aggregate] = await Promise.allSettled([
       api.get<unknown>(`/workspace/${mode === "LIVE" ? "live" : "paper"}/state`),
       api.get<unknown>("/cockpit/state"),
       api.get<unknown>("/analytics/performance", { bucket: "1D" }),
       api.get<unknown>("/missions"),
       api.get<unknown>("/control/preflight"),
+      fetchCockpitOverview(),
     ]);
     const failures: string[] = [];
     if (state.status === "fulfilled") setWorkspace(state.value);
@@ -123,6 +128,8 @@ export default function DashboardPage({ mode }: PageProps) {
     else failures.push(`missions: ${errorMessage(missionRows.reason)}`);
     if (gates.status === "fulfilled") setPreflight(gates.value);
     else failures.push(`preflight: ${errorMessage(gates.reason)}`);
+    // The aggregate telemetry surface is optional: a missing route is not an error.
+    if (aggregate.status === "fulfilled" && aggregate.value !== null) setOverview(aggregate.value);
     setError(failures.length === 5 ? failures.join(" · ") : null);
     setLoading(false);
   }, [mode]);
@@ -181,6 +188,11 @@ export default function DashboardPage({ mode }: PageProps) {
     for (const frame of stream.frames) out[frame.type] = (out[frame.type] ?? 0) + 1;
     return out;
   }, [stream.frames]);
+
+  const telemetry = useMemo(
+    () => mergeTelemetry(telemetryOf(overview), telemetryOf(cockpit), gatewayTelemetry),
+    [overview, cockpit, gatewayTelemetry],
+  );
 
   return (
     <div className="flex flex-col gap-3">
@@ -243,6 +255,22 @@ export default function DashboardPage({ mode }: PageProps) {
           hint="peak-to-trough, basis points"
         />
       </StatGrid>
+
+      <Card
+        title="Gateway Telemetry"
+        subtitle="measured on the real hot paths · core.telemetry · 10 s poll"
+        icon="activity"
+        actions={
+          <Badge tone="neutral" mono>
+            REAL MEASUREMENT
+          </Badge>
+        }
+      >
+        <GatewayHealthStats telemetry={telemetry} />
+        <div className="mt-3 border-t border-hairline pt-2">
+          <RingP99Stats telemetry={telemetry} />
+        </div>
+      </Card>
 
       <div className="grid gap-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(0,1fr)]">
         <Card

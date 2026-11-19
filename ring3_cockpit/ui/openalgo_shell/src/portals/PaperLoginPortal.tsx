@@ -1,5 +1,5 @@
 ﻿/**
- * `/paper/login` â€” two-factor PAPER portal.
+ * `/paper/login` — two-factor PAPER portal.
  */
 
 import { useState } from "react";
@@ -37,7 +37,7 @@ export function PaperLoginPortal() {
 
   return (
     <PortalFrame
-      eyebrow="Door 01 Â· Paper Sandbox"
+      eyebrow="Door 01 · Paper Sandbox"
       title="Enter the paper sandbox"
       subtitle="Simulated execution only. No counterparty, no wire, no statutory tax event. Use it to graduate strategies, not to move money."
       mode="paper"
@@ -47,13 +47,13 @@ export function PaperLoginPortal() {
             <Icon name="lock" size={11} />
             Live vault instead
           </a>
-          <span className="uppercase tracking-[0.12em]">23 gates Â· 4 silos Â· 274 instruments</span>
+          <span className="uppercase tracking-[0.12em]">23 gates · 4 silos · 274 instruments</span>
         </div>
       }
     >
       <div className="mb-3 flex items-center gap-2 rounded-[4px] border border-[#3A2A1E] bg-[#1E1712] px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-accent">
         <Icon name="play" size={12} />
-        PAPER SANDBOX â€” SIMULATED EXECUTION ONLY
+        PAPER SANDBOX — SIMULATED EXECUTION ONLY
       </div>
       <PortalError message={error} />
       <div className="space-y-3">
@@ -61,13 +61,13 @@ export function PaperLoginPortal() {
           <TextInput value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="sovereign.operator" />
         </Field>
         <Field label="Password">
-          <TextInput type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢" />
+          <TextInput type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="••••••••" />
         </Field>
         <div className="flex items-center justify-between text-[10px] text-ink-3">
-          <span className="uppercase tracking-[0.12em]">2-factor Â· no PIN on paper</span>
+          <span className="uppercase tracking-[0.12em]">2-factor · no PIN on paper</span>
           <Badge tone="accent">SANDBOX</Badge>
         </div>
-        <PortalSubmit label={busy ? "Minting sessionâ€¦" : "Enter Sandbox"} onClick={submit} disabled={busy} />
+        <PortalSubmit label={busy ? "Minting session…" : "Enter Sandbox"} onClick={submit} disabled={busy} />
       </div>
     </PortalFrame>
   );

@@ -74,6 +74,11 @@ EXPECTED_TABLES = (
     # append-only outcome timeline; layer 2 is the derived truth cache.
     "nios_entity_timeline",
     "nios_compiled_entity_truths",
+    # V2.3 (PART 1.2 / 2.1-2.3): sealed compaction checkpoints, operator
+    # episodic memory (GIN-indexed context tags) and the migration ledger.
+    "nios_memory_checkpoints",
+    "nios_episodic_memory",
+    "nios_schema_migrations",
 )
 VALID_VAULTS = ("ReserveYield", "LongTermCompounder", "TacticalSwing", "SpinalScalper")
 
@@ -848,15 +853,20 @@ def _translate_for_sqlite(statement: str) -> str | None:
     # V1.9 entity-memory tables: SQLite has no ``jsonb_typeof``, no regex match
     # operator and no GIN indexes, so the same constraints are expressed with
     # the portable equivalents.  The PostgreSQL copy keeps the strict forms.
-    for column in ("entity_ids", "known_failure_modes", "caution_regimes"):
+    for column in ("entity_ids", "known_failure_modes", "caution_regimes", "context_tags"):
         translated = translated.replace(
             f"jsonb_typeof({column}) = 'array'", f"json_valid({column})"
         )
-    for column in ("payload_sha256", "truth_sha256"):
+    # V2.3 compiled-truth checkpoints are an *object*, not an array.
+    translated = translated.replace(
+        "jsonb_typeof(compiled_truths) = 'object'", "json_valid(compiled_truths)"
+    )
+    for column in ("payload_sha256", "truth_sha256", "checkpoint_sha256", "checksum_sha256"):
         translated = translated.replace(
             f"{column} ~ '^[0-9a-f]{{64}}$'", f"length({column}) = 64"
         )
     translated = translated.replace(" USING GIN (entity_ids)", " (entity_ids)")
+    translated = translated.replace(" USING GIN (context_tags)", " (context_tags)")
     translated = translated.replace("CHAR(64)", "TEXT")
     return translated
 

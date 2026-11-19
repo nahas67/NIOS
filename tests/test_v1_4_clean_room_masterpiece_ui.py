@@ -187,7 +187,7 @@ def test_v1_6_document_ships_v2_2_bundle() -> None:
     text = index.read_text(encoding="utf-8")
     assert "nios-frontend" in text
     assert "V2.2-INSTITUTIONAL-TERMINAL" in text
-    assert "v4.2.0-V2.2" in text
+    assert "v4.3.0-V2.3" in text
     assert "#0D0E10" in text
     assert "<script" in text.lower()
     assert "/assets/" in text

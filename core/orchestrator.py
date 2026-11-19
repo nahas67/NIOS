@@ -40,6 +40,7 @@ from core.feature_store import FeatureStore
 from core.llm_transport import LLMHttp2TransportPool, TokenBudgetLedger
 from core.nats_bus import LocalJetStreamBus
 from core.plugins import PluginRegistry
+from core.telemetry import gateway_telemetry
 from core.schemas import (
     ContagionFeatures,
     DualVendorBar,
@@ -532,6 +533,29 @@ class NIOSCoreOrchestrator:
             else default_operator_auth()
         )
         self.control._clean_slate_active = self._clean_slate  # noqa: SLF001
+        # V2.3 (PART 2.1): Tier-1 working memory.  Ring 2 owns the port and must
+        # never import Ring 0 (the air-gap AST guard enforces that), so the
+        # durable SQLite WAL adapter is injected here -- a composition root is
+        # the only layer allowed to see both rings.
+        try:
+            from ring0_vault.ibor.wal_state_store import WALStateStore, wal_store_path
+            from ring2_brain.memory.working_memory import (
+                WorkingMemoryStore,
+                register_working_memory_backend,
+            )
+
+            journal_path = getattr(self.control.state_journal, "path", None)
+            wal_path = (
+                wal_store_path(journal_path)
+                if journal_path is not None
+                else wal_store_path(self.workspace / "nios_workstation_journal.json")
+            )
+            working_memory_store = WALStateStore(wal_path)
+            register_working_memory_backend(lambda: working_memory_store)
+            self.working_memory = WorkingMemoryStore(backend=working_memory_store)
+        except Exception:  # pragma: no cover - memory-only fallback, never fatal
+            self.working_memory = None
+        self.control.working_memory = self.working_memory
         if self._clean_slate:
             # Demo funding already ran so every downstream constructor had a
             # positive NAV; wipe it before the operator can ever observe it.
@@ -579,6 +603,16 @@ class NIOSCoreOrchestrator:
             self.token_ledger.reset()
         except Exception:  # pragma: no cover - ledger may be immutable
             pass
+        # V2.3 (PART 2.1): Tier-1 working memory is volatile runtime context, so a
+        # factory reset must zero it too -- a stale retry ladder or bar history
+        # surviving a clean slate would be a reset that silently un-resets.
+        working_memory_reset: dict[str, Any] = {}
+        working_memory = getattr(self, "working_memory", None)
+        if working_memory is not None:
+            try:
+                working_memory_reset = dict(working_memory.reset())
+            except Exception:  # pragma: no cover - defensive clean-slate sweep
+                working_memory_reset = {"reset": False}
         return {
             "clean_slate": True,
             "ledger": ledger_report,
@@ -593,6 +627,7 @@ class NIOSCoreOrchestrator:
             "orders": [],
             "agents": self._reset_agent_tasks(),
             "backtest": self._reset_backtest_runs(),
+            "working_memory": working_memory_reset,
         }
 
     def _reset_agent_tasks(self) -> dict[str, Any]:
@@ -888,12 +923,15 @@ class NIOSCoreOrchestrator:
     # -- Ring 1 -> Ring 0 -> OMS -----------------------------------------
     def _ring0_gate(self, proposal: UnsignedProposal) -> bool:
         floor = self.control.cost_floor(proposal.silo)
-        verdict = self.firewall.evaluate(
-            proposal,
-            now_ns=time.monotonic_ns(),
-            cost_floor=floor,
-            mode_badge="LIVE CAPITAL",
-        )
+        # V2.3: the sovereign pre-trade firewall is the Ring 0 signing gate, so
+        # its own duration is the Ring 0 latency the cockpit must show.
+        with gateway_telemetry().measure(0, "pre_trade_firewall"):
+            verdict = self.firewall.evaluate(
+                proposal,
+                now_ns=time.monotonic_ns(),
+                cost_floor=floor,
+                mode_badge="LIVE CAPITAL",
+            )
         # Ring 1 numbers proposals per engine, so the same id can be produced by
         # two silos inside one autopilot round.  The verdict key carries the
         # silo to keep the reservations from crossing silo boundaries.
@@ -920,19 +958,20 @@ class NIOSCoreOrchestrator:
         now = time.monotonic_ns()
         price = float(proposal.limit_price)
         half_spread = price * 0.0001
-        self.oms.submit_maker_peg(
-            order,
-            verdict.reservation,
-            (price - half_spread, price + half_spread),
-            now_ns=now,
-        )
-        realized = self._realized_net_micros(proposal)
-        reservation = self.oms.on_fill(
-            order.proposal_id,
-            price=price,
-            realized_net_micros=realized,
-            now_ns=now,
-        )
+        with gateway_telemetry().measure(0, "oms_execute"):
+            self.oms.submit_maker_peg(
+                order,
+                verdict.reservation,
+                (price - half_spread, price + half_spread),
+                now_ns=now,
+            )
+            realized = self._realized_net_micros(proposal)
+            reservation = self.oms.on_fill(
+                order.proposal_id,
+                price=price,
+                realized_net_micros=realized,
+                now_ns=now,
+            )
         self._autopilot_live_fills += 1
         self._last_committed_reservation = reservation
         self.firewall.record_realized_pnl(proposal.silo, realized)
@@ -1188,7 +1227,11 @@ class NIOSCoreOrchestrator:
 
         scan_payload: dict[str, Any] = {}
         if run_scan:
-            scan_result = self.scan_universe(n_symbols=int(scan_symbols), silo=silo)
+            # V2.3: the 490-factor universe scan is Ring 2 compute.
+            with gateway_telemetry().measure(2, "factor_scan"):
+                scan_result = self.scan_universe(
+                    n_symbols=int(scan_symbols), silo=silo
+                )
             scan_payload = {
                 "universe": scan_result.universe_size,
                 "candidates": len(scan_result.candidates),

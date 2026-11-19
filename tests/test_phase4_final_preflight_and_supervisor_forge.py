@@ -303,14 +303,14 @@ def test_gate3_preflight_golive_cli_certifies_release() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate4_regression_inventory_is_thirty_eight_suites() -> None:
+def test_gate4_regression_inventory_is_forty_suites() -> None:
     """Every historical suite plus this one; the release tag stays annotated."""
     suites = sorted(
         path.name
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 38, suites
+    assert len(suites) == 40, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"
@@ -506,7 +506,7 @@ def test_step2_headless_document_serves_both_new_controls(cockpit: Any) -> None:
     document = index.read_text(encoding="utf-8")
     assert "nios-frontend" in document
     assert "nios-release" in document
-    assert "v4.2.0-V2.2" in document
+    assert "v4.3.0-V2.3" in document
 
 
 def test_step2_v2_2_toolchain_present_and_terminal_is_served(cockpit: Any) -> None:
@@ -934,7 +934,7 @@ def test_all_11_cockpit_pages_and_spa_routes_are_served_and_hydrated(
     document = (FRONTEND / "dist" / "index.html").read_text(encoding="utf-8")
     assert "nios-frontend" in document
     assert "nios-release" in document
-    assert "v4.2.0-V2.2" in document
+    assert "v4.3.0-V2.3" in document
     assert "<script" in document.lower()
     assert "/assets/" in document
     assert (FRONTEND / "src").exists()

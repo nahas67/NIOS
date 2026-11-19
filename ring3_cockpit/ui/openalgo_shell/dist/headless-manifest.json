@@ -1,9 +1,9 @@
 {
-  "schema_version": "v4.2.0.terminal",
+  "schema_version": "v4.3.0.terminal",
   "generated_by": "ring3_cockpit/ui/openalgo_shell/vite.config.ts",
-  "release": "v4.2.0-V2.2",
+  "release": "v4.3.0-V2.3",
   "frontend": "V2.2-INSTITUTIONAL-TERMINAL",
-  "javascript": 1,
+  "javascript": 26,
   "stylesheets": 1,
   "css_framework": "Tailwind CSS v4",
   "runtime": "React 19 + Vite",

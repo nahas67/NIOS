@@ -465,8 +465,13 @@ def test_gate4_entries_survive_a_restart(runtime, tmp_path_factory) -> None:
     snapshot = control.journal_snapshot()
     assert snapshot["logbook"] == 1, snapshot
     assert snapshot["backtests"] == 1, snapshot
+    # V2.3: the journal is a SQLite WAL database derived from the document path,
+    # so "durable on disk" is proven by either the legacy document or the WAL DB.
     path = snapshot["journal_path"]
-    assert path and os.path.exists(path), path
+    database_path = snapshot["database_path"]
+    assert path, snapshot
+    assert os.path.exists(path) or os.path.exists(database_path), (path, database_path)
+    assert database_path and os.path.exists(database_path), database_path
 
     # ---- a brand-new ControlPlane must rehydrate from the same journal ----
     workspace = tmp_path_factory.mktemp("nios-v18-restart-ws")

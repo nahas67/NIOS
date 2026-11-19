@@ -147,8 +147,28 @@ class MissionControlSurface:
         self.default_silo = str(default_silo)
         self._missions: dict[str, _MissionRecord] = {}
         self._tranche_sequence = 0
+        #: V2.3 (PART 2.3): optional sink for operator interventions.  The Ring 3
+        #: control plane attaches its episodic-memory recorder here; ``None``
+        #: keeps this surface usable stand-alone.
+        self.decision_hook: Any = None
 
     # -- helpers ----------------------------------------------------------
+    def _emit_decision(self, action_kind: str, payload: Mapping[str, Any]) -> None:
+        """Hand one operator decision to the attached episodic recorder.
+
+        Best effort by contract: the mission transition has already been
+        committed when this runs, so a memory fault must never turn a successful
+        approval into a failed request.
+        """
+
+        hook = getattr(self, "decision_hook", None)
+        if hook is None:
+            return
+        try:
+            hook(str(action_kind), dict(payload))
+        except Exception:  # noqa: BLE001 - memory must never break a control path
+            return
+
     def _record(self, mission_id: str) -> _MissionRecord:
         record = self._missions.get(str(mission_id))
         if record is None:
@@ -398,6 +418,22 @@ class MissionControlSurface:
         # audit trail must not grow a second identical ``APPROVED`` entry.
         if not record.plan_state_history or record.plan_state_history[-1] != "APPROVED":
             record.plan_state_history.append("APPROVED")
+        if revised:
+            # V2.3 (PART 2.3): the ``plannotator`` inline override is exactly the
+            # decision the desk must still remember when the same setup returns.
+            self._emit_decision(
+                "MISSION_OVERRIDE",
+                {
+                    "mission_id": record.spec.mission_id,
+                    "actor": str(operator),
+                    "tranche_caps_micros": dict(sorted(final_caps.items())),
+                    "excluded_symbols": list(final_excluded),
+                    "reserve_split_override_bps": final_reserve,
+                    "operator_note": final_note,
+                    "revision": int(revision),
+                    "approval_state": state,
+                },
+            )
         return self._mission_payload(record, now_ns=stamp)
 
     def _apply_tranche_caps(
@@ -498,6 +534,16 @@ class MissionControlSurface:
         payload = self._mission_payload(record, now_ns=stamp)
         payload["revoked_by"] = str(operator)
         payload["halted_tranches"] = halted
+        # V2.3 (PART 2.3): a revocation is the strongest risk-tightening signal
+        # the desk produces; record it before the response leaves the surface.
+        self._emit_decision(
+            "MISSION_REVOKE",
+            {
+                "mission_id": record.spec.mission_id,
+                "actor": str(operator),
+                "reason": str(reason or ""),
+            },
+        )
         return payload
 
     def list_missions(self, *, now_ns: int | None = None) -> dict[str, Any]:
@@ -646,6 +692,16 @@ class MissionControlSurface:
         payload = state.to_dict() if state is not None else {}
         payload["rearmed"] = bool(changed)
         payload["operator"] = str(operator)
+        # V2.3 (PART 2.3): re-arming a halted tranche is a deliberate re-risk.
+        self._emit_decision(
+            "TRANCHE_REARM",
+            {
+                "tranche_id": str(tranche_id),
+                "actor": str(operator),
+                "mission_id": str(payload.get("mission_id", "") or ""),
+                "rearmed": bool(changed),
+            },
+        )
         return payload
 
     # -- profit split -----------------------------------------------------

@@ -268,7 +268,74 @@ CREATE INDEX IF NOT EXISTS idx_compiled_truth_type
     ON nios_compiled_entity_truths (entity_type, sample_count DESC);
 
 -- ---------------------------------------------------------------------------
--- 9. Operational guard rails
+-- 9. V2.3 memory checkpoints -- sealed compaction boundaries (PART 2.2)
+--
+-- A checkpoint binds the canonical compiled-truth digest to an event cutoff, so
+-- a restart can replay ``seq > checkpoint_seq`` instead of the whole timeline and
+-- still prove it reached the same truths.  ``compiled_truths`` is an object keyed
+-- by entity_id; the SHA-256 over that object is the seal.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS nios_memory_checkpoints (
+    checkpoint_seq          BIGINT      PRIMARY KEY CHECK (checkpoint_seq >= 0),
+    cutoff_ts_utc           TIMESTAMPTZ NOT NULL,
+    event_count_compacted   INTEGER     NOT NULL DEFAULT 0 CHECK (event_count_compacted >= 0),
+    compiled_truths         JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    checkpoint_sha256       CHAR(64)    NOT NULL,
+    created_at_utc          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT memory_checkpoint_truths_object CHECK (jsonb_typeof(compiled_truths) = 'object'),
+    CONSTRAINT memory_checkpoint_digest_hex CHECK (checkpoint_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_checkpoints_cutoff
+    ON nios_memory_checkpoints (cutoff_ts_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_checkpoints_created
+    ON nios_memory_checkpoints (created_at_utc DESC);
+
+-- ---------------------------------------------------------------------------
+-- 10. V2.3 episodic operator memory (PART 2.3)
+--
+-- One row per operator intervention -- a plannotator override, a mission
+-- revocation, a manual tranche rearm, a cold-start freeze clearance, an
+-- autopilot pause/play.  ``context_tags`` is a JSONB array with a GIN index so
+-- ``context_tags @> '["REGIME:CONTRACTION"]'`` stays index-backed.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS nios_episodic_memory (
+    episode_id              TEXT        PRIMARY KEY,
+    ts_utc                  BIGINT      NOT NULL CHECK (ts_utc >= 0),
+    actor                   TEXT        NOT NULL DEFAULT 'operator',
+    action_kind             TEXT        NOT NULL,
+    regime                  TEXT        NOT NULL DEFAULT '',
+    context_tags            JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    decision_summary        TEXT        NOT NULL DEFAULT '',
+    payload_sha256          CHAR(64)    NOT NULL,
+    CONSTRAINT episodic_context_tags_array CHECK (jsonb_typeof(context_tags) = 'array'),
+    CONSTRAINT episodic_digest_hex CHECK (payload_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX IF NOT EXISTS idx_episodic_memory_time
+    ON nios_episodic_memory (ts_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_episodic_memory_kind
+    ON nios_episodic_memory (action_kind, ts_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_episodic_memory_tags
+    ON nios_episodic_memory USING GIN (context_tags);
+
+-- ---------------------------------------------------------------------------
+-- 11. V2.3 schema migration ledger
+--
+-- Every applied DDL version records a SHA-256 of its own body.  A stored
+-- checksum that no longer matches the code means the schema on disk was not
+-- produced by the migration that claims it, and the repository refuses to guess.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS nios_schema_migrations (
+    version                 INTEGER     PRIMARY KEY CHECK (version >= 0),
+    name                    TEXT        NOT NULL,
+    applied_at_utc          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    checksum_sha256         CHAR(64)    NOT NULL,
+    CONSTRAINT schema_migration_digest_hex CHECK (checksum_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+-- ---------------------------------------------------------------------------
+-- 12. Operational guard rails
 -- ---------------------------------------------------------------------------
 COMMENT ON TABLE financial_outbox IS
     'Durable mirror of the TigerBeetle two-phase outbox; one row per deterministic idempotency key.';
@@ -288,5 +355,11 @@ COMMENT ON TABLE nios_entity_timeline IS
     'Append-only post-mortem outcome events keyed by SHA-256 payload commitment (layer 1).';
 COMMENT ON TABLE nios_compiled_entity_truths IS
     'Deterministic rolling truth per entity, derived from nios_entity_timeline (layer 2).';
+COMMENT ON TABLE nios_memory_checkpoints IS
+    'Sealed compaction checkpoints: a cutoff plus the SHA-256 of the compiled truths it stands for.';
+COMMENT ON TABLE nios_episodic_memory IS
+    'Operator decisions (overrides, revocations, rearms, freeze clearances) with GIN-indexed context tags.';
+COMMENT ON TABLE nios_schema_migrations IS
+    'Applied DDL versions with the SHA-256 of each migration body.';
 
 COMMIT;

@@ -920,6 +920,7 @@ class AgentTaskDispatcher:
         "journal",
         "_restored_tasks",
         "entity_memory",
+        "episodic_memory",
         "active_regime",
     )
 
@@ -937,6 +938,7 @@ class AgentTaskDispatcher:
         clock: Callable[[], int] = time.time_ns,
         journal: Any = None,
         entity_memory: Any = None,
+        episodic_memory: Any = None,
     ) -> None:
         self._dashboard = dashboard if dashboard is not None else DecisionDashboard()
         self._valuation = valuation
@@ -977,6 +979,9 @@ class AgentTaskDispatcher:
         # copy rides the atomic journal.  ``None`` degrades to no memory, never
         # to a fabricated lesson.
         self.entity_memory = entity_memory
+        # -- V2.3 (PART 2.3): episodic operator memory.  Same contract: the
+        # store is injected, optional, and a failure degrades to "no caution".
+        self.episodic_memory = episodic_memory
         #: Active macro regime used to decide whether a past failure mode is
         #: *currently* relevant.  Ring 3 sets it from the live macro surface.
         self.active_regime = "NEUTRAL"
@@ -2190,6 +2195,27 @@ class AgentTaskDispatcher:
                 )
             )
             structured = self._apply_post_mortem(structured, memory)
+            cautions = (
+                memory.get("episodic_cautions")
+                if isinstance(memory.get("episodic_cautions"), Mapping)
+                else None
+            )
+            if isinstance(cautions, Mapping):
+                try:
+                    metrics.update(
+                        _prefixed(
+                            task.symbols[0],
+                            {
+                                "episodic_caution_matches": float(
+                                    (cautions.get("metrics") or {}).get(
+                                        "episode_matches", 0.0
+                                    )
+                                ),
+                            },
+                        )
+                    )
+                except (TypeError, ValueError):  # pragma: no cover - defensive
+                    pass
             doc.head("Post-mortem memory")
             doc.note(
                 "Prior lessons",
@@ -2212,6 +2238,24 @@ class AgentTaskDispatcher:
                     + ("yes" if memory["penalty"]["applied"] else "no")
                 ),
             )
+            if isinstance(cautions, Mapping) and cautions.get("narrative"):
+                # The narrative is already digit-free; strip again so a future
+                # summary field can never smuggle a figure into the prose.
+                doc.note("Operator cautions", _digitless(str(cautions["narrative"])))
+        else:
+            # No entity history, but the desk may still have intervened on this
+            # name.  The caution rides the structured result only: with no
+            # sample count there is no post-mortem packet to seal a figure into,
+            # and inventing one would be worse than saying nothing.
+            cautions_only = self._episodic_cautions(task)
+            if cautions_only is not None and cautions_only.get("narrative"):
+                structured = dict(structured)
+                structured["episodic_cautions"] = {
+                    "narrative": _digitless(str(cautions_only["narrative"])),
+                    "episode_ids": list(cautions_only.get("episode_ids") or ()),
+                    "action_kinds": list(cautions_only.get("action_kinds") or ()),
+                    "packet_sha256": str(cautions_only.get("packet_sha256") or ""),
+                }
         packet = GroundedFactPacket(
             symbol=task.symbols[0],
             valid_time_ns=finished_ns,
@@ -2257,6 +2301,16 @@ class AgentTaskDispatcher:
                 ],
                 "packet_sha256": memory["packet_sha256"],
             }
+            episodic_cautions = memory.get("episodic_cautions")
+            if isinstance(episodic_cautions, Mapping):
+                task.structured_result["episodic_cautions"] = {
+                    "narrative": str(episodic_cautions.get("narrative") or ""),
+                    "episode_ids": list(episodic_cautions.get("episode_ids") or ()),
+                    "action_kinds": list(episodic_cautions.get("action_kinds") or ()),
+                    "packet_sha256": str(
+                        episodic_cautions.get("packet_sha256") or ""
+                    ),
+                }
         task.token_cost_usd = self._record_spend(spec)
         task.completed_at_ns = int(self._clock())
         task.latency_ms = max(0.0, (task.completed_at_ns - start_ns) / 1_000_000.0)
@@ -2267,6 +2321,36 @@ class AgentTaskDispatcher:
             task.status = "FAILED"
             task.progress_pct = 100
             task.error = str(verdict.get("error") or "UNGROUNDED-REPORT")
+
+    def _episodic_cautions(self, task: AgentTask) -> dict[str, Any] | None:
+        """Matching operator cautions for this task, or ``None``.
+
+        Best effort by contract: an episodic-memory failure degrades to "no
+        caution", never to a failed proposal.
+        """
+
+        store = getattr(self, "episodic_memory", None)
+        if store is None:
+            return None
+        symbol = task.symbols[0] if task.symbols else ""
+        regime = str(getattr(task, "regime", "") or getattr(self, "active_regime", ""))
+        query_text = " ".join(
+            part
+            for part in (symbol, task.task_type, task.strategy_id, regime)
+            if part
+        )
+        try:
+            cautions = store.cautions_for(
+                symbol=symbol,
+                silo=task.silo,
+                strategy_id=task.strategy_id,
+                regime=regime,
+                query_text=query_text,
+                top_k=3,
+            )
+        except Exception:  # noqa: BLE001 - memory must never fail a proposal
+            return None
+        return dict(cautions) if isinstance(cautions, Mapping) else None
 
     def _post_mortem(self, task: AgentTask) -> dict[str, Any] | None:
         """Retrieve this entity's post-mortem memory before a proposal ships.
@@ -2304,7 +2388,14 @@ class AgentTaskDispatcher:
                 return None
         except (TypeError, ValueError):
             return None
-        return dict(report)
+        memory = dict(report)
+        # V2.3 (PART 2.3): operator interventions on the same entity/regime are a
+        # second, independent caution.  Their narrative is digit-free by
+        # construction and their figures ride their own sealed packet.
+        cautions = self._episodic_cautions(task)
+        if cautions is not None:
+            memory["episodic_cautions"] = cautions
+        return memory
 
     @staticmethod
     def _apply_post_mortem(

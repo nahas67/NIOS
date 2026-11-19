@@ -36,7 +36,7 @@ export function PortalFrame({
           </div>
           <div className="mt-1 text-[9px] uppercase tracking-[0.22em] text-ink-3">Institutional Financial Terminal</div>
           <div className="mt-3 flex items-center gap-1.5">
-            <Badge tone="muted">v4.2.0-V2.2</Badge>
+            <Badge tone="muted">v4.3.0-V2.3</Badge>
             <Badge tone={mode === "live" ? "bear" : mode === "paper" ? "accent" : "neutral"}>
               {mode === "live" ? "LIVE VAULT" : mode === "paper" ? "PAPER SANDBOX" : "SOVEREIGN GATEWAY"}
             </Badge>

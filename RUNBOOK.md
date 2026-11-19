@@ -482,7 +482,7 @@ event.
 ### 1F.7 Release verification for `v3.10.0-V1.9`
 
 ```bash
-python -m pytest tests -q                 # 38 suites, 954 passed, 0 failed, 0 warnings
+python -m pytest tests -q                 # 40 suites, 1015 tests, 0 failed, 0 warnings
 python scripts/run_nios.py --smoke-test   # ROWS=23, EXIT=0
 python scripts/preflight_golive.py --fast # 23/23 PASS, EXIT=0
 ```
@@ -585,16 +585,16 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 38 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 40 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 23/23
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 23/23
 ```
 
-Release seal for `v4.2.0-V2.2`: `pytest tests -q` must report **100% pass across all 38 suites, 0 failed, 0 warnings**
+Release seal for `v4.3.0-V2.3`: `pytest tests -q` must report **100% pass across all 40 suites, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **23/23 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 37-suite inventory
+### 3.2a The 40-suite inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -635,6 +635,9 @@ prerequisites for re-tagging; neither may be waived.
 | 35 | `tests/test_v2_1_analytics_alerts_settings_and_sse.py` | **V2.1** `G7` multiplexed SSE stream (seven closed-loop frames additive to the five V1.8 tape frames, `?topic=` / `?silo=` filtering, unknown-topic `422`, out-of-band event precedence), `G8` `/api/v2/analytics/performance` (equity curve, underwater drawdown, Sharpe / Sortino / Calmar, win rate, profit factor, per-silo / per-tranche / per-mission attribution), `G9` persistent alert and incident center (raise, de-duplicate, filter, acknowledge, `404`), `G10` journal-backed runtime settings (offline default, validated patch, revision history, live-critical tier carve-out, typed rejections) |
 | 36 | `tests/test_v2_1_unified_session_csrf_and_reconciliation.py` | **V2.1** `G11` unified cookie + header session (cookie-auth mutation costs a signed double-submit `X-NIOS-CSRF`, safe methods and the read-only MCP bridge stay exempt, `/api/v2/auth/session` tier + TTL + expiry + CSRF telemetry), `G12` cold-start reconciliation control (rogue venue position freezes the silo, status/run/dry-run, LIVE-elevated clear-freeze with operator note, ADR-009 loss stop refused) |
 | 37 | `tests/test_v2_1_deep_audit_and_hardening.py` | **V2.1** all-out multi-lens backend audit closure. Lens 1: `logout`/`reset`/`elevate-live` pulled out of the CSRF bootstrap exemption (`CSRF_GUARDED_SESSION_PATHS`), `POST /api/v2/settings` promoted to a `session_guard` dependency, `LIVE` tier enforcement on every live-risk knob and on `clear-freeze`, `NaN`/`inf`/overflow/unknown-id `4xx` boundaries across the whole `V2.1` surface, `OFFLINE_REPLAY` socket-proof connector. Lens 2: `PENDING_SWEEP_VERIFICATION` for a `5xx UNKNOWN` sweep outcome, `resolve_pending_sweep` resolver, `apply_statutory=False` for an already-net fill, idempotency-keyed closes, honest `COMPENSATION_PARTIAL`, single post-mortem per close, clean-slate reset of saga/alert/settings/bars. Lens 3: Ring 2 `to_micros` bit-for-bit parity with Ring 0, crossed-book and stale-tick rejection, bounded instrument map, `BTC/USDT` `<->` `BTCUSDT` `<->` `BTC-USDT` entity aliasing across `EntityMemoryGraph` / `PostMortemRecorder` / autopilot sizing, analytics zero-division and `NaN` safety, autopilot kill-latch / `TARGET_LOCK` / closed-venue interlocks. Lens 4: `TransactionStateChecker` probe outside the mutex, `MANUAL_INTERVENTION_REQUIRED` ceiling with a `CRITICAL` alert, 15-cycle `create_app()` thread flatness |
+| 38 | `tests/test_v2_2_final_institutional_terminal_ui.py` | **V2.2** final flat matte institutional terminal: 56 routes across dual `/paper/*` and `/live/*` shells, 17 workstations plus five portals, the `#0D0E10` / `#27292E` hairline palette with zero gradients, shadows, blur or pills, workstation-keyed lazy chunks, session-gated portal redirects, and the compiled bundle manifest |
+| 39 | `tests/test_v2_3_wal_db_compaction_and_episodic_memory.py` | **V2.3** database durability and 3-tier memory: SQLite WAL journal surviving restart with `journal_path` + `database_path`, byte-identical `truth_sha256` across full and compacted `EntityMemoryGraph` compiles with a verified `MemoryCheckpoint` and cold archive, 3-signal hybrid retrieval separating a legacy two-signal tie, `EpisodicMemoryStore` envelope + action filter + bounded compaction, `GET /api/v2/memory/episodes` (empty-safe `200`) and `POST /api/v2/memory/compact` behind `session_guard` + `X-NIOS-CSRF` (`401`/`403`/`200`), WAL memory table wipe on `workspace/reset` and `auth/reset`, 12-table PG16 schema, offline testnet burn-in skip, and Ring 2 memory containment (no Ring 0 signing or socket imports) |
+| 40 | `tests/test_v2_3_telemetry_closure_and_ui_split.py` | **V2.3** telemetry closure and UI split: measured `latency_ms` with p50/p95/p99 sample counts, all four ring `p99` keys, `feed_lag_ms` `IDLE -> LIVE` after a real tick, `pending_intents_count` moving with a real `MAKER_PEG` order, `adwin_drift` advancing one window per closed trade and mirroring `adwin_drift_by_strategy`, `iv_rank_bps` recomputed from its own `MIN_MAX_52W` window with `INSUFFICIENT_HISTORY` instead of a sentinel, supervisor/overview `ring3_p99_ms`, six telemetry fields consumed without placeholder data, LIVE shell free of any shadow-burst control, Agents episodic + `Compact Memory`, the stale 404 hint removed, and 26 built JS chunks (17 pages + 5 portals + entry + vendor + `PortalFrame` + shared) with a proven manual split |
 
 
 ### 3.3 Chaos / crash injection

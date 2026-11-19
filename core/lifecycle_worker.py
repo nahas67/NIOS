@@ -278,6 +278,60 @@ class UnknownOrderQueue:
         with self._lock:
             return tuple(dict(self._rows[key]) for key in self._order)
 
+    def restore(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Rehydrate unresolved rows after a restart (``PART 2.1``).
+
+        The ladder is read-only by design, so restoring it never re-submits an
+        order: it only restores *which venue queries are still open* and when the
+        next probe is due.  An entry whose stored retry deadline has already
+        passed is due immediately, which is the correct behaviour after downtime --
+        the venue has had even longer to settle the order.
+        """
+        stamp = time.time_ns()
+        restored = 0
+        skipped = 0
+        with self._lock:
+            for row in rows or ():
+                if not isinstance(row, Mapping):
+                    skipped += 1
+                    continue
+                key = str(row.get("order_id") or row.get("row_key") or "").strip()
+                if not key or key in self._rows:
+                    skipped += 1
+                    continue
+                state = str(row.get("state") or "PENDING").upper()
+                if state not in ("PENDING", "ESCALATED"):
+                    skipped += 1
+                    continue
+                next_attempt = int(
+                    row.get("next_retry_at_utc_ns") or row.get("next_attempt_at_utc_ns") or 0
+                )
+                self._rows[key] = {
+                    "order_id": key,
+                    "client_order_id": str(row.get("client_order_id") or key),
+                    "silo": str(row.get("silo") or "").upper(),
+                    "symbol": str(row.get("symbol") or "").upper(),
+                    "reason": str(row.get("reason") or "5XX_UNKNOWN"),
+                    "state": state,
+                    "attempts": int(row.get("attempts") or 0),
+                    "next_attempt_at_utc_ns": next_attempt,
+                    "enqueued_at_utc_ns": int(row.get("enqueued_at_utc_ns") or stamp),
+                    "resolved_at_utc_ns": row.get("resolved_at_utc_ns"),
+                    "resolution": str(row.get("resolution") or ""),
+                    "history": [
+                        dict(item) for item in (row.get("history") or ()) if isinstance(item, Mapping)
+                    ],
+                }
+                self._order.append(key)
+                restored += 1
+        return {"restored": restored, "skipped": skipped, "count": len(self._rows)}
+
+    @property
+    def active_count(self) -> int:
+        """Unresolved ``PENDING``/``ESCALATED`` rows (V2.3 ``pending_intents``)."""
+        with self._lock:
+            return sum(1 for row in self._rows.values() if row["state"] != "RESOLVED")
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             counts: dict[str, int] = {}
@@ -320,6 +374,7 @@ class NiosLifecycleWorker:
         unknown_orders: UnknownOrderQueue | None = None,
         enabled: bool = True,
         totp_warn_hours: int = 6,
+        working_memory: Any = None,
     ) -> None:
         self.alert_center = alert_center
         self.quota_engine = quota_engine
@@ -329,6 +384,9 @@ class NiosLifecycleWorker:
         self.reconciliation = reconciliation
         self.autopilot = autopilot
         self.settings_store = settings_store
+        #: V2.3 (PART 2.1): optional Tier-1 working-memory store.  Duck-typed on
+        #: ``persist_unknown_queue`` so Ring 3 never imports ``ring2_brain``.
+        self.working_memory = working_memory
         self.enabled = bool(enabled)
         self.totp_warn_hours = int(totp_warn_hours)
         self.unknown_orders = (
@@ -430,12 +488,29 @@ class NiosLifecycleWorker:
         if job == "listen_key_keepalive":
             return self._job_listen_key(stamp)
         if job == "unknown_order_retry":
-            return {"attempts": self.unknown_orders.tick(now_utc=stamp)}
+            attempts = self.unknown_orders.tick(now_utc=stamp)
+            return {"attempts": attempts, "persisted": self._persist_unknown_orders()}
         if job == "quota_ttl_sweep":
             return self._job_quota_sweep(stamp)
         if job == "concept_drift_check":
             return self._job_drift(stamp)
         return self._job_reconciliation(stamp)
+
+    def _persist_unknown_orders(self) -> int:
+        """Mirror the retry ladder into Tier-1 working memory (``PART 2.1``).
+
+        Best effort by contract: a working-memory failure may never fail the
+        reconciliation job, because losing the ladder is recoverable while
+        skipping the venue probe is not.
+        """
+        store = getattr(self, "working_memory", None)
+        persister = getattr(store, "persist_unknown_queue", None)
+        if not callable(persister):
+            return 0
+        try:
+            return int(persister(self.unknown_orders))
+        except Exception:  # noqa: BLE001 - persistence is best effort
+            return 0
 
     def _job_totp(self, stamp: int) -> dict[str, Any]:
         if self.totp_renewal is None:
