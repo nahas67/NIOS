@@ -190,6 +190,7 @@ export default function TerminalPage({ mode }: PageProps) {
   const [asks, setAsks] = useState<DepthLevel[]>([]);
   const [study, setStudy] = useState<Record<string, unknown>>({});
   const [script, setScript] = useState(STUDY_IDS[0]);
+  const [studiesOpen, setStudiesOpen] = useState(true);
   const [show, setShow] = useState({ ma5: true, ma10: true, ma20: false, vwap: true });
   const [ticket, setTicket] = useState({ side: "BUY", quantity: "1", type: "MARKET", limit: "" });
   const [loading, setLoading] = useState(true);
@@ -530,34 +531,53 @@ export default function TerminalPage({ mode }: PageProps) {
             subtitle="POST /market/tv-study · grounded plot series"
             icon="sigma"
             actions={
-              <Badge tone={studySeries.length > 0 ? "bull" : "muted"} mono>
-                {text(study.study_id, "NO STUDY")}
-              </Badge>
+              <div className="flex items-center gap-1.5">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  active={studiesOpen}
+                  title={studiesOpen ? "Collapse the Pine studies panel" : "Expand the Pine studies panel"}
+                  onClick={() => setStudiesOpen((current) => !current)}
+                >
+                  Pine Studies
+                </Button>
+                <Badge tone={studySeries.length > 0 ? "bull" : "muted"} mono>
+                  {text(study.study_id, "NO STUDY")}
+                </Badge>
+              </div>
             }
           >
-            <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_220px]">
-              <Field label="Study script / id" hint={`supported: ${STUDY_IDS.slice(0, 3).join(" · ")} …`}>
-                <TextArea rows={3} value={script} onChange={setScript} placeholder="STD;RSI" />
-              </Field>
-              <div className="flex flex-col justify-end gap-1.5">
-                <Button size="sm" variant="primary" onClick={() => void submitStudy()}>
-                  Evaluate study
-                </Button>
-                <div className="text-[10px] leading-snug text-ink-3">
-                  {text(asRecord(study.verdict).reason, "plots are hashed before they may be quoted")}
+            {studiesOpen ? (
+              <>
+                <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_220px]">
+                  <Field label="Study script / id" hint={`supported: ${STUDY_IDS.slice(0, 3).join(" · ")} …`}>
+                    <TextArea rows={3} value={script} onChange={setScript} placeholder="STD;RSI" />
+                  </Field>
+                  <div className="flex flex-col justify-end gap-1.5">
+                    <Button size="sm" variant="primary" onClick={() => void submitStudy()}>
+                      Evaluate study
+                    </Button>
+                    <div className="text-[10px] leading-snug text-ink-3">
+                      {text(asRecord(study.verdict).reason, "plots are hashed before they may be quoted")}
+                    </div>
+                  </div>
                 </div>
+                <div className="mt-2">
+                  {studySeries.length === 0 ? (
+                    <EmptyState
+                      title="No study plotted"
+                      hint="Evaluate a Pine study to render its grounded plot series."
+                    />
+                  ) : (
+                    <LineChart series={studySeries} height={140} width={720} />
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="px-1 py-3 text-[10px] uppercase tracking-[0.1em] text-ink-3">
+                Pine studies panel collapsed · click PINE STUDIES to expand
               </div>
-            </div>
-            <div className="mt-2">
-              {studySeries.length === 0 ? (
-                <EmptyState
-                  title="No study plotted"
-                  hint="Evaluate a Pine study to render its grounded plot series."
-                />
-              ) : (
-                <LineChart series={studySeries} height={140} width={720} />
-              )}
-            </div>
+            )}
           </Card>
         </div>
       </div>

@@ -1006,7 +1006,7 @@ def test_analytics_performance_still_parses_after_the_fast_serialiser(cockpit) -
 
 def test_suite41_belongs_to_the_forty_one_suite_release() -> None:
     suites = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(suites) == 41, suites
+    assert len(suites) == 42, suites
     assert SUITE_NAME in suites
     assert "test_v2_3_telemetry_closure_and_ui_split.py" in suites
     assert (ROOT / "tests" / "conftest.py").is_file()
@@ -1016,8 +1016,8 @@ def test_release_documents_advertise_forty_one_suites_and_the_v2_4_seal() -> Non
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "41 suites" in runbook
-    assert "41 suites" in readme
+    assert "42 suites" in runbook
+    assert "42 suites" in readme
     assert "v4.4.0-V2.4" in runbook
     assert "v4.3.0-V2.3" in runbook
     assert SUITE_NAME in runbook

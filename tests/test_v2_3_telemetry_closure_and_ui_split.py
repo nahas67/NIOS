@@ -701,6 +701,6 @@ def test_gate5_forbidden_primitives_are_absent_from_the_sources() -> None:
 
 def test_gate6_suite40_belongs_to_the_forty_suite_release() -> None:
     suites = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(suites) == 41, suites
+    assert len(suites) == 42, suites
     assert SUITE_NAME in suites
     assert "test_v2_3_wal_db_compaction_and_episodic_memory.py" in suites

@@ -454,7 +454,7 @@ export function VerificationPage({ mode }: PageProps) {
               disabled={busy !== null}
               onClick={() => void runDrill()}
             >
-              {busy === "drill" ? "KILLING…" : "Run Drill"}
+              {busy === "drill" ? "KILLING…" : "Run Chaos Drill"}
             </Button>
           }
         >
@@ -714,9 +714,20 @@ export function VerificationPage({ mode }: PageProps) {
         icon="activity"
         dense
         actions={
-          <Badge tone="muted" mono>
-            {int(telemetry.length)} METRICS
-          </Badge>
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="subtle"
+              size="sm"
+              icon="refresh"
+              title="Re-fetch the Prometheus exporter families"
+              onClick={() => void load()}
+            >
+              Prometheus Refresh
+            </Button>
+            <Badge tone="muted" mono>
+              {int(telemetry.length)} METRICS
+            </Badge>
+          </div>
         }
       >
         {telemetry.length === 0 ? (

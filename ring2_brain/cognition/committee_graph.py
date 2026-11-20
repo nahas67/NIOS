@@ -41,6 +41,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from core.llm_api_config import is_live_enabled
+from core.llm_model_policy import ALLOWED_MODEL
 from core.nats_bus import STREAM_RING2_THESES, LocalJetStreamBus
 from core.schemas import (
     FRAGILITY_HALT_THRESHOLD,
@@ -429,6 +431,13 @@ class System2InvestmentCommittee:
                 "used_fallback": True,
                 "reasoning_effort": str(reasoning_effort or self.reasoning_effort),
             }
+        if is_live_enabled():
+            # V2.5: the live committee never falls back to deepseek/claude/
+            # openrouter model ids.  Coerce the whole pool in place so every
+            # dispatched System 2 turn carries hy4-flash-free.
+            enforce = getattr(self.transport_pool, "enforce_live_model", None)
+            if callable(enforce):
+                enforce()
         completion = self.transport_pool.complete_system2(
             prompt,
             reasoning_effort=reasoning_effort or self.reasoning_effort,
@@ -437,7 +446,11 @@ class System2InvestmentCommittee:
         if hasattr(completion, "to_dict"):
             payload = completion.to_dict()
             payload["used_fallback"] = completion.provider == "deterministic-local"
+            if is_live_enabled():
+                payload["model"] = ALLOWED_MODEL
             return payload
+        if is_live_enabled() and isinstance(completion, dict):
+            completion["model"] = ALLOWED_MODEL
         return completion
 
     def llm_state(self) -> dict[str, Any]:
@@ -445,6 +458,9 @@ class System2InvestmentCommittee:
             "reasoning_effort": self.reasoning_effort,
             "transport_wired": self.transport_pool is not None,
         }
+        if is_live_enabled():
+            state["active_model"] = ALLOWED_MODEL
+            state["live_model_lock"] = True
         if self.transport_pool is not None:
             state["transport"] = self.transport_pool.status()
         if self.token_ledger is not None:

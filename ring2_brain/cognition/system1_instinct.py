@@ -33,6 +33,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from core.llm_api_config import is_live_enabled
+from core.llm_model_policy import ALLOWED_MODEL, coerce_model
 from core.schemas import (
     FRAGILITY_HALT_THRESHOLD,
     LEASE_TTL_NS,
@@ -168,6 +170,9 @@ class LLMProvider:
                 raise ValueError(f"{name} must be non-empty")
             setattr(self, name, token)
         self.priority = int(self.priority)
+        if is_live_enabled():
+            # V2.5 single-model lock: override any other id to hy4-flash-free.
+            self.model = coerce_model(self.model)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -457,7 +462,7 @@ class MultiLLMSwitchboard:
                     self.ledger.set_active(1, provider.name)
                 return RoutingDecision(
                     provider_name=provider.name,
-                    model=provider.model,
+                    model=coerce_model(provider.model) if is_live_enabled() else provider.model,
                     suggestion=suggestion,
                     used_fallback=False,
                     latency_ms=elapsed,

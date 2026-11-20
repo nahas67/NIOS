@@ -37,12 +37,18 @@ import re
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 import httpx
 
+from core.llm_api_config import (
+    is_live_enabled,
+    load_llm_api_config,
+    mask_api_key,
+)
+from core.llm_model_policy import ALLOWED_MODEL, coerce_model
 from core.os_tuning import LOW_LATENCY_SOCKET_OPTIONS
 
 __all__ = [
@@ -50,6 +56,7 @@ __all__ = [
     "DEFAULT_DAILY_USD_CAP",
     "HARD_TIMEOUT_MS",
     "LOCAL_PROVIDERS",
+    "active_model",
     "LLM_PROBE_FALLBACK",
     "LLM_PROBE_LOCAL_LIVE",
     "OLLAMA_TAGS_PATH",
@@ -65,6 +72,7 @@ __all__ = [
     "SYSTEM2_PROVIDERS",
     "TokenBudgetLedger",
     "default_provider_specs",
+    "extract_completion_text",
     "parse_instinct_response",
     "probe_llm_endpoints",
     "reasoning_budget_tokens",
@@ -117,6 +125,105 @@ _KEY_SUFFIX = "API" + "_" + "KEY"
 
 def _env(prefix: str) -> str:
     return f"{prefix}_{_KEY_SUFFIX}"
+
+
+# ---------------------------------------------------------------------------
+# V2.5 single-model dispatch policy (live mode only)
+# ---------------------------------------------------------------------------
+
+
+def active_model() -> str:
+    """The only model id that may be dispatched (V2.5 single-model lock)."""
+    return ALLOWED_MODEL
+
+
+def _dispatch_model(spec: LLMProviderSpec) -> str:
+    """Model id for an outbound request.
+
+    Offline (default) keeps each provider's declared model verbatim so the
+    deterministic tests and mock handlers are untouched.  In live mode every
+    provider is overridden to ``hy4-flash-free`` -- no deepseek/claude/
+    openrouter/gemini/groq model id ever reaches the wire.
+    """
+    return coerce_model(spec.model) if is_live_enabled() else spec.model
+
+
+def _live_coerce_specs(specs: Iterable[LLMProviderSpec]) -> tuple[LLMProviderSpec, ...]:
+    """Force every spec to the allowed model when live execution is enabled."""
+    if not is_live_enabled():
+        return tuple(specs)
+    return tuple(replace(spec, model=ALLOWED_MODEL) for spec in specs)
+
+
+def _coerce_text_blocks(value: Any) -> str:
+    """Flatten an OpenAI message field that is a string or a list of blocks.
+
+    hy4-flash-free (and several reasoning models) may return ``content`` as a
+    list of ``{"type": "text", "text": ...}`` blocks instead of a plain string,
+    and may place the answer in ``reasoning_content``.  Both shapes are
+    normalised to a single string here so downstream JSON extraction and the
+    NumericalGroundingVerifier see their usual contract.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, Sequence):
+        parts: list[str] = []
+        for block in value:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, Mapping):
+                parts.append(
+                    str(
+                        block.get("text")
+                        or block.get("content")
+                        or block.get("value")
+                        or ""
+                    )
+                )
+        return "".join(parts)
+    return str(value)
+
+
+def _message_text(message: Any) -> str:
+    """Pick the usable reply text from an OpenAI-compatible chat message."""
+    if not isinstance(message, Mapping):
+        return "" if message is None else str(message)
+    content = _coerce_text_blocks(message.get("content"))
+    if content.strip():
+        return content
+    reasoning = _coerce_text_blocks(message.get("reasoning_content"))
+    if not reasoning.strip():
+        reasoning = _coerce_text_blocks(message.get("reasoning"))
+    if not reasoning.strip():
+        reasoning = _coerce_text_blocks(message.get("text"))
+    return reasoning
+
+
+def extract_completion_text(payload: Mapping[str, Any]) -> str:
+    """Extract usable reply text from an OpenAI-compatible chat response body.
+
+    ``hy4-flash-free`` may place the answer in ``choices[0].message.content`` OR
+    ``choices[0].message.reasoning_content``, each either a plain string or a
+    list of ``{"type": "text", "text": ...}`` blocks.  Content wins when non
+    empty; reasoning / legacy ``text`` fields are the fallback.  The result is
+    a single string so JSON extraction and
+    :class:`~ring2_brain.truth.grounding_gate.NumericalGroundingVerifier` keep
+    their usual contract.
+    """
+    if not isinstance(payload, Mapping):
+        return ""
+    choices = payload.get("choices") or []
+    if choices and isinstance(choices[0], Mapping):
+        first = choices[0]
+        text = _message_text(first.get("message"))
+        if text:
+            return text
+        return _coerce_text_blocks(first.get("text"))
+    return _coerce_text_blocks(payload.get("content") or payload.get("response"))
 
 
 def reasoning_budget_tokens(effort: str | None) -> int:
@@ -198,7 +305,7 @@ class LLMProviderSpec:
 
 def default_provider_specs() -> tuple[LLMProviderSpec, ...]:
     """The exact ``sec_016`` System 1 / System 2 routing pool."""
-    return (
+    specs = (
         LLMProviderSpec(
             "ollama-qwen2.5-3b",
             1,
@@ -300,6 +407,7 @@ def default_provider_specs() -> tuple[LLMProviderSpec, ...]:
             priority=3,
         ),
     )
+    return _live_coerce_specs(specs)
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +782,9 @@ class LLMHttp2TransportPool:
         self.api_keys = {str(k): str(v) for k, v in dict(api_keys or {}).items()}
         self._specs: dict[str, LLMProviderSpec] = {
             spec.name: spec
-            for spec in (providers if providers is not None else default_provider_specs())
+            for spec in _live_coerce_specs(
+                providers if providers is not None else default_provider_specs()
+            )
         }
         if not self._specs:
             raise ValueError("at least one provider spec is required")
@@ -765,6 +875,19 @@ class LLMHttp2TransportPool:
         }
 
     # -- provider helpers -------------------------------------------------
+    def enforce_live_model(self) -> None:
+        """V2.5: coerce every registered provider to the single allowed model.
+
+        Callers that flip live mode on after a pool was constructed (the Ring 3
+        control plane, the System 2 committee) can invoke this to guarantee no
+        other model id reaches the wire, without rebuilding keep-alive clients.
+        """
+        with self._lock:
+            self._specs = {
+                name: replace(spec, model=ALLOWED_MODEL)
+                for name, spec in self._specs.items()
+            }
+
     def spec(self, provider: str) -> LLMProviderSpec:
         try:
             return self._specs[str(provider)]
@@ -883,7 +1006,7 @@ class LLMHttp2TransportPool:
         if spec.kind == "ollama":
             url = f"{spec.base_url}/api/generate"
             body: dict[str, Any] = {
-                "model": spec.model,
+                "model": _dispatch_model(spec),
                 "prompt": prompt,
                 "stream": False,
                 "options": {
@@ -898,7 +1021,7 @@ class LLMHttp2TransportPool:
                 headers["x-api-key"] = key
             headers["anthropic-version"] = "2023-06-01"
             body = {
-                "model": spec.model,
+                "model": _dispatch_model(spec),
                 "max_tokens": budget,
                 "temperature": float(temperature),
                 "messages": [{"role": "user", "content": prompt}],
@@ -909,7 +1032,7 @@ class LLMHttp2TransportPool:
         if key:
             headers["authorization"] = f"Bearer {key}"
         body = {
-            "model": spec.model,
+            "model": _dispatch_model(spec),
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": budget,
             "temperature": float(temperature),
@@ -949,10 +1072,10 @@ class LLMHttp2TransportPool:
             prompt_tokens = int(usage.get("input_tokens") or 0)
             completion_tokens = int(usage.get("output_tokens") or 0)
         else:
-            choices = payload.get("choices") or []
-            if choices:
-                message = choices[0].get("message") or {}
-                text = str(message.get("content") or "")
+            # OpenAI-compatible (/chat/completions): extract_completion_text
+            # normalises content / reasoning_content / text blocks before any
+            # JSON extraction or grounding verification runs.
+            text = extract_completion_text(payload)
             usage = payload.get("usage") or {}
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
             completion_tokens = int(usage.get("completion_tokens") or 0)
@@ -1441,6 +1564,8 @@ def probe_llm_endpoints(
     fetcher: Callable[[str, float], Any] | None = None,
     clock: Callable[[], float] = time.perf_counter,
     now_ns: int | None = None,
+    live_config: Any | None = None,
+    token_usage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Ping the configured System 1 / System 2 endpoints inside 250 ms.
 
@@ -1455,6 +1580,15 @@ def probe_llm_endpoints(
     fetch = fetcher or _probe_http_json
     cap = float(hard_timeout_ms)
     started = clock()
+
+    # V2.5 live telemetry: when live execution is enabled, resolve the operator
+    # config so the probe can surface the locked model and a masked key only.
+    cfg = live_config
+    if cfg is None and is_live_enabled():
+        try:
+            cfg = load_llm_api_config()
+        except (OSError, ValueError):
+            cfg = None
 
     slot1: Mapping[str, Any] = dict(system1 or {})
     slot2: Mapping[str, Any] = dict(system2 or {})
@@ -1487,7 +1621,7 @@ def probe_llm_endpoints(
         probe2 is None or bool(probe2["within_budget"])
     )
 
-    return {
+    report: dict[str, Any] = {
         "status": status,
         "local_ollama_live": local_live,
         "fallback_active": not local_live,
@@ -1534,3 +1668,15 @@ def probe_llm_endpoints(
         "elapsed_ms": elapsed_ms,
         "probed_at_ns": int(now_ns if now_ns is not None else time.time_ns()),
     }
+    # V2.5 telemetry contract: the locked model, the *measured* endpoint
+    # latency, and (when live config is loaded) a write-only key marker.
+    report["model"] = ALLOWED_MODEL
+    report["latency_ms"] = float(probe1["latency_ms"])
+    if token_usage is not None:
+        report["token_usage"] = dict(token_usage)
+    if cfg is not None:
+        report["live"] = True
+        report["api_key_masked"] = getattr(cfg, "masked_key", None) or mask_api_key(
+            str(getattr(cfg, "api_key", ""))
+        )
+    return report

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { EquityDrawdownCurve } from "../charts";
 import { SILOS, VAULTS } from "../config/nav";
@@ -44,6 +44,9 @@ interface Note {
   tone: "neutral" | "bull" | "bear";
   message: string;
 }
+
+/** Hard cap on one dashboard snapshot — must stay under the QA 10s spinner budget. */
+const LOAD_DEADLINE_MS = 7_000;
 
 const RING_BOXES = [
   { ring: "RING 0", label: "SOVEREIGN VAULT", detail: "signs · settles · keys", x: 246, y: 16 },
@@ -107,37 +110,59 @@ export default function DashboardPage({ mode }: PageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
+  const mountedRef = useRef(true);
+  const loadControllerRef = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
-    const [state, rings, perf, missionRows, gates, aggregate] = await Promise.allSettled([
-      api.get<unknown>(`/workspace/${mode === "LIVE" ? "live" : "paper"}/state`),
-      api.get<unknown>("/cockpit/state"),
-      api.get<unknown>("/analytics/performance", { bucket: "1D" }),
-      api.get<unknown>("/missions"),
-      api.get<unknown>("/control/preflight"),
-      fetchCockpitOverview(),
-    ]);
-    const failures: string[] = [];
-    if (state.status === "fulfilled") setWorkspace(state.value);
-    else failures.push(`workspace: ${errorMessage(state.reason)}`);
-    if (rings.status === "fulfilled") setCockpit(rings.value);
-    else failures.push(`cockpit: ${errorMessage(rings.reason)}`);
-    if (perf.status === "fulfilled") setPerformance(perf.value);
-    else failures.push(`analytics: ${errorMessage(perf.reason)}`);
-    if (missionRows.status === "fulfilled") setMissions(missionRows.value);
-    else failures.push(`missions: ${errorMessage(missionRows.reason)}`);
-    if (gates.status === "fulfilled") setPreflight(gates.value);
-    else failures.push(`preflight: ${errorMessage(gates.reason)}`);
-    // The aggregate telemetry surface is optional: a missing route is not an error.
-    if (aggregate.status === "fulfilled" && aggregate.value !== null) setOverview(aggregate.value);
-    setError(failures.length === 5 ? failures.join(" · ") : null);
-    setLoading(false);
+    // Every snapshot is bounded and cancellable. api.ts aborts a single call at
+    // 30s, which is longer than the 10s no-stuck-spinner budget: without this
+    // deadline one stalled gateway route could leave all four spinners up.
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
+    const deadline = globalThis.setTimeout(() => controller.abort(), LOAD_DEADLINE_MS);
+    try {
+      const [state, rings, perf, missionRows, gates, aggregate] = await Promise.allSettled([
+        api.get<unknown>(`/workspace/${mode === "LIVE" ? "live" : "paper"}/state`, undefined, controller.signal),
+        api.get<unknown>("/cockpit/state", undefined, controller.signal),
+        api.get<unknown>("/analytics/performance", { bucket: "1D" }, controller.signal),
+        api.get<unknown>("/missions", undefined, controller.signal),
+        api.get<unknown>("/control/preflight", undefined, controller.signal),
+        fetchCockpitOverview(controller.signal),
+      ]);
+      if (controller.signal.aborted || !mountedRef.current) return;
+      const failures: string[] = [];
+      if (state.status === "fulfilled") setWorkspace(state.value);
+      else failures.push(`workspace: ${errorMessage(state.reason)}`);
+      if (rings.status === "fulfilled") setCockpit(rings.value);
+      else failures.push(`cockpit: ${errorMessage(rings.reason)}`);
+      if (perf.status === "fulfilled") setPerformance(perf.value);
+      else failures.push(`analytics: ${errorMessage(perf.reason)}`);
+      if (missionRows.status === "fulfilled") setMissions(missionRows.value);
+      else failures.push(`missions: ${errorMessage(missionRows.reason)}`);
+      if (gates.status === "fulfilled") setPreflight(gates.value);
+      else failures.push(`preflight: ${errorMessage(gates.reason)}`);
+      // The aggregate telemetry surface is optional: a missing route is not an error.
+      if (aggregate.status === "fulfilled" && aggregate.value !== null) setOverview(aggregate.value);
+      setError(failures.length === 5 ? failures.join(" · ") : null);
+    } catch {
+      // allSettled does not reject; keep the guard so the spinner always clears.
+    } finally {
+      globalThis.clearTimeout(deadline);
+      if (loadControllerRef.current === controller) loadControllerRef.current = null;
+      if (mountedRef.current) setLoading(false);
+    }
   }, [mode]);
 
   useEffect(() => {
+    mountedRef.current = true;
     void load();
     const timer = globalThis.setInterval(() => void load(), 10_000);
-    return () => globalThis.clearInterval(timer);
+    return () => {
+      mountedRef.current = false;
+      globalThis.clearInterval(timer);
+      loadControllerRef.current?.abort();
+    };
   }, [load]);
 
   const siloRows = useMemo(() => siloRowsOf(workspace), [workspace]);

@@ -2079,7 +2079,7 @@ def test_ring2_memory_never_imports_ring0_signing_or_socket_modules() -> None:
 
 def test_suite39_belongs_to_the_forty_suite_release() -> None:
     suites = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(suites) == 41, suites
+    assert len(suites) == 42, suites
     assert SUITE_NAME in suites
     assert "test_v2_3_telemetry_closure_and_ui_split.py" in suites
     assert (ROOT / "tests" / "conftest.py").is_file()
@@ -2088,6 +2088,6 @@ def test_suite39_belongs_to_the_forty_suite_release() -> None:
 def test_release_documents_advertise_forty_suites() -> None:
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "41 suites" in runbook
-    assert "41 suites" in readme
+    assert "42 suites" in runbook
+    assert "42 suites" in readme
     assert "v4.3.0-V2.3" in runbook

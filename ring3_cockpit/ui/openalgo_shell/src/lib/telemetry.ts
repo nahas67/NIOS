@@ -219,10 +219,10 @@ function stopPolling(): void {
  */
 let overviewMounted: boolean | null = null;
 
-export async function fetchCockpitOverview(): Promise<unknown | null> {
+export async function fetchCockpitOverview(signal?: AbortSignal): Promise<unknown | null> {
   if (overviewMounted === false) return null;
   try {
-    const payload = await api.get<unknown>("/cockpit/overview");
+    const payload = await api.get<unknown>("/cockpit/overview", undefined, signal);
     overviewMounted = true;
     return payload;
   } catch (error) {

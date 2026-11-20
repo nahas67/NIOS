@@ -67,6 +67,8 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES, GZipMiddleware
 
 from core import json_codec
+from core.llm_api_config import is_live_enabled, load_llm_api_config
+from core.llm_model_policy import ALLOWED_MODEL
 from core.instrument_registry import (
     MICROS,
     SILO_IDS,
@@ -1920,6 +1922,9 @@ class ControlPlane(V21ControlPlaneMixin):
                 updated_at_ns=time.time_ns(),
             ),
         }
+        # V2.5: when live execution is explicitly enabled, lock both LLM slots
+        # to hy4-flash-free before any cockpit surface can read or dispatch them.
+        self._enforce_live_llm_slots(self._live_llm_config())
         self._brokers: dict[str, _BrokerState] = {}
         for silo in self.registry.silos:
             floor = silo.cost_floor
@@ -2178,6 +2183,29 @@ class ControlPlane(V21ControlPlaneMixin):
             }
         return payload
 
+    # -- V2.5 single-model dispatch lock ----------------------------------
+    def active_llm_model(self) -> str:
+        """Model id reported by every AI surface (locked in live mode)."""
+        return ALLOWED_MODEL if is_live_enabled() else str(self._llm["1"].model)
+
+    def _live_llm_config(self) -> Any | None:
+        """Secret-safe live config, or ``None`` in offline deterministic mode."""
+        if not is_live_enabled():
+            return None
+        try:
+            return load_llm_api_config()
+        except (OSError, ValueError):
+            return None
+
+    def _enforce_live_llm_slots(self, cfg: Any | None) -> None:
+        """Override both cockpit LLM slots to the single allowed model."""
+        if cfg is None:
+            return
+        for slot in self._llm.values():
+            slot.model = ALLOWED_MODEL
+            if getattr(cfg, "base_url", None):
+                slot.base_url = str(cfg.base_url)
+
     def _llm_state(self) -> dict[str, Any]:
         total_spend = sum(slot.spend_usd for slot in self._llm.values())
         ledger = (
@@ -2225,6 +2253,7 @@ class ControlPlane(V21ControlPlaneMixin):
             "by_provider": ledger.get("by_provider", {}),
             "transport": transport,
             "write_only_credentials": True,
+            "active_model": self.active_llm_model(),
             "system1": self._llm["1"].to_dict(),
             "system2": self._llm["2"].to_dict(),
         }
@@ -5656,15 +5685,28 @@ class ControlPlane(V21ControlPlaneMixin):
         )
         # System 1 must always honour the constitutional 250 ms ceiling.
         cap = min(timeout_ms, float(HARD_TIMEOUT_MS))
+        live_cfg = self._live_llm_config()
+        self._enforce_live_llm_slots(live_cfg)
+        token_usage: dict[str, Any] | None = None
+        if live_cfg is not None and self.token_ledger is not None:
+            snapshot = self.token_ledger.snapshot()
+            token_usage = {
+                "prompt_tokens": snapshot.get("prompt_tokens", 0),
+                "completion_tokens": snapshot.get("completion_tokens", 0),
+                "total_tokens": snapshot.get("total_tokens", 0),
+            }
         report = probe_llm_endpoints(
             system1=self._llm["1"].to_dict(),
             system2=self._llm["2"].to_dict(),
             hard_timeout_ms=cap,
             fetcher=self._llm_probe_fetcher,
+            live_config=live_cfg,
+            token_usage=token_usage,
         )
         report["operator"] = str(request.operator) if request is not None else "ring3.operator"
         report["zero_restart"] = True
         report["write_only_credentials"] = True
+        report["active_model"] = self.active_llm_model()
         self._llm_probe = dict(report)
 
         # Reflect the measured latency on the cockpit slot so the operator sees
@@ -5685,6 +5727,8 @@ class ControlPlane(V21ControlPlaneMixin):
     def agents_page(self) -> dict[str, Any]:
         """``GET /api/v2/cockpit/agents`` -- specialist agents and task queue."""
         snapshot = self.task_dispatcher.snapshot()
+        if is_live_enabled():
+            snapshot["active_model"] = ALLOWED_MODEL
         return {
             **snapshot,
             "page": "agents",
@@ -5717,6 +5761,8 @@ class ControlPlane(V21ControlPlaneMixin):
                 priority=request.priority,
             )
         task["token"] = self.task_dispatcher.token_usage()
+        if is_live_enabled():
+            task["active_model"] = ALLOWED_MODEL
         return task
 
     def batch_watchlist(self, request: AgentBatchWatchlistRequest) -> dict[str, Any]:
@@ -5728,14 +5774,19 @@ class ControlPlane(V21ControlPlaneMixin):
             priority=request.priority,
         )
         task["token"] = self.task_dispatcher.token_usage()
+        if is_live_enabled():
+            task["active_model"] = ALLOWED_MODEL
         return task
 
     def agent_followup(self, request: AgentFollowupRequest) -> dict[str, Any]:
         """Answer one grounded follow-up against a completed task."""
-        return self.task_dispatcher.followup(
+        result = self.task_dispatcher.followup(
             task_id=request.task_id,
             question=request.question,
         )
+        if is_live_enabled() and isinstance(result, dict):
+            result["active_model"] = ALLOWED_MODEL
+        return result
 
     def agent_task(self, task_id: str) -> dict[str, Any]:
         """``GET /api/v2/control/agents/tasks/{task_id}`` -- full report."""
@@ -9037,6 +9088,12 @@ class ControlPlane(V21ControlPlaneMixin):
             if value is not None:
                 setattr(slot, name, str(value))
                 updated.append(name)
+        if is_live_enabled():
+            # V2.5: a live operator cannot select another model id; any value
+            # posted to the control surface is overridden to hy4-flash-free.
+            slot.model = ALLOWED_MODEL
+            if "model" not in updated:
+                updated.append("model")
         if request.timeout_ms is not None:
             slot.timeout_ms = int(request.timeout_ms)
             updated.append("timeout_ms")
@@ -10626,7 +10683,10 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         return control.update_llm(request)
 
     # ---- Phase 3 Step 2: live local Ollama / LLM probe (<250 ms) -------
+    # V2.5: singular alias kept alongside the historical plural path so both
+    # cockpit/operator clients reach the same read-only control.probe_llms.
     @app.post("/api/v2/control/llms/probe", dependencies=[SESSION_GUARD])
+    @app.post("/api/v2/control/llm/probe", dependencies=[SESSION_GUARD])
     def control_llms_probe(
         request: LLMProbeRequest | None = None,
     ) -> dict[str, Any]:
