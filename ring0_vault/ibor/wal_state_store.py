@@ -18,6 +18,20 @@ losing the last commit:
     PRAGMA foreign_keys = ON;
     PRAGMA busy_timeout = 5000;
 
+Those four are the durability contract and are never relaxed.  Four further
+**performance** pragmas run after them on every connection, because they are
+per-connection in SQLite and a fresh thread would otherwise pay a cold cache and
+a temp-file spill for its first query:
+
+.. code-block:: sql
+
+    PRAGMA cache_size        = -65536;      -- 64 MiB page cache
+    PRAGMA temp_store        = MEMORY;      -- sorts/index builds never hit disk
+    PRAGMA mmap_size         = 268435456;   -- 256 MiB memory-mapped reads
+    PRAGMA wal_autocheckpoint = 1000;       -- bound the -wal tail
+
+They trade memory for latency only: no row, checksum or commit point changes.
+
 Every mutation is one ``BEGIN IMMEDIATE`` transaction.  ``IMMEDIATE`` takes the
 write lock up front, so two processes racing for the same row serialise on
 ``busy_timeout`` instead of failing late with ``SQLITE_BUSY`` after doing half the
@@ -59,6 +73,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 __all__ = [
     "WAL_BUSY_TIMEOUT_MS",
+    "WAL_PERFORMANCE_PRAGMAS",
     "WAL_PRAGMAS",
     "WAL_SCHEMA_VERSION",
     "WAL_TABLES",
@@ -72,7 +87,7 @@ __all__ = [
 
 #: Logical version of the local DDL below.  A change to any statement bumps the
 #: numeric migration version **and** this tag.
-WAL_SCHEMA_VERSION: str = "v2.3.wal-state-store"
+WAL_SCHEMA_VERSION: str = "v2.4.wal-state-store"
 
 #: The four pragmas ``PART 1.1`` requires, spelled exactly as they are applied.
 WAL_PRAGMAS: Mapping[str, str] = {
@@ -80,6 +95,16 @@ WAL_PRAGMAS: Mapping[str, str] = {
     "synchronous": "full",
     "foreign_keys": "on",
     "busy_timeout": "5000",
+}
+
+#: V2.4 per-connection performance pragmas, applied **after** :data:`WAL_PRAGMAS`
+#: on every connection.  ``cache_size`` is negative, which SQLite reads as KiB
+#: rather than pages, so the cache is 64 MiB whatever the page size is.
+WAL_PERFORMANCE_PRAGMAS: Mapping[str, str] = {
+    "cache_size": "-65536",
+    "temp_store": "MEMORY",
+    "mmap_size": "268435456",
+    "wal_autocheckpoint": "1000",
 }
 
 #: Write-lock contention window.  A ``BEGIN IMMEDIATE`` that meets another writer
@@ -216,11 +241,40 @@ _LOCAL_DDL: tuple[str, ...] = (
     """,
 )
 
+#: V2.4 hot-path covering indexes.
+#:
+#: Each one exists to turn a dashboard query from "scan the table and sort it"
+#: into "walk an index that is already in the order asked for".  They are a
+#: **new** migration instead of an edit to :data:`_LOCAL_DDL` because version 1
+#: is checksummed: rewriting it would make every V2.3 database on disk reject
+#: its own migration ledger.
+_HOT_PATH_INDEXES: tuple[str, ...] = (
+    # (a) newest-first timeline read, covered by ``seq``: no table lookup and,
+    # critically, no ``USE TEMP B-TREE FOR ORDER BY``.
+    """
+    CREATE INDEX IF NOT EXISTS idx_entity_timeline_local_cover
+        ON nios_entity_timeline_local (ts_utc_ns DESC, event_id)
+    """,
+    # (c) one bounded namespace, newest first: ``namespace`` is the equality
+    # prefix and ``updated_at_utc_ns DESC`` supplies the order, which is what
+    # removes the V2.3 temp B-tree.
+    """
+    CREATE INDEX IF NOT EXISTS idx_working_memory_local_updated
+        ON nios_working_memory_local (namespace, updated_at_utc_ns DESC)
+    """,
+    # (b) one action kind, newest first, covered by ``episode_id``.
+    """
+    CREATE INDEX IF NOT EXISTS idx_episodic_memory_local_kind_ts
+        ON nios_episodic_memory_local (action_kind, ts_utc_ns DESC, episode_id)
+    """,
+)
+
 #: ``(version, name, statements)`` migration chain.  Append-only: never edit a
 #: shipped version, add a new tuple.  The checksum of version 1 is over exactly
 #: these statements, so a later edit fails loudly on an existing database.
 LOCAL_MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
     (1, "0001_wal_state_store", _LOCAL_DDL),
+    (2, "0002_hot_path_indexes", _HOT_PATH_INDEXES),
 )
 
 
@@ -346,6 +400,8 @@ class WALStateStore:
         self._closed = False
         #: Journal mode SQLite actually negotiated for this file (``wal``).
         self._journal_mode = ""
+        #: Every pragma as SQLite answered it on the most recent connection open.
+        self._pragma_values: dict[str, Any] = {}
         self._migrations_applied: tuple[dict[str, Any], ...] = ()
 
     # ------------------------------------------------------------------ paths
@@ -363,8 +419,41 @@ class WALStateStore:
         """``wal`` once a connection has been opened."""
         return self._journal_mode
 
+    @property
+    def pragma_values(self) -> dict[str, Any]:
+        """The pragmas as SQLite negotiated them (empty before the first open).
+
+        Recording the *read-back* rather than the request is the point: a store
+        that asked for ``mmap_size`` on a filesystem that refuses to map must be
+        able to say so instead of silently promising a cache it never got.
+        """
+        return dict(self._pragma_values)
+
+    @property
+    def open_connection_count(self) -> int:
+        """Connections this instance currently holds open, one per thread.
+
+        A hot read loop is supposed to keep this at ``1``: the number is the
+        proof that ``connection()`` reuses the thread-affine handle instead of
+        re-opening the file and re-running the pragma/migration preamble.
+        """
+        with self._lock:
+            return len(self._connections)
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
     # --------------------------------------------------------------- open/close
     def _apply_pragmas(self, connection: sqlite3.Connection) -> None:
+        """Apply the mandatory durability pragmas, then the performance ones.
+
+        ``journal_mode`` is always **first**: it is the one pragma whose answer
+        is persisted in the file header, and switching a rollback-journal file
+        into WAL after a cache has been sized against it would waste the open.
+        The four-performance block is per connection in SQLite, so it has to run
+        for every thread's handle, not just the first one.
+        """
         cursor = connection.cursor()
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
@@ -380,11 +469,27 @@ class WALStateStore:
             cursor.execute("PRAGMA synchronous=FULL")
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+            for name, value in WAL_PERFORMANCE_PRAGMAS.items():
+                cursor.execute(f"PRAGMA {name}={value}")
+            # Read every pragma back: SQLite may clamp ``mmap_size`` to what the
+            # filesystem will actually map, and the recorded value is what the
+            # tests are allowed to assert against.
+            values: dict[str, Any] = {}
+            for name in (*WAL_PRAGMAS, *WAL_PERFORMANCE_PRAGMAS):
+                answer = cursor.execute(f"PRAGMA {name}").fetchone()
+                values[name] = answer[0] if answer is not None else None
+            values["busy_timeout"] = self._busy_timeout_ms
+            self._pragma_values = values
         finally:
             cursor.close()
 
     def connection(self) -> sqlite3.Connection:
-        """Return this thread's connection, opening and migrating on first use."""
+        """Return this thread's connection, opening and migrating on first use.
+
+        The hot path is the first three lines: a thread that already holds a
+        handle gets it back without touching the filesystem, re-running a
+        pragma, or re-walking the migration ledger.
+        """
         if self._closed:
             raise WALStoreError("WAL_STORE_CLOSED")
         existing = getattr(self._local, "connection", None)
@@ -408,7 +513,15 @@ class WALStateStore:
         return connection
 
     def close(self) -> None:
-        """Close every connection this instance opened (best effort per thread)."""
+        """Close every connection this instance opened (best effort per thread).
+
+        Draining the registry rather than only this thread's handle is what
+        makes the store safe to hand back to an operating system that is about
+        to unlink the file: an orphaned worker handle would keep the ``-wal``
+        alive.  A connection another thread is mid-query on raises
+        ``sqlite3.Error`` and is tolerated -- :meth:`reopen` gives the instance
+        a clean slate either way.
+        """
         with self._lock:
             self._closed = True
             connections = list(self._connections)
@@ -419,6 +532,21 @@ class WALStateStore:
             except sqlite3.Error:  # pragma: no cover - another thread owns it
                 continue
         self._local = threading.local()
+        self._pragma_values = {}
+
+    def reopen(self) -> "WALStateStore":
+        """Undo :meth:`close` so the next ``connection()`` opens a fresh handle.
+
+        An explicit call rather than an implicit reopen inside ``connection()``:
+        a store that silently resurrects itself after ``close()`` hides a
+        use-after-close bug at shutdown, while a journal that was closed and
+        then asked to save again should simply work.  Callers who need the
+        lenient behaviour (``AtomicStateJournal``) ask for it here.
+        """
+        with self._lock:
+            self._closed = False
+            self._local = threading.local()
+        return self
 
     def __enter__(self) -> "WALStateStore":
         return self
@@ -629,14 +757,37 @@ class WALStateStore:
         saved_at_ns: int,
         schema_version: str,
     ) -> None:
+        """Persist ``rows`` and re-project only the sections that really changed.
+
+        The V2.3 implementation recomputed every section's canonical JSON and
+        hash and then rebuilt all four projection tables from scratch on every
+        save -- O(document) work and O(document) WAL frames for a one-row append.
+        The hash of each stored section is read first, so an unchanged section
+        still refreshes its kv row (``saved_at_ns`` / ``updated_utc_ns`` keep
+        their historical meaning) but is never re-projected.
+
+        One V2.3 characteristic is preserved deliberately: a document that
+        *omits* ``entity_memory`` / ``episodic_memory`` entirely does not clear
+        their projection tables (V2.3 returned early before its ``DELETE``).
+        ``read_document()`` and the projection reads can therefore disagree after
+        a partial ``save()``, exactly as they did before this optimisation --
+        changing that would change read-back, and :meth:`truncate_all` is the
+        documented way to wipe a tier.
+        """
         existing = {
-            str(row["section"])
-            for row in tx.execute("SELECT section FROM nios_kv_sections").fetchall()
+            str(row["section"]): str(row["payload_sha256"])
+            for row in tx.execute(
+                "SELECT section, payload_sha256 FROM nios_kv_sections"
+            ).fetchall()
         }
         stamp = _utc_now_ns()
+        changed: set[str] = set()
         for section, payload in rows.items():
             body = _canonical_json(payload)
             row_count = len(payload) if isinstance(payload, (list, tuple, Mapping)) else 0
+            digest = _sha256_text(body)
+            if existing.get(section) != digest:
+                changed.add(section)
             tx.execute(
                 "INSERT INTO nios_kv_sections"
                 " (section, payload_json, row_count, payload_sha256, saved_at_ns, updated_utc_ns)"
@@ -647,9 +798,9 @@ class WALStateStore:
                 " payload_sha256 = excluded.payload_sha256,"
                 " saved_at_ns = excluded.saved_at_ns,"
                 " updated_utc_ns = excluded.updated_utc_ns",
-                (section, body, int(row_count), _sha256_text(body), int(saved_at_ns), stamp),
+                (section, body, int(row_count), digest, int(saved_at_ns), stamp),
             )
-        for stale in existing - set(rows) - {RESERVED_DOCUMENT_SECTION}:
+        for stale in existing.keys() - set(rows) - {RESERVED_DOCUMENT_SECTION}:
             tx.execute("DELETE FROM nios_kv_sections WHERE section = ?", (stale,))
         envelope = _canonical_json(
             {"saved_at_ns": int(saved_at_ns), "schema_version": str(schema_version)}
@@ -665,8 +816,10 @@ class WALStateStore:
             " updated_utc_ns = excluded.updated_utc_ns",
             (RESERVED_DOCUMENT_SECTION, envelope, _sha256_text(envelope), int(saved_at_ns), stamp),
         )
-        self._project_entity_memory_tx(tx, rows.get("entity_memory"), now_ns=stamp)
-        self._project_episodic_memory_tx(tx, rows.get("episodic_memory"), now_ns=stamp)
+        if "entity_memory" in changed:
+            self._project_entity_memory_tx(tx, rows.get("entity_memory"), now_ns=stamp)
+        if "episodic_memory" in changed:
+            self._project_episodic_memory_tx(tx, rows.get("episodic_memory"), now_ns=stamp)
 
     # ------------------------------------------------------ entity projection
     def _project_entity_memory_tx(
@@ -677,65 +830,121 @@ class WALStateStore:
         The kv section stays authoritative (it is what the journal hands back
         byte-for-byte); these tables are the queryable projection that a restart
         scan or a Suite-39 assertion reads without decoding a blob.
+
+        A key that is absent or not a sequence still means "this section holds
+        no such rows", so the matching table is cleared -- exactly what the
+        V2.3 unconditional ``DELETE`` did.  A key that *is* a sequence is
+        diffed against what is already stored, so an append writes one row.
         """
         if not isinstance(document, Mapping):
             return
         timeline = document.get("timeline")
         truths = document.get("truths")
         checkpoints = document.get("checkpoints")
-        tx.execute("DELETE FROM nios_entity_timeline_local")
-        tx.execute("DELETE FROM nios_entity_truths_local")
         if isinstance(timeline, (list, tuple)):
-            for row in timeline:
-                if not isinstance(row, Mapping):
-                    continue
-                event_id = str(row.get("event_id") or "").strip()
-                if not event_id:
-                    continue
-                body = _canonical_json(dict(row))
-                entity_ids = row.get("entity_ids") or []
-                ids_json = _canonical_json(
-                    list(entity_ids) if isinstance(entity_ids, (list, tuple)) else []
-                )
-                tx.execute(
-                    "INSERT OR REPLACE INTO nios_entity_timeline_local"
-                    " (event_id, ts_utc_ns, outcome_kind, entity_ids_json,"
-                    "  payload_json, payload_sha256, recorded_at_utc_ns)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        event_id,
-                        int(row.get("ts_utc") or 0),
-                        str(row.get("outcome_kind") or ""),
-                        ids_json,
-                        body,
-                        _sha256_text(body),
-                        int(now_ns),
-                    ),
-                )
+            self._sync_timeline_tx(tx, timeline, now_ns=now_ns)
+        else:
+            tx.execute("DELETE FROM nios_entity_timeline_local")
         if isinstance(truths, (list, tuple)):
-            for row in truths:
-                if not isinstance(row, Mapping):
-                    continue
-                entity_id = str(row.get("entity_id") or "").strip()
-                if not entity_id:
-                    continue
-                body = _canonical_json(dict(row))
-                tx.execute(
-                    "INSERT OR REPLACE INTO nios_entity_truths_local"
-                    " (entity_id, entity_type, sample_count, truth_json,"
-                    "  truth_sha256, last_compiled_utc_ns)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        entity_id,
-                        str(row.get("entity_type") or ""),
-                        int(row.get("sample_count") or 0),
-                        body,
-                        str(row.get("truth_sha256") or _sha256_text(body)),
-                        int(row.get("last_compiled_utc") or 0),
-                    ),
-                )
+            self._sync_truths_tx(tx, truths)
+        else:
+            tx.execute("DELETE FROM nios_entity_truths_local")
         if isinstance(checkpoints, (list, tuple)):
             self._replace_checkpoints_tx(tx, checkpoints, now_ns=now_ns)
+
+    def _sync_timeline_tx(
+        self, tx: sqlite3.Connection, timeline: Sequence[Any], *, now_ns: int
+    ) -> None:
+        """Upsert the timeline rows that changed; delete the ones that vanished.
+
+        ``payload_json`` is compared rather than ``payload_sha256``: the body is
+        the contract (it is what ``read_entity_timeline`` hands back), so a row
+        whose bytes are unchanged is left physically untouched -- including its
+        ``seq``, which SQLite would otherwise hand a brand-new AUTOINCREMENT
+        value through ``INSERT OR REPLACE``.
+        """
+        desired: dict[str, tuple[Any, ...]] = {}
+        for row in timeline:
+            if not isinstance(row, Mapping):
+                continue
+            event_id = str(row.get("event_id") or "").strip()
+            if not event_id:
+                continue
+            body = _canonical_json(dict(row))
+            entity_ids = row.get("entity_ids") or []
+            ids_json = _canonical_json(
+                list(entity_ids) if isinstance(entity_ids, (list, tuple)) else []
+            )
+            desired[event_id] = (
+                event_id,
+                int(row.get("ts_utc") or 0),
+                str(row.get("outcome_kind") or ""),
+                ids_json,
+                body,
+                _sha256_text(body),
+                int(now_ns),
+            )
+        stored = {
+            str(row["event_id"]): str(row["payload_json"])
+            for row in tx.execute(
+                "SELECT event_id, payload_json FROM nios_entity_timeline_local"
+            ).fetchall()
+        }
+        for event_id, params in desired.items():
+            if stored.get(event_id) == params[4]:
+                continue
+            tx.execute(
+                "INSERT OR REPLACE INTO nios_entity_timeline_local"
+                " (event_id, ts_utc_ns, outcome_kind, entity_ids_json,"
+                "  payload_json, payload_sha256, recorded_at_utc_ns)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params,
+            )
+        for stale in stored.keys() - desired.keys():
+            tx.execute(
+                "DELETE FROM nios_entity_timeline_local WHERE event_id = ?", (stale,)
+            )
+
+    def _sync_truths_tx(
+        self, tx: sqlite3.Connection, truths: Sequence[Any]
+    ) -> None:
+        """Upsert the per-entity truth rows that changed; delete vanished ones."""
+        desired: dict[str, tuple[Any, ...]] = {}
+        for row in truths:
+            if not isinstance(row, Mapping):
+                continue
+            entity_id = str(row.get("entity_id") or "").strip()
+            if not entity_id:
+                continue
+            body = _canonical_json(dict(row))
+            desired[entity_id] = (
+                entity_id,
+                str(row.get("entity_type") or ""),
+                int(row.get("sample_count") or 0),
+                body,
+                str(row.get("truth_sha256") or _sha256_text(body)),
+                int(row.get("last_compiled_utc") or 0),
+            )
+        stored = {
+            str(row["entity_id"]): str(row["truth_json"])
+            for row in tx.execute(
+                "SELECT entity_id, truth_json FROM nios_entity_truths_local"
+            ).fetchall()
+        }
+        for entity_id, params in desired.items():
+            if stored.get(entity_id) == params[3]:
+                continue
+            tx.execute(
+                "INSERT OR REPLACE INTO nios_entity_truths_local"
+                " (entity_id, entity_type, sample_count, truth_json,"
+                "  truth_sha256, last_compiled_utc_ns)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                params,
+            )
+        for stale in stored.keys() - desired.keys():
+            tx.execute(
+                "DELETE FROM nios_entity_truths_local WHERE entity_id = ?", (stale,)
+            )
 
     def _project_episodic_memory_tx(
         self, tx: sqlite3.Connection, document: Any, *, now_ns: int
@@ -755,7 +964,7 @@ class WALStateStore:
         episodes = document.get("episodes")
         if not isinstance(episodes, (list, tuple)):
             return
-        tx.execute("DELETE FROM nios_episodic_memory_local")
+        desired: dict[str, tuple[Any, ...]] = {}
         for row in episodes:
             if not isinstance(row, Mapping):
                 continue
@@ -769,30 +978,54 @@ class WALStateStore:
                 if isinstance(tags, (list, tuple))
                 else dict(tags or {})
             )
+            desired[episode_id] = (
+                episode_id,
+                _iso_utc_to_ns(row.get("ts_utc")),
+                str(row.get("actor") or ""),
+                str(row.get("action_kind") or ""),
+                str(row.get("regime") or ""),
+                tags_body,
+                str(row.get("decision_summary") or ""),
+                body,
+                str(row.get("payload_sha256") or _sha256_text(body)),
+                int(now_ns),
+            )
+        stored = {
+            str(row["episode_id"]): str(row["payload_json"])
+            for row in tx.execute(
+                "SELECT episode_id, payload_json FROM nios_episodic_memory_local"
+            ).fetchall()
+        }
+        for episode_id, params in desired.items():
+            if stored.get(episode_id) == params[7]:
+                continue
             tx.execute(
                 "INSERT OR REPLACE INTO nios_episodic_memory_local"
                 " (episode_id, ts_utc_ns, actor, action_kind, regime,"
                 "  context_tags_json, decision_summary, payload_json,"
                 "  payload_sha256, recorded_at_utc_ns)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    episode_id,
-                    _iso_utc_to_ns(row.get("ts_utc")),
-                    str(row.get("actor") or ""),
-                    str(row.get("action_kind") or ""),
-                    str(row.get("regime") or ""),
-                    tags_body,
-                    str(row.get("decision_summary") or ""),
-                    body,
-                    str(row.get("payload_sha256") or _sha256_text(body)),
-                    int(now_ns),
-                ),
+                params,
+            )
+        for stale in stored.keys() - desired.keys():
+            tx.execute(
+                "DELETE FROM nios_episodic_memory_local WHERE episode_id = ?", (stale,)
             )
 
     def _replace_checkpoints_tx(
         self, tx: sqlite3.Connection, checkpoints: Sequence[Any], *, now_ns: int
     ) -> None:
-        keep: list[tuple[int, ...]] = []
+        """Reconcile ``nios_memory_checkpoints_local`` with ``checkpoints``.
+
+        A row whose documented fields (``cutoff``, count, truths, checksum) are
+        already stored is not re-inserted, which is what keeps a compaction
+        record from being rewritten by an unrelated save.  ``created_at_utc`` is
+        the one field V2.3 restamped on every save when the document did not
+        supply one; that restamp is kept (a single ``UPDATE``) so the value
+        :meth:`read_memory_checkpoints` reports is byte-identical to V2.3.
+        """
+        desired: list[tuple[int, int, int, str, str, int]] = []
+        explicit: dict[int, bool] = {}
         for row in checkpoints:
             if not isinstance(row, Mapping):
                 continue
@@ -800,24 +1033,53 @@ class WALStateStore:
                 sequence = int(row.get("checkpoint_seq") or 0)
             except (TypeError, ValueError):
                 continue
-            keep.append(
+            supplied = row.get("created_at_utc")
+            explicit[sequence] = bool(supplied)
+            desired.append(
                 (
                     sequence,
                     int(row.get("cutoff_ts_utc") or 0),
                     int(row.get("event_count_compacted") or 0),
                     _canonical_json(row.get("compiled_truths") or {}),
                     str(row.get("checkpoint_sha256") or ""),
-                    int(row.get("created_at_utc") or now_ns),
+                    int(supplied or now_ns),
                 )
             )
-        tx.execute("DELETE FROM nios_memory_checkpoints_local")
-        for row in keep:
+        stored = {
+            int(row["checkpoint_seq"]): (
+                int(row["cutoff_ts_utc_ns"]),
+                int(row["event_count_compacted"]),
+                str(row["compiled_truths_json"]),
+                str(row["checkpoint_sha256"]),
+            )
+            for row in tx.execute(
+                "SELECT checkpoint_seq, cutoff_ts_utc_ns, event_count_compacted,"
+                " compiled_truths_json, checkpoint_sha256"
+                " FROM nios_memory_checkpoints_local"
+            ).fetchall()
+        }
+        kept: set[int] = set()
+        for sequence, cutoff, count, truths_json, checksum, created in desired:
+            kept.add(sequence)
+            if stored.get(sequence) == (cutoff, count, truths_json, checksum):
+                if not explicit.get(sequence):
+                    tx.execute(
+                        "UPDATE nios_memory_checkpoints_local SET created_at_utc_ns = ?"
+                        " WHERE checkpoint_seq = ?",
+                        (created, sequence),
+                    )
+                continue
             tx.execute(
                 "INSERT OR REPLACE INTO nios_memory_checkpoints_local"
                 " (checkpoint_seq, cutoff_ts_utc_ns, event_count_compacted,"
                 "  compiled_truths_json, checkpoint_sha256, created_at_utc_ns)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
-                row,
+                (sequence, cutoff, count, truths_json, checksum, created),
+            )
+        for stale in stored.keys() - kept:
+            tx.execute(
+                "DELETE FROM nios_memory_checkpoints_local WHERE checkpoint_seq = ?",
+                (stale,),
             )
 
     def read_entity_timeline(self, *, limit: int | None = None) -> tuple[dict[str, Any], ...]:
@@ -1265,6 +1527,8 @@ class WALStateStore:
             "synchronous": "FULL",
             "foreign_keys": True,
             "busy_timeout_ms": self._busy_timeout_ms,
+            "pragmas": self.pragma_values,
+            "open_connections": self.open_connection_count,
             "tables": self.table_counts(),
             "sections": self.section_count(),
             "migrations": [row["version"] for row in self.schema_versions()],

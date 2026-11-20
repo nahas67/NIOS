@@ -262,11 +262,20 @@ class AtomicStateJournal:
         Must be called with ``self._lock`` held.  Import happens **once**: when
         the database has no sections and no import marker yet, and a legacy JSON
         document exists at :attr:`path`.
+
+        A store that was explicitly closed is reopened rather than fatal: the
+        journal outlives any single shutdown, and ``reset()`` followed by a save
+        must not answer ``WAL_STORE_CLOSED``.  The reopen is explicit (a direct
+        :meth:`WALStateStore.connection` on a closed store still raises), so a
+        use-after-close bug in a caller is not hidden by this convenience.
         """
         store = self._store
         if store is None:
             store = WALStateStore(wal_database_path(self._path))
             self._store = store
+        elif store.is_closed:
+            store.reopen()
+            self._imported = None
         if not store.exists:
             store.connection()  # creates the file and applies the local DDL
         if self._imported is None:

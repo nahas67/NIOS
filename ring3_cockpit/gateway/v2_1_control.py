@@ -38,10 +38,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from core import json_codec
 from core.lifecycle_worker import NiosLifecycleWorker
 from core.runtime_settings import RuntimeSettingsStore
 from core.telemetry import gateway_telemetry
@@ -1412,9 +1413,16 @@ def register_v2_1_routes(
         silo: str | None = None,
         mission_id: str | None = None,
         bucket: str = "1D",
-    ) -> dict[str, Any]:
-        return control.v21_analytics_performance(
+    ) -> Response:
+        # V2.4 PART 3.4: the equity curve is O(buckets) records plus three
+        # attribution tables, all integer-micros and floats. Serialising it once
+        # on the fast codec skips FastAPI's jsonable_encoder pass.
+        payload = control.v21_analytics_performance(
             silo=silo, mission_id=mission_id, bucket=bucket
+        )
+        return Response(
+            content=json_codec.dumps_bytes(payload, iso_datetime=True),
+            media_type="application/json",
         )
 
     # ---- G9 alerts ----------------------------------------------------

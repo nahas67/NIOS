@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 
 import { Heatmap, type HeatCell } from "../charts";
 import { SILOS } from "../config/nav";
@@ -74,6 +74,61 @@ function fxCells(payload: unknown): HeatCell[] {
     sub: num(row.policy_rate_pct, 2),
   }));
 }
+
+function floorBpsFor(siloId: string): number {
+  return SILOS.find((entry) => entry.id === siloId)?.floorBps ?? 0;
+}
+
+interface ScreenerRowData {
+  symbol: string;
+  name: string;
+  siloId: string;
+  assetClass: string;
+  sector: string;
+  last: number;
+  change: number;
+  floorBps: number;
+  hasOptions: boolean;
+}
+
+function ScreenerRowBase({
+  row,
+  active,
+  onSelect,
+}: {
+  row: ScreenerRowData;
+  active: boolean;
+  onSelect: (symbol: string) => void;
+}) {
+  return (
+    <Row onClick={() => onSelect(row.symbol)} tone={active ? "bull" : undefined}>
+      <Cell mono className="text-ink">
+        {row.symbol}
+      </Cell>
+      <Cell className="max-w-[220px] truncate">{row.name}</Cell>
+      <Cell mono className="text-ink-3">
+        {row.siloId}
+      </Cell>
+      <Cell className="text-ink-2">{row.assetClass}</Cell>
+      <Cell className="max-w-[150px] truncate text-ink-2">{row.sector}</Cell>
+      <Cell align="right">{Number.isFinite(row.last) ? num(row.last, 2) : "—"}</Cell>
+      <Cell align="right" tone={Number.isFinite(row.change) ? (row.change >= 0 ? "bull" : "bear") : "muted"}>
+        {Number.isFinite(row.change) ? pct(row.change, 2) : "—"}
+      </Cell>
+      <Cell align="right" className="text-ink-2">
+        {num(row.floorBps, 2)} bps
+      </Cell>
+      <Cell align="right">
+        <Badge tone={row.hasOptions ? "accent" : "muted"} mono>
+          {row.hasOptions ? "OPT" : "—"}
+        </Badge>
+      </Cell>
+    </Row>
+  );
+}
+
+const ScreenerRow = memo(ScreenerRowBase);
+ScreenerRow.displayName = "ScreenerRow";
 
 export default function ScreenerPage({ mode }: PageProps) {
   const [universe, setUniverse] = useState<Record<string, unknown>[]>([]);
@@ -207,9 +262,43 @@ export default function ScreenerPage({ mode }: PageProps) {
     [filtered, currentPage],
   );
 
-  const floorFor = (siloId: string) => SILOS.find((entry) => entry.id === siloId)?.floorBps ?? 0;
+  const optionableCount = useMemo(
+    () => filtered.filter((row) => safeBool(row.has_options, false)).length,
+    [filtered],
+  );
+
+  /** One stable descriptor per visible contract so a row only re-renders when its own data moves. */
+  const visibleRows = useMemo(
+    () =>
+      visible.map((row) => {
+        const symbol = text(row.symbol, "—");
+        const siloId = text(row.silo, "—");
+        const summary = asRecord(row.feature_summary);
+        return {
+          symbol,
+          name: text(row.display_name),
+          siloId,
+          assetClass: text(row.asset_class),
+          sector: text(row.sector),
+          last: safeNumber(summary.spot_reference, safeNumber(row.spot_reference, Number.NaN)),
+          change: safeNumber(changes[symbol], Number.NaN),
+          floorBps: floorBpsFor(siloId),
+          hasOptions: safeBool(row.has_options, false),
+        };
+      }),
+    [visible, changes],
+  );
+
+  const selectRow = useCallback((symbol: string) => setSelected(symbol), []);
+
+  const indiaSectorCells = useMemo(() => sectorCells(heatmaps.india_sectors), [heatmaps]);
+  const usSectorCells = useMemo(() => sectorCells(heatmaps.us_gics_sectors), [heatmaps]);
+  const cryptoNarrativeCells = useMemo(() => sectorCells(heatmaps.crypto_narratives), [heatmaps]);
+  const fxStrengthCells = useMemo(() => fxCells(heatmaps.fx_g10_strength), [heatmaps]);
+
   const totalCount = Math.max(serverTotal, filtered.length);
-  const macroRows = rowsOf(macro);
+  const macroRows = useMemo(() => rowsOf(macro), [macro]);
+  const macroPreview = useMemo(() => macroRows.slice(0, 12), [macroRows]);
   const detailContract = asRecord(detail?.contract);
   const statutory = asRecord(detail?.statutory_cost);
   const surface = asRecord(detail?.options_surface);
@@ -263,7 +352,7 @@ export default function ScreenerPage({ mode }: PageProps) {
         />
         <Stat
           label="Optionable"
-          value={num(filtered.filter((row) => safeBool(row.has_options, false)).length, 0)}
+          value={num(optionableCount, 0)}
           hint="has_options = true"
         />
         <Stat label="Page" value={`${currentPage + 1}/${pageCount}`} hint={`${PAGE_SIZE} rows per page`} />
@@ -330,42 +419,9 @@ export default function ScreenerPage({ mode }: PageProps) {
           </div>
         ) : (
           <Table columns={["SYMBOL", "NAME", "SILO", "CLASS", "SECTOR", "LAST", "CHG%", "TAX FLOOR", "OPT"]}>
-            {visible.map((row) => {
-              const symbol = text(row.symbol, "—");
-              const siloId = text(row.silo, "—");
-              const summary = asRecord(row.feature_summary);
-              const last = safeNumber(summary.spot_reference, safeNumber(row.spot_reference, Number.NaN));
-              const change = safeNumber(changes[symbol], Number.NaN);
-              const active = symbol === selected;
-              return (
-                <Row key={symbol} onClick={() => setSelected(symbol)} tone={active ? "bull" : undefined}>
-                  <Cell mono className="text-ink">
-                    {symbol}
-                  </Cell>
-                  <Cell className="max-w-[220px] truncate">{text(row.display_name)}</Cell>
-                  <Cell mono className="text-ink-3">
-                    {siloId}
-                  </Cell>
-                  <Cell className="text-ink-2">{text(row.asset_class)}</Cell>
-                  <Cell className="max-w-[150px] truncate text-ink-2">{text(row.sector)}</Cell>
-                  <Cell align="right">{Number.isFinite(last) ? num(last, 2) : "—"}</Cell>
-                  <Cell
-                    align="right"
-                    tone={Number.isFinite(change) ? (change >= 0 ? "bull" : "bear") : "muted"}
-                  >
-                    {Number.isFinite(change) ? pct(change, 2) : "—"}
-                  </Cell>
-                  <Cell align="right" className="text-ink-2">
-                    {num(floorFor(siloId), 2)} bps
-                  </Cell>
-                  <Cell align="right">
-                    <Badge tone={safeBool(row.has_options, false) ? "accent" : "muted"} mono>
-                      {safeBool(row.has_options, false) ? "OPT" : "—"}
-                    </Badge>
-                  </Cell>
-                </Row>
-              );
-            })}
+            {visibleRows.map((row) => (
+              <ScreenerRow key={row.symbol} row={row} active={row.symbol === selected} onSelect={selectRow} />
+            ))}
           </Table>
         )}
 
@@ -402,16 +458,16 @@ export default function ScreenerPage({ mode }: PageProps) {
         <div className="flex min-w-0 flex-col gap-3">
           <div className="grid gap-3 md:grid-cols-2">
             <Card title="India Sectors" subtitle="avg 1d change" icon="grid">
-              <Heatmap cells={sectorCells(heatmaps.india_sectors)} columns={4} cellHeight={42} />
+              <Heatmap cells={indiaSectorCells} columns={4} cellHeight={42} />
             </Card>
             <Card title="US GICS Sectors" subtitle="avg 1d change" icon="grid">
-              <Heatmap cells={sectorCells(heatmaps.us_gics_sectors)} columns={4} cellHeight={42} />
+              <Heatmap cells={usSectorCells} columns={4} cellHeight={42} />
             </Card>
             <Card title="Crypto Narratives" subtitle="avg 1d change" icon="grid">
-              <Heatmap cells={sectorCells(heatmaps.crypto_narratives)} columns={4} cellHeight={42} />
+              <Heatmap cells={cryptoNarrativeCells} columns={4} cellHeight={42} />
             </Card>
             <Card title="FX G10 Strength" subtitle="relative strength" icon="grid">
-              <Heatmap cells={fxCells(heatmaps.fx_g10_strength)} columns={4} cellHeight={42} />
+              <Heatmap cells={fxStrengthCells} columns={4} cellHeight={42} />
             </Card>
           </div>
 
@@ -435,7 +491,7 @@ export default function ScreenerPage({ mode }: PageProps) {
               </div>
             ) : (
               <Table columns={["WHEN", "REGION", "EVENT", "IMPACT", "VOL X"]} dense>
-                {macroRows.slice(0, 12).map((event, index) => {
+                {macroPreview.map((event, index) => {
                   const tier = text(event.impact_tier, "MEDIUM");
                   return (
                     <Row key={`${text(event.event_id, "event")}-${index}`}>

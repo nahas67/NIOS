@@ -255,7 +255,8 @@ def test_suite39_is_registered_under_the_expected_name() -> None:
 def test_wal_store_declares_the_seven_tables_from_part_1_1() -> None:
     assert WAL_TABLES == EXPECTED_WAL_TABLES
     assert len(WAL_TABLES) == 7
-    assert WAL_SCHEMA_VERSION == "v2.3.wal-state-store"
+    # V2.4 appends migration 0002 (hot-path covering indexes) to the local DDL.
+    assert WAL_SCHEMA_VERSION == "v2.4.wal-state-store"
     assert WAL_PRAGMAS == {
         "journal_mode": "wal",
         "synchronous": "full",
@@ -301,9 +302,13 @@ def test_wal_store_integrity_check_is_ok_and_schema_is_complete(store: WALStateS
     assert not missing, missing
 
     versions = store.schema_versions()
-    assert [row["version"] for row in versions] == [1]
-    assert versions[0]["name"] == "0001_wal_state_store"
-    assert _HEX64.match(versions[0]["checksum_sha256"])
+    assert [row["version"] for row in versions] == [1, 2]
+    assert [row["name"] for row in versions] == [
+        "0001_wal_state_store",
+        "0002_hot_path_indexes",
+    ]
+    for row in versions:
+        assert _HEX64.match(row["checksum_sha256"])
 
     stats = store.stats()
     assert stats["journal_mode"] == "wal"
@@ -2074,7 +2079,7 @@ def test_ring2_memory_never_imports_ring0_signing_or_socket_modules() -> None:
 
 def test_suite39_belongs_to_the_forty_suite_release() -> None:
     suites = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(suites) == 40, suites
+    assert len(suites) == 41, suites
     assert SUITE_NAME in suites
     assert "test_v2_3_telemetry_closure_and_ui_split.py" in suites
     assert (ROOT / "tests" / "conftest.py").is_file()
@@ -2083,6 +2088,6 @@ def test_suite39_belongs_to_the_forty_suite_release() -> None:
 def test_release_documents_advertise_forty_suites() -> None:
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "40 suites" in runbook
-    assert "40 suites" in readme
+    assert "41 suites" in runbook
+    assert "41 suites" in readme
     assert "v4.3.0-V2.3" in runbook

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 
 import { SILOS } from "../config/nav";
 import {
@@ -73,6 +73,79 @@ function isTerminal(state: string): boolean {
   return state === "FILLED" || state === "CANCELED" || state === "REJECTED";
 }
 
+function outboxTone(state: string): "bull" | "muted" | "bear" | "accent" {
+  return state === "COMMITTED" ? "bull" : state === "VOIDED" ? "muted" : state === "REJECTED" ? "bear" : "accent";
+}
+
+interface WorkingOrderRowData {
+  key: string;
+  orderId: string;
+  symbol: string;
+  side: string;
+  qty: unknown;
+  state: string;
+  repegsRemaining: unknown;
+}
+
+function WorkingOrderRowBase({ row, onCancel }: { row: WorkingOrderRowData; onCancel: (orderId: string) => void }) {
+  return (
+    <Row>
+      <Cell mono className="text-ink">
+        {row.orderId}
+      </Cell>
+      <Cell mono>{row.symbol}</Cell>
+      <Cell tone={row.side.toUpperCase() === "BUY" ? "bull" : "bear"}>{row.side}</Cell>
+      <Cell align="right">{num(row.qty, 4)}</Cell>
+      <Cell align="right">
+        <Badge tone={stateTone(row.state)} mono>
+          {row.state}
+        </Badge>
+      </Cell>
+      <Cell align="right" tone="muted">
+        {num(row.repegsRemaining, 0)}
+      </Cell>
+      <Cell align="right">
+        <Button size="sm" variant="danger" disabled={isTerminal(row.state)} onClick={() => onCancel(row.orderId)}>
+          Cancel
+        </Button>
+      </Cell>
+    </Row>
+  );
+}
+
+const WorkingOrderRow = memo(WorkingOrderRowBase);
+WorkingOrderRow.displayName = "WorkingOrderRow";
+
+interface OutboxRowData {
+  key: string;
+  tx: string;
+  state: string;
+  intent: string;
+  updated: string;
+}
+
+function OutboxRowBase({ row }: { row: OutboxRowData }) {
+  return (
+    <Row>
+      <Cell mono className="text-ink">
+        {row.tx}
+      </Cell>
+      <Cell align="right">
+        <Badge tone={outboxTone(row.state)} mono>
+          {row.state}
+        </Badge>
+      </Cell>
+      <Cell className="max-w-[320px] truncate">{row.intent}</Cell>
+      <Cell mono align="right" tone="muted">
+        {row.updated}
+      </Cell>
+    </Row>
+  );
+}
+
+const OutboxRow = memo(OutboxRowBase);
+OutboxRow.displayName = "OutboxRow";
+
 export default function OrdersPage({ mode }: PageProps) {
   const tick = useTicker(500);
   const [book, setBook] = useState<unknown>({});
@@ -128,6 +201,44 @@ export default function OrdersPage({ mode }: PageProps) {
     if (sagasRows.length > 0) return sagasRows;
     return rowsOf(book).filter((row) => typeof row.state === "string");
   }, [book, sagas]);
+
+  /** Descriptors are rebuilt only when the polled blotter changes, never on the ops clock tick. */
+  const workingRows = useMemo(
+    () =>
+      working.map((row, index) => {
+        const orderId = text(row.order_id, `order-${index}`);
+        return {
+          key: `${orderId}-${index}`,
+          orderId,
+          symbol: text(row.symbol),
+          side: text(row.side),
+          qty: row.qty,
+          state: text(row.state, "NEW").toUpperCase(),
+          repegsRemaining: row.repegs_remaining,
+        };
+      }),
+    [working],
+  );
+
+  const outboxVisible = useMemo(
+    () =>
+      outboxRows.slice(0, 20).map((row, index) => {
+        const tx = text(row.pending_transfer_id ?? row.outbox_idempotency_key ?? row.saga_id, `tx-${index}`);
+        const state = text(row.state, "PENDING").toUpperCase();
+        const qtyMicros = safeNumber(row.qty_micros, Number.NaN);
+        const units = Number.isFinite(qtyMicros)
+          ? qtyMicros / 1_000_000
+          : safeNumber(row.notional_micros, 0) / 1_000_000;
+        return {
+          key: `${tx}-${index}`,
+          tx,
+          state,
+          intent: text(row.intent, "") || `${text(row.side, "—")} ${num(units, 4)} ${text(row.symbol, "—")}`,
+          updated: clockNs(row.updated_ns ?? row.updated_at_utc_ns),
+        };
+      }),
+    [outboxRows],
+  );
 
   const instrument = asRecord(asRecord(lastOrder).instrument);
   const instrumentCheck = asRecord(asRecord(lastOrder).instrument_check);
@@ -205,15 +316,18 @@ export default function OrdersPage({ mode }: PageProps) {
     }
   };
 
-  const cancel = async (orderId: string) => {
-    try {
-      await api.post<unknown>("/control/orders/cancel", { order_id: orderId });
-      setNote({ tone: "neutral", message: `CANCEL sent for ${orderId}; the outbox hold is voided with it.` });
-      await load();
-    } catch (caught) {
-      setNote({ tone: "bear", message: errorMessage(caught) });
-    }
-  };
+  const cancel = useCallback(
+    async (orderId: string) => {
+      try {
+        await api.post<unknown>("/control/orders/cancel", { order_id: orderId });
+        setNote({ tone: "neutral", message: `CANCEL sent for ${orderId}; the outbox hold is voided with it.` });
+        await load();
+      } catch (caught) {
+        setNote({ tone: "bear", message: errorMessage(caught) });
+      }
+    },
+    [load],
+  );
 
   const orderState =
     lastOrder === null
@@ -435,40 +549,9 @@ export default function OrdersPage({ mode }: PageProps) {
             </div>
           ) : (
             <Table columns={["ORDER", "SYMBOL", "SIDE", "QTY", "STATE", "PEGS", ""]}>
-              {working.map((row, index) => {
-                const orderId = text(row.order_id, `order-${index}`);
-                const state = text(row.state, "NEW").toUpperCase();
-                return (
-                  <Row key={`${orderId}-${index}`}>
-                    <Cell mono className="text-ink">
-                      {orderId}
-                    </Cell>
-                    <Cell mono>{text(row.symbol)}</Cell>
-                    <Cell tone={text(row.side).toUpperCase() === "BUY" ? "bull" : "bear"}>
-                      {text(row.side)}
-                    </Cell>
-                    <Cell align="right">{num(row.qty, 4)}</Cell>
-                    <Cell align="right">
-                      <Badge tone={stateTone(state)} mono>
-                        {state}
-                      </Badge>
-                    </Cell>
-                    <Cell align="right" tone="muted">
-                      {num(row.repegs_remaining, 0)}
-                    </Cell>
-                    <Cell align="right">
-                      <Button
-                        size="sm"
-                        variant="danger"
-                        disabled={isTerminal(state)}
-                        onClick={() => void cancel(orderId)}
-                      >
-                        Cancel
-                      </Button>
-                    </Cell>
-                  </Row>
-                );
-              })}
+              {workingRows.map((row) => (
+                <WorkingOrderRow key={row.key} row={row} onCancel={cancel} />
+              ))}
             </Table>
           )}
         </Card>
@@ -536,47 +619,9 @@ export default function OrdersPage({ mode }: PageProps) {
           </div>
         ) : (
           <Table columns={["TX", "STATE", "INTENT", "UPDATED"]} dense>
-            {outboxRows.slice(0, 20).map((row, index) => {
-              const tx = text(
-                row.pending_transfer_id ?? row.outbox_idempotency_key ?? row.saga_id,
-                `tx-${index}`,
-              );
-              const state = text(row.state, "PENDING").toUpperCase();
-              const qtyMicros = safeNumber(row.qty_micros, Number.NaN);
-              const units = Number.isFinite(qtyMicros)
-                ? qtyMicros / 1_000_000
-                : safeNumber(row.notional_micros, 0) / 1_000_000;
-              const intent =
-                text(row.intent, "") || `${text(row.side, "—")} ${num(units, 4)} ${text(row.symbol, "—")}`;
-              const updated = clockNs(row.updated_ns ?? row.updated_at_utc_ns);
-              return (
-                <Row key={`${tx}-${index}`}>
-                  <Cell mono className="text-ink">
-                    {tx}
-                  </Cell>
-                  <Cell align="right">
-                    <Badge
-                      tone={
-                        state === "COMMITTED"
-                          ? "bull"
-                          : state === "VOIDED"
-                            ? "muted"
-                            : state === "REJECTED"
-                              ? "bear"
-                              : "accent"
-                      }
-                      mono
-                    >
-                      {state}
-                    </Badge>
-                  </Cell>
-                  <Cell className="max-w-[320px] truncate">{intent}</Cell>
-                  <Cell mono align="right" tone="muted">
-                    {updated}
-                  </Cell>
-                </Row>
-              );
-            })}
+            {outboxVisible.map((row) => (
+              <OutboxRow key={row.key} row={row} />
+            ))}
           </Table>
         )}
       </Card>

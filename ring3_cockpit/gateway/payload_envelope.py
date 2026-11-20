@@ -19,10 +19,11 @@ It also attaches complete risk and margin telemetry per silo
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import time
 from typing import Any, Mapping, Sequence
+
+from core.json_codec import canonical_bytes, canonical_json as _canonical_json
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -147,21 +148,20 @@ def _max_drawdown_bps(series: Sequence[int]) -> float:
 
 
 def canonical_json(payload: Mapping[str, Any]) -> str:
-    """Canonical JSON: sorted keys, no whitespace, NaN/Inf coerced to ``null``."""
-    return json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-        default=str,
-    )
+    """Canonical JSON: sorted keys, no whitespace, NaN/Inf coerced to ``null``.
+
+    Delegates to :func:`core.json_codec.canonical_json`, which keeps the exact
+    pre-V2.4 flags (``sort_keys``, ``(",", ":")``, ``ensure_ascii=True``,
+    ``allow_nan=False``, ``default=str``).  The digest bytes are unchanged; the
+    move only makes the contract importable from the shared ``core`` substrate.
+    """
+    return _canonical_json(payload)
 
 
 def payload_digest(payload: Mapping[str, Any]) -> str:
     """SHA-256 of the payload with ``payload_sha256`` removed."""
     body = {key: value for key, value in payload.items() if key != "payload_sha256"}
-    return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_bytes(body)).hexdigest()
 
 
 def workspace_mode_of(value: Any) -> str:

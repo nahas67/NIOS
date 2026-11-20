@@ -5,6 +5,12 @@
  * `X-NIOS-Session` header and the `?topic=` / `?silo=` projections can be
  * forwarded, and so an `AbortController` gives us deterministic unmount
  * cleanup.  All twelve Ring 3 frame types are recognised.
+ *
+ * Market frames (`TICK` / `DEPTH`) are coalesced: only the newest value per
+ * instrument survives inside one animation frame (hard 100 ms fallback), so a
+ * tick storm can never allocate an unbounded frame backlog.  State-critical
+ * frames are never buffered and are always dispatched after the buffered
+ * market tail, so a halt is never read behind a stale quote.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -60,6 +66,142 @@ export interface StreamOptions {
   onStatus?: (status: StreamStatus, error: string | null) => void;
 }
 
+/**
+ * Market-data frame types.  They arrive at tick rate and every consumer only
+ * renders the newest value per instrument, so they are safe to coalesce.  Both
+ * the terminal vocabulary (`TICK` / `DEPTH`) and the gateway vocabulary
+ * (`TICK_UPDATE` / `L2_DEPTH_DELTA`) are recognised.
+ */
+export const MARKET_FRAME_TYPES: ReadonlySet<string> = new Set([
+  "TICK",
+  "TICK_UPDATE",
+  "DEPTH",
+  "DEPTH_DELTA",
+  "L2_DEPTH_DELTA",
+]);
+
+/**
+ * State-critical frames.  They carry order, tranche, wallet, reconciliation or
+ * alert state and must never be buffered, collapsed or reordered behind a
+ * quote.
+ */
+export const STATE_CRITICAL_TYPES: ReadonlySet<string> = new Set([
+  "ORDER",
+  "ORDER_LIFECYCLE",
+  "TRANCHE_HALT",
+  "WALLET_SWEEP",
+  "COLD_START_RECON",
+  "SYSTEM_ALERT",
+]);
+
+/** Hard ceiling on the coalescing window when `requestAnimationFrame` cannot run. */
+export const COALESCE_FALLBACK_MS = 100;
+
+/** Upper bound on buffered instrument keys; the buffer is LRU-evicted beyond this. */
+const MAX_PENDING_FRAMES = 1_024;
+
+function frameKey(frame: StreamFrame): string {
+  const identity = text(
+    frame.data.symbol ?? frame.data.instrument_id ?? frame.data.instrument ?? frame.data.key ?? frame.topic,
+    "",
+  );
+  return `${frame.type}|${identity}`;
+}
+
+function canAnimate(): boolean {
+  if (typeof globalThis.requestAnimationFrame !== "function") return false;
+  if (typeof document === "undefined") return true;
+  return document.visibilityState !== "hidden";
+}
+
+export interface FrameCoalescer {
+  /** Buffer a market frame, or dispatch an immediate frame ahead of the buffer. */
+  push: (frame: StreamFrame) => void;
+  /** Deliver everything buffered right now and keep accepting frames. */
+  flushNow: () => void;
+  /** Drop the buffer and cancel the rAF / fallback timer.  Terminal. */
+  dispose: () => void;
+}
+
+/**
+ * Bounded frame coalescer.
+ *
+ * High-frequency market frames are merged into a `Map` keyed by frame type and
+ * instrument, so peak memory is `O(instruments)` rather than `O(ticks)`.  The
+ * flush is driven by `requestAnimationFrame` with an unconditional `fallbackMs`
+ * timer, which also covers hidden tabs (where rAF never fires) and runtimes
+ * without rAF.  Any non-market frame flushes the buffer first, so delivery
+ * order always matches arrival order at the control-frame boundaries.
+ */
+export function createFrameCoalescer(
+  deliver: (frame: StreamFrame) => void,
+  fallbackMs = COALESCE_FALLBACK_MS,
+): FrameCoalescer {
+  const pending = new Map<string, StreamFrame>();
+  let rafHandle: number | null = null;
+  let timerHandle: ReturnType<typeof globalThis.setTimeout> | null = null;
+  let disposed = false;
+
+  const cancel = () => {
+    if (rafHandle !== null) {
+      if (typeof globalThis.cancelAnimationFrame === "function") globalThis.cancelAnimationFrame(rafHandle);
+      rafHandle = null;
+    }
+    if (timerHandle !== null) {
+      globalThis.clearTimeout(timerHandle);
+      timerHandle = null;
+    }
+  };
+
+  const flushNow = () => {
+    cancel();
+    if (disposed || pending.size === 0) return;
+    const batch = [...pending.values()];
+    pending.clear();
+    for (const frame of batch) deliver(frame);
+  };
+
+  const schedule = () => {
+    if (disposed) return;
+    if (timerHandle === null) timerHandle = globalThis.setTimeout(flushNow, fallbackMs);
+    if (rafHandle === null && canAnimate()) rafHandle = globalThis.requestAnimationFrame(flushNow);
+  };
+
+  const push = (frame: StreamFrame) => {
+    if (disposed) return;
+    const coalescable = MARKET_FRAME_TYPES.has(frame.type) && !STATE_CRITICAL_TYPES.has(frame.type);
+    if (!coalescable) {
+      // Zero buffering for control frames, and the market tail is flushed ahead
+      // of them so a halt can never be read behind a stale quote.
+      flushNow();
+      deliver(frame);
+      return;
+    }
+    const key = frameKey(frame);
+    pending.delete(key);
+    pending.set(key, frame);
+    if (pending.size > MAX_PENDING_FRAMES) {
+      const oldest = pending.keys().next();
+      if (!oldest.done) pending.delete(oldest.value);
+    }
+    schedule();
+  };
+
+  const dispose = () => {
+    disposed = true;
+    cancel();
+    pending.clear();
+  };
+
+  return { push, flushNow, dispose };
+}
+
+export interface StreamHandle {
+  (): void;
+  /** Deliver any buffered market frames immediately; the stream stays open. */
+  flushNow: () => void;
+}
+
 function buildUrl(options: StreamOptions): string {
   const params = new URLSearchParams();
   if (options.topics && options.topics.length > 0) params.set("topic", options.topics.join(","));
@@ -69,10 +211,10 @@ function buildUrl(options: StreamOptions): string {
 }
 
 /**
- * Open the multiplexed SSE stream.  Returns a disposer that aborts the socket.
- * The caller owns reconnection policy.
+ * Open the multiplexed SSE stream.  Returns a disposer that aborts the socket
+ * and drops any buffered market frame.  The caller owns reconnection policy.
  */
-export function openStream(options: StreamOptions): () => void {
+export function openStream(options: StreamOptions): StreamHandle {
   const controller = new AbortController();
   const url = buildUrl(options);
   let closed = false;
@@ -81,6 +223,13 @@ export function openStream(options: StreamOptions): () => void {
   let pendingType = "MESSAGE";
   let pendingId = "";
   let pendingData: string[] = [];
+
+  const coalescer = createFrameCoalescer((frame) => {
+    if (closed) return;
+    sequence += 1;
+    frame.id = sequence;
+    options.onFrame?.(frame);
+  });
 
   const emit = (type: string, id: string, payload: string) => {
     let data: Record<string, unknown> = {};
@@ -92,15 +241,13 @@ export function openStream(options: StreamOptions): () => void {
         data = { raw: payload };
       }
     }
-    sequence += 1;
-    const frame: StreamFrame = {
-      id: sequence,
+    coalescer.push({
+      id: 0,
       type: type.length > 0 ? type.toUpperCase() : "MESSAGE",
       topic: text(data.topic ?? data.channel ?? id, "stream"),
       receivedAt: Date.now(),
       data,
-    };
-    options.onFrame?.(frame);
+    });
   };
 
   const dispatchLine = (line: string) => {
@@ -160,15 +307,21 @@ export function openStream(options: StreamOptions): () => void {
     } catch (error) {
       if (!closed && !controller.signal.aborted) options.onStatus?.("error", String(error));
     }
+
+    coalescer.flushNow();
   };
 
   void run();
 
-  return () => {
+  const dispose = () => {
+    if (closed) return;
     closed = true;
+    coalescer.dispose();
     controller.abort();
     options.onStatus?.("closed", null);
   };
+
+  return Object.assign(dispose, { flushNow: () => coalescer.flushNow() });
 }
 
 export interface UseMarketStreamResult {

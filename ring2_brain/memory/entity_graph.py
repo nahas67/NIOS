@@ -37,7 +37,9 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -52,6 +54,7 @@ __all__ = [
     "KEEP_RECENT",
     "LEXICAL_WEIGHT",
     "MAX_COLD_ARCHIVE_EVENTS",
+    "MEMORY_CACHE_MAX_ENTITIES",
     "OUTCOME_KINDS",
     "SEMANTIC_WEIGHT",
     "CompiledEntityTruth",
@@ -153,6 +156,18 @@ OLLAMA_TIMEOUT_S = 2.0
 BM25_K1 = 1.5
 BM25_B = 0.75
 
+#: V2.4 PART 2 -- bounded per-entity retrieval cache.  ``query_entity_memory``
+#: used to re-tokenize the whole corpus, recompute document frequency and
+#: re-materialise a 384-dim vector on every call.  A long-running process may
+#: serve hundreds of entities, so the cache is an LRU with a hard ceiling: no
+#: query pattern can grow this graph's heap without bound.
+#:
+#: The ceiling is sized to the live universe -- the 274-instrument registry plus
+#: its silo / strategy / regime / macro arms -- so a full-universe scan is a
+#: steady stream of hits instead of a thrash that would re-embed most of the
+#: corpus on every call.
+MEMORY_CACHE_MAX_ENTITIES = 512
+
 #: Deterministic caution penalties. A matching caution regime costs 10 points of
 #: confidence, each carried failure mode costs 5, and the combined haircut is
 #: capped at 40 points so a memory warning can never veto a trade on its own.
@@ -226,17 +241,31 @@ def canonical_symbol_key(value: Any) -> str:
     return token
 
 
+#: V2.4 PART 2: both folds are pure functions of a short string and are called
+#: once per truth per query (and once per event per recompilation), so the
+#: memo is a strict win.  Bounded so an adversarial ticker storm cannot grow it.
+@lru_cache(maxsize=4096)
+def _canonical_symbol_key_cached(token: str) -> str:
+    for separator in _SYMBOL_SEPARATORS:
+        token = token.replace(separator, "")
+    return token
+
+
 def canonical_entity_alias(entity_id: Any) -> str:
     """Return the alias a ``symbol:`` entity id is looked up under.
 
     Non-symbol arms (``silo:``, ``strategy:``, ``macro:``, ``regime:``) are
     returned unchanged: a silo id is not an instrument and must never be folded.
     """
-    token = str(entity_id or "").strip()
+    return _canonical_entity_alias_cached(str(entity_id or "").strip())
+
+
+@lru_cache(maxsize=4096)
+def _canonical_entity_alias_cached(token: str) -> str:
     kind, _, value = token.partition(":")
     if kind.strip().lower() != "symbol":
         return token
-    return f"symbol:{canonical_symbol_key(value)}"
+    return f"symbol:{_canonical_symbol_key_cached(value.strip().upper())}"
 
 
 def _fold_symbol(value: Any) -> str:
@@ -740,6 +769,42 @@ def _cached_hashed_embedding(text: str) -> tuple[float, ...]:
     return vector
 
 
+def _sparse_vector(text: str) -> tuple[tuple[float, ...], tuple[int, ...], tuple[float, ...]]:
+    """``(dense, non_zero_indices, non_zero_values)`` for the hashed embedding.
+
+    The hashed n-gram vector is extremely sparse (a few dozen live buckets out of
+    384), so a cosine computed over the live buckets of the *query* adds exactly
+    the same terms, in exactly the same ascending-index order, as the dense dot
+    product: every skipped term is ``0.0 * value == +/-0.0`` and adding a signed
+    zero to a float accumulator is an identity.
+    """
+
+    vector = _cached_hashed_embedding(text)
+    indices: list[int] = []
+    values: list[float] = []
+    for index, value in enumerate(vector):
+        if value:
+            indices.append(index)
+            values.append(value)
+    return vector, tuple(indices), tuple(values)
+
+
+def _sparse_cosine(
+    query_indices: Sequence[int],
+    query_values: Sequence[float],
+    document: Sequence[float],
+) -> float:
+    """Bit-identical cosine via the query's non-zero buckets only."""
+
+    width = len(document)
+    if not query_indices or not width or query_indices[-1] >= width:
+        return 0.0
+    dot = 0.0
+    for index, value in zip(query_indices, query_values):
+        dot += value * document[index]
+    return max(-1.0, min(1.0, dot))
+
+
 #: One bounded probe per process; a dead daemon disables the hook for good.
 _OLLAMA_STATE: dict[str, Any] = {"model": "", "enabled": False, "probed": False}
 
@@ -812,6 +877,33 @@ def _ollama_base_url() -> str:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class _RetrievalEntry:
+    """One cached entity corpus projection (V2.4 PART 2).
+
+    ``counts``/``length``/``distinct`` are the exact token statistics the BM25
+    arm derives from the corpus document, so a hit never re-tokenizes; ``vector``
+    is the 384-dim hashed n-gram embedding, stored as the immutable tuple the
+    embedder produced (no per-call re-materialisation).
+
+    ``timeline_seq`` and ``checkpoint_seq`` record the graph counters the entry
+    was built under, for audit.  *Validation* uses the narrower
+    ``(epoch, arm_revision, truth_sha256)`` triple: an append that does not touch
+    this entity must not evict it, and a global sequence number would evict every
+    entity on every unrelated tick.
+    """
+
+    epoch: int
+    arm_revision: int
+    truth_sha256: str
+    counts: dict[str, int]
+    length: int
+    distinct: frozenset[str]
+    vector: tuple[float, ...] | None
+    timeline_seq: int
+    checkpoint_seq: int
+
+
 class EntityMemoryGraph:
     """Append-only entity timeline plus deterministically compiled truths.
 
@@ -852,6 +944,23 @@ class EntityMemoryGraph:
         self._archive_path: Path | None = (
             Path(archive_path) if archive_path is not None else None
         )
+        # -- V2.4 PART 2: incremental retrieval cache ---------------------
+        #: LRU of per-entity corpus projections, keyed by canonical entity id.
+        self._retrieval_cache: OrderedDict[str, _RetrievalEntry] = OrderedDict()
+        self._cache_limit = max(1, int(MEMORY_CACHE_MAX_ENTITIES))
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
+        #: Per-arm lesson revision.  Bumped only for the entities an appended
+        #: event actually names (and for the entities a compaction removed), so
+        #: an unrelated outcome never invalidates a hot entry.
+        self._arm_revision: dict[str, int] = {}
+        #: Bumped on every whole-graph replacement (``reset``/``load_state``).
+        self._cache_epoch = 0
+        #: Bumped whenever the truth set or the corpus may have changed; it keys
+        #: the shared document-frequency table.
+        self._corpus_generation = 0
+        self._df_cache: tuple[int, dict[str, int], float, int] | None = None
         if isinstance(state, Mapping):
             self.load_state(state)
 
@@ -907,6 +1016,9 @@ class EntityMemoryGraph:
             if len(self._events) > self._max_events:
                 self._events = self._events[-self._max_events :]
             self._dirty = True
+            # V2.4 PART 2: only the entities this event names can have a new
+            # corpus document, so only their cached projections are dropped.
+            self._invalidate_entities(event.entity_ids)
             # V2.3 PART 2.2: seal a checkpoint the moment the active timeline
             # outgrows the threshold so startup replay is bounded by
             # ``keep_recent`` instead of growing without limit.
@@ -1010,6 +1122,9 @@ class EntityMemoryGraph:
             and representatives.get(canonical_entity_alias(key), key) != key
         ]:
             self._truths.pop(stale, None)
+        # The truth set (and therefore the corpus) may have changed: key the
+        # shared document-frequency table on the new generation.
+        self._corpus_generation += 1
         return touched
 
     def _compile(self, entity_id: str, *, fallback_stamp: int) -> CompiledEntityTruth:
@@ -1179,6 +1294,11 @@ class EntityMemoryGraph:
             self._sealed_seq += len(sealed)
             self._events = ordered[cut:]
             self._archive_events(sealed, first_seq=first_seq)
+            # V2.4 PART 2: sealing removes lessons from the hot corpus, so the
+            # cached projection of every entity those events named is stale.
+            self._invalidate_entities(
+                arm for event in sealed for arm in event.entity_ids
+            )
             # The checkpoint freezes the *sealed prefix* truths ...
             sealed_truths = self._truths_from_folds(fallback_stamp=stamp)
             checkpoint = MemoryCheckpoint(
@@ -1299,6 +1419,100 @@ class EntityMemoryGraph:
                 ),
             }
 
+    # -- retrieval cache (V2.4 PART 2) ------------------------------------
+
+    def cache_stats(self) -> dict[str, int]:
+        """Counters for the bounded per-entity retrieval cache."""
+
+        with self._lock:
+            return {
+                "hits": int(self._cache_hits),
+                "misses": int(self._cache_misses),
+                "entries": len(self._retrieval_cache),
+                "evictions": int(self._cache_evictions),
+            }
+
+    def cache_clear(self) -> dict[str, int]:
+        """Drop every cached projection and reset the counters."""
+
+        with self._lock:
+            self._retrieval_cache.clear()
+            self._arm_revision.clear()
+            self._df_cache = None
+            self._cache_epoch += 1
+            self._cache_hits = 0
+            self._cache_misses = 0
+            self._cache_evictions = 0
+            return {
+                "hits": 0,
+                "misses": 0,
+                "entries": 0,
+                "evictions": 0,
+            }
+
+    def _invalidate_entities(self, arms: Iterable[str]) -> None:
+        """Invalidate exactly the entities the caller names."""
+
+        for arm in arms:
+            key = str(arm)
+            self._retrieval_cache.pop(key, None)
+            self._arm_revision[key] = self._arm_revision.get(key, 0) + 1
+
+    def _cache_lookup(
+        self,
+        entity_id: str,
+        *,
+        epoch: int,
+        revision: int,
+        truth_sha256: str,
+        require_vector: bool = False,
+    ) -> _RetrievalEntry | None:
+        entry = self._retrieval_cache.get(entity_id)
+        if (
+            entry is not None
+            and entry.epoch == epoch
+            and entry.arm_revision == revision
+            and entry.truth_sha256 == truth_sha256
+            and (entry.vector is not None or not require_vector)
+        ):
+            self._retrieval_cache.move_to_end(entity_id)
+            self._cache_hits += 1
+            return entry
+        self._cache_misses += 1
+        return None
+
+    def _cache_store(
+        self,
+        entity_id: str,
+        entry: _RetrievalEntry,
+        *,
+        epoch: int,
+        revision: int,
+    ) -> None:
+        # Never publish an entry built from a snapshot that has since moved on.
+        if entry.epoch != epoch or self._arm_revision.get(entity_id, 0) != revision:
+            return
+        cache = self._retrieval_cache
+        cache[entity_id] = entry
+        cache.move_to_end(entity_id)
+        while len(cache) > self._cache_limit:
+            cache.popitem(last=False)
+            self._cache_evictions += 1
+
+    @property
+    def timeline_seq(self) -> int:
+        """Monotonic counter of every outcome the graph has ever accepted."""
+
+        with self._lock:
+            return int(self._sequence)
+
+    @property
+    def checkpoint_seq(self) -> int:
+        """Cumulative number of events sealed into the current checkpoint."""
+
+        with self._lock:
+            return int(self._sealed_seq)
+
     # -- hybrid retrieval ------------------------------------------------
 
     def query_entity_memory(
@@ -1357,17 +1571,72 @@ class EntityMemoryGraph:
             truth_rows = list(self._truths.values())
             events = list(self._events)
             sealed_seq = int(self._sealed_seq)
+            generation = int(self._corpus_generation)
+            epoch = int(self._cache_epoch)
+            timeline_seq = int(self._sequence)
+            revisions = {
+                truth.entity_id: self._arm_revision.get(truth.entity_id, 0)
+                for truth in truth_rows
+            }
 
-        corpus = self._corpus(truth_rows, events)
-        lexical = self._bm25(corpus, _tokens(query_text))
-        ceiling = max(lexical.values()) if lexical else 0.0
-        semantic = (
-            self._semantic_scores(
-                corpus, features=features, query_text=query_text, embedder=embedder
+        # Resolve the semantic arm's embedder exactly where ``_semantic_scores``
+        # would, so the cacheability decision cannot change when a probe fires.
+        semantic_query = ""
+        if use_semantic and truth_rows:
+            semantic_query = " ".join(
+                part
+                for part in (str(query_text or ""), *(str(value) for value in features.values()))
+                if part
+            ).strip()
+        embed: Any = None
+        cached_semantics = True
+        if semantic_query:
+            embed = embedder if callable(embedder) else ollama_embedder()
+            if embed is None:
+                embed = _cached_hashed_embedding
+            else:
+                # An operator-supplied or daemon embedder is opaque: it may be
+                # stateful or non-deterministic, so its vectors are never cached
+                # and the pre-V2.4 path is used verbatim.
+                cached_semantics = False
+
+        # The cached projection path is taken whenever the semantic arm is
+        # deterministic (default hashed embedder) or disabled.  An opaque
+        # embedder falls through to the verbatim pre-V2.4 pass.
+        use_cached_path = (not use_semantic) or cached_semantics
+        projections: dict[str, _RetrievalEntry] | None = None
+        if truth_rows and use_cached_path:
+            projections = self._retrieval_projections(
+                truth_rows,
+                events,
+                epoch=epoch,
+                timeline_seq=timeline_seq,
+                checkpoint_seq=sealed_seq,
+                revisions=revisions,
+                use_semantic=use_semantic and bool(semantic_query),
             )
-            if use_semantic
-            else {}
-        )
+
+        if projections is not None:
+            lexical = self._bm25_cached(
+                truth_rows, projections, _tokens(query_text), generation
+            )
+            ceiling = max(lexical.values()) if lexical else 0.0
+            semantic = (
+                self._semantic_scores_cached(truth_rows, projections, semantic_query)
+                if use_semantic
+                else {}
+            )
+        else:
+            corpus = self._corpus(truth_rows, events)
+            lexical = self._bm25(corpus, _tokens(query_text))
+            ceiling = max(lexical.values()) if lexical else 0.0
+            semantic = (
+                self._semantic_scores(
+                    corpus, features=features, query_text=query_text, embedder=embedder
+                )
+                if use_semantic
+                else {}
+            )
 
         scored: list[dict[str, Any]] = []
         for truth in truth_rows:
@@ -1490,6 +1759,179 @@ class EntityMemoryGraph:
         return result["penalty"]
 
     # -- retrieval internals ---------------------------------------------
+
+    def _retrieval_projections(
+        self,
+        truths: Sequence[CompiledEntityTruth],
+        events: Sequence[PostMortemEvent],
+        *,
+        epoch: int,
+        timeline_seq: int,
+        checkpoint_seq: int,
+        revisions: Mapping[str, int],
+        use_semantic: bool,
+    ) -> dict[str, _RetrievalEntry]:
+        """Return one cached corpus projection per truth (V2.4 PART 2).
+
+        A projection carries the exact per-document artefacts the retrieval
+        arms consume -- token counts, document length, the distinct-token set
+        the IDF table needs, and the 384-dim vector -- so a hit performs no
+        tokenization and no embedding at all.
+
+        Misses are rebuilt from the same ``events`` snapshot the caller is about
+        to score, through a lesson index built once per call, so a cold query is
+        never worse than the pre-V2.4 full pass by more than one index build.
+        """
+
+        projections: dict[str, _RetrievalEntry] = {}
+        lesson_index: dict[str, list[str]] | None = None
+        for truth in truths:
+            entity_id = truth.entity_id
+            revision = int(revisions.get(entity_id, 0))
+            entry = self._cache_lookup(
+                entity_id,
+                epoch=epoch,
+                revision=revision,
+                truth_sha256=truth.truth_sha256,
+                require_vector=use_semantic,
+            )
+            if entry is not None:
+                projections[entity_id] = entry
+                continue
+            if lesson_index is None:
+                lesson_index = self._lesson_index(events)
+            text = self._corpus_text(truth, lesson_index)
+            tokens = _tokens(text)
+            counts: dict[str, int] = {}
+            for token in tokens:
+                counts[token] = counts.get(token, 0) + 1
+            fresh = _RetrievalEntry(
+                epoch=epoch,
+                arm_revision=revision,
+                truth_sha256=truth.truth_sha256,
+                counts=counts,
+                length=len(tokens),
+                distinct=frozenset(counts),
+                vector=_cached_hashed_embedding(text) if use_semantic else None,
+                timeline_seq=timeline_seq,
+                checkpoint_seq=checkpoint_seq,
+            )
+            projections[entity_id] = fresh
+            with self._lock:
+                self._cache_store(entity_id, fresh, epoch=epoch, revision=revision)
+        return projections
+
+    @staticmethod
+    def _lesson_index(events: Sequence[PostMortemEvent]) -> dict[str, list[str]]:
+        """``arm -> lesson summaries`` in canonical event order."""
+
+        index: dict[str, list[str]] = {}
+        for event in events:
+            summary = event.lesson_summary
+            for arm in event.entity_ids:
+                index.setdefault(arm, []).append(summary)
+        return index
+
+    @staticmethod
+    def _corpus_text(
+        truth: CompiledEntityTruth,
+        lesson_index: Mapping[str, Sequence[str]],
+    ) -> str:
+        """Exactly the document ``_corpus`` builds for one entity."""
+
+        parts = [
+            truth.entity_id,
+            truth.entity_type,
+            " ".join(truth.known_failure_modes),
+            " ".join(truth.caution_regimes),
+            " ".join(lesson_index.get(truth.entity_id, ())),
+        ]
+        return " ".join(part for part in parts if part)
+
+    def _document_frequency(
+        self,
+        projections: Mapping[str, _RetrievalEntry],
+        generation: int,
+    ) -> tuple[dict[str, int], float, int]:
+        """Corpus-global IDF inputs, memoised per corpus generation.
+
+        Document frequency is the one genuinely global term in BM25, so it is
+        derived from the cached distinct-token sets (cheap integer counts)
+        rather than from a re-tokenized corpus, and shared across queries until
+        the corpus itself changes.
+        """
+
+        cached = self._df_cache
+        if cached is not None and cached[0] == generation:
+            return cached[1], cached[2], cached[3]
+        document_frequency: dict[str, int] = {}
+        total_docs = 0
+        length_sum = 0
+        for entry in projections.values():
+            total_docs += 1
+            length_sum += entry.length
+            for token in entry.distinct:
+                document_frequency[token] = document_frequency.get(token, 0) + 1
+        average = (length_sum / total_docs) if total_docs else 0.0
+        self._df_cache = (generation, document_frequency, average, total_docs)
+        return document_frequency, average, total_docs
+
+    def _bm25_cached(
+        self,
+        truths: Sequence[CompiledEntityTruth],
+        projections: Mapping[str, _RetrievalEntry],
+        query: Sequence[str],
+        generation: int,
+    ) -> dict[str, float]:
+        """BM25 over cached projections -- identical arithmetic to ``_bm25``."""
+
+        if not projections or not query:
+            return {}
+        document_frequency, average, total_docs = self._document_frequency(
+            projections, generation
+        )
+        scores: dict[str, float] = {}
+        for truth in truths:
+            entry = projections[truth.entity_id]
+            counts = entry.counts
+            length = entry.length or 1
+            score = 0.0
+            for token in query:
+                frequency = counts.get(token, 0)
+                if not frequency:
+                    continue
+                df = document_frequency.get(token, 0)
+                idf = math.log(1.0 + (total_docs - df + 0.5) / (df + 0.5))
+                denominator = frequency + BM25_K1 * (
+                    1.0 - BM25_B + BM25_B * (length / (average or 1.0))
+                )
+                score += idf * (frequency * (BM25_K1 + 1.0)) / denominator
+            scores[truth.entity_id] = score
+        return scores
+
+    def _semantic_scores_cached(
+        self,
+        truths: Sequence[CompiledEntityTruth],
+        projections: Mapping[str, _RetrievalEntry],
+        query: str,
+    ) -> dict[str, float]:
+        """Signal 3 over cached vectors -- identical scores to ``_semantic_scores``."""
+
+        if not query or not projections:
+            return {}
+        query_vector, query_indices, query_values = _sparse_vector(query)
+        width = len(query_vector)
+        scores: dict[str, float] = {}
+        for truth in truths:
+            entry = projections[truth.entity_id]
+            vector = entry.vector
+            if vector is None or len(vector) != width:
+                scores[truth.entity_id] = 0.0
+                continue
+            scores[truth.entity_id] = round(
+                max(0.0, min(1.0, _sparse_cosine(query_indices, query_values, vector))), 6
+            )
+        return scores
 
     def _corpus(
         self,
@@ -1802,6 +2244,9 @@ class EntityMemoryGraph:
             )
             self._cold_archive = archive
             self._sequence = int(state.get("sequence") or len(self._events))
+            # V2.4 PART 2: the whole graph was just replaced, so every cached
+            # projection belongs to a history that no longer exists.
+            self.cache_clear()
             # The timeline is the source of truth; replay it so a tampered or
             # truncated cache can never outvote the raw events.  With a verified
             # checkpoint this walks only ``seq > checkpoint_seq``.
@@ -1821,6 +2266,8 @@ class EntityMemoryGraph:
             self._cold_archive = []
             self._sequence = 0
             self._dirty = True
+            # V2.4 PART 2: a clean slate invalidates every cached projection.
+            self.cache_clear()
             if self._archive_path is not None:
                 try:
                     if self._archive_path.is_file():

@@ -157,12 +157,21 @@ class Bar:
 
 @dataclass(slots=True)
 class _InstrumentState:
+    """Per-instrument hot state (V2.4 PART 2).
+
+    ``bids``/``asks`` are re-assigned bounded ladders and ``bars``/``surface`` are
+    fixed-key replacements, so ``history`` was the only collection that could grow
+    per tick.  It is now a ``deque(maxlen=max_bars)`` per timeframe: the cap is
+    enforced by the container instead of by a slice copy on every close, which is
+    what removes the per-close ``list`` allocation churn from the hot path.
+    """
+
     spot_micros: int = 0
     last_update_utc_ns: int = 0
     bids: list[tuple[int, int]] = field(default_factory=list)
     asks: list[tuple[int, int]] = field(default_factory=list)
     bars: dict[str, Bar] = field(default_factory=dict)
-    history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    history: dict[str, deque[dict[str, Any]]] = field(default_factory=dict)
     surface: dict[str, Any] = field(default_factory=dict)
 
 
@@ -326,6 +335,15 @@ class LiveBarAggregator:
         self._state[key] = state
         return state
 
+    def _history_for(self, state: _InstrumentState, timeframe: str) -> deque[dict[str, Any]]:
+        """The bounded closed-bar ring for one timeframe (created on first close)."""
+
+        history = state.history.get(timeframe)
+        if history is None:
+            history = deque(maxlen=self.max_bars)
+            state.history[timeframe] = history
+        return history
+
     def _roll(
         self,
         state: _InstrumentState,
@@ -348,10 +366,9 @@ class LiveBarAggregator:
             if live is not None:
                 live.closed = True
                 finished = live
-                history = state.history.setdefault(timeframe, [])
-                history.append(live.to_dict())
-                if len(history) > self.max_bars:
-                    state.history[timeframe] = history[-self.max_bars :]
+                # ``maxlen`` drops the oldest closed bar for us: no slice, no
+                # re-assignment, no unbounded list to collect.
+                self._history_for(state, timeframe).append(live.to_dict())
             live = Bar(
                 silo=silo,
                 symbol=symbol,
@@ -696,11 +713,18 @@ class LiveBarAggregator:
                     state.last_update_utc_ns = start_ns
                     state.spot_micros = close_micros
                 if bar.closed:
-                    history = state.history.setdefault(timeframe, [])
-                    history.append(bar.to_dict())
-                    history.sort(key=lambda item: int(item.get("start_utc_ns") or 0))
-                    if len(history) > self.max_bars:
-                        state.history[timeframe] = history[-self.max_bars :]
+                    # Restore must keep the pre-V2.4 rule exactly: sort the whole
+                    # series ascending, then retain the newest ``max_bars``.  The
+                    # deque's ``maxlen`` would drop the oldest row *before* the
+                    # sort and silently re-order a late (out-of-order) insert.
+                    history = self._history_for(state, timeframe)
+                    ordered = list(history)
+                    ordered.append(bar.to_dict())
+                    ordered.sort(key=lambda item: int(item.get("start_utc_ns") or 0))
+                    if len(ordered) > self.max_bars:
+                        ordered = ordered[-self.max_bars :]
+                    history.clear()
+                    history.extend(ordered)
                     restored_closed += 1
                 else:
                     existing = state.bars.get(timeframe)

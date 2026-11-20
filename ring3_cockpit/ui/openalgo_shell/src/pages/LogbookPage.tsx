@@ -5,7 +5,7 @@
  * a winning trade that loses money after costs can never look profitable.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { BarChart } from "../charts";
 import {
   Badge,
@@ -67,6 +67,95 @@ function dayOf(entry: Record<string, unknown>): string {
 function toMicros(value: unknown): number {
   return Math.round(safeNumber(value, 0) * 1_000_000);
 }
+
+interface LogbookRowData {
+  key: string;
+  tone: "bull" | "bear" | undefined;
+  recordedAtNs: unknown;
+  symbol: string;
+  sideText: string;
+  sideShort: boolean;
+  quantity: unknown;
+  entryPrice: unknown;
+  exitPrice: unknown;
+  grossMicros: number;
+  brokerage: number;
+  tax: number;
+  exchange: number;
+  gst: number;
+  stamp: number;
+  other: number;
+  costMicros: number;
+  netMicros: number;
+  rMultiple: number;
+  outcomeText: string;
+  outcomeWin: boolean;
+  setup: string;
+  workspace: string;
+}
+
+function LogbookRowBase({ row }: { row: LogbookRowData }) {
+  return (
+    <Row tone={row.tone}>
+      <Cell mono className="whitespace-nowrap">
+        {clockNs(row.recordedAtNs)}
+      </Cell>
+      <Cell mono className="font-semibold text-ink">
+        {row.symbol}
+      </Cell>
+      <Cell>
+        <Badge tone={row.sideShort ? "bear" : "bull"}>{row.sideText}</Badge>
+      </Cell>
+      <Cell align="right">{num(row.quantity, 2)}</Cell>
+      <Cell align="right" mono>
+        {num(row.entryPrice, 2)}
+      </Cell>
+      <Cell align="right" mono>
+        {num(row.exitPrice, 2)}
+      </Cell>
+      <Cell align="right" tone={row.grossMicros >= 0 ? "bull" : "bear"}>
+        {usdSigned(row.grossMicros)}
+      </Cell>
+      <Cell align="right" tone="muted">
+        {usd(row.brokerage)}
+      </Cell>
+      <Cell align="right" tone="muted">
+        {usd(row.tax)}
+      </Cell>
+      <Cell align="right" tone="muted">
+        {usd(row.exchange)}
+      </Cell>
+      <Cell align="right" tone="muted">
+        {usd(row.gst)}
+      </Cell>
+      <Cell align="right" tone="muted">
+        {usd(row.stamp)}
+      </Cell>
+      <Cell align="right" tone="muted">
+        {usd(row.other)}
+      </Cell>
+      <Cell align="right" tone="bear">
+        {usd(row.costMicros)}
+      </Cell>
+      <Cell align="right" tone={row.netMicros >= 0 ? "bull" : "bear"} className="font-semibold">
+        {usdSigned(row.netMicros)}
+      </Cell>
+      <Cell align="right" tone={row.rMultiple >= 1 ? "bull" : row.rMultiple < 0 ? "bear" : "muted"}>
+        {num(row.rMultiple, 2)}
+      </Cell>
+      <Cell className="text-[9.5px] text-ink-3">
+        <div className="flex flex-wrap items-center gap-1">
+          <Badge tone={row.outcomeWin ? "bull" : "muted"}>{row.outcomeText}</Badge>
+          <span className="font-mono">{row.setup}</span>
+          <span>{row.workspace}</span>
+        </div>
+      </Cell>
+    </Row>
+  );
+}
+
+const LogbookRow = memo(LogbookRowBase);
+LogbookRow.displayName = "LogbookRow";
 
 export function LogbookPage({ mode }: PageProps) {
   const [entries, setEntries] = useState<Record<string, unknown>[]>([]);
@@ -178,6 +267,50 @@ export function LogbookPage({ mode }: PageProps) {
           label: text(entry.symbol, "?"),
           value,
           tone: value >= 0 ? ("bull" as const) : ("bear" as const),
+        };
+      }),
+    [filtered],
+  );
+
+  /** Journal descriptors are rebuilt only when the slice changes, never on the 1 s clock tick. */
+  const rows = useMemo(
+    () =>
+      filtered.map((entry, index) => {
+        const statutory = asRecord(entry.statutory_cost);
+        const components = rowsOf(statutory.components, ["components"]);
+        const costMicros = numberAt(entry, ["cost_drag_micros"], toMicros(entry.cost_drag));
+        const grossMicros = toMicros(entry.gross_pnl);
+        const netMicros = toMicros(entry.net_pnl);
+        const brokerage = legMicros(components, BROKERAGE_LEGS);
+        const tax = legMicros(components, TAX_LEGS);
+        const exchange = legMicros(components, EXCHANGE_LEGS);
+        const gst = legMicros(components, GST_LEGS);
+        const stamp = legMicros(components, STAMP_LEGS);
+        const other = Math.max(0, costMicros - brokerage - tax - exchange - gst - stamp);
+        return {
+          key: `${text(entry.entry_id, "entry")}-${index}`,
+          tone: netMicros > 0 ? ("bull" as const) : netMicros < 0 ? ("bear" as const) : undefined,
+          recordedAtNs: entry.recorded_at_ns,
+          symbol: text(entry.symbol),
+          sideText: text(entry.side, "—"),
+          sideShort: text(entry.side, "").toUpperCase() === "SHORT",
+          quantity: entry.quantity,
+          entryPrice: entry.entry_price,
+          exitPrice: entry.exit_price,
+          grossMicros,
+          brokerage,
+          tax,
+          exchange,
+          gst,
+          stamp,
+          other,
+          costMicros,
+          netMicros,
+          rMultiple: safeNumber(entry.r_multiple, 0),
+          outcomeText: text(entry.outcome, "—"),
+          outcomeWin: text(entry.outcome, "").toUpperCase() === "WIN",
+          setup: text(entry.setup_strategy, "—"),
+          workspace: text(entry.workspace, ""),
         };
       }),
     [filtered],
@@ -389,84 +522,9 @@ export function LogbookPage({ mode }: PageProps) {
               "TAGS",
             ]}
           >
-            {filtered.map((entry, index) => {
-              const statutory = asRecord(entry.statutory_cost);
-              const components = rowsOf(statutory.components, ["components"]);
-              const costMicros = numberAt(entry, ["cost_drag_micros"], toMicros(entry.cost_drag));
-              const grossMicros = toMicros(entry.gross_pnl);
-              const netMicros = toMicros(entry.net_pnl);
-              const rMultiple = safeNumber(entry.r_multiple, 0);
-              const brokerage = legMicros(components, BROKERAGE_LEGS);
-              const tax = legMicros(components, TAX_LEGS);
-              const exchange = legMicros(components, EXCHANGE_LEGS);
-              const gst = legMicros(components, GST_LEGS);
-              const stamp = legMicros(components, STAMP_LEGS);
-              const other = Math.max(0, costMicros - brokerage - tax - exchange - gst - stamp);
-              return (
-                <Row
-                  key={`${text(entry.entry_id, "entry")}-${index}`}
-                  tone={netMicros > 0 ? "bull" : netMicros < 0 ? "bear" : undefined}
-                >
-                  <Cell mono className="whitespace-nowrap">
-                    {clockNs(entry.recorded_at_ns)}
-                  </Cell>
-                  <Cell mono className="font-semibold text-ink">
-                    {text(entry.symbol)}
-                  </Cell>
-                  <Cell>
-                    <Badge tone={text(entry.side, "").toUpperCase() === "SHORT" ? "bear" : "bull"}>
-                      {text(entry.side, "—")}
-                    </Badge>
-                  </Cell>
-                  <Cell align="right">{num(entry.quantity, 2)}</Cell>
-                  <Cell align="right" mono>
-                    {num(entry.entry_price, 2)}
-                  </Cell>
-                  <Cell align="right" mono>
-                    {num(entry.exit_price, 2)}
-                  </Cell>
-                  <Cell align="right" tone={grossMicros >= 0 ? "bull" : "bear"}>
-                    {usdSigned(grossMicros)}
-                  </Cell>
-                  <Cell align="right" tone="muted">
-                    {usd(brokerage)}
-                  </Cell>
-                  <Cell align="right" tone="muted">
-                    {usd(tax)}
-                  </Cell>
-                  <Cell align="right" tone="muted">
-                    {usd(exchange)}
-                  </Cell>
-                  <Cell align="right" tone="muted">
-                    {usd(gst)}
-                  </Cell>
-                  <Cell align="right" tone="muted">
-                    {usd(stamp)}
-                  </Cell>
-                  <Cell align="right" tone="muted">
-                    {usd(other)}
-                  </Cell>
-                  <Cell align="right" tone="bear">
-                    {usd(costMicros)}
-                  </Cell>
-                  <Cell align="right" tone={netMicros >= 0 ? "bull" : "bear"} className="font-semibold">
-                    {usdSigned(netMicros)}
-                  </Cell>
-                  <Cell align="right" tone={rMultiple >= 1 ? "bull" : rMultiple < 0 ? "bear" : "muted"}>
-                    {num(rMultiple, 2)}
-                  </Cell>
-                  <Cell className="text-[9.5px] text-ink-3">
-                    <div className="flex flex-wrap items-center gap-1">
-                      <Badge tone={text(entry.outcome, "").toUpperCase() === "WIN" ? "bull" : "muted"}>
-                        {text(entry.outcome, "—")}
-                      </Badge>
-                      <span className="font-mono">{text(entry.setup_strategy, "—")}</span>
-                      <span>{text(entry.workspace, "")}</span>
-                    </div>
-                  </Cell>
-                </Row>
-              );
-            })}
+            {rows.map((row) => (
+              <LogbookRow key={row.key} row={row} />
+            ))}
           </Table>
         )}
       </Card>

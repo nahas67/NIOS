@@ -55,15 +55,18 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, ClassVar, Iterable, Iterator, Literal, Mapping
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES, GZipMiddleware
 
+from core import json_codec
 from core.instrument_registry import (
     MICROS,
     SILO_IDS,
@@ -87,7 +90,7 @@ from core.schemas import (
     VaultName,
     PlainEnglishCockpitCard,
 )
-from core.telemetry import gateway_telemetry
+from core.telemetry import LatencyASGIMiddleware, gateway_telemetry
 from ring0_vault.kernel.firewalls_and_oms import (
     ADR009ReduceOnlyFastPath,
     ExecutionEvent,
@@ -138,7 +141,6 @@ from ring3_cockpit.gateway.payload_envelope import (
 )
 from ring3_cockpit.gateway.telemetry_views import (
     adwin_drift_payload,
-    latency_already_recorded,
     request_started_ns_of,
     telemetry_fields,
 )
@@ -10142,6 +10144,71 @@ async def autopilot_paper_loop(
         control.end_autopilot_tape()
 
 
+# ---------------------------------------------------------------------------
+# V2.4 PART 3.2 / 3.3 -- transport compression and immutable asset caching
+# ---------------------------------------------------------------------------
+
+#: Static assets Vite emits with a content hash in the filename. They can never
+#: change under the same URL, so the browser may keep them for a year.
+CACHE_CONTROL_IMMUTABLE: str = "public, max-age=31536000, immutable"
+
+#: ``index.html`` and every SPA route answer: revalidate every time, because the
+#: HTML is what points at the current hashed bundle.
+CACHE_CONTROL_REVALIDATE: str = "no-cache"
+
+#: Unhashed static files (images, fonts, favicons): conservative one hour.
+CACHE_CONTROL_STATIC: str = "public, max-age=3600"
+
+#: Media types that must never be gzipped. Starlette's defaults are preserved
+#: and ``text/event-stream`` is named explicitly: an SSE frame must reach the
+#: client byte-for-byte and immediately.
+_GZIP_EXCLUDED_CONTENT_TYPES: tuple[str, ...] = tuple(
+    dict.fromkeys((*DEFAULT_EXCLUDED_CONTENT_TYPES, "text/event-stream"))
+)
+
+
+def _static_cache_control(path: Path | str) -> str:
+    """Cache policy for one **URL-relative** static path.
+
+    ``assets/index-BSyqsIEm.js`` -> one year, immutable (the hash is the
+    identity). ``index.html``, any ``*.html`` and any extension-less path (an
+    SPA route such as ``cockpit/orders`` or ``/``) -> ``no-cache`` so a deploy
+    is picked up on the next navigation. Anything else -> one hour.
+
+    Kept as a free function so the policy is unit-testable without an app, a
+    client or a filesystem.
+    """
+    segments = [
+        part
+        for part in PurePosixPath(str(path).replace("\\", "/")).parts
+        if part not in ("", ".", "..")
+    ]
+    if segments and segments[0].lower() == "assets":
+        return CACHE_CONTROL_IMMUTABLE
+    name = segments[-1].lower() if segments else ""
+    # No name at all ("/") or no extension ("cockpit/orders") is a document
+    # route, never a hashed asset: it must revalidate.
+    if not name or "." not in name or name.endswith(".html"):
+        return CACHE_CONTROL_REVALIDATE
+    return CACHE_CONTROL_STATIC
+
+
+class _CachedStaticFiles(StaticFiles):
+    """``StaticFiles`` that stamps the same Cache-Control policy as the SPA route.
+
+    ``StaticFiles`` sets ``ETag``/``Last-Modified`` but no ``Cache-Control``, so
+    a browser re-validates every hashed bundle on every load. This subclass adds
+    the header from :func:`_static_cache_control` and changes nothing else --
+    range requests, path traversal protection and 404 behaviour are inherited.
+    """
+
+    async def get_response(self, path: str, scope: Any) -> Response:
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 206, 304):
+            response.headers.setdefault("cache-control", _static_cache_control(path))
+        return response
+
+
 def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -> FastAPI:
     """Build the Ring 3 ASGI app around an existing control plane.
 
@@ -10224,30 +10291,21 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
     )
     app.state.control = control
 
-    #: V2.3 PART 3: every HTTP request is one real Ring 3 latency sample.  The
-    #: span is opened before the route runs and closed when the response is
-    #: produced; a handler that already recorded the in-flight span (the
-    #: telemetry surfaces, so their own payload carries a real number) sets
+    #: V2.4 PART 3.1: every HTTP request is one real Ring 3 latency sample.
+    #: This is a **pure ASGI** middleware (``LatencyASGIMiddleware``), not a
+    #: ``BaseHTTPMiddleware``: no task group, no anyio memory-object stream, no
+    #: body pump.  It stamps ``scope["state"]["nios_telemetry_started_ns"]``
+    #: before the route runs and records when ``http.response.start`` is sent,
+    #: so the 60 fps SSE hub is measured from first frame and never delayed.
+    #: A handler that already recorded the in-flight span (the telemetry
+    #: surfaces, so their own payload carries a real number) sets
     #: ``request.state.nios_latency_recorded`` and is not double-counted.
-    @app.middleware("http")
-    async def _latency_middleware(request: Request, call_next: Any) -> Any:
-        started_ns = time.perf_counter_ns()
-        request.state.nios_telemetry_started_ns = started_ns
-        try:
-            response = await call_next(request)
-        except Exception:
-            gateway_telemetry().record(
-                3,
-                time.perf_counter_ns() - started_ns,
-                metric="http_request_error",
-            )
-            raise
-        if not latency_already_recorded(request):
-            gateway_telemetry().record(
-                3, time.perf_counter_ns() - started_ns, metric="http_request"
-            )
-            request.state.nios_latency_recorded = True
-        return response
+    app.add_middleware(
+        LatencyASGIMiddleware,
+        ring=3,
+        metric="http_request",
+        error_metric="http_request_error",
+    )
 
     #: V1.6: every cockpit/workspace payload carries the deterministic
     #: envelope (schema_version, generated_at_ns, clean_slate_active,
@@ -10291,7 +10349,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         async for chunk in response.body_iterator:
             raw += chunk
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            payload = json_codec.loads(raw)
         except (ValueError, UnicodeDecodeError):  # pragma: no cover - defensive
             return Response(
                 content=raw,
@@ -10326,7 +10384,7 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             ),
             risk=risk,
         )
-        body = json.dumps(enriched, default=str, ensure_ascii=True).encode("utf-8")
+        body = json_codec.dumps_bytes(enriched)
         headers = {
             key: value
             for key, value in response.headers.items()
@@ -10339,6 +10397,30 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             headers=headers,
             media_type="application/json",
         )
+
+    #: V2.4 PART 3.2: transport compression, registered so the envelope rewrite
+    #: happens **before** compression in the stack
+    #: (``csrf -> gzip -> envelope -> latency -> cors -> router``).
+    #:
+    #: ``text/event-stream`` is excluded, so ``GET /api/v2/stream`` sends its
+    #: head and every frame through untouched -- no buffering, no compressor,
+    #: no ``content-encoding`` header.  The rest of Starlette's default media
+    #: exclusions (``image/*``, ``video/*``, woff2, zip, grpc) are preserved
+    #: explicitly: re-compressing a PNG is pure CPU for zero bytes saved, and
+    #: dropping them by passing only ``("text/event-stream",)`` would silently
+    #: gzip the cockpit's JPEG/PNG assets.
+    #:
+    #: ``compresslevel=6`` instead of Starlette's default ``9``: level 9 is
+    #: ~2.5x more CPU for ~2% smaller bytes, and a 52 KB catalogue is compressed
+    #: **inline on the event loop** (Starlette only offloads bodies above
+    #: ``thread_minimum_size``, 128 KiB).  Measured on this gateway, level 9
+    #: made ``GET /api/v2/instruments`` slower than not compressing at all.
+    app.add_middleware(
+        GZipMiddleware,
+        minimum_size=1024,
+        compresslevel=6,
+        exclude_content_types=_GZIP_EXCLUDED_CONTENT_TYPES,
+    )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(
@@ -10859,8 +10941,14 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
         tv_ticker: str | None = None,
         limit: int = Query(default=50, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-    ) -> dict[str, Any]:
-        return control.instrument_catalog(
+    ) -> Response:
+        # V2.4 PART 3.4: the catalogue is the largest JSON document the gateway
+        # serves (>250 KB at the default page), so it is serialised once on the
+        # fast codec instead of twice through ``jsonable_encoder`` +
+        # ``JSONResponse``. ``iso_datetime=True`` keeps FastAPI's own datetime
+        # rendering, and the payload is plain str/int/float/bool/None, so the
+        # bytes are semantically identical to the previous dict return.
+        payload = control.instrument_catalog(
             silo=silo,
             asset_class=asset_class,
             sector=sector,
@@ -10869,6 +10957,10 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
             tv_ticker=tv_ticker,
             limit=limit,
             offset=offset,
+        )
+        return Response(
+            content=json_codec.dumps_bytes(payload, iso_datetime=True),
+            media_type="application/json",
         )
 
     @app.get("/api/v2/instruments/{symbol}")
@@ -11384,16 +11476,27 @@ def create_app(control: ControlPlane, *, static_dir: str | Path | None = None) -
                         status_code=404, detail="Not Found"
                     ) from None
                 if candidate.is_file():
-                    return FileResponse(candidate)
-            return FileResponse(index_html, media_type="text/html")
-        return Response(content=_headless_html(), media_type="text/html")
+                    return FileResponse(
+                        candidate,
+                        headers={
+                            "cache-control": _static_cache_control(full_path)
+                        },
+                    )
+            return FileResponse(
+                index_html,
+                media_type="text/html",
+                headers={"cache-control": CACHE_CONTROL_REVALIDATE},
+            )
+        return Response(
+            content=_headless_html(),
+            media_type="text/html",
+            headers={"cache-control": CACHE_CONTROL_REVALIDATE},
+        )
 
     if bundle.is_dir():
-        from fastapi.staticfiles import StaticFiles
-
         app.mount(
             "/",
-            StaticFiles(directory=str(bundle), html=True),
+            _CachedStaticFiles(directory=str(bundle), html=True),
             name="cockpit-ui",
         )
 

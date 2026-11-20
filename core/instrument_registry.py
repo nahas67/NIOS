@@ -42,7 +42,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, ClassVar, Iterable, Mapping
+from typing import Any, ClassVar, Iterable, Mapping, Sequence
 
 __all__ = [
     "MICROS",
@@ -398,13 +398,42 @@ class InstrumentCheck:
 
 
 class InstrumentRegistry:
-    """Read-only, deterministic registry of every canonical instrument."""
+    """Read-only, deterministic registry of every canonical instrument.
+
+    V2.4 PART 2: the catalogue is immutable once built, so every filter key
+    ``GET /api/v2/instruments`` accepts is pre-indexed at construction instead
+    of being re-derived by a linear scan (and a re-normalised ``str.strip().upper()``
+    per spec) on each request.  The indexes are derived *views*: ``add`` is the
+    only mutator and it marks them dirty, so a hand-built registry stays
+    consistent and the public surface keeps returning the same rows in the same
+    order.
+    """
 
     SCHEMA_VERSION: ClassVar[str] = "v1.7.instrument-registry"
 
     def __init__(self, specs: Iterable[InstrumentSpec] = ()) -> None:
         self._by_key: dict[tuple[str, str], InstrumentSpec] = {}
         self._by_symbol: dict[str, list[InstrumentSpec]] = {}
+        # -- V2.4 PART 2 indexes (rebuilt lazily after a mutation) ---------
+        self._index_dirty = True
+        #: Insertion order per silo -- exactly what ``by_silo`` always returned.
+        self._idx_silo_insertion: dict[str, tuple[InstrumentSpec, ...]] = {}
+        #: ``(silo, symbol)``-ranked candidates per filter value.  Every tuple is
+        #: a subsequence of the canonical ranking, so filtering one keeps the
+        #: documented order without a per-request sort.
+        self._idx_ranked: tuple[InstrumentSpec, ...] = ()
+        self._idx_ranked_by_silo: dict[str, tuple[InstrumentSpec, ...]] = {}
+        self._idx_ranked_by_asset_class: dict[str, tuple[InstrumentSpec, ...]] = {}
+        self._idx_ranked_by_sector: dict[str, tuple[InstrumentSpec, ...]] = {}
+        self._idx_ranked_optionable: tuple[InstrumentSpec, ...] = ()
+        self._idx_ranked_non_optionable: tuple[InstrumentSpec, ...] = ()
+        self._idx_by_tv_ticker: dict[str, InstrumentSpec] = {}
+        self._idx_search: dict[str, tuple[str, ...]] = {}
+        self._idx_symbols: tuple[str, ...] = ()
+        self._idx_symbols_by_silo: dict[str, tuple[str, ...]] = {}
+        self._idx_counts: dict[str, int] = {}
+        self._idx_sectors: dict[str | None, dict[str, int]] = {}
+        self._idx_asset_classes: dict[str | None, dict[str, int]] = {}
         for spec in specs:
             self.add(spec)
 
@@ -421,7 +450,97 @@ class InstrumentRegistry:
             )
         self._by_key[key] = spec
         self._by_symbol.setdefault(spec.symbol, []).append(spec)
+        self._index_dirty = True
         return spec
+
+    # -- indexes (V2.4 PART 2) ---------------------------------------------
+    def _ensure_indexes(self) -> None:
+        """Build every derived lookup exactly once per catalogue revision."""
+
+        if not self._index_dirty:
+            return
+        ranked = tuple(sorted(self._by_key.values(), key=lambda s: (s.silo, s.symbol)))
+        self._idx_ranked = ranked
+
+        silo_insertion: dict[str, list[InstrumentSpec]] = {}
+        by_silo: dict[str, list[InstrumentSpec]] = {}
+        by_class: dict[str, list[InstrumentSpec]] = {}
+        by_sector: dict[str, list[InstrumentSpec]] = {}
+        optionable: list[InstrumentSpec] = []
+        non_optionable: list[InstrumentSpec] = []
+        tickers: dict[str, InstrumentSpec] = {}
+        search: dict[str, tuple[str, ...]] = {}
+        for (owner, _), spec in self._by_key.items():
+            silo_insertion.setdefault(owner, []).append(spec)
+        for spec in ranked:
+            by_silo.setdefault(spec.silo, []).append(spec)
+            by_class.setdefault(spec.asset_class, []).append(spec)
+            by_sector.setdefault(spec.sector, []).append(spec)
+            if spec.has_options:
+                optionable.append(spec)
+            else:
+                non_optionable.append(spec)
+            tickers[spec.tradingview_ticker] = spec
+            search[spec.symbol] = (
+                spec.symbol.lower(),
+                spec.display_name.lower(),
+                spec.sub_category.lower(),
+                spec.sector.lower(),
+                spec.asset_class.lower(),
+                spec.venue.lower(),
+                spec.isin_or_id.lower(),
+                spec.tradingview_ticker.lower(),
+            )
+        self._idx_silo_insertion = {
+            silo: tuple(rows) for silo, rows in silo_insertion.items()
+        }
+        self._idx_ranked_by_silo = {silo: tuple(rows) for silo, rows in by_silo.items()}
+        self._idx_ranked_by_asset_class = {
+            token: tuple(rows) for token, rows in by_class.items()
+        }
+        self._idx_ranked_by_sector = {
+            token: tuple(rows) for token, rows in by_sector.items()
+        }
+        self._idx_ranked_optionable = tuple(optionable)
+        self._idx_ranked_non_optionable = tuple(non_optionable)
+        self._idx_by_tv_ticker = tickers
+        self._idx_search = search
+        self._idx_symbols = tuple(sorted(self._by_symbol))
+        self._idx_symbols_by_silo = {
+            silo: tuple(sorted({spec.symbol for spec in rows}))
+            for silo, rows in silo_insertion.items()
+        }
+        self._idx_counts = {
+            silo: len(self._idx_silo_insertion.get(silo, ())) for silo in SILO_IDS
+        }
+        self._idx_sectors = {}
+        self._idx_asset_classes = {}
+        for scope, pool in (
+            (None, ranked),
+            *((silo, tuple(rows)) for silo, rows in by_silo.items()),
+        ):
+            sector_histogram: dict[str, int] = {}
+            class_histogram: dict[str, int] = {}
+            for spec in pool:
+                sector_histogram[spec.sector] = sector_histogram.get(spec.sector, 0) + 1
+                class_histogram[spec.asset_class] = (
+                    class_histogram.get(spec.asset_class, 0) + 1
+                )
+            self._idx_sectors[scope] = {
+                key: sector_histogram[key] for key in sorted(sector_histogram)
+            }
+            self._idx_asset_classes[scope] = {
+                key: class_histogram[key] for key in sorted(class_histogram)
+            }
+        self._index_dirty = False
+
+    #: Read-only view of every optionable symbol (V2.4 PART 2).  ``by_silo`` and
+    #: ``by_symbol`` are already public *methods*, so the equivalent immutable
+    #: dicts stay private and are surfaced through the accessors below.
+    @property
+    def optionable_symbols(self) -> frozenset[str]:
+        self._ensure_indexes()
+        return frozenset(spec.symbol for spec in self._idx_ranked_optionable)
 
     # -- queries -----------------------------------------------------------
     def get(self, silo: str, symbol: str) -> InstrumentSpec:
@@ -485,38 +604,35 @@ class InstrumentRegistry:
 
     def by_silo(self, silo: str) -> tuple[InstrumentSpec, ...]:
         token = str(silo).strip().upper()
-        return tuple(
-            spec for (owner, _), spec in self._by_key.items() if owner == token
-        )
+        self._ensure_indexes()
+        return self._idx_silo_insertion.get(token, ())
 
     def all(self) -> tuple[InstrumentSpec, ...]:
         return tuple(self._by_key.values())
 
     def symbols(self, silo: str | None = None) -> tuple[str, ...]:
+        self._ensure_indexes()
         if silo is None:
-            return tuple(sorted(self._by_symbol))
-        return tuple(sorted({spec.symbol for spec in self.by_silo(silo)}))
+            return self._idx_symbols
+        return self._idx_symbols_by_silo.get(str(silo).strip().upper(), ())
 
     def counts(self) -> dict[str, int]:
-        return {silo: len(self.by_silo(silo)) for silo in SILO_IDS}
+        self._ensure_indexes()
+        return dict(self._idx_counts)
 
     def total(self) -> int:
         return len(self._by_key)
 
     def sectors(self, silo: str | None = None) -> dict[str, int]:
         """Sorted sector -> instrument-count histogram (optionally per silo)."""
-        pool = self.by_silo(silo) if silo is not None else self.all()
-        histogram: dict[str, int] = {}
-        for spec in pool:
-            histogram[spec.sector] = histogram.get(spec.sector, 0) + 1
-        return {key: histogram[key] for key in sorted(histogram)}
+        self._ensure_indexes()
+        scope = None if silo is None else str(silo).strip().upper()
+        return dict(self._idx_sectors.get(scope, {}))
 
     def asset_classes(self, silo: str | None = None) -> dict[str, int]:
-        pool = self.by_silo(silo) if silo is not None else self.all()
-        histogram: dict[str, int] = {}
-        for spec in pool:
-            histogram[spec.asset_class] = histogram.get(spec.asset_class, 0) + 1
-        return {key: histogram[key] for key in sorted(histogram)}
+        self._ensure_indexes()
+        scope = None if silo is None else str(silo).strip().upper()
+        return dict(self._idx_asset_classes.get(scope, {}))
 
     def query(
         self,
@@ -535,6 +651,13 @@ class InstrumentRegistry:
         The stable ordering is ``(silo, symbol)`` so two identical calls always
         return the identical page, and an ``offset`` walk never skips or repeats
         a row even when the registry is rebuilt.
+
+        V2.4 PART 2: the filter tokens are normalised once per call and the
+        candidate set starts from the narrowest pre-built index (ticker, then
+        silo, then asset class, then optionability, then sector), so the common
+        request touches tens of rows instead of re-scanning and re-sorting all
+        274.  Every index tuple is already in canonical order, which is what
+        keeps the payload byte-identical to the linear scan.
         """
         limit = int(limit)
         offset = int(offset)
@@ -543,18 +666,49 @@ class InstrumentRegistry:
         if offset < 0:
             raise ValueError("offset must be >= 0")
 
-        rows = [
-            spec
-            for spec in sorted(self._by_key.values(), key=lambda s: (s.silo, s.symbol))
-            if spec.matches(
-                silo=silo,
-                asset_class=asset_class,
-                sector=sector,
-                has_options=has_options,
-                search=search,
-            )
-            and (tv_ticker is None or spec.tradingview_ticker == str(tv_ticker).strip().upper())
-        ]
+        self._ensure_indexes()
+        silo_token = None if silo is None else str(silo).strip().upper()
+        class_token = None if asset_class is None else str(asset_class).strip().upper()
+        sector_token = None if sector is None else str(sector).strip()
+        # ``matches`` compared against ``bool(has_options)`` with ``is``: a
+        # truthy non-bool (``1``) therefore behaved like ``False``, and that
+        # quirk is preserved rather than silently reinterpreted.
+        option_flag = None if has_options is None else bool(has_options)
+        ticker_token = None if tv_ticker is None else str(tv_ticker).strip().upper()
+        needle = str(search).strip().lower() if search else ""
+
+        if ticker_token is not None:
+            hit = self._idx_by_tv_ticker.get(ticker_token)
+            candidates: Sequence[InstrumentSpec] = () if hit is None else (hit,)
+        elif silo_token is not None:
+            candidates = self._idx_ranked_by_silo.get(silo_token, ())
+        elif class_token is not None:
+            candidates = self._idx_ranked_by_asset_class.get(class_token, ())
+        elif option_flag is True:
+            candidates = self._idx_ranked_optionable
+        elif option_flag is False:
+            candidates = self._idx_ranked_non_optionable
+        elif sector_token is not None:
+            candidates = self._idx_ranked_by_sector.get(sector_token, ())
+        else:
+            candidates = self._idx_ranked
+
+        search_index = self._idx_search
+        rows: list[InstrumentSpec] = []
+        for spec in candidates:
+            if silo_token is not None and spec.silo != silo_token:
+                continue
+            if class_token is not None and spec.asset_class != class_token:
+                continue
+            if sector_token is not None and spec.sector != sector_token:
+                continue
+            if option_flag is not None and spec.has_options is not option_flag:
+                continue
+            if needle and not any(needle in field for field in search_index[spec.symbol]):
+                continue
+            if ticker_token is not None and spec.tradingview_ticker != ticker_token:
+                continue
+            rows.append(spec)
         page = rows[offset : offset + limit]
         silo_counts: dict[str, int] = {silo_id: 0 for silo_id in SILO_IDS}
         for spec in rows:
@@ -567,14 +721,12 @@ class InstrumentRegistry:
             "has_more": offset + len(page) < len(rows),
             "silo_counts": silo_counts,
             "filters": {
-                "silo": None if silo is None else str(silo).strip().upper(),
-                "asset_class": (
-                    None if asset_class is None else str(asset_class).strip().upper()
-                ),
-                "sector": None if sector is None else str(sector).strip(),
+                "silo": silo_token,
+                "asset_class": class_token,
+                "sector": sector_token,
                 "search": None if search is None else str(search).strip(),
                 "has_options": has_options,
-                "tv_ticker": None if tv_ticker is None else str(tv_ticker).strip().upper(),
+                "tv_ticker": ticker_token,
             },
             "items": page,
         }

@@ -20,11 +20,9 @@ line, and then stays alive until SIGTERM.
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -49,6 +47,25 @@ __all__ = [
     "run_smoke",
     "run_server",
 ]
+
+# ``tempfile`` costs ~16 ms of module import (it pulls ``shutil``, ``random``,
+# ``bz2``, ``lzma`` and ``weakref`` with it) and is only ever needed once a
+# runtime is actually being built.  A ``--port``/``--help`` invocation, or any
+# module that merely imports this launcher, must not pay for it: ``main()``
+# parses arguments from a deferred ``argparse`` and every scratch directory
+# comes from this getter.
+_TEMPFILE: Any = None
+
+
+def _tempfile():
+    """The ``tempfile`` module, imported the first time a scratch dir is needed."""
+    global _TEMPFILE
+    if _TEMPFILE is None:
+        import tempfile
+
+        _TEMPFILE = tempfile
+    return _TEMPFILE
+
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
@@ -118,7 +135,7 @@ def build_runtime(
     resolved = (
         Path(workspace)
         if workspace is not None
-        else Path(tempfile.mkdtemp(prefix="nios-runtime-"))
+        else Path(_tempfile().mkdtemp(prefix="nios-runtime-"))
     )
     return NIOSCoreOrchestrator(
         workspace=resolved,
@@ -164,7 +181,7 @@ def install_scratch_operator_vault() -> Path:
         reset_operator_auth_singleton,
     )
 
-    root = Path(tempfile.mkdtemp(prefix="nios-script-operator-"))
+    root = Path(_tempfile().mkdtemp(prefix="nios-script-operator-"))
     os.environ["NIOS_OPERATOR_AUTH_DIR"] = str(root)
     reset_operator_auth_singleton()
     return root
@@ -388,7 +405,7 @@ def run_smoke(
 
             provisioner = runtime.tb_pg_provisioner or TigerBeetlePG16Provisioner()
             formatted = provisioner.format_temporary_replica(
-                Path(tempfile.mkdtemp(prefix="nios-smoke-tb-"))
+                Path(_tempfile().mkdtemp(prefix="nios-smoke-tb-"))
             )
             status = provisioner.status()
             assert status["tigerbeetle"]["found"], status["tigerbeetle"]
@@ -553,7 +570,7 @@ def run_smoke(
             from core.schemas import VaultName
             from ring0_vault.ibor.ledger_outbox import IBORLedger, LedgerStore
 
-            recovery_dir = tempfile.mkdtemp(prefix="nios-smoke-recovery-")
+            recovery_dir = _tempfile().mkdtemp(prefix="nios-smoke-recovery-")
             path = os.path.join(recovery_dir, "ledger.sqlite3")
             store = LedgerStore(path, probe=False)
             ledger = IBORLedger(store, silos=["CRYPTO_BINANCE"])
@@ -599,7 +616,7 @@ def run_smoke(
                 TestnetExecutionBridge,
             )
 
-            sandbox_dir = tempfile.mkdtemp(prefix="nios-smoke-testnet-")
+            sandbox_dir = _tempfile().mkdtemp(prefix="nios-smoke-testnet-")
             store = LedgerStore(os.path.join(sandbox_dir, "ledger.sqlite3"), probe=False)
             ledger = IBORLedger(store, silos=["CRYPTO_BINANCE"])
             ledger.open_silo("CRYPTO_BINANCE", funding_micros=10_000_000_000)
@@ -932,6 +949,10 @@ def run_multiprocess(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Deferred: ``argparse`` is ~4 ms of import and is only needed once the
+    # process actually parses a command line.
+    import argparse
+
     parser = argparse.ArgumentParser(
         prog="run_nios.py",
         description="Unified NIOS 4-ring production server and smoke test.",

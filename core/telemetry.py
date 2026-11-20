@@ -40,6 +40,7 @@ __all__ = [
     "GATEWAY_TELEMETRY_SCHEMA",
     "GatewayLatencySpan",
     "GatewayTelemetryTracker",
+    "LatencyASGIMiddleware",
     "QUANTILE_KEYS",
     "TickLatencyRecorder",
     "TICK_LATENCY",
@@ -475,3 +476,94 @@ def reset_gateway_telemetry() -> GatewayTelemetryTracker:
     tracker.reset()
     return tracker
 
+
+# ===========================================================================
+# V2.4 -- pure ASGI Ring 3 latency middleware
+# ===========================================================================
+
+
+#: Scope key the handlers read through ``request.state.nios_telemetry_started_ns``.
+_STATE_STARTED = "nios_telemetry_started_ns"
+
+#: Scope key a handler sets when it already recorded its own in-flight span.
+_STATE_RECORDED = "nios_latency_recorded"
+
+
+class LatencyASGIMiddleware:
+    """One real Ring 3 latency sample per HTTP request -- no body buffering.
+
+    This replaces the Starlette ``@app.middleware("http")`` hook from V2.3.
+    That hook is a :class:`starlette.middleware.base.BaseHTTPMiddleware` under
+    the hood, which spawns a task group and pumps the response body through an
+    anyio memory-object stream for **every** request.  A 60 fps SSE hub paid
+    that cost on every frame even though it only needs a stamp.
+
+    The pure-ASGI contract here is narrow on purpose:
+
+    * ``scope["type"] != "http"`` is forwarded untouched (``lifespan``,
+      ``websocket``) before anything is measured;
+    * ``scope["state"]`` is created if missing and stamped with
+      ``nios_telemetry_started_ns``, so ``request.state.nios_telemetry_started_ns``
+      keeps working for :mod:`ring3_cockpit.gateway.telemetry_views`;
+    * the sample is recorded when ``http.response.start`` is sent.  For a
+      normal response that is the response head; for SSE it is the first frame
+      header, so a stream is measured from first byte and never delayed;
+    * ``receive`` is never wrapped and no body bytes are copied: the pass-through
+      path allocates one closure and nothing else;
+    * a handler that records its own span first sets
+      ``state["nios_latency_recorded"] = True`` and is not double-counted;
+    * an exception records ``error_metric`` and is re-raised unchanged.
+    """
+
+    __slots__ = ("app", "error_metric", "metric", "ring")
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        ring: int = 3,
+        metric: str = "http_request",
+        error_metric: str = "http_request_error",
+    ) -> None:
+        self.app = app
+        self.ring = int(ring)
+        self.metric = str(metric)
+        self.error_metric = str(error_metric)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        state = scope.get("state")
+        if state is None:
+            state = {}
+            scope["state"] = state
+        started_ns = time.perf_counter_ns()
+        state[_STATE_STARTED] = started_ns
+
+        recorded = False
+
+        async def send_with_latency(message: Any) -> None:
+            nonlocal recorded
+            if not recorded and message.get("type") == "http.response.start":
+                recorded = True
+                if not state.get(_STATE_RECORDED, False):
+                    state[_STATE_RECORDED] = True
+                    gateway_telemetry().record(
+                        self.ring,
+                        time.perf_counter_ns() - started_ns,
+                        metric=self.metric,
+                    )
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_latency)
+        except Exception:
+            if not recorded:
+                gateway_telemetry().record(
+                    self.ring,
+                    time.perf_counter_ns() - started_ns,
+                    metric=self.error_metric,
+                )
+            raise

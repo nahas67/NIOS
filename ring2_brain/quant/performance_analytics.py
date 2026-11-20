@@ -38,13 +38,17 @@ Formula decisions that matter and are therefore stated explicitly:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
 import time
+from collections import OrderedDict
+from collections.abc import Mapping as _MappingABC
 from typing import Any, Iterable, Mapping, Sequence
 
 __all__ = [
+    "ANALYTICS_CACHE_MAXSIZE",
     "BUCKETS",
     "PerformanceAnalytics",
     "PerformanceRow",
@@ -57,6 +61,15 @@ _NS_PER_SECOND = 1_000_000_000
 
 #: Trading days assumed for annualisation.
 TRADING_DAYS: int = 252
+
+#: V2.4 PART 2 -- bounded report cache.  A cockpit polls the same slice with the
+#: same rows far more often than the rows change, so the metric pass is memoised
+#: against a content revision of the *input*, never against a timestamp.
+ANALYTICS_CACHE_MAXSIZE = 64
+
+_FNV_OFFSET = 0xCBF29CE484222325
+_FNV_PRIME = 0x100000001B3
+_U64 = (1 << 64) - 1
 
 
 def _seal(payload: Mapping[str, Any]) -> str:
@@ -99,7 +112,12 @@ class PerformanceRow(dict):
 class PerformanceAnalytics:
     """Deterministic performance math over handed-in rows (``G8``)."""
 
-    def __init__(self, *, risk_free_annual: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        risk_free_annual: float = 0.0,
+        cache_maxsize: int = ANALYTICS_CACHE_MAXSIZE,
+    ) -> None:
         # A risk-free rate at or below -100% would make ``(1 + rf) ** k`` a complex
         # number (or a ZeroDivision), so it is clamped to something annualisable.
         try:
@@ -109,6 +127,122 @@ class PerformanceAnalytics:
         if not math.isfinite(rate) or rate <= -1.0:
             rate = 0.0
         self.risk_free_annual = rate
+        # -- V2.4 PART 2: bounded, revision-keyed report cache ------------
+        self._cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+        self._cache_maxsize = max(1, int(cache_maxsize))
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
+        #: Bumped by :meth:`invalidate`; part of every key, so a computation that
+        #: was already in flight when the ledger moved can never be reused.
+        self._revision_epoch = 0
+
+    # ------------------------------------------------------------------
+    # Cache surface
+    # ------------------------------------------------------------------
+    def cache_stats(self) -> dict[str, int]:
+        """Counters for the bounded report cache."""
+
+        return {
+            "hits": int(self._cache_hits),
+            "misses": int(self._cache_misses),
+            "entries": len(self._cache),
+            "evictions": int(self._cache_evictions),
+        }
+
+    def cache_clear(self) -> dict[str, int]:
+        """Drop every cached report and reset the counters."""
+
+        self._cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
+        self._revision_epoch += 1
+        return self.cache_stats()
+
+    def invalidate(self, *, reason: str = "") -> dict[str, int]:
+        """Explicit hook for a trade close, a deposit or a workspace reset.
+
+        The cache is already content-keyed, so a changed row set is a miss on
+        its own; this entry point exists for the control plane to *force* a
+        miss on an event that is not visible in the rows (a settlement replay,
+        a ledger repair, a clean slate) and to keep that intent auditable.
+
+        ``reason`` is accepted for the caller's logs and does not alter the
+        payload or the counters.
+        """
+
+        del reason  # documented for operators, deliberately not in any payload
+        return self.cache_clear()
+
+    @staticmethod
+    def _rows_revision(rows: Sequence[Any]) -> str | None:
+        """Cheap, order-sensitive content revision of the *raw* input rows.
+
+        Any edit -- a closed trade, a deposit, an edited NAV, a re-ordered
+        ledger -- changes the accumulator, so a stale report can never be served.
+        The revision is deliberately computed from the raw field values (no
+        re-normalisation): two spellings that ``_rows`` would fold together
+        produce two revisions and therefore at most a redundant cache entry,
+        never a wrong one.
+
+        ``None`` means "not safely revisable" (a non-mapping row, or a field
+        that is not hashable); the caller then takes the uncached path so the
+        canonical ``TypeError`` still comes from ``_rows``.
+
+        The accumulator is a *process-local cache key*, not a published
+        commitment: it mixes Python's salted string hash for the string fields.
+        Equal data therefore always yields an equal revision inside one process,
+        which is the only scope a cache entry lives in; the cross-process
+        commitment remains the sealed ``report_sha256``.
+        """
+
+        accumulator = _FNV_OFFSET
+        count = 0
+        for row in rows:
+            # ``dict`` is the overwhelmingly common case (``PerformanceRow`` is
+            # one); the ABC check only runs for an exotic mapping.
+            if not isinstance(row, dict) and not isinstance(row, _MappingABC):
+                return None
+            try:
+                if type(row) is PerformanceRow:
+                    # Fixed seven-key contract, so the field order is a constant
+                    # and one C-level tuple hash covers the whole row.
+                    fingerprint = hash(tuple(row.values()))
+                else:
+                    fingerprint = hash(
+                        (
+                            row.get("ts_utc_ns"),
+                            row.get("nav_micros"),
+                            row.get("pnl_micros"),
+                            row.get("silo"),
+                            row.get("mission_id"),
+                            row.get("tranche_id"),
+                            row.get("trade_id"),
+                        )
+                    )
+            except TypeError:  # unhashable field value
+                return None
+            count += 1
+            accumulator = ((accumulator ^ fingerprint) * _FNV_PRIME) & _U64
+        body = f"{count}:{accumulator:016x}"
+        return hashlib.blake2b(body.encode("ascii"), digest_size=16).hexdigest()
+
+    def _cache_get(self, key: tuple[Any, ...]) -> dict[str, Any] | None:
+        cached = self._cache.get(key)
+        if cached is None:
+            self._cache_misses += 1
+            return None
+        self._cache.move_to_end(key)
+        self._cache_hits += 1
+        return cached
+
+    def _cache_put(self, key: tuple[Any, ...], template: dict[str, Any]) -> None:
+        self._cache[key] = template
+        self._cache.move_to_end(key)
+        while len(self._cache) > self._cache_maxsize:
+            self._cache.popitem(last=False)
+            self._cache_evictions += 1
 
     # ------------------------------------------------------------------
     # Normalisation
@@ -117,7 +251,10 @@ class PerformanceAnalytics:
     def _rows(rows: Iterable[Any]) -> list[dict[str, Any]]:
         normalised: list[dict[str, Any]] = []
         for row in rows:
-            if isinstance(row, Mapping):
+            # ``dict`` first (``PerformanceRow`` subclasses it); the ABC check is
+            # only paid for an exotic mapping.  ``typing.Mapping`` would run a
+            # generic-alias ``__instancecheck__`` per row for the same answer.
+            if isinstance(row, dict) or isinstance(row, _MappingABC):
                 try:
                     ts = int(row.get("ts_utc_ns", 0))
                 except (TypeError, ValueError):
@@ -347,12 +484,40 @@ class PerformanceAnalytics:
         bucket: str = "1D",
         now_ns: int | None = None,
     ) -> dict[str, Any]:
-        """Build the full performance document for the requested slice."""
+        """Build the full performance document for the requested slice.
+
+        V2.4 PART 2: the metric pass is memoised against a content revision of
+        the input rows, and only the metric pass.  ``as_of_utc_ns`` is always
+        stamped from *this* call (``now_ns`` when the caller supplies one,
+        otherwise the wall clock) and ``report_sha256`` is always re-sealed over
+        the document that is actually returned, so a cached report can never
+        advertise a frozen timestamp or a digest of somebody else's payload.
+        """
         granularity = str(bucket or "1D")
         if granularity not in BUCKETS:
             raise ValueError(f"UNKNOWN_BUCKET:{bucket!r}")
         stamp = int(now_ns if now_ns is not None else time.time_ns())
-        all_rows = self._rows(rows)
+        source = rows if isinstance(rows, (list, tuple)) else list(rows)
+        revision = self._rows_revision(source)
+        cache_key: tuple[Any, ...] | None = None
+        if revision is not None:
+            cache_key = (
+                str(silo).strip().upper() if silo else None,
+                str(mission_id) if mission_id else None,
+                granularity,
+                revision,
+                int(self._revision_epoch),
+            )
+            template = self._cache_get(cache_key)
+            if template is not None:
+                payload = copy.deepcopy(template)
+                payload["as_of_utc_ns"] = stamp
+                payload["report_sha256"] = _seal(
+                    {key: value for key, value in payload.items() if key != "report_sha256"}
+                )
+                return payload
+
+        all_rows = self._rows(source)
         selected = self._filter(all_rows, silo=silo, mission_id=mission_id)
         curve = self._buckets(selected, granularity)
         returns = self._returns(curve)
@@ -404,6 +569,14 @@ class PerformanceAnalytics:
         payload["report_sha256"] = _seal(
             {key: value for key, value in payload.items() if key != "report_sha256"}
         )
+        if cache_key is not None:
+            # The template is the sealed metric document minus the two fields
+            # that are per-call by contract (stamp and seal); they are re-derived
+            # on every hit, in the same insertion order.
+            self._cache_put(
+                cache_key,
+                {key: value for key, value in payload.items() if key != "report_sha256"},
+            )
         return payload
 
     def status(self) -> dict[str, Any]:

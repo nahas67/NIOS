@@ -482,7 +482,7 @@ event.
 ### 1F.7 Release verification for `v3.10.0-V1.9`
 
 ```bash
-python -m pytest tests -q                 # 40 suites, 1015 tests, 0 failed, 0 warnings
+python -m pytest tests -q                 # 41 suites, 1069 tests, 0 failed, 0 warnings
 python scripts/run_nios.py --smoke-test   # ROWS=23, EXIT=0
 python scripts/preflight_golive.py --fast # 23/23 PASS, EXIT=0
 ```
@@ -585,16 +585,20 @@ Verification commands:
 
 ```bash
 python scripts/run_nios.py --smoke-test          # EXIT=0 required, 22 rows
-python -m pytest tests -q                        # 40 suites, 0 failures, 0 warnings
+python -m pytest tests -q                        # 41 suites, 0 failures, 0 warnings
 python scripts/preflight_golive.py --strict      # go-live readiness certificate, 23/23
 python scripts/preflight_golive.py --fast        # replay smoke receipt (interactive), 23/23
 ```
 
-Release seal for `v4.3.0-V2.3`: `pytest tests -q` must report **100% pass across all 40 suites, 0 failed, 0 warnings**
+Release seal for `v4.4.0-V2.4`: `pytest tests -q` must report **100% pass across all 41 suites, 0 failed, 0 warnings**
 and `python scripts/preflight_golive.py --fast` must report **23/23 PASS, EXIT=0**. Both are
 prerequisites for re-tagging; neither may be waived.
 
-### 3.2a The 40-suite inventory
+Release seal for `v4.3.0-V2.3` (previous, retained for history): `pytest tests -q` had to report
+**100% pass across all 40 suites, 0 failed, 0 warnings** and `python scripts/preflight_golive.py --fast`
+had to report **23/23 PASS, EXIT=0**.
+
+### 3.2a The 41-suite inventory
 
 | # | Suite | Covers |
 |---|---|---|
@@ -638,6 +642,7 @@ prerequisites for re-tagging; neither may be waived.
 | 38 | `tests/test_v2_2_final_institutional_terminal_ui.py` | **V2.2** final flat matte institutional terminal: 56 routes across dual `/paper/*` and `/live/*` shells, 17 workstations plus five portals, the `#0D0E10` / `#27292E` hairline palette with zero gradients, shadows, blur or pills, workstation-keyed lazy chunks, session-gated portal redirects, and the compiled bundle manifest |
 | 39 | `tests/test_v2_3_wal_db_compaction_and_episodic_memory.py` | **V2.3** database durability and 3-tier memory: SQLite WAL journal surviving restart with `journal_path` + `database_path`, byte-identical `truth_sha256` across full and compacted `EntityMemoryGraph` compiles with a verified `MemoryCheckpoint` and cold archive, 3-signal hybrid retrieval separating a legacy two-signal tie, `EpisodicMemoryStore` envelope + action filter + bounded compaction, `GET /api/v2/memory/episodes` (empty-safe `200`) and `POST /api/v2/memory/compact` behind `session_guard` + `X-NIOS-CSRF` (`401`/`403`/`200`), WAL memory table wipe on `workspace/reset` and `auth/reset`, 12-table PG16 schema, offline testnet burn-in skip, and Ring 2 memory containment (no Ring 0 signing or socket imports) |
 | 40 | `tests/test_v2_3_telemetry_closure_and_ui_split.py` | **V2.3** telemetry closure and UI split: measured `latency_ms` with p50/p95/p99 sample counts, all four ring `p99` keys, `feed_lag_ms` `IDLE -> LIVE` after a real tick, `pending_intents_count` moving with a real `MAKER_PEG` order, `adwin_drift` advancing one window per closed trade and mirroring `adwin_drift_by_strategy`, `iv_rank_bps` recomputed from its own `MIN_MAX_52W` window with `INSUFFICIENT_HISTORY` instead of a sentinel, supervisor/overview `ring3_p99_ms`, six telemetry fields consumed without placeholder data, LIVE shell free of any shadow-burst control, Agents episodic + `Compact Memory`, the stale 404 hint removed, and 26 built JS chunks (17 pages + 5 portals + entry + vendor + `PortalFrame` + shared) with a proven manual split |
+| 41 | `tests/test_v2_4_performance_and_optimization_budgets.py` | **V2.4** end-to-end optimisation budgets with zero invariant movement: SQLite WAL connection profile (`journal_mode=wal`, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000` plus `cache_size=-65536`, `temp_store=MEMORY`, `mmap_size=268435456`, `wal_autocheckpoint=1000`) read back from the engine, thread-local connection reuse with deterministic teardown, index-driven plans for the three Ring 0 hot lookups with no `USE TEMP B-TREE FOR ORDER BY`, byte-identical document/timeline round-trip through the incremental save path, `reset()`-then-`save()` reopening the pool, pure-ASGI latency middleware that never buffers the SSE stream, `GZipMiddleware` at a 1,024-byte floor excluding `text/event-stream`, `Cache-Control: public, max-age=31536000, immutable` on `/assets/*` and `no-cache` on the SPA shell, canonical JSON hash parity through the codec, byte-identical cached versus cold `EntityMemoryGraph` rankings and `GroundedFactPacket` digests, immediate `PerformanceAnalytics` cache invalidation on trade close / deposit / workspace reset, O(1) instrument-registry lookups, `deque(maxlen=…)` bar history, `stream.ts` market-frame coalescing that still delivers state-critical frames immediately, memoised charts and hot table rows, and a compiled bundle with no chunk at or above 500 kB and zero blur / shadow / gradient / pill primitives |
 
 
 ### 3.3 Chaos / crash injection
