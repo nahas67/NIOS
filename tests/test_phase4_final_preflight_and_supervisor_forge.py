@@ -310,7 +310,7 @@ def test_gate4_regression_inventory_is_forty_suites() -> None:
         for path in (ROOT / "tests").glob("test_*.py")
         if path.is_file()
     )
-    assert len(suites) == 42, suites
+    assert len(suites) == 41, suites
     assert THIS_SUITE in suites
     missing = [name for name in BASELINE_SUITES if name not in suites]
     assert not missing, f"baseline suite(s) removed: {missing}"
@@ -494,26 +494,27 @@ def test_step2_live_cutover_requires_a_green_certificate(
 
 
 def test_step2_headless_document_serves_both_new_controls(cockpit: Any) -> None:
-    """The terminal document served at ``/`` declares the Step 2 surfaces."""
+    """The headless document served at ``/`` declares the Step 2 surfaces."""
     root = cockpit.get("/")
     assert root.status_code == 200
     assert "text/html" in root.headers.get("content-type", "")
-    assert '<script type="module"' in root.text
+    assert "<script" not in root.text.lower()
 
     bundle = ROOT / "ring3_cockpit" / "ui" / "openalgo_shell" / "dist"
     index = bundle / "index.html"
-    assert index.is_file(), "terminal document was not rebuilt"
+    assert index.is_file(), "headless document was not rebuilt"
     document = index.read_text(encoding="utf-8")
     assert "nios-frontend" in document
     assert "nios-release" in document
-    assert "v4.3.0-V2.3" in document
+    assert "v4.6.0-V2.6" in document
+    assert "HEADLESS_API" in document
 
 
 def test_step2_v2_2_toolchain_present_and_terminal_is_served(cockpit: Any) -> None:
-    """V2.2 ships the React 19 terminal; ``GET /`` serves the built document."""
-    assert (FRONTEND / "package.json").exists()
-    assert (FRONTEND / "src").exists()
-    assert (FRONTEND / "vite.config.ts").exists()
+    """V2.6 removed the React terminal; ``GET /`` serves the headless document."""
+    assert not (FRONTEND / "package.json").exists()
+    assert not (FRONTEND / "src").exists()
+    assert not (FRONTEND / "vite.config.ts").exists()
 
     bundle = FRONTEND / "dist"
     index_bytes = (bundle / "index.html").read_bytes()
@@ -522,8 +523,9 @@ def test_step2_v2_2_toolchain_present_and_terminal_is_served(cockpit: Any) -> No
     assert served.status_code == 200
     assert "text/html" in served.headers.get("content-type", "")
     assert served.content == index_bytes
-    assert "<script" in index_html.lower()
-    assert "/assets/" in index_html
+    assert "<script" not in index_html.lower()
+    assert "/assets/" not in index_html
+    assert not (bundle / "assets").exists()
 
 def test_step2_preflight_under_active_autopilot_passes_22_of_22() -> None:
     """Gate 22 must measure the hardware latch, never the tape's GIL slice.
@@ -934,11 +936,11 @@ def test_all_11_cockpit_pages_and_spa_routes_are_served_and_hydrated(
     document = (FRONTEND / "dist" / "index.html").read_text(encoding="utf-8")
     assert "nios-frontend" in document
     assert "nios-release" in document
-    assert "v4.3.0-V2.3" in document
-    assert "<script" in document.lower()
-    assert "/assets/" in document
-    assert (FRONTEND / "src").exists()
-    assert (FRONTEND / "package.json").exists()
+    assert "v4.6.0-V2.6" in document
+    assert "<script" not in document.lower()
+    assert "/assets/" not in document
+    assert not (FRONTEND / "src").exists()
+    assert not (FRONTEND / "package.json").exists()
     titles = {page["title"] for page in payload["pages"]}
     assert len(titles) == 15, titles
     for legacy in (
@@ -1216,12 +1218,13 @@ def test_interactive_workstation_actions_across_pages_on_v1(cockpit: Any) -> Non
         assert isinstance(silo_row["vaults"], dict)
         assert silo_row["vaults"]
 
-    # ------------------------------------------------- terminal document
+    # ------------------------------------------- headless document
     document = (FRONTEND / "dist" / "index.html").read_text(encoding="utf-8")
     assert "nios-frontend" in document
-    assert "V2.2-INSTITUTIONAL-TERMINAL" in document
-    assert '<script type="module"' in document
-    assert "/assets/" in document
+    assert 'content="NONE"' in document
+    assert "HEADLESS_API" in document
+    assert "<script" not in document.lower()
+    assert "/assets/" not in document
     schema = cockpit.get("/openapi.json").json()
     paths = set(schema["paths"])
     for control in (
@@ -1624,12 +1627,12 @@ def test_interactive_verification_brain_and_forge_actions_on_v1(cockpit: Any) ->
     assert forge_page.status_code == 200
     assert forge_page.json()["plugins"]["count"] >= 1
 
-    # --------------------------------------- 7. terminal document + openapi
+    # --------------------------------------- 7. headless document + openapi
     response = cockpit.get("/")
     assert response.status_code == 200
     assert "nios-frontend" in response.text
-    assert '<script type="module"' in response.text
-    assert "/assets/" in response.text
+    assert "<script" not in response.text.lower()
+    assert "/assets/" not in response.text
 
     schema = cockpit.get("/openapi.json").json()
     paths = set(schema["paths"])

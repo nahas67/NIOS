@@ -507,26 +507,29 @@ def run_smoke(
         def ring3_static() -> str:
             index = SMOKE_UI_ROOT / "index.html"
             assert index.exists(), f"missing {index}"
+            assert not (SMOKE_UI_ROOT / "assets").exists(), "compiled asset bundles still ship"
+            assert not (index.parents[1] / "src").exists(), "React sources still ship"
+            assert not (index.parents[1] / "package.json").exists(), "frontend build tooling still ships"
+
             response = client.get("/")
             assert response.status_code == 200, response.text
+            assert "no-cache" in response.headers.get("cache-control", ""), "shell must revalidate"
             document = response.text
-            assert '<script type="module"' in document, "the V2.2 module bundle is not referenced"
-            assert "nios-frontend" in document, "V2.2 terminal marker missing"
-            assert "V2.2-INSTITUTIONAL-TERMINAL" in document, "V2.2 terminal identity missing"
-            assert "/assets/" in document, "the compiled asset bundle is not linked"
+            assert "<script" not in document.lower(), "the headless shell must carry zero scripts"
+            assert "/assets/" not in document, "the headless shell must not link compiled bundles"
+            assert "nios-frontend" in document, "headless marker missing"
+            assert 'content="NONE"' in document, "headless frontend marker missing"
+            assert "HEADLESS_API" in document, "headless mode marker missing"
             assert "backdrop-filter" not in document.lower(), "glass effect leaked into the document"
-            assets = sorted((SMOKE_UI_ROOT / "assets").glob("*"))
-            assert assets, "the compiled frontend bundle is missing"
-            scripts = [path for path in assets if path.suffix == ".js"]
-            sheets = [path for path in assets if path.suffix == ".css"]
-            assert scripts, "no compiled JavaScript asset"
-            assert sheets, "no compiled stylesheet asset"
-            return (
-                "V2.2 institutional terminal served at / "
-                f"({len(scripts)} JavaScript, {len(sheets)} stylesheet asset)"
-            )
 
-        table.check("Unified server V2.2 terminal document", ring3_static)
+            for route in ("/dashboard", "/agents/deep/path"):
+                spa = client.get(route)
+                assert spa.status_code == 200, (route, spa.text)
+                assert "no-cache" in spa.headers.get("cache-control", ""), route
+                assert "<script" not in spa.text.lower(), route
+            return "zero-JavaScript headless shell served at / and every client route (0 JS, 0 CSS)"
+
+        table.check("Unified server headless zero-JS document", ring3_static)
 
         def ring3_mcp_jsonrpc() -> str:
             response = client.post(

@@ -16,10 +16,9 @@ paid for:
   on the SSE stream.
 * Ring 2 hot paths: the cached entity-memory ranking is byte-identical to a
   cold ranking, and the analytics cache invalidates on a workspace reset.
-* Ring 3 frontend runtime: no chunk at or above the 500 kB budget, zero
-  forbidden flat-matte primitives in the shipped CSS, and the stream client
-  still coalesces market bursts while delivering state-critical frames
-  immediately.
+* Ring 3 frontend runtime: the shipped shell is a zero-JavaScript headless
+  document -- no ``src/``, no ``dist/assets/``, no build tooling, and a manifest
+  that declares ``javascript: 0``.
 """
 
 from __future__ import annotations
@@ -51,8 +50,6 @@ SUITE_NAME = "test_v2_4_performance_and_optimization_budgets.py"
 UI_ROOT = ROOT / "ring3_cockpit" / "ui" / "openalgo_shell"
 SRC_ROOT = UI_ROOT / "src"
 DIST_ROOT = UI_ROOT / "dist"
-
-CHUNK_BUDGET_BYTES = 500_000
 
 # The mandatory durability quartet plus the four V2.4 performance pragmas.
 EXPECTED_PRAGMAS = {
@@ -265,62 +262,60 @@ def test_state_journal_reset_then_save_still_works(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Ring 3 -- frontend runtime and shipped-asset budgets
+# Ring 3 -- headless shell and shipped-asset budgets
 # ---------------------------------------------------------------------------
 
 
-def test_no_shipped_chunk_reaches_the_five_hundred_kilobyte_budget() -> None:
-    assets = sorted((DIST_ROOT / "assets").glob("*.js"))
-    assert assets, "the compiled bundle is missing; run `npm run build` before the seal"
+def test_shipped_shell_carries_zero_javascript_and_zero_assets() -> None:
+    assert not (DIST_ROOT / "assets").exists(), "dist/assets/ still ships compiled bundles"
+    assert not SRC_ROOT.exists(), "src/ still ships React/TypeScript sources"
 
-    oversized = {path.name: path.stat().st_size for path in assets if path.stat().st_size >= CHUNK_BUDGET_BYTES}
-    assert oversized == {}, f"chunks at or above {CHUNK_BUDGET_BYTES} bytes: {oversized}"
+    document = (DIST_ROOT / "index.html").read_text(encoding="utf-8")
+    assert document.lower().count("<script") == 0
+    assert "/assets/" not in document
+    assert 'content="HEADLESS_API"' in document
+    assert 'content="NONE"' in document
 
-
-def test_shipped_stylesheet_keeps_the_flat_matte_contract() -> None:
-    stylesheets = sorted((DIST_ROOT / "assets").glob("*.css"))
-    assert stylesheets, "the compiled stylesheet is missing"
-
-    css = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in stylesheets)
-    forbidden = {
-        "blur(": css.count("blur("),
-        "box-shadow": css.count("box-shadow"),
-        "linear-gradient": css.count("linear-gradient"),
-        "radial-gradient": css.count("radial-gradient"),
-        "radius:9999px": css.replace(" ", "").count("border-radius:9999px"),
-    }
-    assert forbidden == dict.fromkeys(forbidden, 0), forbidden
+    manifest = json.loads((DIST_ROOT / "headless-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["frontend"] == "NONE"
+    assert manifest["javascript"] == 0
+    assert manifest["js_assets"] == 0
+    assert manifest["css_assets"] == 0
+    assert manifest["css_framework"] == "NONE"
+    assert manifest["mode"] == "HEADLESS_API"
 
 
-def test_stream_client_coalesces_market_frames_and_never_buffers_control_frames() -> None:
-    source = (SRC_ROOT / "lib" / "stream.ts").read_text(encoding="utf-8")
+def test_shipped_shell_keeps_the_flat_matte_contract() -> None:
+    document = (DIST_ROOT / "index.html").read_text(encoding="utf-8").replace(" ", "").lower()
+    forbidden = (
+        "blur(",
+        "box-shadow",
+        "linear-gradient",
+        "radial-gradient",
+        "border-radius:9999px",
+        "backdrop-filter",
+    )
+    for token in forbidden:
+        assert token not in document, token
 
-    assert "requestAnimationFrame" in source, "market bursts must be coalesced on the frame clock"
-    assert "COALESCE_FALLBACK_MS" in source, "hidden tabs still need a timer fallback"
-    assert "flushNow" in source, "a control frame must flush the buffered market tail first"
 
-    for frame in ("TICK", "DEPTH"):
-        assert frame in source, f"{frame} must be treated as a coalescable market frame"
-    for frame in (
-        "ORDER",
-        "TRANCHE_HALT",
-        "WALLET_SWEEP",
-        "COLD_START_RECON",
-        "SYSTEM_ALERT",
+def test_headless_shell_ships_no_build_tooling() -> None:
+    for name in (
+        "package.json",
+        "package-lock.json",
+        "vite.config.ts",
+        "tsconfig.json",
+        "tsconfig.app.json",
+        "tsconfig.node.json",
+        "postcss.config.mjs",
+        "postcss.flatness.mjs",
+        "biome.json",
+        "index.html",
+        "src",
+        "public",
+        "node_modules",
     ):
-        assert frame in source, f"{frame} must stay state-critical (delivered immediately)"
-
-
-def test_charts_and_hot_tables_are_memoised() -> None:
-    charts = (SRC_ROOT / "charts" / "index.tsx").read_text(encoding="utf-8")
-    assert charts.count("memo(") >= 8, "all eight SVG charts must be memoised"
-    assert "useMemo(" in charts, "chart geometry must be memoised on its data inputs"
-    assert charts.count("displayName") >= 8
-
-    for page in ("ScreenerPage", "LogbookPage", "OrdersPage"):
-        source = (SRC_ROOT / "pages" / f"{page}.tsx").read_text(encoding="utf-8")
-        assert "memo(" in source, f"{page} rows must be memoised"
-        assert "useMemo(" in source, f"{page} derived rows must be memoised"
+        assert not (UI_ROOT / name).exists(), f"{name} still ships build tooling"
 
 
 # ---------------------------------------------------------------------------
@@ -1006,7 +1001,7 @@ def test_analytics_performance_still_parses_after_the_fast_serialiser(cockpit) -
 
 def test_suite41_belongs_to_the_forty_one_suite_release() -> None:
     suites = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(suites) == 42, suites
+    assert len(suites) == 41, suites
     assert SUITE_NAME in suites
     assert "test_v2_3_telemetry_closure_and_ui_split.py" in suites
     assert (ROOT / "tests" / "conftest.py").is_file()
@@ -1016,8 +1011,8 @@ def test_release_documents_advertise_forty_one_suites_and_the_v2_4_seal() -> Non
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "42 suites" in runbook
-    assert "42 suites" in readme
+    assert "41 suites" in runbook
+    assert "41 suites" in readme
     assert "v4.4.0-V2.4" in runbook
     assert "v4.3.0-V2.3" in runbook
     assert SUITE_NAME in runbook

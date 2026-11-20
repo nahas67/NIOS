@@ -150,7 +150,8 @@ def test_v2_2_document_is_flat_matte_terminal() -> None:
     lowered = text.lower()
     for forbidden in ("styled-components", "emotion"):
         assert forbidden not in lowered, forbidden
-    assert "<script" in lowered
+    assert "<script" not in lowered
+    assert "/assets/" not in text
     assert "backdrop-filter" not in lowered
 
 

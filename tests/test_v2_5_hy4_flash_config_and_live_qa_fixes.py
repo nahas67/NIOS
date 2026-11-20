@@ -1,9 +1,10 @@
-"""Suite 42 -- V2.5 hy4-flash-free single-model lock and live human-QA fixes.
+"""Suite 41 -- V2.5 hy4-flash-free single-model lock and backend QA fixes.
 
 The V2.5 pass integrates the operator-supplied ``opencode-g0-api.txt`` at
 runtime ONLY, locks every AI dispatch surface to the single model
-``hy4-flash-free``, and adds regressions for every interactive defect found by
-the live human-tester Playwright pass.
+``hy4-flash-free``, and adds regressions for the interactive defects found by
+the live operator QA pass.  V2.6 removed the React terminal and its Playwright
+driver, so only the backend contracts below remain.
 
 Non-negotiable contracts asserted here:
 
@@ -340,7 +341,7 @@ def test_api_file_lives_outside_repository() -> None:
     assert not str(DEFAULT_API_FILE).startswith(str(ROOT))
 
 
-def test_suite_is_registered_as_number_42() -> None:
+def test_suite_is_registered_as_number_41() -> None:
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
     assert SUITE_NAME in runbook
-    assert "42 suites" in runbook
+    assert "41 suites" in runbook

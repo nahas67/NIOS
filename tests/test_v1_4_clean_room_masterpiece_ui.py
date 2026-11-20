@@ -168,17 +168,18 @@ def _headers(client) -> dict[str, str]:
 
 
 def test_v1_6_frontend_tree_is_v2_2_terminal() -> None:
-    assert SRC_ROOT.is_dir()
-    assert (UI_ROOT / "public").is_dir()
-    assert (UI_ROOT / "package.json").is_file()
-    assert (UI_ROOT / "package-lock.json").is_file()
-    assert (UI_ROOT / "vite.config.ts").is_file()
-    assert (UI_ROOT / "biome.json").is_file()
-    assert (UI_ROOT / "tsconfig.json").is_file()
-    assert (UI_ROOT / "tsconfig.app.json").is_file()
-    assert (UI_ROOT / "postcss.config.mjs").is_file()
-    assert (UI_ROOT / "postcss.flatness.mjs").is_file()
-    assert (DIST_ROOT / "assets").is_dir()
+    """V2.6 removed the frontend tree entirely; only the headless document ships."""
+    assert not SRC_ROOT.exists()
+    assert not (UI_ROOT / "public").exists()
+    assert not (UI_ROOT / "package.json").exists()
+    assert not (UI_ROOT / "package-lock.json").exists()
+    assert not (UI_ROOT / "vite.config.ts").exists()
+    assert not (UI_ROOT / "biome.json").exists()
+    assert not (UI_ROOT / "tsconfig.json").exists()
+    assert not (UI_ROOT / "tsconfig.app.json").exists()
+    assert not (UI_ROOT / "postcss.config.mjs").exists()
+    assert not (UI_ROOT / "postcss.flatness.mjs").exists()
+    assert not (DIST_ROOT / "assets").exists()
 
 
 def test_v1_6_document_ships_v2_2_bundle() -> None:
@@ -186,15 +187,15 @@ def test_v1_6_document_ships_v2_2_bundle() -> None:
     assert index.is_file()
     text = index.read_text(encoding="utf-8")
     assert "nios-frontend" in text
-    assert "V2.2-INSTITUTIONAL-TERMINAL" in text
-    assert "v4.3.0-V2.3" in text
-    assert "#0D0E10" in text
-    assert "<script" in text.lower()
-    assert "/assets/" in text
+    assert 'content="NONE"' in text
+    assert "HEADLESS_API" in text
+    assert "v4.6.0-V2.6" in text
+    assert "<script" not in text.lower()
+    assert "/assets/" not in text
 
     manifest = json.loads((DIST_ROOT / "headless-manifest.json").read_text(encoding="utf-8"))
-    assert manifest["frontend"] != "NONE"
-    assert manifest["javascript"] >= 1
+    assert manifest["frontend"] == "NONE"
+    assert manifest["javascript"] == 0
     assert manifest["contracts"]["statutory_floors_bps"]["INDIA_ZERODHA_DHAN"] == 8.5
 
 

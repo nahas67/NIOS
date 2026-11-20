@@ -872,30 +872,30 @@ def test_gate4_page_aliases_are_declared_in_the_backend() -> None:
     assert '"group"' in source
     document = (UI_ROOT / "dist" / "index.html").read_text(encoding="utf-8")
     assert "nios-frontend" in document
-    assert "<script" in document.lower()
+    assert "<script" not in document.lower()
 
 
 def test_gate4_v2_2_frontend_toolchain_present() -> None:
-    """V2.2 ships React 19 + Vite + Tailwind v4 + Biome."""
-    assert (UI_ROOT / "package.json").exists()
-    assert (UI_ROOT / "vite.config.ts").exists()
-    assert (UI_ROOT / "biome.json").exists()
-    assert (UI_ROOT / "src").exists()
+    """V2.6 removed React/Vite/Tailwind/Biome; only the headless document ships."""
+    assert not (UI_ROOT / "package.json").exists()
+    assert not (UI_ROOT / "vite.config.ts").exists()
+    assert not (UI_ROOT / "biome.json").exists()
+    assert not (UI_ROOT / "src").exists()
     document = (UI_ROOT / "dist" / "index.html").read_text(encoding="utf-8")
     assert "nios-frontend" in document
-    assert "<script" in document.lower()
+    assert "<script" not in document.lower()
 
 
 def test_gate4_terminal_document_is_built() -> None:
     index_html = UI_ROOT / "dist" / "index.html"
-    assert index_html.exists(), "the terminal bundle document is missing"
+    assert index_html.exists(), "the headless document is missing"
     text = index_html.read_text(encoding="utf-8")
     assert "nios-release" in text
-    assert "v4.3.0-V2.3" in text
-    assert "<script" in text.lower()
-    assert "/assets/" in text
-    assert (UI_ROOT / "src").is_dir()
-    assert (UI_ROOT / "package.json").is_file()
+    assert "v4.6.0-V2.6" in text
+    assert "<script" not in text.lower()
+    assert "/assets/" not in text
+    assert not (UI_ROOT / "src").exists()
+    assert not (UI_ROOT / "package.json").exists()
 
 def test_gate5_watchlist_batch_qa_followup_and_8_strategy_comparison(
     client,

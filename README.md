@@ -162,7 +162,8 @@ premium 247.0 bps.
 
 ## Test suite
 
-**1114 tests · 42 suites · 0 failures · 0 warnings.** A warning is treated as a defect:
+**41 suites · 0 failures · 0 warnings.** V2.6 is a **pure headless backend**: the React
+terminal, its build tooling, its compiled bundles and its Playwright QA driver are gone. A warning is treated as a defect:
 `pyproject.toml` sets `filterwarnings = ["error"]` and exempts only four named third-party donor
 modules.
 
@@ -215,11 +216,10 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 | 35 | `test_v2_1_analytics_alerts_settings_and_sse.py` | **V2.1** `G7` closed-loop SSE topics, `G8` performance analytics, `G9` alert center, `G10` journal-backed runtime settings |
 | 36 | `test_v2_1_unified_session_csrf_and_reconciliation.py` | **V2.1** `G11` cookie + header session with CSRF double-submit and session telemetry, `G12` reconciliation status / run / clear-freeze |
 | 37 | `test_v2_1_deep_audit_and_hardening.py` | **V2.1** deep security / saga / concurrency audit closure: CSRF-guarded session transitions, LIVE-tier knobs, `PENDING_SWEEP_VERIFICATION`, idempotent closes, `to_micros` parity, symbol aliasing, bounded bar/lifecycle state |
-| 38 | `test_v2_2_final_institutional_terminal_ui.py` | **V2.2** flat-matte institutional terminal: 56 client routes, 12 canonical colour tokens, Paper/Live shell separation, CSRF on every mutation, zero glass / elevation / gradient / pill primitives |
-| 39 | `test_v2_3_wal_db_compaction_and_episodic_memory.py` | **V2.3** SQLite WAL `journal_mode=wal` + `BEGIN IMMEDIATE` thread/process concurrency, crash-restart recovery of the retry ladder / bars / Q&A threads, clean-slate WAL zeroing, 12-table PG16 DDL + versioned checksum-pinned migrations, offline daemon/burn-in scripts, byte-identical `truth_sha256` across checkpoint+delta replay, 3-signal hybrid retrieval in a sealed packet, episodic operator memory + `/memory/episodes` + `/memory/compact` |
-| 40 | `test_v2_3_telemetry_closure_and_ui_split.py` | **V2.3** all six gateway telemetry fields measured and dynamically updating (latency + per-ring p99, `feed_lag_ms` IDLE→LIVE, `pending_intents_count`, `adwin_drift`, `iv_rank_bps`), intentional-null contract, route-split bundle under the 500 kB ceiling with zero flatness violations, LIVE analyzer free of shadow-burst DOM |
-| 41 | `test_v2_4_performance_and_optimization_budgets.py` | **V2.4** end-to-end optimisation budgets: WAL connection profile, thread-local reuse, index-driven hot lookups, incremental document round-trip, pure-ASGI latency middleware, gzip/cache headers, canonical JSON + grounding digest parity, O(1) registries, coalesced SSE frames, and a flat-matte sub-500 kB bundle |
-| 42 | `test_v2_5_hy4_flash_config_and_live_qa_fixes.py` | **V2.5** `hy4-flash-free` single-model lock (`MODEL_NOT_ALLOWED`), `load_llm_api_config()` free-form parsing with `***last4` redaction, reasoning-content fallback, singular LLM probe alias, and regression coverage for every live human-QA defect fixed |
+| 38 | `test_v2_3_wal_db_compaction_and_episodic_memory.py` | **V2.3** SQLite WAL `journal_mode=wal` + `BEGIN IMMEDIATE` thread/process concurrency, crash-restart recovery of the retry ladder / bars / Q&A threads, clean-slate WAL zeroing, 12-table PG16 DDL + versioned checksum-pinned migrations, offline daemon/burn-in scripts, byte-identical `truth_sha256` across checkpoint+delta replay, 3-signal hybrid retrieval in a sealed packet, episodic operator memory + `/memory/episodes` + `/memory/compact` |
+| 39 | `test_v2_3_telemetry_closure_and_ui_split.py` | **V2.3** all six gateway telemetry fields measured and dynamically updating (latency + per-ring p99, `feed_lag_ms` IDLE→LIVE, `pending_intents_count`, `adwin_drift`, `iv_rank_bps`), intentional-null contract, and the zero-JavaScript headless shell (no `src/`, no `dist/assets/`, no `package.json`, zero `<script>` tags) |
+| 40 | `test_v2_4_performance_and_optimization_budgets.py` | **V2.4** end-to-end optimisation budgets: WAL connection profile, thread-local reuse, index-driven hot lookups, incremental document round-trip, pure-ASGI latency middleware, gzip/cache headers, canonical JSON + grounding digest parity, O(1) registries, coalesced SSE frames, and a headless shell that ships zero JavaScript and zero compiled assets |
+| 41 | `test_v2_5_hy4_flash_config_and_live_qa_fixes.py` | **V2.5** `hy4-flash-free` single-model lock (`MODEL_NOT_ALLOWED`), `load_llm_api_config()` free-form parsing with `***last4` redaction, reasoning-content fallback, singular LLM probe alias, and regression coverage for the operator-QA backend defects fixed (no React terminal, no Playwright driver) |
 
 
 With `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `pytest` is the only plugin loaded, so the result is
@@ -563,7 +563,7 @@ ring1_spinal/              zero-GC hot path + feed adapters
 ring2_brain/               quant/ truth/ mirofish/ cognition/
 ring3_cockpit/             gateway/ ui/openalgo_shell/
 specs/                     TLA+ models: KillSwitch, OrderLifecycle, Outbox, Reconciliation
-tests/                     1114 tests across 42 suites
+tests/                     41 headless backend suites
 scripts/run_nios.py        smoke test + unified server
 scripts/nios_port_check.py free-port resolver (--scan 8000 8010)
 scripts/preflight_golive.py 23-gate go-live readiness certificate (--strict / --fast)

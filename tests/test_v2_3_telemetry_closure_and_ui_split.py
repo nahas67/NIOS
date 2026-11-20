@@ -1,9 +1,11 @@
-"""NIOS V2.3 -- Suite 40: gateway telemetry closure and the route-split UI seal.
+"""NIOS V2.3 -- Suite 40: gateway telemetry closure and the headless shell seal.
 
 Part 3 of V2.3 replaced six fields the cockpit could only render as ``—`` with
-measured values, and Part 4 split the terminal into route-level chunks.  This
-suite is the executable contract for both, and it deliberately proves
-**movement**, not constants:
+measured values.  V2.6 removed the React terminal entirely, so Part 4 is now the
+**zero-JavaScript headless shell** contract: no ``src/``, no ``dist/assets/``,
+no ``package.json``, zero ``<script>`` tags, and a manifest that declares
+``javascript: 0``.  This suite is the executable contract for both, and it
+deliberately proves **movement**, not constants:
 
 ``latency_ms`` / per-ring ``p99``
     Every figure is a real ``time.perf_counter_ns()`` span.  A ring that has not
@@ -24,15 +26,11 @@ suite is the executable contract for both, and it deliberately proves
     three observations, then an int inside ``0..10000`` with a consistent
     ``iv_rank_detail`` window.
 
-The UI half asserts the shipped artefact: at least two ``*.js`` chunks (route
-splitting is real), **every** chunk below ``500 kB``, zero flat-matte violations
-(``backdrop-filter`` / ``backdrop-blur`` / ``box-shadow`` / gradients /
-``9999px`` / ``rounded-full``) and a LIVE analyzer that contains no shadow-burst
-control at all.
-
-If ``dist/`` has not been built, the artefact tests skip with an explicit reason
-rather than pretending to pass; run ``npm run build`` in
-``ring3_cockpit/ui/openalgo_shell`` to execute them.
+The shell half asserts the shipped artefact is a headless backend document:
+the ``dist/index.html`` carries zero ``<script>`` tags, ``dist/assets/`` and
+``src/`` are absent from the tree, and the manifest declares ``frontend: NONE``
+with ``javascript: 0``.  There is no build step to run: the document is served
+verbatim by ``ring3_cockpit/gateway/control_plane.py``.
 """
 
 from __future__ import annotations
@@ -55,18 +53,9 @@ if str(ROOT) not in sys.path:
 
 SUITE_NAME = Path(__file__).name
 UNITS = 1_000_000
-CHUNK_CEILING_BYTES = 500 * 1024
 RING_P99_KEYS = ("ring0_p99_ms", "ring1_p99_ms", "ring2_p99_ms", "ring3_p99_ms")
-FORBIDDEN_CSS = (
-    "backdrop-filter",
-    "backdrop-blur",
-    "box-shadow",
-    "linear-gradient",
-    "radial-gradient",
-    "9999px",
-    "rounded-full",
-)
-RELEASE = "v4.3.0-V2.3"
+RELEASE = "v4.6.0-V2.6"
+HEADLESS_SCHEMA = "v1.6.headless-backend"
 DRIFT_STATES = ("STABLE", "HALVED", "PAUSED")
 
 
@@ -527,171 +516,129 @@ def test_gate3_status_payload_is_enveloped_and_hashed(cockpit: Any) -> None:
 
 
 # ===========================================================================
-# Gate 4 -- frontend artefact: real route splitting, zero flatness violations
+# Gate 4 -- headless artefact: zero JavaScript, zero build tooling
 # ===========================================================================
 
 
-def _dist_assets() -> tuple[Path, ...]:
-    return tuple(sorted((DIST_ROOT / "assets").glob("*")))
+def _headless_document() -> str:
+    return (DIST_ROOT / "index.html").read_text(encoding="utf-8")
 
 
-def _chunk_table() -> list[dict[str, Any]]:
-    rows = []
-    for path in _dist_assets():
-        if path.suffix not in (".js", ".css"):
-            continue
-        rows.append({"name": path.name, "bytes": path.stat().st_size})
-    return sorted(rows, key=lambda row: (-row["bytes"], row["name"]))
+def _document_manifest() -> dict[str, Any]:
+    document = _headless_document()
+    match = re.search(r'<pre id="nios-headless-manifest">(.*?)</pre>', document, re.S)
+    assert match is not None, "dist/index.html lost the nios-headless-manifest block"
+    return json.loads(match.group(1))
 
 
-def test_gate4_bundle_is_route_split_and_under_the_chunk_ceiling() -> None:
-    if not (DIST_ROOT / "assets").is_dir():
-        pytest.skip("dist/assets is absent; run `npm run build` first")
-
-    chunks = _chunk_table()
-    javascript = [row for row in chunks if row["name"].endswith(".js")]
-    assert len(javascript) >= 2, f"route splitting produced {len(javascript)} chunk(s)"
-    # One chunk per workstation means a large, independently verifiable count.
-    assert len(javascript) >= 17, [row["name"] for row in javascript]
-
-    oversized = [
-        (row["name"], row["bytes"]) for row in chunks if row["bytes"] >= CHUNK_CEILING_BYTES
-    ]
-    assert not oversized, f"chunk(s) over the 500 kB ceiling: {oversized}"
-
-    biggest = chunks[0]
-    assert biggest["bytes"] < CHUNK_CEILING_BYTES
-    # A route chunk is genuinely smaller than the shared vendor/react entry.
-    assert any(row["bytes"] < biggest["bytes"] // 2 for row in chunks)
+def _shipped_manifest() -> dict[str, Any]:
+    return json.loads((DIST_ROOT / "headless-manifest.json").read_text(encoding="utf-8"))
 
 
-def test_gate4_bundle_keeps_zero_forbidden_flat_matte_primitives() -> None:
-    if not (DIST_ROOT / "assets").is_dir():
-        pytest.skip("dist/assets is absent; run `npm run build` first")
-
-    scanned = 0
-    for path in _dist_assets():
-        if path.suffix not in (".js", ".css"):
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace").lower()
-        for forbidden in FORBIDDEN_CSS:
-            assert forbidden not in text, f"{path.name} contains {forbidden}"
-        scanned += 1
-    assert scanned >= 2
-
-    document = (DIST_ROOT / "index.html").read_text(encoding="utf-8")
-    for forbidden in FORBIDDEN_CSS:
-        assert forbidden not in document.lower(), forbidden
-    assert (DIST_ROOT / "headless-manifest.json").is_file()
+def test_gate4_document_ships_zero_script_tags() -> None:
+    document = _headless_document()
+    assert document.lower().count("<script") == 0
+    assert 'name="nios-frontend"' in document
+    assert 'name="nios-mode"' in document
+    assert 'content="HEADLESS_API"' in document
+    assert "NIOS Headless Backend" in document
+    assert "No frontend application is shipped" in document
+    assert "/assets/" not in document
 
 
-def test_gate4_release_marker_is_v2_3() -> None:
-    if not DIST_ROOT.is_dir():
-        pytest.skip("dist is absent; run `npm run build` first")
+def test_gate4_dist_assets_and_source_tree_are_gone() -> None:
+    assert not (DIST_ROOT / "assets").exists(), "dist/assets/ still ships compiled JS/CSS"
+    assert not SRC_ROOT.exists(), "src/ still ships React/TypeScript sources"
+    assert not (UI_ROOT / "src").exists()
+    assert not (UI_ROOT / "public").exists()
+    assert not (UI_ROOT / "package.json").exists()
+    assert not (UI_ROOT / "package-lock.json").exists()
+    assert not (UI_ROOT / "vite.config.ts").exists()
+    assert not (UI_ROOT / "node_modules").exists()
+    assert not (UI_ROOT / "index.html").exists()
 
-    document = (DIST_ROOT / "index.html").read_text(encoding="utf-8")
-    assert f'content="{RELEASE}"' in document
-    assert "nios-release" in document
-    assert "nios-frontend" in document
-    assert "V2.2-INSTITUTIONAL-TERMINAL" in document
+    shipped = {path.name for path in DIST_ROOT.iterdir() if path.is_file()}
+    assert shipped == {"index.html", "headless-manifest.json"}, shipped
 
-    manifest = json.loads((DIST_ROOT / "headless-manifest.json").read_text(encoding="utf-8"))
+
+def test_gate4_manifest_declares_a_headless_backend() -> None:
+    manifest = _shipped_manifest()
+    assert manifest["schema_version"] == HEADLESS_SCHEMA
     assert manifest["release"] == RELEASE
-    assert manifest["schema_version"] == "v4.3.0.terminal"
-    assert manifest["javascript"] >= 17
-    assert manifest["routes"] == 56
-    assert manifest["workstations"] == 17
-    assert manifest["shells"] == ["PaperShell", "LiveShell"]
+    assert manifest["frontend"] == "NONE"
+    assert manifest["javascript"] == 0
+    assert manifest["js_assets"] == 0
+    assert manifest["css_assets"] == 0
+    assert manifest["css_framework"] == "NONE"
+    assert manifest["mode"] == "HEADLESS_API"
+    assert manifest["api_root"] == "/api/v2"
+    assert manifest["runtime"] == "FastAPI REST + SSE"
+    for retired in ("shells", "routes", "workstations", "surfaces", "stylesheets"):
+        assert retired not in manifest, retired
 
-    # The authored document carries the same marker before the build.
-    source_document = (UI_ROOT / "index.html").read_text(encoding="utf-8")
-    assert f'content="{RELEASE}"' in source_document
+    document_manifest = _document_manifest()
+    assert document_manifest["schema_version"] == HEADLESS_SCHEMA
+    assert document_manifest["release"] == RELEASE
+    assert document_manifest["frontend"] == "NONE"
+    assert document_manifest["javascript"] == 0
+    assert document_manifest["js_assets"] == 0
+    assert document_manifest["css_assets"] == 0
+    assert document_manifest["mode"] == "HEADLESS_API"
+    assert document_manifest["document_id"] == "NIOS-ARC-2026-V3"
 
 
-def test_gate4_source_carries_the_release_marker_and_no_legacy_string() -> None:
-    for relative in (
-        "index.html",
-        "vite.config.ts",
-        "src/shells/ShellFrame.tsx",
-        "src/portals/PortalFrame.tsx",
-    ):
-        text = (UI_ROOT / relative).read_text(encoding="utf-8")
-        assert RELEASE in text, relative
-        assert "v4.2.0-V2.2" not in text, f"{relative} still pins the V2.2 release"
+def test_gate4_manifest_contracts_match_the_document() -> None:
+    manifest = _shipped_manifest()
+    document_manifest = _document_manifest()
+    assert manifest["contracts"]["envelope"] == document_manifest["payload_envelope"]
+    assert manifest["contracts"]["risk_telemetry"] == document_manifest["risk_telemetry"]
+    assert len(manifest["contracts"]["envelope"]) == 5
+    assert len(manifest["contracts"]["risk_telemetry"]) == 10
+    assert manifest["contracts"]["statutory_floors_bps"] == {
+        "INDIA_ZERODHA_DHAN": 8.5,
+        "CRYPTO_BINANCE": 16.0,
+        "US_IBKR": 2.8,
+        "FX_MT5": 1.6,
+    }
 
 
 # ===========================================================================
-# Gate 5 -- LIVE analyzer purity and route-level code splitting
+# Gate 5 -- the gateway serves the headless document with no-cache
 # ===========================================================================
 
 
-def test_gate5_live_shell_contains_no_burst_control() -> None:
-    live_shell = SRC_ROOT / "shells" / "LiveShell.tsx"
-    assert live_shell.is_file()
-    assert "burst" not in live_shell.read_text(encoding="utf-8").lower()
+def test_gate5_gateway_serves_the_headless_document_with_no_cache(cockpit) -> None:
+    client, _runtime = cockpit
+    for route in ("/", "/dashboard", "/agents/deep/path", "/ledger"):
+        response = client.get(route)
+        assert response.status_code == 200, (route, response.status_code)
+        assert "no-cache" in response.headers.get("cache-control", ""), route
+        assert "<script" not in response.text.lower(), route
+        assert "HEADLESS_API" in response.text, route
 
 
-def test_gate5_analyzer_renders_shadow_burst_only_under_paper() -> None:
-    source = (SRC_ROOT / "pages" / "AnalyzerPage.tsx").read_text(encoding="utf-8")
+def test_gate5_gateway_never_crashes_without_dist_assets(cockpit) -> None:
+    client, _runtime = cockpit
+    assert not (DIST_ROOT / "assets").exists()
 
-    # Every burst control sits inside a ``mode === "PAPER" ?`` branch: there is
-    # exactly one gate per handler, and no handler outside a gate.
-    handlers = source.count("void burst()")
-    gates = list(re.finditer(r'mode === "PAPER" \?', source))
-    assert handlers >= 1, "the PAPER burst handler disappeared entirely"
-    assert handlers == len(gates), (handlers, len(gates))
-    for gate in gates:
-        tail = source[gate.end() : gate.end() + 800]
-        assert "void burst()" in tail, "a PAPER gate does not contain the burst handler"
-
-    # The LIVE branch is an explicit removal, not a disabled button.
-    assert 'disabled={mode === "LIVE"' not in source
-    assert "Shadow burst is PAPER-only" not in source
-
-    assert source.count('mode === "PAPER" ?') >= 2
-    assert source.count('mode === "LIVE"') >= 1
-    # The LIVE banner explains the absence rather than offering the control.
-    assert "PAPER-only control" in source
+    missing_chunk = client.get("/assets/index-B--LNYwK.js")
+    assert "immutable" not in missing_chunk.headers.get("cache-control", "").lower()
+    assert "<script" not in missing_chunk.text.lower()
 
 
-def test_gate5_routes_are_lazy_loaded_behind_one_suspense_boundary() -> None:
-    app = (SRC_ROOT / "App.tsx").read_text(encoding="utf-8")
-    assert "lazy(() => import(" in app
-    assert app.count("lazy(() => import(") >= 17
-    assert "<Suspense" in app
-    assert "RouteSuspense" in app
-    # The shared fallback is flat matte: no animation, no shadow, no blur.
-    assert "#0D0E10" in app
-    assert "#27292E" in app
-    assert "animate-" not in app
-    assert "shadow-" not in app
-    assert "backdrop" not in app
+def test_gate5_static_cache_policy_is_unchanged_for_assets() -> None:
+    from ring3_cockpit.gateway.control_plane import (
+        CACHE_CONTROL_IMMUTABLE,
+        CACHE_CONTROL_REVALIDATE,
+        _static_cache_control,
+    )
 
-    for page in ("DashboardPage", "BrainPage", "ForgePage", "OptionsPage"):
-        text = (SRC_ROOT / "pages" / f"{page}.tsx").read_text(encoding="utf-8")
-        assert "telemetry" in text.lower(), f"{page} does not render the telemetry block"
-
-    shell = (SRC_ROOT / "shells" / "ShellFrame.tsx").read_text(encoding="utf-8")
-    assert "TelemetryStrip" in shell
-
-
-def test_gate5_agents_page_renders_the_episodic_panel() -> None:
-    agents = (SRC_ROOT / "pages" / "AgentsPage.tsx").read_text(encoding="utf-8")
-    assert "Episodic operator decisions" in agents
-    assert "/memory/episodes" in agents
-    assert "/memory/compact" in agents
-    assert "Compact Memory" in agents
-    assert "EPISODE_KINDS" in agents
-
-
-def test_gate5_forbidden_primitives_are_absent_from_the_sources() -> None:
-    scanned = 0
-    for path in sorted(SRC_ROOT.rglob("*.tsx")) + sorted(SRC_ROOT.rglob("*.ts")):
-        text = path.read_text(encoding="utf-8").lower()
-        for forbidden in ("backdrop-filter", "backdrop-blur", "linear-gradient", "radial-gradient"):
-            assert forbidden not in text, f"{path.name} contains {forbidden}"
-        scanned += 1
-    assert scanned >= 30, scanned
+    assert _static_cache_control("assets/index-abc.js") == CACHE_CONTROL_IMMUTABLE
+    assert _static_cache_control("assets/index-abc.css") == CACHE_CONTROL_IMMUTABLE
+    assert _static_cache_control("Assets/APP.JS") == CACHE_CONTROL_IMMUTABLE
+    assert _static_cache_control("") == CACHE_CONTROL_REVALIDATE
+    assert _static_cache_control("dashboard") == CACHE_CONTROL_REVALIDATE
+    assert _static_cache_control("index.html") == CACHE_CONTROL_REVALIDATE
 
 
 # ===========================================================================
@@ -699,8 +646,9 @@ def test_gate5_forbidden_primitives_are_absent_from_the_sources() -> None:
 # ===========================================================================
 
 
-def test_gate6_suite40_belongs_to_the_forty_suite_release() -> None:
+def test_gate6_suite40_belongs_to_the_forty_one_suite_release() -> None:
     suites = sorted(path.name for path in (ROOT / "tests").glob("test_*.py"))
-    assert len(suites) == 42, suites
+    assert len(suites) == 41, suites
     assert SUITE_NAME in suites
     assert "test_v2_3_wal_db_compaction_and_episodic_memory.py" in suites
+    assert "test_v2_2_final_institutional_terminal_ui.py" not in suites

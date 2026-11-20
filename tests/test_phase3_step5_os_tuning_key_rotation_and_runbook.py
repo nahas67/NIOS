@@ -451,7 +451,7 @@ def test_gate3_runbook_documents_all_sops_and_endpoints() -> None:
 
 def test_gate4_test_inventory_is_thirty_eight_files() -> None:
     test_files = sorted(TESTS_DIR.glob("test_*.py"))
-    assert len(test_files) == 42, [path.name for path in test_files]
+    assert len(test_files) == 41, [path.name for path in test_files]
     assert "test_phase3_step5_os_tuning_key_rotation_and_runbook.py" in {
         path.name for path in test_files
     }
@@ -463,11 +463,11 @@ def test_gate4_headless_document_contains_rotation_controls() -> None:
     document = index.read_text(encoding="utf-8")
     assert "nios-frontend" in document
     assert "nios-release" in document
-    assert '<script type="module"' in document
-    assert "/assets/" in document
+    assert "<script" not in document.lower()
+    assert "/assets/" not in document
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
     assert "/api/v2/control/vault/rotate-keys" in runbook
-    assert "42 suites" in runbook
+    assert "41 suites" in runbook
 
 
 def test_gate4_release_tag_is_annotated_when_present() -> None:

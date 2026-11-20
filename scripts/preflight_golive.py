@@ -445,18 +445,18 @@ def gate_release_tag(ctx: PreflightContext) -> Gate:
 
 
 def gate_artifacts_present(_ctx: PreflightContext) -> Gate:
-    """Every release artifact exists and the runbook advertises 42 suites."""
+    """Every release artifact exists and the runbook advertises 41 suites."""
     missing = [rel for rel in REQUIRED_ARTIFACTS if not (ROOT / rel).is_file()]
     runbook = ROOT / "RUNBOOK.md"
     suite_ok = False
     if runbook.is_file():
         text = runbook.read_text(encoding="utf-8", errors="replace")
-        suite_ok = "42 suites" in text
+        suite_ok = "41 suites" in text
     ok = not missing and suite_ok
     detail = f"{len(REQUIRED_ARTIFACTS) - len(missing)}/{len(REQUIRED_ARTIFACTS)} artifacts"
     if missing:
         detail += f", missing={missing[:4]}"
-    detail += f", runbook_42_suites={'yes' if suite_ok else 'no'}"
+    detail += f", runbook_41_suites={'yes' if suite_ok else 'no'}"
     return Gate(
         "release.artifacts_present",
         "Release artifacts + runbook suite inventory",
@@ -466,7 +466,7 @@ def gate_artifacts_present(_ctx: PreflightContext) -> Gate:
             "artifacts_expected": len(REQUIRED_ARTIFACTS),
             "artifacts_missing": len(missing),
             "missing": missing[:8],
-            "runbook_declares_42_suites": suite_ok,
+            "runbook_declares_41_suites": suite_ok,
         },
     )
 

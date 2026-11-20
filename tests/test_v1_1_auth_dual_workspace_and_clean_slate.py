@@ -341,7 +341,7 @@ def test_gate3_paper_and_live_routes_and_headless_document(client):
         assert response.status_code == 200, route
         assert "text/html" in response.headers.get("content-type", "")
         assert "nios-frontend" in response.text
-        assert '<script type="module"' in response.text.lower()
+        assert "<script" not in response.text.lower()
 
     # API paths must never be swallowed by the fallback.
     missing = client.get("/api/v2/does-not-exist")
@@ -351,9 +351,11 @@ def test_gate3_paper_and_live_routes_and_headless_document(client):
     assert index_html.exists()
     document = index_html.read_text(encoding="utf-8")
     assert "nios-frontend" in document
-    assert "<script" in document.lower()
-    assert (UI_ROOT / "package.json").is_file()
-    assert (UI_ROOT / "src").is_dir()
+    assert 'content="NONE"' in document
+    assert "HEADLESS_API" in document
+    assert "<script" not in document.lower()
+    assert not (UI_ROOT / "package.json").exists()
+    assert not (UI_ROOT / "src").exists()
 
 
 def test_gate3b_workspace_state_contracts(client, paper_session):
@@ -376,8 +378,8 @@ def test_gate3b_workspace_state_contracts(client, paper_session):
     # V2.2: the workspace contract is the API and the compiled terminal.
     document = (UI_ROOT / "dist" / "index.html").read_text(encoding="utf-8")
     assert "nios-frontend" in document
-    assert '<script type="module"' in document
-    assert (UI_ROOT / "dist" / "assets").is_dir()
+    assert "<script" not in document.lower()
+    assert not (UI_ROOT / "dist" / "assets").exists()
 
 
 # ---------------------------------------------------------------------------

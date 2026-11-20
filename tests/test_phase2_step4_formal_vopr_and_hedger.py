@@ -310,7 +310,7 @@ def test_gate5_air_gap_ast_has_zero_violations() -> None:
 
 def test_gate5_full_test_inventory_is_thirty_eight_files() -> None:
     test_files = sorted((ROOT / "tests").glob("test_*.py"))
-    assert len(test_files) == 42, [path.name for path in test_files]
+    assert len(test_files) == 41, [path.name for path in test_files]
     assert (ROOT / "tests" / "test_phase2_step4_formal_vopr_and_hedger.py") in test_files
     assert (ROOT / "tests" / "test_step9_paper_autopilot.py") in test_files
     assert (ROOT / "tests" / "test_v2_1_deep_audit_and_hardening.py") in test_files
@@ -372,14 +372,15 @@ def certified_client(tmp_path_factory: pytest.TempPathFactory):
 
 
 def test_gate6_headless_status_document_exists_and_is_served(certified_client) -> None:
-    """V2.2: every client route serves the compiled institutional terminal."""
+    """V2.6: every client route serves the zero-JavaScript headless document."""
     index = DIST_ROOT / "index.html"
-    assert index.is_file(), "the terminal document is missing"
+    assert index.is_file(), "the headless document is missing"
     html = index.read_text(encoding="utf-8")
     assert "nios-frontend" in html
-    assert "V2.2-INSTITUTIONAL-TERMINAL" in html
-    assert '<script type="module"' in html
-    assert "/assets/" in html
+    assert 'content="NONE"' in html
+    assert "HEADLESS_API" in html
+    assert "<script" not in html.lower()
+    assert "/assets/" not in html
     assert "backdrop-filter" not in html.lower()
 
     for route in ("/", "/dashboard", "/orders", "/paper/dashboard", "/live/control"):
@@ -387,7 +388,7 @@ def test_gate6_headless_status_document_exists_and_is_served(certified_client) -
         assert served.status_code == 200, route
         assert "text/html" in served.headers.get("content-type", "")
         assert "nios-frontend" in served.text
-        assert '<script type="module"' in served.text
+        assert "<script" not in served.text.lower()
 
 
 def test_gate6_formal_proofs_endpoint_certifies_phase2_step4(certified_client) -> None:
