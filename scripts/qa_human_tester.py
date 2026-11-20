@@ -285,9 +285,15 @@ def dom_fingerprint(page: Any) -> str:
                 const buttons = Array.from(document.querySelectorAll('button'))
                   .map(b => [b.innerText, b.disabled, b.className]).join('|');
                 const modals = document.querySelectorAll('.fixed.inset-0').length;
+                // React sets <input>/<select>/<textarea> .value as a DOM property,
+                // which is NOT reflected in outerHTML or innerText. Include live
+                // form-control values/checked state so state-changing buttons
+                // (e.g. Re-issue algo id) are not misflagged as dead buttons.
+                const controls = Array.from(document.querySelectorAll('input,textarea,select'))
+                  .map(c => [c.tagName, c.value, c.checked]).join('|');
                 return JSON.stringify({html: main.outerHTML.slice(0, 8000),
                                        text: main.innerText.slice(0, 4000),
-                                       buttons, modals, href: location.href});
+                                       buttons, controls, modals, href: location.href});
             }"""
         )
         return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
